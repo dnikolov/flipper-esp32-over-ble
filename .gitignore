@@ -1,0 +1,13 @@
+# ESP-IDF build output
+build/
+*.log
+
+# Editor/OS cruft
+.vscode/
+Thumbs.db
+
+# Cached vendor checkout (its own git repo; reproducible from REVISION.txt)
+docs/references/flipper-firmware/upstream/
+
+# Claude Code runtime state
+.claude/scheduled_tasks.lock

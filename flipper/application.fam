@@ -1,0 +1,10 @@
+App(
+    appid="flipper_esp32_over_ble",
+    name="ESP32 over BLE",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flipper_esp32_over_ble_app",
+    sources=["flipper_esp32_over_ble.c", "framing.c", "cbor_codec.c", "pairing_crypto.c", "pairing.c", "session_crypto.c", "session.c"],
+    requires=["gui", "bt"],
+    fap_category="Connectivity",
+    targets=["f7"],
+)

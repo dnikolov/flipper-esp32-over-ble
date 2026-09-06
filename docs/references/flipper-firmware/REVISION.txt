@@ -1,0 +1,13 @@
+﻿Commit: 3c9be0fdd9d301a9436765099a2d1780b36a1795
+Remote: https://github.com/DarkFlippers/unleashed-firmware.git
+Retrieved: 2026-09-03T16:41:05Z
+
+Note: this mirror was previously (incorrectly) a checkout of the vanilla
+flipperdevices/flipperzero-firmware.git repo at commit
+2d8711939ac8442a572219ed0fb4beaa02a89858, mislabeled as Unleashed. Found
+2026-09-03 during step 5 pairing design research (see docs/SESSION_MEMORY.md)
+by checking targets/f7/api_symbols.csv against the actual pinned checkout at
+C:\Users\Deyan\unleashed-firmware-unlshd-092. Fixed by re-fetching this
+directory directly from the correct Unleashed repo at the project's pinned
+commit (matches CLAUDE.md's "Pinned baselines"). Verified: targets/f7/api_symbols.csv
+reports Version 88.4, matching the pinned baseline.

@@ -1,0 +1,1 @@
+idf_component_register(SRCS "main.c" "framing.c" "cbor_codec.c" "pairing_crypto.c" "pairing.c" "session_crypto.c" "session.c" "factory_reset.c" INCLUDE_DIRS "." REQUIRES bt esp_timer mbedtls nvs_flash esp_hw_support esp_driver_gpio esp_driver_rmt)

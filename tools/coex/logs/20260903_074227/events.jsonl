@@ -1,0 +1,15 @@
+{"degradations":"0","last_reconnect_via":"none","t_ms":"960998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:42:47.3583940+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1020998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:43:47.3449259+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1080998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:44:47.3352474+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1140998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:45:47.3378632+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1200998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:46:47.3362041+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1260998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:47:47.3390745+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1320998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:48:47.3384008+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1380998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:49:47.3388822+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1440998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:50:47.3386441+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1500998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:51:47.3366823+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1560998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:52:47.3359083+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1620998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:53:47.3360773+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1680998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:54:47.3332015+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1740998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:55:47.3189941+03:00","disconnects":"0"}
+{"degradations":"0","last_reconnect_via":"none","t_ms":"1800998","event":"COEX_SUMMARY","point":"4","longest_gap_ms":"0","hard_fails":"0","_ts":"2026-09-03T07:56:47.3310035+03:00","disconnects":"0"}
