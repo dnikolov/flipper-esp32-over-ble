@@ -216,6 +216,32 @@ vector, latent since step 3;
 fixed 2026-09-05 by raising it to `512u` to match. Validate bounds against `docs/PROTOCOL.md`
 directly, never against the other implementation or the vectors.
 
+A second example, wifi_scan (2026-09-07): `feb_cbor_skip_value()`'s nesting-depth budget is a
+pure internal recursion counter with no wire representation, so nothing in `docs/PROTOCOL.md`
+or the test vectors could catch a wrong assumption about it — and both firmwares independently
+assumed the same wrong one (that a field nested inside `payload`, like `command.arguments` or
+`status.result`, should inherit `payload_span`'s depth-2 starting point). It doesn't: a field
+with its own dedicated, schema-aware decoder is its own self-contained span and must get a
+*fresh* depth-0 budget when it recurses into `feb_cbor_skip_value()` for a still-generic
+sub-piece, otherwise a real, spec-legal shape (here, `result` → `aps` array → 6-field
+`<ap-result>` map — 3 real containers) silently exceeds `FEB_CBOR_MAX_NESTING` and gets
+rejected. Both agents hit this the same way, independently, confirming it's a genuine spec gap
+and not implementation carelessness — but also confirming the general point: **when you add a
+new schema-aware decoder for a field that itself sits inside another generically-validated
+field, explicitly decide and state what depth budget it starts from; don't silently inherit
+whatever the outer call site happened to be at.** This is now documented in `docs/PROTOCOL.md`'s
+"Nesting depth" section — read it before adding another nested payload shape.
+
+**When you and the Flipper agent add new shared codec functions/macros in parallel, diff
+`cbor_codec.h` against `flipper/cbor_codec.h` before reporting done.** The convention (stated
+above) is that this header's actual API surface — function signatures, struct layouts, macro
+names — stays byte-identical between firmwares, with only comment wording allowed to differ.
+wifi_scan's parallel implementation broke this silently: the two agents wrote genuinely
+different signatures for `feb_cbor_encode_wifi_scan_result_payload()` and a differently-named
+macro, and nothing caught it until an explicit post-hoc `diff` in the orchestrating session.
+Run that diff yourself as your last step whenever you add new shared-header content in
+parallel with the Flipper side, not just when told to.
+
 ### Efficiency: fix the constraint rather than paying for it on every record
 
 The 64-byte Write characteristic means each record costs ~4x the ATT round trips it needs at

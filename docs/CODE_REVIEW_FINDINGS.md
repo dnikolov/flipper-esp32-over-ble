@@ -14,7 +14,7 @@ currently unreachable from a live connection; they become live the moment step 7
 
 ## Critical / correctness
 
-### 1. Out-of-bounds read in the Flipper's CBOR map validator
+### 1. Out-of-bounds read in the Flipper's CBOR map validator — FIXED 2026-09-07
 `flipper/cbor_codec.c:373`, inside `feb_cbor_skip_value()`'s major-type-5 (map) case:
 
 ```c
@@ -29,7 +29,7 @@ read past the end of `in`. The ESP32's equivalent function has the missing guard
 `payload` map arriving on the write characteristic, pre-authentication — the highest-priority
 fix in this list: small, isolated, remotely triggerable.
 
-### 2. The two `feb_cbor_skip_value()` implementations accept different CBOR value sets
+### 2. The two `feb_cbor_skip_value()` implementations accept different CBOR value sets — FIXED 2026-09-07
 `payload_span` is exactly what gets encrypted and covered by AAD once step 7 lands, so both
 peers must agree on what counts as a structurally valid payload. They currently don't:
 
@@ -44,13 +44,29 @@ live landmine for step 7 and the future `wifi_scan` step. `feb_cbor_skip_value()
 direct unit-test coverage** on either side (checked `tests/esp32/` and `tests/flipper/`), which
 is how this drifted unnoticed.
 
-### 3. Nesting depth differs by one level between the two decoders
+**Resolution:** converged on the ESP32's stricter behavior (decision D2 in
+[CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)) — both sides now accept only majors 0
+(unsigned int), 2 (bytes), 3 (text), 4 (array), 5 (map), rejecting negative integers, tags, and
+`true`/`false`/`null`. Recorded in [PROTOCOL.md](PROTOCOL.md)'s "Canonical CBOR encoding"
+section. Direct `feb_cbor_skip_value()` unit tests added to both `tests/esp32/` and
+`tests/flipper/`, asserting identical `feb_cbor_status_t` on both sides.
+
+### 3. Nesting depth differs by one level between the two decoders — FIXED 2026-09-07
 The payload span is validated starting at `depth = 2` on the ESP32
 (`esp32/main/cbor_codec.c:758`, inside `feb_cbor_decode_unencrypted()`) but at `depth = 1` on the
 Flipper (`flipper/cbor_codec.c:655`), against the same `FEB_CBOR_MAX_NESTING` limit. The Flipper
 will accept one level of payload nesting the ESP32 rejects as `FEB_CBOR_ERR_TOO_DEEP`.
 
-### 4. Over-length `board_id` silently derives an all-zero AES-256 session key on the ESP32
+**Scope correction:** a second call site has the same divergence and was not caught by the
+original scan — `flipper/pairing.c:195-196`'s `feb_cbor_decode_pairing_envelope()` also passed
+`depth = 1` against the ESP32's `depth = 2` (`esp32/main/pairing.c:170`).
+
+**Resolution:** converged on the ESP32's depth (`2`), which matches `cbor_codec.h`'s own
+documented derivation of `FEB_CBOR_MAX_NESTING` ("outer map -> payload map -> array -> element",
+4 levels) — decision D3 in [CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md). Both Flipper call
+sites (`cbor_codec.c` and `pairing.c`) changed from `1` to `2`; no protocol change needed.
+
+### 4. Over-length `board_id` silently derives an all-zero AES-256 session key on the ESP32 — FIXED 2026-09-07
 `feb_session_derive_key()` bounds `board_id_len` at `FEB_PAIRING_BOARD_ID_MAX_LEN` (32), but the
 runtime envelope decoders (`feb_cbor_decode_unencrypted`/`_protected`) only bound `board_id` at
 the general `FEB_CBOR_MAX_TEXT_LEN` (64) — only `pairing.c`'s pairing-envelope decoder enforces
@@ -65,6 +81,26 @@ Both are incorrect; the ESP32's all-zero key is the dangerous one, since `feb_se
 returns `void` and no caller can detect the failure. The same clamp-vs-zero split exists between
 the proof helpers (`session_proof_tag()` on the Flipper vs. `feb_session_hmac_label()` on the
 ESP32).
+
+**Scope correction:** the same clamp-vs-zero divergence also exists between
+`feb_pairing_derive_secret()` on the Flipper (`flipper/pairing.c:617-619`, was a silent clamp) and
+the ESP32 (`esp32/main/pairing.c:799-802`, already zeroed) — not caught by the original scan.
+
+**Corrected severity:** as written above this reads as a live exploit path; it is not currently
+reachable. Both application layers already bound `board_id` before reaching these functions —
+ESP32 `main.c:1227-1228` compares against its own ~20-char `board_id`, and Flipper
+`handle_hello()` calls `board_id_is_valid()`, which rejects `len > 32`. This is defense-in-depth
+in a shared primitive, not a live bug — but it stays in scope for the fix pass since step 7 adds
+new callers of the derivation path that shouldn't be able to get it wrong.
+
+**Resolution:** converged on the ESP32's zero-on-overflow behavior (decision D4 in
+[CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)): an all-zero key/secret fails GCM
+authentication or proof/confirmation HMAC checks immediately and visibly, where a
+silently-truncated `board_id` would derive a real but wrong key/secret that presents as an
+unexplained mismatch. Both Flipper functions (`feb_session_derive_key()`,
+`feb_pairing_derive_secret()`) now zero their output (via `feb_secure_zero()`) and return early
+on an over-length `board_id`, matching the ESP32. Shared headers unchanged (`void`-returning by
+frozen contract).
 
 ### 5. Fragment header validation diverges between the two `framing.c` implementations
 The protocol says `flags` is reserved and must be all zero. The ESP32 enforces this
@@ -110,7 +146,7 @@ The third, `esp32/main/main.c:1315` (idle-connection timeout), correctly uses th
 path (`esp32/main/main.c:1122`), so a wrap there makes a freshly-opened pairing window appear
 already expired.
 
-### 9. Flipper's GCM wrapper silently discards hardware failure status
+### 9. Flipper's GCM wrapper silently discards hardware failure status — FIXED 2026-09-07
 `flipper/session_crypto.c:31`, `feb_gcm_encrypt()`: discards the return value of
 `furi_hal_crypto_gcm_encrypt_and_tag()`. On a hardware key-load failure, `ciphertext_out` is left
 **completely untouched**, and whatever stale bytes were already in that buffer go out over BLE.
@@ -121,13 +157,28 @@ the ESP32 does (`esp32/main/session_crypto.c:59-64`) — a direct violation of t
 stated "zeroize on every success and failure path" security property
 (`CLAUDE.md`/`docs/PROTOCOL.md`).
 
-### 10. Trailing bytes after a decoded record are never rejected
+**Resolution:** `feb_gcm_encrypt()` now captures `furi_hal_crypto_gcm_encrypt_and_tag()`'s
+`FuriHalCryptoGCMState` (instead of discarding it via `(void)`) and zeroizes `ciphertext_out`/
+`tag_out` on anything other than `FuriHalCryptoGCMStateOk`; `feb_gcm_decrypt()` zeroizes
+`plaintext_out` before returning 0 on a failed tag verification. Both frozen signatures
+unchanged. Zeroization goes through `feb_secure_zero()` (`#include "pairing_crypto.h"` added),
+per that header's contract that all zeroization goes through the one auditable function.
+
+### 10. Trailing bytes after a decoded record are never rejected — FIXED 2026-09-07
 Neither `feb_cbor_decode_unencrypted()` nor `feb_cbor_decode_protected()`, on either firmware,
 checks that the decode consumed exactly `in_len` bytes. Two different byte strings can decode to
 the same logical record if one has trailing garbage appended. Not an authentication bypass today
 (the AAD is always rebuilt from the freshly-parsed fields, never trusted from the wire), but it
 breaks the "canonical CBOR, byte-identical encoding" guarantee `docs/PROTOCOL.md` is built on,
 and it's cheap to close: one length check per decoder.
+
+**Resolution:** added an exact-consumption check (`pos == in_len`, else
+`FEB_CBOR_ERR_UNEXPECTED_TYPE` per decision D5 in
+[CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)) to all three record-level decoders on both
+firmwares: `feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, and
+`feb_cbor_decode_pairing_envelope`. Deliberately **not** applied to the payload-specific decoders
+(`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`) — see [PROTOCOL.md](PROTOCOL.md)'s
+"Trailing bytes" note for why that's structurally unnecessary there, not an oversight.
 
 ## Memory & performance (embedded-target relevant)
 

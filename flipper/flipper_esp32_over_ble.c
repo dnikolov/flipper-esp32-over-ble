@@ -34,6 +34,16 @@
 #define PAIRING_REASON_MAX_LEN 32
 #define PAIRING_DIR_NAME "pairings"
 #define FEB_PAIRINGS_PATH_MAX_LEN 96
+/* docs/PLAN.md step 7: capability-cache file, own subdirectory next to (not inside)
+   "pairings", same atomic-write pattern, one file per board_id. */
+#define CAPABILITY_DIR_NAME "capabilities"
+#define FEB_CAPABILITIES_PATH_MAX_LEN 96
+/* Compact on-screen capability line: "<board>: <features>". Real values today are short
+   ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
+   full 64 bytes -- a real scrollable capability view is backlogged for when `features`
+   actually grows (docs/PLAN.md step 7). */
+#define CAPABILITY_BOARD_MAX_LEN 31
+#define CAPABILITY_FEATURES_MAX_LEN 40
 /* Polling period for the reassembly-stall check, well under FEB_REASSEMBLY_TIMEOUT_MS
    (2000ms) so a stalled fragment sequence is reclaimed promptly rather than right at the
    deadline. */
@@ -61,18 +71,45 @@ typedef enum {
     PairingPhaseFailed,
 } PairingPhase;
 
+/* docs/PLAN.md's Wi-Fi scan capability follow-on step: manual-trigger-only, results shown
+   in a dedicated scrollable view, distinct from the fixed-layout main status screen. */
+typedef enum {
+    AppScreenMain,
+    AppScreenWifiScanResults,
+} AppScreen;
+
 typedef enum {
     AppEventInput,
     AppEventBtStatus,
     AppEventPairingPhase,
+    AppEventCapabilityInfo,
+    AppEventWifiScanAp,
+    AppEventWifiScanDone,
+    AppEventWifiScanError,
 } AppEventType;
 
+/* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
+   (feb_wifi_scan_ap_t, decoded on the BLE thread from a buffer valid only for the duration
+   of that one profile_event_handler call) cannot outlive the event post; ssid is sanitized
+   to printable ASCII here (docs/PROTOCOL.md: raw bytes on the wire, not guaranteed
+   printable/UTF-8) so both this event and the display list downstream always hold a safe,
+   NUL-terminated C string. */
 typedef struct {
     AppEventType type;
     InputEvent input;
     BtStatus bt_status;
     PairingPhase pairing_phase;
     char pairing_reason[PAIRING_REASON_MAX_LEN];
+    char capability_board[CAPABILITY_BOARD_MAX_LEN + 1];
+    char capability_features[CAPABILITY_FEATURES_MAX_LEN];
+    bool capability_has_wifi_scan;
+    char wifi_scan_ap_ssid[FEB_WIFI_SCAN_SSID_MAX_LEN + 1];
+    uint8_t wifi_scan_ap_bssid[FEB_WIFI_SCAN_BSSID_LEN];
+    int32_t wifi_scan_ap_rssi_dbm;
+    uint32_t wifi_scan_ap_channel;
+    char wifi_scan_ap_phy[8];
+    char wifi_scan_ap_auth[24];
+    char wifi_scan_error_message[48];
 } AppEvent;
 
 typedef struct {
@@ -84,6 +121,15 @@ typedef struct {
     PairingPhase pairing_phase;
     char pairing_reason[PAIRING_REASON_MAX_LEN];
     bool has_saved_pairing;
+    bool has_capability_info;
+    char capability_board[CAPABILITY_BOARD_MAX_LEN + 1];
+    char capability_features[CAPABILITY_FEATURES_MAX_LEN];
+    bool capability_has_wifi_scan;
+    AppScreen screen;
+    bool wifi_scan_in_progress;
+    bool wifi_scan_complete;
+    size_t wifi_scan_scroll_offset;
+    char wifi_scan_error_message[48];
 } Esp32App;
 
 typedef struct {
@@ -235,6 +281,8 @@ static bool board_id_is_valid(const char* board_id, size_t len) {
    BleEventWorker afterward. */
 static char pairings_dir_path[FEB_PAIRINGS_PATH_MAX_LEN];
 static bool pairings_dir_ready;
+static char capabilities_dir_path[FEB_CAPABILITIES_PATH_MAX_LEN];
+static bool capabilities_dir_ready;
 
 static bool resolve_pairings_dir_path(Storage* storage) {
     FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(PAIRING_DIR_NAME));
@@ -275,6 +323,53 @@ static bool build_pairing_path(
         out_cap,
         "%s/%.*s%s",
         pairings_dir_path,
+        (int)board_id_len,
+        board_id,
+        tmp ? ".dat.tmp" : ".dat");
+    return written > 0 && (size_t)written < out_cap;
+}
+
+/* Same resolve-once-from-this-app's-own-thread rationale as resolve_pairings_dir_path()
+   above -- a separate subdirectory, never nested inside "pairings", so an unpair (step 8)
+   can delete each independently while still deleting both together as one operation. */
+static bool resolve_capabilities_dir_path(Storage* storage) {
+    FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(CAPABILITY_DIR_NAME));
+    storage_common_resolve_path_and_ensure_app_directory(storage, resolved);
+    bool ok = furi_string_size(resolved) < sizeof(capabilities_dir_path);
+    if(ok) {
+        strncpy(
+            capabilities_dir_path, furi_string_get_cstr(resolved), sizeof(capabilities_dir_path) - 1);
+        capabilities_dir_path[sizeof(capabilities_dir_path) - 1] = '\0';
+    } else {
+        FURI_LOG_E(TAG, "Resolved capabilities path too long to cache");
+    }
+    furi_string_free(resolved);
+    if(!ok) {
+        return false;
+    }
+
+    FS_Error mkdir_err = storage_common_mkdir(storage, capabilities_dir_path);
+    if(mkdir_err != FSE_OK && mkdir_err != FSE_EXIST) {
+        FURI_LOG_E(TAG, "mkdir capabilities dir failed: %d", mkdir_err);
+        return false;
+    }
+    return true;
+}
+
+static bool build_capability_path(
+    char* out,
+    size_t out_cap,
+    const char* board_id,
+    size_t board_id_len,
+    bool tmp) {
+    if(!capabilities_dir_ready) {
+        return false;
+    }
+    int written = snprintf(
+        out,
+        out_cap,
+        "%s/%.*s%s",
+        capabilities_dir_path,
         (int)board_id_len,
         board_id,
         tmp ? ".dat.tmp" : ".dat");
@@ -358,8 +453,101 @@ static bool any_saved_pairing_exists(Storage* storage) {
     return found;
 }
 
+static bool
+    capability_storage_exists(Storage* storage, const char* board_id, size_t board_id_len) {
+    static char path[96];
+    if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
+        return false;
+    }
+    return storage_file_exists(storage, path);
+}
+
+/* Persists the raw canonical-CBOR `capability_response` payload bytes verbatim (docs/
+   CAPABILITIES.md "Storage and persistence") -- same atomic temp-file/exact-write/
+   storage_file_sync()/close/rename sequence as pairing_storage_save(), but a variable
+   length rather than a fixed FEB_PAIRING_SECRET_LEN. */
+static bool capability_storage_save(
+    Storage* storage,
+    const char* board_id,
+    size_t board_id_len,
+    const uint8_t* payload,
+    size_t payload_len) {
+    static char final_path[96];
+    static char tmp_path[96];
+    if(!build_capability_path(final_path, sizeof(final_path), board_id, board_id_len, false) ||
+       !build_capability_path(tmp_path, sizeof(tmp_path), board_id, board_id_len, true)) {
+        return false;
+    }
+
+    File* file = storage_file_alloc(storage);
+    bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    if(ok) {
+        size_t written = storage_file_write(file, payload, payload_len);
+        ok = (written == payload_len) && storage_file_sync(file);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    if(!ok) {
+        storage_common_remove(storage, tmp_path);
+        return false;
+    }
+
+    storage_common_remove(storage, final_path);
+    FS_Error rename_err = storage_common_rename(storage, tmp_path, final_path);
+    if(rename_err != FSE_OK) {
+        FURI_LOG_E(TAG, "rename capability file failed: %d", rename_err);
+        storage_common_remove(storage, tmp_path);
+        return false;
+    }
+    return true;
+}
+
+/* Loads a previously-cached capability_response payload for `board_id` into `out` (capacity
+   `out_cap`, callers pass FEB_CBOR_MAX_PAYLOAD). Returns false uniformly for "no file",
+   "unreadable", and "too large for out_cap" -- matches pairing_storage_load()'s
+   don't-expose-the-cause convention, though this cache is non-sensitive. */
+static bool capability_storage_load(
+    Storage* storage,
+    const char* board_id,
+    size_t board_id_len,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    static char path[96];
+    if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
+        return false;
+    }
+    File* file = storage_file_alloc(storage);
+    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    if(ok) {
+        uint64_t size = storage_file_size(file);
+        if(size == 0 || size > out_cap) {
+            ok = false;
+        } else {
+            size_t read = storage_file_read(file, out, (size_t)size);
+            ok = (read == (size_t)size);
+            if(ok) {
+                *out_len = read;
+            }
+        }
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    return ok;
+}
+
+/* docs/PLAN.md step 7 grew AppEvent past this file's ~100-byte static-storage threshold
+   (added capability_board/capability_features) -- event is now static, not stack-local, to
+   keep it off the 1280-byte BleEventWorker stack (this function is reachable from
+   profile_event_handler via the handle_pair_ and handle_hello/handle_client_auth
+   callbacks). A static local with a designated initializer only runs that initializer once
+   at program load, not per call (docs/SESSION_MEMORY.md's cmult() trap), so every field is
+   explicitly reset here instead. */
 static void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* reason) {
-    AppEvent event = {.type = AppEventPairingPhase, .pairing_phase = phase};
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventPairingPhase;
+    event.pairing_phase = phase;
     if(reason) {
         strncpy(event.pairing_reason, reason, sizeof(event.pairing_reason) - 1);
         event.pairing_reason[sizeof(event.pairing_reason) - 1] = '\0';
@@ -652,6 +840,73 @@ static uint8_t session_transcript_buf[FEB_SESSION_MAX_TRANSCRIPT_LEN];
 static size_t session_transcript_len;
 static uint8_t session_pairing_secret[FEB_PAIRING_SECRET_LEN];
 static uint8_t session_key[FEB_SESSION_KEY_LEN];
+/* docs/PLAN.md step 7: per-direction protected-record sequence counters, each beginning at
+   1 for the session (docs/PROTOCOL.md#cryptographic-requirements). Not secret, so plain
+   reset (not feb_secure_zero) is fine. */
+static uint64_t session_seq_out;
+static uint64_t session_seq_in;
+
+/* feb_session_decrypt_record()'s plaintext output; its contract requires capacity >=
+   FEB_CBOR_MAX_PAYLOAD (session.h) -- not shrunk to "today's actual capability_response
+   size" on purpose, matching the project's own 256-vs-512 lesson (docs/PLAN.md step 3
+   backlog) about payload buffers silently rejecting a legitimate larger record later. */
+static uint8_t session_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
+/* capability_query's own plaintext payload and its GCM ciphertext scratch: this firmware
+   always sends an empty map (`requested` omitted, docs/PLAN.md step 7), so a few bytes of
+   margin over the 1-byte real encoding is enough -- sized to what's actually reachable
+   here, not FEB_CBOR_MAX_PAYLOAD's full 512 (docs/SESSION_MEMORY.md's static-buffer
+   sizing guidance). */
+#define FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN 16u
+static uint8_t capability_query_payload_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN];
+static uint8_t capability_query_ciphertext_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN];
+
+/* ---- wifi_scan capability (docs/PLAN.md's Wi-Fi scan capability follow-on step) ----
+   Unlike every other outbound protected record in this file (sent synchronously from
+   inside a BLE-thread callback, in direct response to an incoming record), the `command`
+   that triggers a scan is sent from this app's own main thread, in direct response to a
+   user OK-press on the results screen -- there is no incoming BLE event to key it off of.
+   Dedicated scratch buffers (separate from pairing_record_buf/capability_query_*_buf, which
+   remain BLE-thread-only) avoid any aliasing between the two independent senders, even
+   though in practice they cannot run concurrently: the "Scan now" action is gated on
+   app.capability_has_wifi_scan, which can only become true after capability_bootstrap()'s
+   own send (if any, on the BLE thread) has already returned and its response has been
+   processed -- see send_wifi_scan_command()'s own comment below for the full argument. */
+/* map(1) + "capability" key(1+10) + "wifi_scan" value(1+9) + "request_id" key(1+10) +
+   uint value(1-9) + "arguments" key(1+9) + empty-map value(1) = 45-53 bytes worst case.
+   The original 32u only counted value bytes, forgetting the three CBOR map *key* text
+   strings entirely -- feb_cbor_encode_command_payload() silently returned 0 (out_cap
+   exhausted partway through encoding "request_id"'s key) on every single call, so
+   send_wifi_scan_command() failed 100% of the time (hardware-verified 2026-09-07: OK-press
+   never reached the ESP32). Sized with real margin now, not shaved to the byte. */
+#define FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN 64u
+static uint8_t wifi_scan_cmd_payload_buf[FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN];
+static uint8_t wifi_scan_cmd_ciphertext_buf[FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN];
+static uint8_t wifi_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+static uint64_t wifi_scan_next_request_id = 1;
+
+/* Per-AP display state, accumulated across one or more `status` records for the results
+   view. Not reachable from profile_event_handler (BLE-thread callbacks only ever post one
+   AP's worth of data at a time through app->queue -- see post_wifi_scan_ap() below), but
+   kept static and off the stack-resident Esp32App struct anyway: this app's own main-thread
+   stack size isn't documented/pinned anywhere in this project (unlike BleEventWorker's
+   1280 bytes), so a several-KB array (32 entries) is treated with the same caution rather
+   than assumed safe as a local/struct-member. */
+#define WIFI_SCAN_SSID_DISPLAY_LEN (FEB_WIFI_SCAN_SSID_MAX_LEN + 1)
+#define WIFI_SCAN_PHY_DISPLAY_LEN 8
+#define WIFI_SCAN_AUTH_DISPLAY_LEN 24
+#define WIFI_SCAN_MAX_DISPLAY_APS FEB_WIFI_SCAN_MAX_APS_PER_RECORD
+
+typedef struct {
+    char ssid[WIFI_SCAN_SSID_DISPLAY_LEN];
+    uint8_t bssid[FEB_WIFI_SCAN_BSSID_LEN];
+    int32_t rssi_dbm;
+    uint32_t channel;
+    char phy[WIFI_SCAN_PHY_DISPLAY_LEN];
+    char auth[WIFI_SCAN_AUTH_DISPLAY_LEN];
+} WifiScanApDisplay;
+
+static WifiScanApDisplay wifi_scan_aps[WIFI_SCAN_MAX_DISPLAY_APS];
+static size_t wifi_scan_ap_count;
 
 static void session_reset_state(void) {
     session_stage = SessionStageNone;
@@ -664,6 +919,8 @@ static void session_reset_state(void) {
     session_transcript_len = 0;
     feb_secure_zero(session_pairing_secret, sizeof(session_pairing_secret));
     feb_secure_zero(session_key, sizeof(session_key));
+    session_seq_out = 0;
+    session_seq_in = 0;
 }
 
 /* docs/PROTOCOL.md's "Runtime auth failure handling": unknown_board replies use the
@@ -805,6 +1062,331 @@ static void handle_hello(Esp32BleProfile* profile, const feb_unencrypted_record_
     post_pairing_phase(app, PairingPhaseAuthenticating, NULL);
 }
 
+/* ---- board identity / capability registry (docs/PLAN.md step 7) ----
+   Fires automatically the moment runtime auth succeeds (handle_client_auth() below), no UI
+   gesture. `session_plaintext_buf`/`capability_query_payload_buf`/
+   `capability_query_ciphertext_buf` are declared with this file's other session statics
+   above; safe as static for the same single-in-flight-BLE-event-dispatch reason. */
+
+static void format_capability_display(
+    const feb_capability_response_payload_t* payload,
+    char* board_out,
+    size_t board_out_cap,
+    char* features_out,
+    size_t features_out_cap) {
+    size_t board_len = payload->board_len;
+    if(board_len > board_out_cap - 1) {
+        board_len = board_out_cap - 1;
+    }
+    memcpy(board_out, payload->board, board_len);
+    board_out[board_len] = '\0';
+
+    size_t pos = 0;
+    for(size_t i = 0; i < payload->feature_count && pos < features_out_cap - 1; i++) {
+        if(i > 0 && pos < features_out_cap - 1) {
+            features_out[pos++] = ',';
+        }
+        size_t copy_len = payload->feature_lens[i];
+        if(copy_len > features_out_cap - 1 - pos) {
+            copy_len = features_out_cap - 1 - pos;
+        }
+        memcpy(features_out + pos, payload->features[i], copy_len);
+        pos += copy_len;
+    }
+    features_out[pos] = '\0';
+}
+
+static bool capability_has_feature(const feb_capability_response_payload_t* payload, const char* feature) {
+    size_t feature_len = strlen(feature);
+    for(size_t i = 0; i < payload->feature_count; i++) {
+        if(payload->feature_lens[i] == feature_len &&
+           memcmp(payload->features[i], feature, feature_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void post_capability_info(Esp32App* app, const feb_capability_response_payload_t* payload) {
+    /* static, not stack-local -- see post_pairing_phase()'s comment above; same rationale
+       and same reset-every-call requirement apply here. */
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventCapabilityInfo;
+    format_capability_display(
+        payload,
+        event.capability_board,
+        sizeof(event.capability_board),
+        event.capability_features,
+        sizeof(event.capability_features));
+    event.capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* Persists the just-received capability_response payload verbatim (docs/CAPABILITIES.md)
+   and posts it for display. `plaintext`/`plaintext_len` alias session_plaintext_buf,
+   valid only until the next BLE event is dispatched -- both the decode and the storage
+   write below happen synchronously before that can occur. */
+static void handle_capability_response(
+    Esp32BleProfile* profile,
+    const uint8_t* plaintext,
+    size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_capability_response_payload_t response;
+    feb_cbor_status_t status =
+        feb_cbor_decode_capability_response_payload(plaintext, plaintext_len, &response);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "capability_response payload decode failed: %d; dropping", status);
+        return;
+    }
+    if(!capability_storage_save(app->storage, session_board_id, session_board_id_len, plaintext, plaintext_len)) {
+        FURI_LOG_E(TAG, "Failed to persist capability record for board '%s'", session_board_id);
+    }
+    post_capability_info(app, &response);
+    FURI_LOG_I(TAG, "capability_response cached for board '%s'", session_board_id);
+}
+
+/* Sends capability_query (requested omitted, docs/PLAN.md step 7) only the first time
+   runtime auth succeeds for a board with no locally cached capability record yet; loads and
+   displays the cached record instead when one already exists. No retry/timeout of its own
+   on send/decode failure -- a dropped or malformed response is simply retried on the next
+   reconnect (docs/PLAN.md step 7 implementation-level decisions). */
+static void capability_bootstrap(Esp32BleProfile* profile) {
+    Esp32App* app = profile->app;
+    if(capability_storage_exists(app->storage, session_board_id, session_board_id_len)) {
+        size_t loaded_len = 0;
+        if(capability_storage_load(
+               app->storage,
+               session_board_id,
+               session_board_id_len,
+               session_plaintext_buf,
+               sizeof(session_plaintext_buf),
+               &loaded_len)) {
+            static feb_capability_response_payload_t cached;
+            if(feb_cbor_decode_capability_response_payload(session_plaintext_buf, loaded_len, &cached) ==
+               FEB_CBOR_OK) {
+                post_capability_info(app, &cached);
+            } else {
+                FURI_LOG_W(TAG, "Cached capability file for '%s' is malformed", session_board_id);
+            }
+        }
+        return;
+    }
+
+    static feb_capability_query_payload_t query_payload;
+    query_payload.has_requested = 0;
+    size_t payload_len = feb_cbor_encode_capability_query_payload(
+        capability_query_payload_buf, sizeof(capability_query_payload_buf), &query_payload);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "capability_query: payload encode failed");
+        return;
+    }
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "capability_query",
+        sizeof("capability_query") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        capability_query_payload_buf,
+        payload_len,
+        capability_query_ciphertext_buf,
+        sizeof(capability_query_ciphertext_buf),
+        pairing_record_buf,
+        sizeof(pairing_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "capability_query: record encode failed");
+        return;
+    }
+    if(!send_pairing_record(profile, pairing_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "capability_query: send failed");
+        return;
+    }
+    session_seq_out++;
+    FURI_LOG_I(TAG, "capability_query sent for board '%s'", session_board_id);
+}
+
+/* ---- wifi_scan capability (docs/PLAN.md's Wi-Fi scan capability follow-on step) ---- */
+
+/* Copies up to `dst_cap - 1` bytes of a non-NUL-terminated text span (as returned by the
+   cbor_codec decoders -- phy/auth alias the decode buffer, not a C string) into `dst`,
+   NUL-terminating. */
+static void copy_clamped_text(char* dst, size_t dst_cap, const char* src, size_t src_len) {
+    size_t n = src_len > dst_cap - 1 ? dst_cap - 1 : src_len;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+/* Sanitizes and posts one decoded AP for display -- ssid is raw bytes on the wire (docs/
+   PROTOCOL.md: "not guaranteed valid UTF-8"), so every non-printable-ASCII byte is replaced
+   with '.' here, once, rather than deferring sanitization to every later draw call. */
+static void post_wifi_scan_ap(Esp32App* app, const feb_wifi_scan_ap_t* ap) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWifiScanAp;
+    size_t ssid_len = ap->ssid_len > FEB_WIFI_SCAN_SSID_MAX_LEN ? FEB_WIFI_SCAN_SSID_MAX_LEN : ap->ssid_len;
+    for(size_t i = 0; i < ssid_len; i++) {
+        uint8_t b = ap->ssid[i];
+        event.wifi_scan_ap_ssid[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+    }
+    event.wifi_scan_ap_ssid[ssid_len] = '\0';
+    memcpy(event.wifi_scan_ap_bssid, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    event.wifi_scan_ap_rssi_dbm = (int32_t)ap->rssi_offset - 128;
+    event.wifi_scan_ap_channel = (uint32_t)ap->channel;
+    copy_clamped_text(event.wifi_scan_ap_phy, sizeof(event.wifi_scan_ap_phy), ap->phy, ap->phy_len);
+    copy_clamped_text(event.wifi_scan_ap_auth, sizeof(event.wifi_scan_ap_auth), ap->auth, ap->auth_len);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_wifi_scan_complete(Esp32App* app) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWifiScanDone;
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_wifi_scan_error(Esp32App* app, const char* message) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWifiScanError;
+    strncpy(event.wifi_scan_error_message, message, sizeof(event.wifi_scan_error_message) - 1);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* `status` (docs/PROTOCOL.md's "`wifi_scan` command and status payloads"). `result` is
+   generic at the outer codec layer (see cbor_codec.h) -- decoded further here, since this
+   is the only capability that currently exists, into the wifi_scan-specific `{"aps": [...]}`
+   shape. An unrecognized `state` (neither "partial" nor "complete") is dropped: the generic
+   status codec does not validate that string, by design (see its header comment), so this
+   dispatch layer is where PROTOCOL.md's two-state contract is actually enforced. */
+static void
+    handle_wifi_scan_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_status_payload_t status_payload;
+    feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "wifi_scan status payload decode failed: %d; dropping", status);
+        return;
+    }
+    bool is_partial = text_matches(status_payload.state, status_payload.state_len, "partial");
+    bool is_complete = text_matches(status_payload.state, status_payload.state_len, "complete");
+    if(!is_partial && !is_complete) {
+        FURI_LOG_W(
+            TAG,
+            "wifi_scan status: unexpected state '%.*s'; dropping",
+            (int)status_payload.state_len,
+            status_payload.state);
+        return;
+    }
+    if(status_payload.has_result) {
+        static feb_wifi_scan_result_payload_t result;
+        feb_cbor_status_t result_status = feb_cbor_decode_wifi_scan_result_payload(
+            status_payload.result_span, status_payload.result_span_len, &result);
+        if(result_status != FEB_CBOR_OK) {
+            FURI_LOG_W(TAG, "wifi_scan status.result decode failed: %d; dropping", result_status);
+            return;
+        }
+        for(size_t i = 0; i < result.ap_count; i++) {
+            post_wifi_scan_ap(app, &result.aps[i]);
+        }
+    }
+    if(is_complete) {
+        post_wifi_scan_complete(app);
+    }
+}
+
+/* Protected-record `error` (post-session-establishment shape, docs/PROTOCOL.md "Runtime
+   auth failure handling" / message-payloads table) -- today only surfaced for wifi_scan's
+   `busy` response (docs/PROTOCOL.md's "Busy handling"); any other code is logged and
+   otherwise ignored, since no other capability/command exists yet to react to one. */
+static void
+    handle_runtime_error(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_error_payload_t error_payload;
+    feb_cbor_status_t status = feb_cbor_decode_error_payload(plaintext, plaintext_len, &error_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "runtime error payload decode failed: %d; dropping", status);
+        return;
+    }
+    FURI_LOG_W(
+        TAG, "runtime error received: code='%.*s'", (int)error_payload.code_len, error_payload.code);
+    if(text_matches(error_payload.code, error_payload.code_len, "busy")) {
+        post_wifi_scan_error(app, "ESP32 busy, try again");
+    }
+}
+
+/* Sends the wifi_scan `command` (capability="wifi_scan", fresh request_id, always-empty
+   arguments per docs/PROTOCOL.md). Unlike every other sender in this file, this one runs on
+   this app's own main thread (triggered by a user OK-press in the main loop below), not
+   synchronously from inside a BLE-thread callback -- there is no incoming BLE event to key
+   it off of, since "start a scan" is a user-initiated action, not a response to the peer.
+   This is safe against the `session_key`/`session_seq_out`/`outgoing_message_id` statics
+   this function shares with the BLE-thread-driven senders (capability_bootstrap() etc.)
+   specifically because every call site gates this function on
+   app->capability_has_wifi_scan, which can only become true after processing a real
+   capability_response -- and that can only happen strictly after capability_bootstrap()'s
+   own send (if it took the query-not-cached branch) has already returned on the BLE thread,
+   since the response is itself a later, separate BLE event. If this gating condition is
+   ever loosened, this reasoning needs re-examining. */
+static bool send_wifi_scan_command(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    uint8_t arguments_buf[2];
+    size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "wifi_scan command: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "wifi_scan",
+        .capability_len = sizeof("wifi_scan") - 1,
+        .request_id = wifi_scan_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        wifi_scan_cmd_payload_buf, sizeof(wifi_scan_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "wifi_scan command: payload encode failed");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        wifi_scan_cmd_payload_buf,
+        payload_len,
+        wifi_scan_cmd_ciphertext_buf,
+        sizeof(wifi_scan_cmd_ciphertext_buf),
+        wifi_scan_cmd_record_buf,
+        sizeof(wifi_scan_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "wifi_scan command: record encode failed");
+        return false;
+    }
+    if(!send_pairing_record(profile, wifi_scan_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "wifi_scan command: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(TAG, "wifi_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    return true;
+}
+
 /* `client_auth` carries the ESP32's proof over the same transcript S computed in
    handle_hello(). A proof mismatch is a real anomaly (desync/corruption/impersonation),
    not the "never paired" case -- per docs/PROTOCOL.md, it gets no reply at all (matching
@@ -858,6 +1440,8 @@ static void handle_client_auth(Esp32BleProfile* profile, const feb_unencrypted_r
     feb_secure_zero(session_pairing_secret, sizeof(session_pairing_secret));
 
     session_stage = SessionStageActive;
+    session_seq_out = 1;
+    session_seq_in = 1;
     if(profile->app->notifications) {
         /* Must stop the running blink sequence explicitly - it's a separate
            hardware LED-blink subsystem that a plain RGB message can't override. */
@@ -866,6 +1450,7 @@ static void handle_client_auth(Esp32BleProfile* profile, const feb_unencrypted_r
     }
     post_pairing_phase(profile->app, PairingPhaseSessionActive, NULL);
     FURI_LOG_I(TAG, "Runtime session authenticated for board '%s'", session_board_id);
+    capability_bootstrap(profile);
 }
 
 /* Runs on the Furi timer-service thread (not BleEventWorker) — see reassembly_mutex's
@@ -977,6 +1562,60 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                             (int)session_envelope.type_len,
                             session_envelope.type);
                     }
+                } else if(field_count == 7) {
+                    /* docs/PLAN.md step 7: protected (AES-256-GCM) record, e.g.
+                       capability_response. Per docs/PROTOCOL.md, decode/decrypt failure,
+                       a session/board_id/sequence mismatch, or an unrecognized type are
+                       all dropped silently -- this Flipper (the BLE peripheral) has no
+                       safe way to proactively terminate an established connection from
+                       inside profile_event_handler (see this file's existing
+                       no-proactive-bt_disconnect() rationale above); the ESP32's own
+                       30-second idle-connection timeout is what eventually reaps a
+                       connection stuck this way. */
+                    if(session_stage != SessionStageActive) {
+                        FURI_LOG_W(TAG, "Ignoring protected record: no active session");
+                        return BleEventAckFlowEnable;
+                    }
+                    static feb_session_decrypted_record_t decrypted;
+                    feb_cbor_status_t decode_status = feb_session_decrypt_record(
+                        session_key,
+                        out_record,
+                        out_len,
+                        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+                        session_plaintext_buf,
+                        sizeof(session_plaintext_buf),
+                        &decrypted);
+                    if(decode_status != FEB_CBOR_OK) {
+                        FURI_LOG_W(
+                            TAG,
+                            "Protected record decode/decrypt failed: %d; dropping (no reply)",
+                            decode_status);
+                        return BleEventAckFlowEnable;
+                    }
+                    if(decrypted.version != 2 ||
+                       memcmp(decrypted.session_id, session_id_bytes, FEB_SESSION_ID_LEN) != 0 ||
+                       decrypted.board_id_len != session_board_id_len ||
+                       memcmp(decrypted.board_id, session_board_id, session_board_id_len) != 0 ||
+                       decrypted.sequence != session_seq_in) {
+                        FURI_LOG_W(TAG, "Protected record session/sequence mismatch; dropping (no reply)");
+                        return BleEventAckFlowEnable;
+                    }
+                    session_seq_in++;
+
+                    if(text_matches(decrypted.type, decrypted.type_len, "capability_response")) {
+                        handle_capability_response(profile, decrypted.plaintext, decrypted.plaintext_len);
+                    } else if(text_matches(decrypted.type, decrypted.type_len, "status")) {
+                        handle_wifi_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                    } else if(text_matches(decrypted.type, decrypted.type_len, "error")) {
+                        handle_runtime_error(profile, decrypted.plaintext, decrypted.plaintext_len);
+                    } else {
+                        FURI_LOG_W(
+                            TAG,
+                            "Ignoring unrecognized protected record type '%.*s'",
+                            (int)decrypted.type_len,
+                            decrypted.type);
+                    }
+                    return BleEventAckFlowEnable;
                 } else {
                     FURI_LOG_W(TAG, "Rejected record: unexpected field count %u", (unsigned)field_count);
                 }
@@ -1080,27 +1719,116 @@ static const char* pairing_phase_text(PairingPhase phase) {
     }
 }
 
-static void draw_callback(Canvas* canvas, void* context) {
-    Esp32App* app = context;
+/* wifi_scan results view (docs/PLAN.md's Wi-Fi scan capability follow-on step): a dedicated
+   scrollable list, separate from the fixed-layout main screen above, showing every reported
+   AP (scrolled with Up/Down, not truncated to a summary). `wifi_scan_aps`/`wifi_scan_ap_count`
+   are this file's own statics (see their declaration comment), not Esp32App members. */
+#define WIFI_SCAN_RESULTS_ROW_HEIGHT 10
+#define WIFI_SCAN_RESULTS_MAX_ROWS 4
+#define WIFI_SCAN_RESULTS_FIRST_ROW_Y 22
+#define WIFI_SCAN_RESULTS_FOOTER_Y 62
+
+static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 12, "ESP32 over BLE");
+    char header[32];
+    if(app->wifi_scan_in_progress) {
+        snprintf(header, sizeof(header), "Scanning...");
+    } else {
+        snprintf(header, sizeof(header), "Wifi scan: %u found", (unsigned)wifi_scan_ap_count);
+    }
+    canvas_draw_str(canvas, 2, 11, header);
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 27, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
+
+    uint8_t y = WIFI_SCAN_RESULTS_FIRST_ROW_Y;
+    size_t max_rows = WIFI_SCAN_RESULTS_MAX_ROWS;
+    if(app->wifi_scan_error_message[0] != '\0') {
+        canvas_draw_str(canvas, 2, y, app->wifi_scan_error_message);
+        y += WIFI_SCAN_RESULTS_ROW_HEIGHT;
+        max_rows--;
+    }
+
+    for(size_t row = 0; row < max_rows; row++) {
+        size_t index = app->wifi_scan_scroll_offset + row;
+        if(index >= wifi_scan_ap_count) {
+            break;
+        }
+        const WifiScanApDisplay* ap = &wifi_scan_aps[index];
+        char line[48];
+        snprintf(
+            line,
+            sizeof(line),
+            "%s ch%lu %ldm",
+            ap->ssid[0] != '\0' ? ap->ssid : "(hidden)",
+            (unsigned long)ap->channel,
+            (long)ap->rssi_dbm);
+        canvas_draw_str(canvas, 2, (uint8_t)(y + row * WIFI_SCAN_RESULTS_ROW_HEIGHT), line);
+    }
+
+    char footer[32];
+    if(wifi_scan_ap_count == 0) {
+        snprintf(footer, sizeof(footer), "Back: exit view");
+    } else {
+        snprintf(
+            footer,
+            sizeof(footer),
+            "%u/%u  Back: exit",
+            (unsigned)(app->wifi_scan_scroll_offset + 1),
+            (unsigned)wifi_scan_ap_count);
+    }
+    canvas_draw_str(canvas, 2, WIFI_SCAN_RESULTS_FOOTER_Y, footer);
+}
+
+static void draw_callback(Canvas* canvas, void* context) {
+    Esp32App* app = context;
+    if(app->screen == AppScreenWifiScanResults) {
+        draw_wifi_scan_results(canvas, app);
+        return;
+    }
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "ESP32 over BLE");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 22, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
     if(app->pairing_phase == PairingPhaseFailed) {
         char line[48];
         snprintf(line, sizeof(line), "Failed: %s", app->pairing_reason);
-        canvas_draw_str(canvas, 2, 40, line);
+        canvas_draw_str(canvas, 2, 33, line);
     } else {
-        canvas_draw_str(canvas, 2, 40, pairing_phase_text(app->pairing_phase));
+        canvas_draw_str(canvas, 2, 33, pairing_phase_text(app->pairing_phase));
     }
-    canvas_draw_str(canvas, 2, 53, "Back: exit");
+    /* docs/PLAN.md step 7: compact capability line, extending this same fixed-layout
+       screen rather than a new scrollable view -- see this file's capability_bootstrap(). */
+    if(app->has_capability_info) {
+        char line[CAPABILITY_BOARD_MAX_LEN + CAPABILITY_FEATURES_MAX_LEN + 4];
+        snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
+        canvas_draw_str(canvas, 2, 44, line);
+    }
+    if(app->capability_has_wifi_scan && app->pairing_phase == PairingPhaseSessionActive) {
+        canvas_draw_str(canvas, 2, 56, "OK: scan  Back: exit");
+    } else {
+        canvas_draw_str(canvas, 2, 56, "Back: exit");
+    }
 }
 
 static void input_callback(InputEvent* input, void* context) {
     Esp32App* app = context;
     AppEvent event = {.type = AppEventInput, .input = *input};
     furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* Returns to the main screen and discards any in-progress/completed scan results (docs/PLAN.md's
+   Wi-Fi scan capability follow-on step: "results... cleared when the user leaves the results
+   view"). Also called whenever the underlying session/connection goes away (disconnect,
+   reconnect, profile teardown) -- a lost session can never deliver the rest of an in-flight
+   scan's status records, so leaving stale partial results on screen would be misleading. */
+static void reset_wifi_scan_ui_state(Esp32App* app) {
+    app->screen = AppScreenMain;
+    app->wifi_scan_in_progress = false;
+    app->wifi_scan_complete = false;
+    app->wifi_scan_scroll_offset = 0;
+    app->wifi_scan_error_message[0] = '\0';
+    wifi_scan_ap_count = 0;
 }
 
 static void stop_service(Esp32App* app) {
@@ -1113,6 +1841,7 @@ static void stop_service(Esp32App* app) {
     }
     pairing_reset_state();
     session_reset_state();
+    reset_wifi_scan_ui_state(app);
     if(app->notifications) {
         notification_message(app->notifications, &sequence_blink_stop);
         notification_message(app->notifications, &sequence_reset_blue);
@@ -1167,6 +1896,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     if(!pairings_dir_ready) {
         FURI_LOG_E(TAG, "Failed to resolve pairings directory path");
     }
+    capabilities_dir_ready = resolve_capabilities_dir_path(app.storage);
+    if(!capabilities_dir_ready) {
+        FURI_LOG_E(TAG, "Failed to resolve capabilities directory path");
+    }
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
 
@@ -1199,11 +1932,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 if(event.bt_status == BtStatusConnected) {
                     pairing_reset_state();
                     session_reset_state();
+                    reset_wifi_scan_ui_state(&app);
                     app.pairing_phase = PairingPhaseExchanging;
                 } else if(event.bt_status == BtStatusAdvertising) {
                     if(app.pairing_phase != PairingPhaseDone) {
                         pairing_reset_state();
                         session_reset_state();
+                        reset_wifi_scan_ui_state(&app);
                         notification_message(app.notifications, &sequence_blink_start_blue);
                         app.pairing_phase = PairingPhaseWaiting;
                     }
@@ -1219,11 +1954,79 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             } else if(event.pairing_phase == PairingPhaseDone) {
                 app.has_saved_pairing = true;
             }
+        } else if(event.type == AppEventCapabilityInfo) {
+            app.has_capability_info = true;
+            strncpy(app.capability_board, event.capability_board, sizeof(app.capability_board) - 1);
+            app.capability_board[sizeof(app.capability_board) - 1] = '\0';
+            strncpy(
+                app.capability_features, event.capability_features, sizeof(app.capability_features) - 1);
+            app.capability_features[sizeof(app.capability_features) - 1] = '\0';
+            app.capability_has_wifi_scan = event.capability_has_wifi_scan;
+        } else if(event.type == AppEventWifiScanAp) {
+            if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
+                WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
+                strncpy(slot->ssid, event.wifi_scan_ap_ssid, sizeof(slot->ssid) - 1);
+                slot->ssid[sizeof(slot->ssid) - 1] = '\0';
+                memcpy(slot->bssid, event.wifi_scan_ap_bssid, sizeof(slot->bssid));
+                slot->rssi_dbm = event.wifi_scan_ap_rssi_dbm;
+                slot->channel = event.wifi_scan_ap_channel;
+                strncpy(slot->phy, event.wifi_scan_ap_phy, sizeof(slot->phy) - 1);
+                slot->phy[sizeof(slot->phy) - 1] = '\0';
+                strncpy(slot->auth, event.wifi_scan_ap_auth, sizeof(slot->auth) - 1);
+                slot->auth[sizeof(slot->auth) - 1] = '\0';
+            }
+        } else if(event.type == AppEventWifiScanDone) {
+            app.wifi_scan_in_progress = false;
+            app.wifi_scan_complete = true;
+        } else if(event.type == AppEventWifiScanError) {
+            app.wifi_scan_in_progress = false;
+            strncpy(
+                app.wifi_scan_error_message,
+                event.wifi_scan_error_message,
+                sizeof(app.wifi_scan_error_message) - 1);
+            app.wifi_scan_error_message[sizeof(app.wifi_scan_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
-            if(event.input.key == InputKeyBack) {
-                running = false;
-            } else if(event.input.key == InputKeyOk && !app.profile) {
-                start_profile(&app);
+            if(app.screen == AppScreenWifiScanResults) {
+                if(event.input.key == InputKeyBack) {
+                    reset_wifi_scan_ui_state(&app);
+                } else if(event.input.key == InputKeyUp) {
+                    if(app.wifi_scan_scroll_offset > 0) {
+                        app.wifi_scan_scroll_offset--;
+                    }
+                } else if(event.input.key == InputKeyDown) {
+                    size_t visible_rows = WIFI_SCAN_RESULTS_MAX_ROWS;
+                    if(wifi_scan_ap_count > visible_rows &&
+                       app.wifi_scan_scroll_offset < wifi_scan_ap_count - visible_rows) {
+                        app.wifi_scan_scroll_offset++;
+                    }
+                } else if(event.input.key == InputKeyOk && !app.wifi_scan_in_progress) {
+                    /* Re-trigger from inside the results view too, e.g. after a completed
+                       scan -- "Scan now" is a repeatable manual action, not one-shot. */
+                    wifi_scan_ap_count = 0;
+                    app.wifi_scan_scroll_offset = 0;
+                    app.wifi_scan_complete = false;
+                    app.wifi_scan_error_message[0] = '\0';
+                    app.wifi_scan_in_progress = send_wifi_scan_command(&app);
+                }
+            } else {
+                if(event.input.key == InputKeyBack) {
+                    running = false;
+                } else if(event.input.key == InputKeyOk && !app.profile) {
+                    start_profile(&app);
+                } else if(
+                    event.input.key == InputKeyOk && app.profile &&
+                    app.pairing_phase == PairingPhaseSessionActive && app.capability_has_wifi_scan &&
+                    !app.wifi_scan_in_progress) {
+                    wifi_scan_ap_count = 0;
+                    app.wifi_scan_scroll_offset = 0;
+                    app.wifi_scan_complete = false;
+                    app.wifi_scan_error_message[0] = '\0';
+                    app.screen = AppScreenWifiScanResults;
+                    app.wifi_scan_in_progress = send_wifi_scan_command(&app);
+                    if(!app.wifi_scan_in_progress) {
+                        app.screen = AppScreenMain;
+                    }
+                }
             }
         }
         view_port_update(view_port);

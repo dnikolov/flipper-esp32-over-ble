@@ -188,6 +188,9 @@ feb_cbor_status_t feb_cbor_decode_pairing_envelope(const uint8_t *in, size_t in_
             return FEB_CBOR_ERR_MISSING_FIELD;
         }
     }
+    if (pos != in_len) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
     return FEB_CBOR_OK;
 }
 

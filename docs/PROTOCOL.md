@@ -102,6 +102,12 @@ All protected records use this shape:
 
 This is a deliberate simplification over general canonical CBOR (RFC 8949 §4.2.1): the field sets here are fixed at compile time, so a general sorting algorithm buys nothing and only adds a second, independently-implemented sort to keep in sync between the two firmwares. It also has a concrete correctness reason: the AES-GCM AAD is the canonical CBOR encoding of `{version, type, session_id, sequence, board_id}`, and both peers must independently produce byte-identical AAD or every session fails authentication immediately — pinning one fixed field order removes any room for the two implementations to disagree.
 
+**Permitted payload value types.** A `payload` map's values are restricted to unsigned integers (CBOR major type 0), byte strings (2), text strings (3), arrays (4), and maps (5). Negative integers (1), tags (6), and simple/float values (7 — including `true`/`false`/`null`) are rejected. This closes a gap where the two firmwares' generic structural validator (`feb_cbor_skip_value()`) had independently drifted to accept different subsets of these types (fixed 2026-09-07; see [CODE_REVIEW_FINDINGS.md](CODE_REVIEW_FINDINGS.md) findings #1–#3). Widening this set (e.g. to add booleans for a future capability payload) is a deliberate protocol revision with matching test vectors on both sides, not a decoder-local choice.
+
+**Nesting depth.** `FEB_CBOR_MAX_NESTING` (4) bounds the chain outer map → payload map → array/map → element. The payload span itself is validated at depth `2` (the outer record's own map decode is depth 0, the pairing/session envelope's outer map is not itself passed through the generic validator, and the payload span starts one level in at depth `2`); one further container level (depth `3`) and its own elements (depth `4`) are the deepest structure a payload may contain before rejection. This budget applies specifically to a field whose content is validated/captured *generically* via `feb_cbor_skip_value()` because its schema is still opaque at that call site (e.g. the top-level `payload` map itself, or `capability_query`'s currently-unused `requested` array). A field with its own dedicated, schema-aware decoder — one that knows its exact fixed field order rather than generically skipping it — is its own self-contained span and gets a **fresh depth budget starting at 0** when recursing into `feb_cbor_skip_value()` for any sub-piece of it that is still generically validated, rather than continuing to add to the depth already accumulated by whatever positioned it. `command.arguments` and `status.result` (see "`wifi_scan` command and status payloads" below) are both examples: `result`'s own real structure (`result` map → `aps` array → `<ap-result>` map → scalar fields) is 3 container levels deep, which would exceed `FEB_CBOR_MAX_NESTING` if it inherited depth `2` from being a field inside `payload` — but since `status`'s decoder is schema-aware down to the `<ap-result>` field level, `result` is validated as its own fresh span, not as continued generic descent from `payload`. This is a decoder-internal bookkeeping choice with no wire representation, but both firmwares' decoders must apply it identically or one will reject a record the other accepts.
+
+**Trailing bytes.** The three record-level decoders (`feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, `feb_cbor_decode_pairing_envelope`) must reject any input where decoding the fixed field set does not consume the entire buffer — decoding must end exactly at the buffer's length, with no unconsumed trailing bytes. This is not applied to the payload-specific decoders (`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`): those are always handed the exact `payload_span`/`payload_span_len` that `feb_cbor_skip_value()` already computed as the payload's own precise extent, so trailing bytes there are structurally impossible by construction, and a redundant check would add no coverage.
+
 ## Session establishment
 
 1. The ESP32 generates a new `session_id`, connects to the advertised BLE service, and sends unencrypted `hello` with payload `{ "client_nonce": bytes(16) }`.
@@ -176,6 +182,43 @@ Outside an open window, `pairing_disabled` is the sole response to a pairing rec
 Defined `error.code` values are `unsupported_version`, `malformed_record`, `payload_too_large`, `unsupported_capability`, `invalid_command`, `busy`, `internal_error`, `pairing_disabled`, `pairing_expired`, `pairing_failed`, and `unknown_board` (see "Runtime auth failure handling" above).
 
 **Notes on capability discovery:** The `requested` field on `capability_query` is defined but currently unimplemented — the ESP32 always returns the full registry regardless of what's sent (or not sent), and the Flipper always omits the field. This is flagged as a backlog item to revisit once there's a real multi-capability use case that would benefit from partial queries. The `board` and `firmware` fields in `capability_response` are hand-maintained constant strings per firmware build (not derived or validated), and the Flipper receives them as opaque values — no enum, no allowlist, no validation against known values. Capability gating is driven entirely by the `features` array, never by the `board` string.
+
+### `wifi_scan` command and status payloads
+
+The `wifi_scan` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is the first user of the
+generic `command`/`status` message types defined in the table above. Its shapes are:
+
+- `command` for `wifi_scan`: `capability = "wifi_scan"`, `arguments = {}` (always an empty map —
+  no scan configuration options are exposed yet; a non-empty `arguments` map is rejected as
+  `invalid_command`).
+- `status` for `wifi_scan`: `state` is `"partial"` or `"complete"` only — there is no separate
+  "scan started" acknowledgment state, and no total/progress count field. `result` is
+  `{ "aps": [ <ap-result>, ... ] }`. The ESP32 sends one or more `partial` status records
+  followed by exactly one `complete` status record (which may itself carry the final batch of
+  results, or an empty `aps` array if a prior `partial` record already delivered everything).
+  Each `status` record's `aps` array is sized to fit within the 512-byte payload cap; the ESP32
+  is free to choose how many AP results fit per record.
+
+Each `<ap-result>` map has this fixed field order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `ssid` | byte string, 0-32 bytes | Raw SSID octets, exactly as reported by the radio. Not guaranteed valid UTF-8 — encoded as bytes, not text, for this reason. Rendered by the Flipper with non-printable-byte sanitization at display time; this is a display-layer concern, not a protocol one. |
+| `bssid` | byte string, 6 bytes | AP MAC address. |
+| `rssi_offset` | unsigned integer | Signal strength encoded as `rssi_dbm + 128` to stay within this protocol's payload value-type restriction against negative integers (see "Canonical CBOR encoding (definition)" above). The Flipper recovers real RSSI as `rssi_offset - 128`. |
+| `channel` | unsigned integer | Wi-Fi channel number. |
+| `phy` | text string | One of `"11b"`, `"11g"`, `"11n"`, `"11ax"` — the highest-generation PHY mode the AP advertises support for (a real AP typically advertises several generations for backward compatibility; this field reports only the highest, matching CAPABILITIES.md's framing of PHY generation as a single per-AP property). |
+| `auth` | text string | One of `"open"`, `"wep"`, `"wpa_psk"`, `"wpa2_psk"`, `"wpa_wpa2_psk"`, `"wpa2_enterprise"`, `"wpa3_psk"`, `"wpa2_wpa3_psk"`, `"wapi_psk"`, `"owe"`, `"wpa3_ent_192"`, `"wpa3_ext_psk"`, `"wpa3_ext_psk_mixed_mode"`, `"dpp"`, `"wpa3_enterprise"`, `"wpa2_wpa3_enterprise"`, `"wpa_enterprise"`, or `"unknown"` for any `wifi_auth_mode_t` value not in this list (future-proofing against a newer ESP-IDF adding auth modes without a protocol revision). This list matches every value in the pinned ESP-IDF v5.5.2's `wifi_auth_mode_t` (`esp_wifi_types_generic.h`). |
+
+**Result cap.** If a scan finds more than 32 APs, the ESP32 reports only the 32 with the
+strongest RSSI and silently drops the rest.
+
+**Busy handling.** A `wifi_scan` command received while a scan is already in progress is
+rejected immediately with `error` code `busy` and the same `request_id`. `wifi_scan` is a
+read-only, side-effect-free capability, so the ESP32 does not keep a `request_id` dedup cache
+for it — PROTOCOL.md's general dedup-cache guidance under "Reliability and reconnect behavior"
+exists to avoid repeating non-idempotent work, which does not apply here; a retried
+`request_id` simply triggers a normal fresh scan.
 
 ## Reliability and reconnect behavior
 

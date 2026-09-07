@@ -683,6 +683,16 @@ screen and LED both confirmed correct on the physical device.
 - **`features` list generation (ESP32 side).** A hardcoded compile-time array/constant (today: just containing `"wifi_scan"`). Explicitly no runtime hardware-detection abstraction/framework built now — that gets designed later, informed by real hardware specifics, when the GPS phase is designed in its own future grill-me session.
 - **Command-handling scaffolding.** Step 7 does NOT add any generic `command`-message rejection/dispatch scaffold (e.g. a generic "reject a command naming an unsupported capability" path), even though `unsupported_capability` is already a defined error code in PROTOCOL.md. That entire mechanism, including the `unsupported_capability` rejection path, is owned by the future `wifi_scan` follow-on step, designed together with the real command handler from a clean slate — building rejection-only scaffolding with no real handler behind it yet was explicitly rejected as premature.
 
+### Step 7 implementation-level decisions (2026-09-07 follow-up grill-me session)
+
+A second, narrower grill-me session filled in implementation gaps the first session (above) left open, before any code was written:
+
+- **Capability-cache file (Flipper side).** Same pattern as the pairing-secret file: its own subdirectory (`capabilities/`, alongside the existing `pairings/`), one file per `board_id` named `<board_id>.dat`, written atomically (temp file, exact write verification, `storage_file_sync()`, close, rename) — mirroring `build_pairing_path`/`pairing_storage_save` in `flipper/flipper_esp32_over_ble.c`. The file stores the raw canonical-CBOR `capability_response` *payload* bytes verbatim (not a separate hand-rolled on-disk format), decoded on load with the existing `cbor_codec` payload decoder. Rationale: reuses existing code, and a future wire-format change to `capability_response` is already a coordinated both-firmwares event under this project's conventions, so a non-sensitive cache file trivially invalidated by unpair+repair doesn't need its own independent migration story.
+- **`capability_query` trigger timing.** Fully automatic, no UI gesture: fires immediately once runtime auth succeeds, whenever no `capabilities/<board_id>.dat` exists yet. Consistent with runtime auth itself already being automatic on every reconnect.
+- **Missing/malformed `capability_response` handling.** No special-cased timeout or retry for this one exchange. Relies entirely on the existing 30-second idle-connection close and the protocol's general malformed-record handling (PROTOCOL.md's already-specified rejection/drop behavior). Since nothing is cached until a valid response lands, the failure mode is simply "retried automatically on the next reconnect" — building a bespoke retry timer for one specific message type this early was rejected as premature, consistent with how the rest of the protocol avoids per-message special-casing.
+- **On-screen rendering.** Extend the existing single fixed-layout status screen (`draw_callback` in `flipper/flipper_esp32_over_ble.c`) with a compact line for `board` + `features` (today just `wifi_scan`), rather than building a new scrollable list view/screen. Backlogged: a real scrollable capability-list screen, once `features` actually grows large enough (likely around the GPS/wardriving phase) to need one — see Backlog below.
+- **Build order.** No new shared contract needs freezing first (unlike step 3's `framing.c`/`cbor_codec.c`, which were genuinely new and needed independent parallel implementation to cross-check agreement) — `capability_query`/`capability_response`'s wire shape and field order are already fully specified, unchanged, in PROTOCOL.md/CAPABILITIES.md. `esp32-developer` and `flipper-developer` implement in parallel directly against the existing spec plus the four decisions above, with no prerequisite contract-authoring step.
+
 ### Capability roadmap
 
 Capabilities ship incrementally, gated on hardware actually present on a given board — see [CAPABILITIES.md](CAPABILITIES.md) for the registry format and the full, current capability list. See "Roadmap phases" above for how these map onto Phase 3/4/5.
@@ -702,9 +712,64 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 
 **Done when:** Flipper renders only the authenticated capability list reported by the paired board, correctly reflecting that board's hardware.
 
+### Step 7 status (2026-09-07)
+
+`esp32-developer` and `flipper-developer` implemented both sides in parallel, directly against
+the two grill-me sessions' decisions above — no shared-contract-freeze step, as planned, since
+`capability_query`/`capability_response`'s wire shape was already fully pinned in
+`docs/PROTOCOL.md`/`docs/CAPABILITIES.md`. Both build-verified only (`idf.py build` /
+`fbt.cmd fap_flipper_esp32_over_ble`), no hardware touched — see `docs/SESSION_MEMORY.md`'s
+matching dated entry for full narrative detail. Summary:
+
+- **ESP32**: new `feb_capability_query_payload_t`/`feb_capability_response_payload_t` codecs in
+  `cbor_codec.h`/`.c`; `main.c` gained `handle_capability_query()` (hardcoded
+  `board="esp32-c6-devkit"`, `firmware="0.1.0"`, `features=["wifi_scan"]`) and its dispatch from
+  a new `RUNTIME_AUTH_STATE_AUTHENTICATED` branch. This is also the first code path that decodes
+  any protected (post-auth) record at all — before this step, an authenticated-session record
+  had nowhere to go and would have incorrectly failed auth. `idf.py build`: clean, `0xa7570`
+  bytes, 56% of the app partition free.
+- **Flipper**: matching codecs (diff-verified against the ESP32 copy — byte-identical except one
+  pre-existing comment-wording difference on `FEB_CBOR_MAX_BYTES_LEN`); new `capabilities/`
+  storage subdirectory (mirroring `pairings/`'s atomic temp-file/sync/rename pattern) with
+  `build_capability_path()`/`capability_storage_exists()`/`_save()`/`_load()`; automatic
+  query-or-load in a new `capability_bootstrap()` called from `handle_client_auth()`; response
+  handling via a new 7-field-envelope branch in `profile_event_handler()`; the status screen's
+  `draw_callback()` gained a 5th line for `board`+`features`. `fbt.cmd
+  fap_flipper_esp32_over_ble`: clean, artifact 62,036 bytes.
+- **Sequence-counter cross-check (done by the orchestrating session, not either agent):** both
+  sides independently converged on identical semantics — `session_seq_out`/`session_seq_in`
+  (Flipper) and `rt_tx_sequence`/`rt_rx_sequence` (ESP32) each reset at connect and set to `1`
+  exactly once client_auth completes, confirming the two independent implementations agree
+  without needing a pre-freeze step, as the build-order decision predicted.
+- **Real regression found and fixed during the Flipper-side implementation:** the new
+  `AppEvent` capability fields pushed a couple of `post_*` functions' `AppEvent event` locals
+  over this project's own documented static-storage threshold for anything reachable from
+  `profile_event_handler` (the same 1280-byte-`BleEventWorker`-stack class of bug that has hit
+  this codebase three times before — see step 3's `docs/SESSION_MEMORY.md` entries). Fixed by
+  converting `post_pairing_phase()`/`post_capability_info()` to `static AppEvent event;` with an
+  explicit per-call `memset`+field-reset (a static with a designated initializer would only run
+  once).
+- **Hardware-verified 2026-09-07.** Both boards flashed (`idf.py -p COM9 flash`; `fbt.cmd
+  launch APPSRC=flipper_esp32_over_ble` on COM8), user-authorized. The ESP32's repeated,
+  clean `hello`/`hello_ack`/`client_auth` cycles confirmed no regression to the existing
+  runtime-auth path. The capability exchange itself is confirmed by a different, stronger
+  piece of evidence than a log line: a brand-new `capabilities/esp32c6-acebe6fffeda.dat`
+  (58 bytes) now exists on the Flipper, in a directory that did not exist before this
+  session's implementation, matching the paired board's exact `board_id` — this file could
+  only have been produced by a real `capability_query` → `capability_response` round trip
+  (send, receive, decrypt, persist) using today's new code. The ESP32-side monitor capture
+  never caught the literal `sending capability_response` log line, but this is a benign
+  capture-window artifact, not a gap: attaching the monitor forces a board reset (a known
+  quirk), so that capture window began *after* the real exchange had already happened and
+  been cached — and `capability_query` fires only once per board by design, so it correctly
+  did not repeat on the later reconnects the capture did observe. **Physical Flipper screen
+  visually confirmed by the user 2026-09-07**: the new `board: features` line renders
+  correctly — step 7's "done when" bar is now fully met on all three fronts (persistence,
+  decode, and display).
+
 ## 8. Harden persistent state and release configuration
 
-- Store the C6 pairing record in a dedicated encrypted NVS namespace with a version, validity marker, and atomic replacement procedure.
+- Store the C6 pairing record in a dedicated encrypted NVS namespace with a version, validity marker, and atomic replacement procedure. Cross-referenced from `docs/CODE_REVIEW_FINDINGS.md` finding #17: today's ESP32 storage (`persist_pairing_secret`/`load_pairing_secret`) is a bare `nvs_set_blob()` with none of version/validity-marker/atomicity — a real, currently-uncosted gap against the written contract that this step owns closing.
 - Implement explicit local unpair/factory-reset behavior and define which pairing record is removed on each side (unpairing one board must not disturb other stored pairing records — see step 7).
 - Store the Flipper pairing record through an atomic app-owned storage update (temporary file, exact write verification, `storage_file_sync()`, close, rename) and do not log it. Treat local SD-card, debug, and modified-firmware access as outside the standalone FAP protection boundary (see [PROTOCOL.md](PROTOCOL.md) "Implementation security requirements" — this is an accepted limitation, not a gap to close in this phase).
 - The wardriving buffer (step 7) uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — drop the oldest record when the buffer is full.
@@ -736,6 +801,309 @@ Because of that accepted threat model, none of the following are required for an
 
 **No irreversible hardware operations are to be performed on any board in this phase.** If this work is ever picked up, it requires a dedicated sacrificial board for eFuse validation before any irreversible setting is applied to a board actually in use — do not attempt it on the primary development board.
 
+## Wi-Fi scan capability (Phase 3 follow-on step)
+
+### wifi_scan implementation decisions (2026-09-07 grill-me session)
+
+A grill-me design-review session on 2026-09-07 walked the first real capability command end to
+end, before any implementation started. This is the "follow-on `wifi_scan`-command step" named
+in Phase 3's roadmap description above — not step 8 (hardened persistence) and not part of step
+7 (which explicitly deferred all `command`/`status` handling to this step). Decisions:
+
+- **Trigger and output.** Manual only: the Flipper user presses a "Scan now" action; the ESP32
+  runs one scan and reports results. Nothing is persisted or exported to SD — that remains
+  `wardriving`'s job once GPS lands (see [CAPABILITIES.md](CAPABILITIES.md)). Results are shown
+  on-screen only, cleared when the user leaves the results view.
+- **Display.** A new dedicated scrollable list view (Furi list/submenu widget) on the Flipper,
+  showing every reported AP — not squeezed into the existing single fixed-layout status screen,
+  and not truncated to a "top N" summary.
+- **Result cap.** The ESP32 reports at most 32 APs per scan. If more are found, it keeps the 32
+  with the strongest RSSI and silently drops the rest.
+- **Wire format is new shared contract, not a step-7-style reuse.** Step 7's `capability_query`/
+  `capability_response` reused an already-fully-specified wire shape, so `esp32-developer`/
+  `flipper-developer` implemented directly in parallel with no freeze step. This step introduces
+  genuinely new payload shapes (the `command`/`status` types were previously undefined in
+  practice), so it follows steps 3/5's pattern instead: freeze the exact CBOR shapes in
+  `docs/PROTOCOL.md`/`docs/CAPABILITIES.md` first (done this session — see PROTOCOL.md's new
+  "`wifi_scan` command and status payloads" section), add test vectors, then delegate parallel
+  implementation.
+- **`command.arguments`.** Always an empty map for `wifi_scan` — no scan configuration exposed
+  yet (channel selection, active/passive, duration, etc. are all backlog items for later if a
+  real need shows up).
+- **`status.state` values.** Only `"partial"` and `"complete"` — no separate "scan started"
+  acknowledgment state, and no total/progress count field. Reasoning: the scan itself completes
+  server-side in one shot (`WIFI_EVENT_SCAN_DONE` fires once, after ~1.5-2s of default-timing
+  full-channel active scanning — well under the 30-second idle-connection timeout, so no
+  keepalive/heartbeat design is needed here), so pagination exists purely to fit the 512-byte
+  payload cap, not to reflect live scan progress. A progress indicator would only reflect
+  page-delivery progress, not real scan progress, and was rejected as not worth the added field.
+- **Per-AP fields and two real wire-format gaps closed this session:**
+  - SSID is encoded as a CBOR byte string, not text — real 802.11 SSIDs are not guaranteed valid
+    UTF-8, and this project's hand-rolled codec has no UTF-8 validation on `text` fields at all
+    (a pre-existing gap, first exposed by this field). The Flipper sanitizes for display.
+  - RSSI is encoded as an unsigned offset (`rssi_dbm + 128`), not a native signed integer,
+    because PROTOCOL.md's "Canonical CBOR encoding (definition)" section explicitly rejects
+    negative integers in payload maps and calls widening that rule "a deliberate protocol
+    revision... not a decoder-local choice." The offset encoding avoids touching that rule.
+  - PHY generation is one text string naming the highest generation the AP advertises support
+    for (`"11b"`/`"11g"`/`"11n"`/`"11ax"`), not a bitmask/array — a real AP typically advertises
+    several generations at once for backward compatibility, and CAPABILITIES.md already frames
+    PHY generation as one per-AP property.
+  - Auth mode is a full-fidelity string enum matching every `wifi_auth_mode_t` value in the
+    pinned ESP-IDF v5.5.2 (`esp_wifi_types_generic.h`), plus an `"unknown"` fallback for any
+    value not in that set — added to the protocol at the user's request, even though
+    CAPABILITIES.md did not previously mention auth mode at all.
+- **Busy handling, no dedup cache.** A `wifi_scan` command received while one is already running
+  is rejected with `error` code `busy`. No `request_id` dedup cache is kept for this capability:
+  PROTOCOL.md's general dedup-cache guidance (under "Reliability and reconnect behavior") exists
+  to avoid repeating non-idempotent work, and `wifi_scan` is a pure read with no side effects, so
+  it doesn't apply — a retried `request_id` just triggers a normal fresh scan.
+- **Wi-Fi driver lifecycle (ESP32).** `esp_netif`/default event loop/`esp_wifi` initialize once
+  at boot, in STA mode without connecting to anything, and stay resident for the device's whole
+  lifetime — matching the future `wardriving` capability's need for an always-on radio, and
+  avoiding any re-init race with an already-active BLE connection. Not lazy-initialized on first
+  scan.
+- **Scan execution model (ESP32).** The scan runs asynchronously:
+  `esp_wifi_scan_start(..., block=false)` plus a `WIFI_EVENT_SCAN_DONE` handler on the default
+  event-loop's own task. It must not run synchronously inside the existing protected-record
+  handler (`esp32/main/main.c`'s authenticated-record dispatch, around the
+  `RUNTIME_AUTH_STATE_AUTHENTICATED` branch), because that code runs on the NimBLE host task —
+  the same task responsible for BLE connection supervision — and a multi-second blocking scan
+  there risks connection-timeout/missed-event regressions of the kind this project has already
+  hit twice (the step-3 stack-overflow bugs from unsafe assumptions about BLE-callback-path
+  code).
+
+**Nothing has been built yet** — this session was design-only. Next: write the frozen contract
+into `docs/PROTOCOL.md`/`docs/CAPABILITIES.md` (see PROTOCOL.md's new "`wifi_scan` command and
+status payloads" section, added this session) plus new test vectors covering the RSSI-offset and
+SSID-as-bytes encodings in particular, then delegate `esp32-developer`/`flipper-developer`
+implementation in parallel.
+
+### wifi_scan test vectors (2026-09-07)
+
+Added to `tests/vectors/generate_vectors.py`/`vectors.h` (orchestrating session, not delegated —
+same rationale as the pre-step-7 shared-contract fixes: these are cross-firmware convergence
+artifacts both implementations must agree on byte-for-byte). Covers:
+
+- `<ap-result>` encodings: a normal entry, plus the `rssi_offset` encoding's two extremes
+  (`rssi_dbm` -128 -> offset 0, +127 -> offset 255), a hidden network (zero-length SSID), a
+  non-UTF-8 SSID (raw bytes), and the `auth = "unknown"` fallback.
+- `result` maps (`{"aps": [...]}`) with one AP, three APs, and an empty array (the "prior
+  `partial` already delivered everything" case).
+- `command` payload: valid (empty `arguments`) and malformed (non-empty `arguments`, must be
+  rejected `invalid_command`).
+- `status` payload: mid-scan `partial`, final `complete` with results, final `complete` with an
+  empty `aps` array, and a malformed `state` string.
+- End-to-end: the valid `command` and both real `status` payloads wrapped as protected records
+  under the existing step 6 golden session, continuing its per-direction sequence counters
+  (`command` is that session's first Flipper->ESP32 protected record; the two `status` records
+  continue the ESP32->Flipper counter after the existing `FEB_VEC_SESS_PROT1`/`PROT2` at
+  sequence 3/4).
+
+Not generated: a 32-AP-capacity vector or a >32-AP overflow case — the cap/keep-strongest
+behavior is ESP32-side scan-result logic to unit-test with its own mocked scan data, not a codec
+concern the shared vector file needs to carry.
+
+`generate_vectors.py` runs clean; `vectors.h` regenerated. Next: delegate
+`esp32-developer`/`flipper-developer` implementation in parallel against these vectors plus the
+frozen `docs/PROTOCOL.md` contract, then build-verify both (host-native tests + `idf.py build` /
+`fbt.cmd fap_flipper_esp32_over_ble`). Hardware-verify only after explicit user go-ahead.
+
+### wifi_scan implementation: ESP32 side complete (2026-09-07)
+
+`esp32-developer` implemented the ESP32 side in parallel with `flipper-developer` (Flipper side
+in progress as of this entry). Summary:
+
+- **Codec** (`cbor_codec.h`/`.c`): generic `feb_command_payload_t`/`feb_status_payload_t`
+  (capability/request_id/arguments; request_id/state/result — not wifi_scan-specific, per
+  PROTOCOL.md's general `command`/`status` types) plus the wifi_scan-specific
+  `feb_wifi_scan_ap_t`/`feb_wifi_scan_result_payload_t`.
+- **Wi-Fi driver**: `esp_netif`/default event loop/`esp_wifi` initialized once at boot in STA
+  mode, never connecting, resident for the device's lifetime — `esp32/main/CMakeLists.txt` now
+  also requires `esp_wifi`/`esp_netif`/`esp_event`.
+- **Command dispatch**: new `handle_command()` in the authenticated protected-record branch —
+  rejects wrong capability (`unsupported_capability`), non-empty `arguments`
+  (`invalid_command`), and a scan already running (`busy`).
+- **Scan execution**: `esp_wifi_scan_start(block=false)` plus a `WIFI_EVENT_SCAN_DONE` handler on
+  the default event-loop task (never the NimBLE host task) — fetches up to 64 raw results (see
+  judgment call below), keeps the 32 strongest by RSSI, collapses PHY bits to the highest
+  generation string, maps `wifi_auth_mode_t` to PROTOCOL.md's full enum with an `unknown`
+  fallback, then hands off to the NimBLE host task via a `ble_npl_callout` (the same
+  cross-task pattern `reassembly_timeout_co` already used).
+- **Status delivery**: batches APs per `status` record to fit `FEB_CBOR_MAX_PAYLOAD`, chaining
+  `partial` → ... → `complete` through a new tx-completion action, reusing the existing
+  fragmentation/AES-256-GCM machinery.
+
+**Real spec gap found and fixed (promoted into `docs/PROTOCOL.md`'s "Nesting depth" section):**
+validating `status.result` (`result` map → `aps` array → `<ap-result>` map → its own fields —
+3 real container levels) by continuing to add depth on top of the existing "payload starts at
+depth 2" convention pushes the innermost fields to depth 5, one past `FEB_CBOR_MAX_NESTING` (4)
+— confirmed as an actually-failing host-native test against the frozen
+`FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD`/`STATUS_COMPLETE_PAYLOAD` vectors before the fix.
+Resolved: `command.arguments`/`status.result` each get a **fresh nesting-depth budget starting
+at 0** when a schema-aware decoder recurses into them for a still-generically-validated
+sub-piece, rather than inheriting depth from the field's position inside `payload`. Purely a
+decoder-internal bookkeeping convention with no wire representation — but both firmwares must
+apply it identically. Flagged to the in-flight `flipper-developer` agent directly (session
+message, not a rerun) so it applies the same convention rather than risking an independent,
+possibly-incompatible fix or shipping without ever exercising the case.
+
+**Other judgment calls** (not spec gaps, ESP32-local): `wifi_ap_record_t.ssid` is a null-padded
+33-byte ESP-IDF buffer with no separate length field, so an SSID containing an embedded null
+byte (legal, rare) reports truncated — an accepted ESP-IDF API limitation, documented inline,
+not fixable in this app. Raw-scan fetch is capped at 64 (`FEB_WIFI_SCAN_RAW_MAX`, distinct from
+the 32-AP wire cap) because ESP-IDF doesn't guarantee RSSI-ordered results, so real
+top-32-by-RSSI selection needs headroom; a real scan returning >64 APs would only consider the
+first 64 in driver order — accepted as extremely-unlikely-in-practice rather than building
+dynamic allocation for it. On disconnect, `esp_wifi_scan_stop()` is called (never clearing
+`wifi_scan_in_progress` directly) so the guaranteed resulting `SCAN_DONE` event does cleanup
+uniformly through the normal no-connection discard path, avoiding a race between an old
+in-flight scan's completion and a new connection's fresh scan.
+
+Build-verified only, no hardware touched: host-native tests pass (46/46 `tests/esp32/build.ps1`
+incl. 17 new wifi_scan checks; 31/31 `build_session.ps1` incl. 6 new end-to-end wifi_scan
+protected-record checks matching the frozen vectors byte-for-byte); `idf.py build` clean after a
+full rebuild, `0x12e420` bytes, 21% of the app partition free.
+
+### wifi_scan implementation: Flipper side complete (2026-09-07)
+
+`flipper-developer` implemented the Flipper side against the same frozen contract, including the
+nesting-depth fix above (independently rediscovered the same gap before the coordinator's message
+about it arrived — converged on the identical depth-0-budget fix; confirms the two firmwares
+agree, the same cross-check value step 3's parallel-implementation pattern has produced before).
+This run stalled once (no progress for 600s) mid-edit on the depth fix and was resumed with an
+explicit instruction to re-verify actual file state before continuing, rather than trust its own
+prior stated intent — finished clean on resume. Summary:
+
+- **Codec** (`cbor_codec.h`/`.c`): matching generic `command`/`status` codecs and the
+  `wifi_scan`-specific `<ap-result>`/`result` codecs; `arguments`/`result` captured as opaque
+  spans at the generic-codec layer (capability-specific validation, e.g. "arguments must be
+  empty for wifi_scan," lives in the dispatch layer, not the codec).
+- **UI**: a new scrollable results view (`AppScreenWifiScanResults`) added to this file's
+  existing single-`ViewPort`/`AppEvent`-queue architecture (see judgment call below) rather than
+  a `Submenu`/`ViewDispatcher` — Up/Down scroll, header shows found count, one `SSID chN dBm`
+  row per AP, footer position indicator. "OK: scan" appears on the main screen only once a
+  session is active and the board advertises `wifi_scan`. Results clear on Back-from-results and
+  on any disconnect/reconnect.
+- **Command send / status receive**: `send_wifi_scan_command()` sends from the app's own main
+  thread (the first sender in this file not running inside a BLE-thread callback);
+  `handle_wifi_scan_status()`/`handle_runtime_error()` decode on the BLE thread and post events
+  through the existing queue.
+- **Stack safety**: all BLE-thread-reachable decode structs made `static`, matching the existing
+  `post_pairing_phase`/`post_capability_info` pattern; the 32-AP display array is file-scope
+  `static` (not just for `BleEventWorker` — this app's own main-thread stack size isn't pinned
+  anywhere in this project's docs, so it was kept off any thread's stack).
+
+**Judgment calls / flagged concerns (not fixed, recorded here and in Backlog below):**
+- **UI widget deviated from the task brief's literal wording** ("Furi list/submenu widget") in
+  favor of extending the existing single-`ViewPort` architecture, since this app has no
+  `ViewDispatcher`/scene-manager at all today and introducing one would be a materially larger
+  structural change than this step's scope. Still satisfies CAPABILITIES.md/PLAN.md's actual
+  requirement (dedicated scrollable view, every AP shown, cleared on exit).
+- **Stack-usage concern: measured (2026-09-07, see `docs/SESSION_MEMORY.md`'s matching entry) and
+  fixed, superseding the estimate below.** Real `-fstack-usage` measurement using the actual
+  `fbt.cmd`-invoked compiler flags found the worst case was 6 stacked `feb_cbor_skip_value` frames
+  (depths 0-5, not 5 — the depth check fires one call *after* the guard value, so the
+  instantly-rejected depth-5 call still costs a full frame), totaling 1016 of 1280 bytes (20.6%
+  headroom, below this project's 30% bar) before the fix, purely from `flipper/cbor_codec.c`'s
+  per-recursion-level duplicate-key-check arrays. Fixed by making those arrays `static`, indexed
+  by recursion depth (Flipper-side only, `cbor_codec.h`'s contract/ESP32 side untouched) — new
+  worst case 632 of 1280 bytes (49.4%, 50.6% headroom). One frame (`hci_user_evt_proc()`, ST
+  vendor code) remains unmeasured — flagged as a caveat, not assumed negligible.
+  *(Original estimate, superseded but kept for history: the depth-0 `feb_cbor_skip_value()`
+  budget for `arguments`/`result` lets a misbehaving-but-authenticated ESP32 force up to 5 nested
+  stack frames through one call site — 2 more than any other `skip_value` call site in this file
+  reaches today. Rough estimate (~150-200 bytes/frame, compiler-dependent): ~900-1100 bytes of the
+  1280-byte `BleEventWorker` budget in the theoretical worst case — tighter than anything else in
+  this codebase, though not a confirmed overflow, and not something either agent could
+  unilaterally tighten once it's a fixed cross-firmware contract decision.)* Given this project has
+  hit this exact bug class three times already (step 3's two stack-overflow entries, this
+  session's step-7 `AppEvent`-locals fix), **do not treat clean builds as proof of stack safety
+  here** — see Backlog below.
+- **No `request_id` correlation on `busy` errors**: any protected `busy` error surfaces in the
+  UI regardless of whether its `request_id` matches the outstanding scan — acceptable since the
+  UI itself never allows two scans in flight.
+- **Unsynchronized cross-thread session-state access**: `send_wifi_scan_command()` (main thread)
+  reads `session_key`/`session_seq_out`/`outgoing_message_id` that BLE-thread senders also touch,
+  with no mutex — argued safe because "Scan now" is only reachable after
+  `capability_bootstrap()`'s own BLE-thread send has already returned, not enforced by any lock.
+- **Pre-existing gap, not introduced this session**: `capability_query`/`capability_response`
+  (step 7) still have zero host-test coverage in `tests/flipper/`.
+
+Build-verified only, no hardware touched: host-native tests pass (117/117 `tests/flipper/
+build.ps1`, 57/57 `build_session.ps1` incl. 3 new end-to-end wifi_scan protected-record cases,
+67/67 `build_pairing.ps1` unaffected); `fbt.cmd fap_flipper_esp32_over_ble` clean, artifact
+70,204 bytes (up from 62,036 at step 7).
+
+**Both sides now build- and host-test-verified against the same frozen contract and vectors.**
+
+### wifi_scan `cbor_codec.h` cross-firmware convergence fix (2026-09-07)
+
+The combined-repo sanity pass found real drift beyond the intentionally-per-firmware
+`arguments`/`result` opaque-span handling: unlike every prior step, the two agents' independently
+written `cbor_codec.h` headers were not byte-identical for the new wifi_scan section — the
+Flipper's `feb_cbor_encode_wifi_scan_result_payload()` took `(out, out_cap, const
+feb_wifi_scan_ap_t *aps, size_t ap_count)` where the ESP32's took `(out, out_cap, const
+feb_wifi_scan_result_payload_t *payload)` (inconsistent with every other `encode_*_payload`
+function in this codebase, which all take a payload struct pointer), plus a differently-named
+macro (`FEB_WIFI_SCAN_MAX_APS` vs `FEB_WIFI_SCAN_MAX_APS_PER_RECORD`) and reworded comments. This
+broke this project's established convention (since step 3) that `cbor_codec.h`'s actual API
+surface — not just its `.c` implementation style — is held byte-identical between firmwares, with
+only comment wording allowed to differ.
+
+Fixed directly by the orchestrating session (same rationale as the pre-step-7 convergence fixes:
+a cross-firmware .h-contract reconciliation, not board-specific implementation work). The
+function was unused outside `tests/flipper/`'s own test file (the Flipper only ever *decodes* a
+`result` payload — the ESP32 is the one that encodes it, since it's the scanner), so the fix was
+low-risk: changed the Flipper's signature/macro name to match the ESP32's exactly, updated the
+one `.c` implementation and its three call sites in `test_flipper_codec.c`, and renamed
+`flipper_esp32_over_ble.c`'s one remaining reference to the old macro name. All three Flipper
+host-test suites re-verified green after the fix (117/117 `build.ps1`, 57/57 `build_session.ps1`,
+67/67 `build_pairing.ps1`), and `fbt.cmd fap_flipper_esp32_over_ble` rebuilt clean at the same
+70,204-byte artifact size (confirming the signature change was purely mechanical, no behavior
+change). `esp32/main/cbor_codec.h`/`flipper/cbor_codec.h` are now byte-identical except the one
+pre-existing, already-known `FEB_CBOR_MAX_BYTES_LEN` comment-wording difference from step 6.
+
+**Stack-usage measurement done (2026-09-07)** — see the "Stack-usage concern: measured..." bullet
+above and `docs/SESSION_MEMORY.md`'s matching entry; real (not estimated), fixed on the Flipper
+side.
+
+**Hardware verification started 2026-09-07, was blocked on a new ESP32-side bug — bug now fixed
+and hardware-reverified, full pass still pending.**
+See `docs/SESSION_MEMORY.md`'s "2026-09-07: wifi_scan first hardware test" and "`nimble_host`
+wifi_scan stack-overflow fix" entries for full detail. Summary: a real, deterministic
+Flipper-side bug (`FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN` undersized, 32→64 fixed) was found and
+fixed — the OK-press send path is hardware-confirmed working end-to-end at the transport/crypto
+layer. Immediately after, a **new, deterministic ESP32-side bug** was found: the ESP32 crashed
+with a `Guru Meditation Error: Core 0 panic'ed (Stack protection fault)` in FreeRTOS task
+`nimble_host` (~4084-byte stack) roughly 4-5 seconds after `wifi_scan started` logs, every time
+(2/2 repro rate). Root cause: `wifi_scan_send_next_batch()` (runs entirely on `nimble_host`) held
+its working set — two full 32-entry `feb_wifi_scan_result_payload_t`, a `feb_status_payload_t`,
+and a `FEB_CBOR_MAX_PAYLOAD`-sized buffer — as stack-locals. **Fixed** by converting all four to
+file-scope `static` (same bug class, same fix pattern as this project's Flipper-side
+`BleEventWorker`/ported-X25519 stack issues). `idf.py build` passes clean.
+**Hardware-reverified 2026-09-07: 3/3 clean `wifi_scan` attempts, zero crashes** (previously
+2/2 crashed before the fix), with the idle-reconnect/runtime-reauth cycle also confirmed clean
+across ~30 cycles in the same capture window (no regression).
+
+**wifi_scan hardware verification fully closed out (2026-09-07).** See
+`docs/SESSION_MEMORY.md`'s "ESP32-side `feb_cbor_skip_value` stack check, busy-path finding,
+and results-screen confirmation" entry for full detail:
+- ESP32-side `feb_cbor_skip_value` stack usage measured (66.3% headroom, clears this
+  project's 30% bar) — no fix needed.
+- Busy/error path confirmed unreachable from the real UI by design (client-side gate in
+  `flipper/flipper_esp32_over_ble.c` prevents a second command while one is in flight) — not
+  a bug, no hardware repro needed to confirm this.
+- Results-screen rendering user-confirmed correct on real hardware, including correct
+  screen-state recovery across an idle-timeout reconnect.
+- **Accepted gap:** no non-ASCII/non-printable SSID was available nearby to test that specific
+  render path on real hardware (host-native codec tests already cover the encoding). Per this
+  step's own design note ("if one is nearby"), this doesn't block closing out verification.
+
+**Done when** (the step's original wire-format/build bar) was already met 2026-09-07 at
+implementation; the follow-on hardware-verification pass described above is now also
+complete, with the one accepted non-ASCII-SSID gap noted above.
+
 ## Backlog
 
 Smaller items surfaced during design review, not yet scheduled to a specific step above.
@@ -765,10 +1133,52 @@ project's convention of a dedicated grill-me design session before implementing 
 step (steps 3, 5, and 6 each got one), that design session should happen before writing any
 step 7 code.
 
+- **Unexplained "blocked by classifier" security-warning annotation on a Haiku subagent's
+  completed task** (2026-09-07, deploying the FAP to the Flipper via `fbt.cmd launch` as part
+  of the pre-step-7 hardware re-verification — see `docs/SESSION_MEMORY.md`'s "pre-step-7 fix
+  plan hardware-verified" entry). The agent's own tool-by-tool trace showed nothing unusual
+  (only port-discovery queries and the documented deploy flow), a direct follow-up question to
+  the same agent found nothing in its transcript matching the flag, and the flagged task's
+  output file on disk was empty (0 bytes) when inspected, so the actual cause couldn't be
+  determined from either side. Treated as a probable harness-level false positive on a
+  hardware-write action rather than a real problem, since the deploy's own output was
+  unambiguous and the subsequent ESP32-side hardware behavior independently confirmed the
+  Flipper had correctly validated the runtime-auth handshake. Not investigated further this
+  session — worth a closer look if it recurs (same flag on a similar hardware-write task) or if
+  a way is found to inspect the classifier's own reasoning rather than just the subagent's
+  transcript.
 - Manual "disconnect current board" Flipper UI action (step 7).
 - Automatic BLE connection arbitration between multiple paired boards — gated on an unresolved BLE-HAL feasibility question (step 7).
 - GPS backfill-to-first-fix as a Flipper-settable wardriving option, instead of discarding pre-fix results (step 7).
 - Idle-connection keepalive/heartbeat during a live wardriving view session (step 9).
+- Real scrollable capability-list screen on the Flipper, once `features` grows large enough to need one (step 7's initial implementation extends the existing single status screen instead — see "Step 7 implementation-level decisions" above).
+- ~~Measure real BleEventWorker stack usage for the wifi_scan `command`/`status` decode path~~
+  **Measured and fixed 2026-09-07** (Flipper side only) — real `-fstack-usage` against the actual
+  `fbt.cmd` compile flags found the true worst case was 1016/1280 bytes (20.6% headroom, below
+  this project's 30% bar), driven by `feb_cbor_skip_value()`'s recursion actually reaching 6
+  stacked frames (depths 0-5, not 5 — the depth check fires one call after the guard value).
+  Fixed by making the map case's per-recursion-level duplicate-key arrays `static`, indexed by
+  depth (72 bytes/frame instead of 136); new worst case 632/1280 bytes (49.4%, 50.6% headroom).
+  See `docs/SESSION_MEMORY.md`'s matching 2026-09-07 entry for the full per-function table,
+  the fix rationale, and the one remaining measurement caveat (`hci_user_evt_proc()`'s own
+  frame, ST vendor code, not measured). ESP32-side `feb_cbor_skip_value` was not examined for
+  the same issue — flagged as an open question for `esp32-developer`, not fixed here (this task
+  was explicitly scoped to the Flipper side only). Hardware verification of this fix is
+  **done** (2026-09-07) — the Flipper-side send path is confirmed reaching the ESP32 every
+  time; see the "Wi-Fi scan capability" section's hardware-verification entry above for the
+  separate ESP32-side crash bug this uncovered, still open.
+- **New, not yet fixed (2026-09-07): ESP32 `nimble_host` task stack overflow crash during
+  wifi_scan.** See the "Wi-Fi scan capability" section's hardware-verification entry above and
+  `docs/SESSION_MEMORY.md`'s matching dated entry for full detail — a `Guru Meditation Error`
+  stack-protection fault in the ~4KB `nimble_host` task, deterministic, ~4-5s after every
+  `wifi_scan started` log line. Needs `esp32-developer` to trace the actual call chain and fix
+  it before wifi_scan hardware verification can continue.
+- Check ESP32-side `feb_cbor_skip_value()` (in `esp32/main/cbor_codec.c`) for the same
+  recursion-depth stack-usage issue found and fixed on the Flipper side above — flagged but not
+  examined, since that task was explicitly scoped to the Flipper only.
+- Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP, instead of the single-`ViewPort`/`AppEvent`-queue pattern every screen so far (including wifi_scan's results view) has been bolted onto — flagged by `flipper-developer` as a materially larger structural change than any single step's scope, but each new screen makes the single-`ViewPort` approach a bit more strained.
+- Add host-test coverage for `capability_query`/`capability_response` (step 7) on the Flipper side — currently zero, a pre-existing gap noticed while adding wifi_scan's own test coverage.
+- Mutex (or documented-safe alternative) for the Flipper's cross-thread `session_key`/`session_seq_out`/`outgoing_message_id` access — `send_wifi_scan_command()` (app main thread) and the existing BLE-thread senders touch the same session state with no lock today; currently argued safe only by a UI-gating invariant ("Scan now" unreachable before `capability_bootstrap()`'s send returns), not enforced by any lock.
 - Automatic pause-on-degradation fallback for concurrent BLE-source wardriving scanning while connected — only if step 4 shows concurrent operation is unstable.
 - Generalize the Flipper's pairing-flow LED status stub (step 5, 2026-09-05 session: continuous blue blink while waiting/handshaking, solid blue on pairing success, off on failure) into a reusable status/notification abstraction usable by other app states (capability streaming, wardriving status, etc.), instead of the hardcoded single-flow stub built for step 5.
 - ~~Flipper pairing files are saved under the wrong app's data directory~~ **Fixed
@@ -1026,3 +1436,50 @@ Delegated to `esp32-developer` and `flipper-developer` in parallel, each build-v
 - **`feb_fragment_record()` doc comment** (`framing.h`, both copies): rewritten to describe the real implementation — a file-scope static buffer sized `FEB_FRAG_HEADER_SIZE + FEB_MAX_RECORD_SIZE`, safe because fragmentation is synchronous and single-in-flight on both firmwares, not a caller-owned buffer parameter.
 - **`feb_reassembly_check_timeout()` wiring**: ESP32 side (`esp32/main/main.c`) now calls it periodically via an NimBLE `ble_npl_callout` on a `FEB_REASSEMBLY_CHECK_INTERVAL_MS` (half the 2s timeout) cadence. The Flipper side (`flipper/flipper_esp32_over_ble.c`) had the identical undocumented gap — found during this fix, not previously listed above — and now calls it from a FuriTimer callback guarded by a new `reassembly_mutex` shared with the feed path. Both follow the existing drop-and-continue policy on timeout: discard the reassembly buffer, keep the connection open, no response sent.
 - **`FEB_CBOR_MAX_BYTES_LEN`** (`cbor_codec.h`, both copies): raised from `256u` to `512u` to match `FEB_CBOR_MAX_PAYLOAD`, so a maximum-size AES-128-GCM ciphertext can round-trip. Confirmed safe: both call sites just bound-check a pointer+length into the existing input buffer, no fixed-size copy target sized off the old constant.
+
+### Pre-step-7 shared-contract convergence fixes (2026-09-07)
+
+Six work items from `docs/CODE_REVIEW_FINDINGS.md` (#1, #2, #3, #4, #9, #10), executed per
+`docs/CODE_REVIEW_FIX_PLAN.md` in the orchestrating session (not delegated to
+`esp32-developer`/`flipper-developer`, per that plan's decision D6 — these are cross-firmware
+convergence edits whose entire purpose is that both copies end up behaving identically). Done
+ahead of step 7 because all six live in the shared CBOR/framing/session-crypto primitives step
+7's capability payload schemas and protected-record path build directly on top of.
+
+- **`feb_cbor_skip_value()` bounds/type/depth convergence** (findings #1–#3): added the missing
+  `pos >= in_len` bounds guard to the Flipper's map-entry validator (was a real OOB read,
+  remotely reachable pre-authentication); converged both sides to accept only CBOR majors 0
+  (uint), 2 (bytes), 3 (text), 4 (array), 5 (map) — removed the ESP32's negative-integer
+  acceptance and the Flipper's `true`/`false`/`null` acceptance; converged the Flipper's payload
+  nesting depth from `1` to `2` at both call sites (`cbor_codec.c` and the previously-unscoped
+  `pairing.c`), matching the ESP32 and `cbor_codec.h`'s own documented `FEB_CBOR_MAX_NESTING`
+  derivation. Recorded in `docs/PROTOCOL.md`'s "Canonical CBOR encoding" section (permitted
+  payload value types, nesting depth).
+- **Over-length `board_id` now zeroes, not clamps** (finding #4): `flipper/session.c`'s
+  `feb_session_derive_key()` and `flipper/pairing.c`'s `feb_pairing_derive_secret()` now zero
+  their output and return early on `board_id_len > FEB_PAIRING_BOARD_ID_MAX_LEN`, matching the
+  ESP32 — an all-zero key/secret fails authentication immediately and visibly, where the
+  previous silent truncation derived a real but wrong key/secret. Not currently reachable (both
+  application layers already bound `board_id` before reaching these functions), but step 7 adds
+  new callers of this path.
+- **Flipper GCM wrapper now fails deterministically** (finding #9): `feb_gcm_encrypt()`/
+  `feb_gcm_decrypt()` in `flipper/session_crypto.c` now zeroize their output buffers on a
+  hardware failure / failed tag verification, via `feb_secure_zero()`, matching the ESP32 and
+  this project's "zeroize on every success and failure path" security property.
+- **Trailing bytes after a decoded record now rejected** (finding #10): all three record-level
+  decoders (`feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`,
+  `feb_cbor_decode_pairing_envelope`) on both firmwares now require the decode to consume exactly
+  `in_len` bytes. Payload-specific decoders (`hello`, `pair_*`, `error`, etc.) deliberately exempt
+  — see `docs/PROTOCOL.md`'s "Trailing bytes" note for why.
+
+Test-vector-driven: new shared vectors added to `tests/vectors/vectors.h` (via
+`generate_vectors.py`) covering negative-int/`true`/`null` payload values, a truncated map header
+(W1's repro), payload nesting at-limit and one-level-too-deep, and a record with one trailing
+byte — plus direct `feb_cbor_skip_value()` unit cases (previously zero direct coverage on either
+side). All six host-native test binaries (`tests/esp32/` and `tests/flipper/`, framing/cbor,
+pairing, session) pass on both firmwares after the fixes; confirmed red beforehand in the
+expected asymmetric pattern (predominantly Flipper-side failures, since four of the six items
+were the Flipper's independently-written copy having drifted looser than the ESP32's). Build-
+verified only (`idf.py build`, `fbt.cmd fap_flipper_esp32_over_ble`) — **not yet hardware
+re-verified**; see `docs/SESSION_MEMORY.md`'s matching entry for the recommended pairing +
+runtime-auth hardware check before these are trusted in the field.

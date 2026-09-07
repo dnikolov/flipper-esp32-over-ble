@@ -11,6 +11,8 @@
    this file. */
 #include "session_crypto.h"
 
+#include "pairing_crypto.h"
+
 #include <furi_hal_crypto.h>
 
 void feb_gcm_encrypt(
@@ -22,14 +24,21 @@ void feb_gcm_encrypt(
     size_t plaintext_len,
     uint8_t* ciphertext_out,
     uint8_t tag_out[FEB_SESSION_GCM_TAG_LEN]) {
-    /* Per this header's contract, this cannot fail for any well-formed input of the sizes
-       this protocol ever uses; furi_hal_crypto_gcm_encrypt_and_tag()'s only failure path
+    /* furi_hal_crypto_gcm_encrypt_and_tag()'s only failure path
        (FuriHalCryptoGCMStateError) is a hardware key-load failure, not a data-dependent
-       condition, so the return value is intentionally not surfaced here (matches this
-       header's declared void return, mirroring feb_x25519()'s total-function style in
-       pairing_crypto.h). */
-    (void)furi_hal_crypto_gcm_encrypt_and_tag(
+       condition -- this cannot fail for any well-formed input of the sizes this protocol
+       ever uses. The state is still captured (rather than discarded, matching this
+       header's declared void return / feb_x25519()'s total-function style in
+       pairing_crypto.h) so that a hardware failure zeroizes the output instead of leaving
+       stale buffer contents to go out over BLE. */
+    FuriHalCryptoGCMState state = furi_hal_crypto_gcm_encrypt_and_tag(
         key, nonce, aad, aad_len, plaintext, ciphertext_out, plaintext_len, tag_out);
+    if(state != FuriHalCryptoGCMStateOk) {
+        if(plaintext_len > 0) {
+            feb_secure_zero(ciphertext_out, plaintext_len);
+        }
+        feb_secure_zero(tag_out, FEB_SESSION_GCM_TAG_LEN);
+    }
 }
 
 int feb_gcm_decrypt(
@@ -43,5 +52,11 @@ int feb_gcm_decrypt(
     uint8_t* plaintext_out) {
     FuriHalCryptoGCMState state = furi_hal_crypto_gcm_decrypt_and_verify(
         key, nonce, aad, aad_len, ciphertext, plaintext_out, ciphertext_len, tag);
-    return state == FuriHalCryptoGCMStateOk ? 1 : 0;
+    if(state != FuriHalCryptoGCMStateOk) {
+        if(ciphertext_len > 0) {
+            feb_secure_zero(plaintext_out, ciphertext_len);
+        }
+        return 0;
+    }
+    return 1;
 }

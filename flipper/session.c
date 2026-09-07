@@ -385,11 +385,18 @@ void feb_session_derive_key(
 
     memcpy(info, info_prefix, sizeof(info_prefix) - 1);
     info_len = sizeof(info_prefix) - 1;
-    /* Callers must uphold board_id_len <= FEB_PAIRING_BOARD_ID_MAX_LEN (enforced upstream
-       by the pairing/session envelope decoders); this clamp is a defensive backstop
-       against buffer overflow, not a substitute for that check. */
+    /* Over-length board_id yields an all-zero session key with no error signal (void
+       return), matching the ESP32's behavior: an all-zero key fails GCM authentication
+       immediately and visibly, whereas silently truncating board_id would derive a real
+       but wrong key that presents as an unexplained proof mismatch. Callers must uphold
+       board_id_len <= FEB_PAIRING_BOARD_ID_MAX_LEN (enforced upstream by the
+       pairing/session envelope decoders); this is defense-in-depth for a shared
+       primitive, not the primary enforcement point. */
     if(board_id_len > FEB_PAIRING_BOARD_ID_MAX_LEN) {
-        board_id_len = FEB_PAIRING_BOARD_ID_MAX_LEN;
+        feb_secure_zero(out, FEB_SESSION_KEY_LEN);
+        feb_secure_zero(salt, sizeof(salt));
+        feb_secure_zero(info, sizeof(info));
+        return;
     }
     if(board_id_len > 0) {
         memcpy(info + info_len, board_id, board_id_len);

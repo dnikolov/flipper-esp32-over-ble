@@ -2,10 +2,13 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
@@ -86,6 +89,29 @@ static const char *TAG = "flipper_esp32_over_ble";
 #define FEB_FLIPPER_WRITE_CHAR_MAX_LEN 64u
 #define FEB_FLIPPER_WRITE_EFFECTIVE_MTU (FEB_FLIPPER_WRITE_CHAR_MAX_LEN + FEB_ATT_WRITE_OVERHEAD)
 
+/* docs/PLAN.md step 7: hand-maintained, opaque, per-firmware-target constants -- not
+   build-injected, bumped by hand. See docs/CAPABILITIES.md. */
+#define FEB_BOARD_MODEL "esp32-c6-devkit"
+#define FEB_FIRMWARE_VERSION "0.1.0"
+
+/* docs/PLAN.md "Wi-Fi scan capability" step. Self-imposed static-buffer bound for the raw
+   esp_wifi_scan_get_ap_records() fetch -- distinct from docs/PROTOCOL.md's 32-AP *wire* cap
+   (FEB_WIFI_SCAN_MAX_APS_PER_RECORD in cbor_codec.h). A larger raw-fetch buffer than the
+   wire cap is needed to honor PROTOCOL.md's "report the 32 strongest by RSSI" rule
+   correctly: ESP-IDF does not guarantee scan results are RSSI-ordered, so with a raw buffer
+   sized exactly to the wire cap there would be no way to tell whether the first 32 returned
+   are actually the 32 strongest of everything the radio found. 64 is a pragmatic bound (real
+   environments essentially never return more distinct BSSIDs than this in one scan); if the
+   radio ever does find more than 64, only the first 64 as returned by the driver (in
+   undefined order) are candidates for the top-32 selection -- an accepted, documented
+   limitation rather than unbounded/dynamic allocation from radio-reported data. */
+#define FEB_WIFI_SCAN_RAW_MAX 64u
+/* Reserve this much headroom below FEB_CBOR_MAX_PAYLOAD when packing `aps` entries into one
+   wifi_scan `status` record, to leave room for the enclosing status payload's own
+   request_id/state/result-key map overhead (a handful of bytes; this is a generous margin,
+   not a tight bound). */
+#define FEB_WIFI_SCAN_STATUS_ENCODE_HEADROOM 32u
+
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x9c, 0x3f, 0x7e, 0x6a, 0xf4, 0x03, 0x4c, 0x31,
     0x9e, 0xa2, 0x58, 0xa7, 0xa2, 0x0f, 0xb8, 0x11);
@@ -137,6 +163,7 @@ typedef enum {
     TX_DONE_DISCONNECT,
     TX_DONE_AWAIT_HELLO_ACK,
     TX_DONE_RUNTIME_AUTHENTICATED,
+    TX_DONE_CONTINUE_WIFI_SCAN, /* another wifi_scan status batch is queued behind this one */
 } tx_done_action_t;
 static tx_done_action_t tx_done_action = TX_DONE_NONE;
 
@@ -177,6 +204,36 @@ static size_t rt_transcript_len;
 static uint8_t runtime_auth_failure_count;
 static uint32_t hello_ack_deadline_ms; /* 0 = no deadline currently active */
 static uint32_t last_record_activity_ms; /* reset on connect and on each record received */
+
+/* docs/PLAN.md step 7: first protected records exchanged post-auth. Per
+   docs/PROTOCOL.md, a sequence counter begins at 1 for each authenticated session and
+   increases by exactly one per protected record in a direction; set to 1 when
+   runtime_auth_state becomes AUTHENTICATED (write_complete()'s TX_DONE_RUNTIME_AUTHENTICATED
+   case), reset alongside the rest of the per-connection state on BLE_GAP_EVENT_CONNECT. */
+static uint64_t rt_tx_sequence;
+static uint64_t rt_rx_sequence;
+static uint8_t rt_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
+static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+
+static const char *const feb_features[] = {"wifi_scan"};
+#define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
+
+/* docs/PLAN.md "Wi-Fi scan capability" step. wifi_scan_raw_records/wifi_scan_selected are
+   written exactly once per scan by wifi_scan_done_handler() (runs on the default event
+   loop's own task, per docs/PLAN.md's scan-execution-model decision) and then only ever read
+   by code running on the NimBLE host task (wifi_scan_done_cb() and everything it calls) --
+   handed off safely via the wifi_scan_done_co callout below, the same
+   cross-task-safe-scheduling mechanism reassembly_timeout_co already uses, rather than a
+   second lock. No new scan can start (wifi_scan_in_progress gates handle_command()) until
+   that handoff's consumer clears it, so there is never a concurrent writer while the NimBLE
+   task is reading. */
+static wifi_ap_record_t wifi_scan_raw_records[FEB_WIFI_SCAN_RAW_MAX];
+static feb_wifi_scan_ap_t wifi_scan_selected[FEB_WIFI_SCAN_MAX_APS_PER_RECORD];
+static uint16_t wifi_scan_found_count;
+static uint16_t wifi_scan_send_next_index;
+static volatile bool wifi_scan_in_progress;
+static uint64_t wifi_scan_request_id;
+static struct ble_npl_callout wifi_scan_done_co;
 
 static uint8_t esp32_private_key[FEB_X25519_KEY_LEN];
 static uint8_t esp32_public_key[FEB_X25519_KEY_LEN];
@@ -224,6 +281,12 @@ static void fail_runtime_auth(uint16_t conn_handle);
 static void handle_runtime_auth_unknown_board(uint16_t conn_handle);
 static void schedule_runtime_auth_backoff(void);
 static bool connecting_permitted(void);
+static void handle_capability_query(uint16_t conn_handle);
+static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void wifi_scan_send_next_batch(uint16_t conn_handle);
+static void wifi_scan_done_cb(struct ble_npl_event *ev);
+static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
+static void start_wifi_subsystem(void);
 
 static void compute_board_id(void)
 {
@@ -687,6 +750,408 @@ static bool encode_and_queue_session_record(const char *type, size_t type_len,
     return queue_encoded_record_for_tx(record_len);
 }
 
+/* docs/PLAN.md step 7: protected (AES-256-GCM) record, ESP32-to-Flipper direction only --
+   the ESP32 never originates a protected record in the other direction today. */
+static bool encode_and_queue_protected_record(const char *type, size_t type_len,
+                                              const uint8_t *payload, size_t payload_len,
+                                              uint64_t sequence)
+{
+    size_t record_len = feb_session_encrypt_record(rt_session_key, 2, type, type_len,
+                                                    rt_session_id, board_id_buf, board_id_len,
+                                                    FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, sequence,
+                                                    payload, payload_len,
+                                                    rt_ciphertext_scratch, sizeof(rt_ciphertext_scratch),
+                                                    pairing_record_encode_buf, sizeof(pairing_record_encode_buf));
+
+    if (record_len == 0) {
+        ESP_LOGE(TAG, "protected envelope encode failed for type %.*s", (int)type_len, type);
+        return false;
+    }
+    return queue_encoded_record_for_tx(record_len);
+}
+
+/* Shared tail of every protected-record send: encode+queue, advance rt_tx_sequence, arm
+   `next_action` for write_complete() to run once every fragment of this record has gone out,
+   and kick off the first fragment. `next_action` is TX_DONE_NONE for a one-shot record
+   (capability_response, error) or TX_DONE_CONTINUE_WIFI_SCAN when another status batch is
+   already queued behind this one (docs/PLAN.md "Wi-Fi scan capability" step). */
+static bool queue_and_send_protected(uint16_t conn_handle, const char *type, size_t type_len,
+                                     const uint8_t *payload, size_t payload_len,
+                                     tx_done_action_t next_action)
+{
+    if (!encode_and_queue_protected_record(type, type_len, payload, payload_len, rt_tx_sequence)) {
+        return false;
+    }
+    rt_tx_sequence++;
+    tx_done_action = next_action;
+    send_next_tx_fragment(conn_handle);
+    return true;
+}
+
+static bool send_protected(uint16_t conn_handle, const char *type, size_t type_len,
+                           const uint8_t *payload, size_t payload_len)
+{
+    return queue_and_send_protected(conn_handle, type, type_len, payload, payload_len, TX_DONE_NONE);
+}
+
+static bool send_protected_error(uint16_t conn_handle, const char *code, size_t code_len,
+                                 int has_request_id, uint64_t request_id)
+{
+    feb_error_payload_t err = {0};
+    size_t payload_len;
+
+    err.code = code;
+    err.code_len = code_len;
+    err.has_request_id = has_request_id;
+    err.request_id = request_id;
+    payload_len = feb_cbor_encode_error_payload(pairing_payload_encode_buf,
+                                                sizeof(pairing_payload_encode_buf), &err);
+    if (payload_len == 0) {
+        return false;
+    }
+    return send_protected(conn_handle, "error", strlen("error"), pairing_payload_encode_buf, payload_len);
+}
+
+static void handle_capability_query(uint16_t conn_handle)
+{
+    feb_capability_response_payload_t response = {0};
+    size_t payload_len;
+    size_t i;
+
+    response.board = FEB_BOARD_MODEL;
+    response.board_len = strlen(FEB_BOARD_MODEL);
+    response.firmware = FEB_FIRMWARE_VERSION;
+    response.firmware_len = strlen(FEB_FIRMWARE_VERSION);
+    response.feature_count = FEB_FEATURE_COUNT;
+    for (i = 0; i < FEB_FEATURE_COUNT; i++) {
+        response.features[i] = feb_features[i];
+        response.feature_lens[i] = strlen(feb_features[i]);
+    }
+
+    payload_len = feb_cbor_encode_capability_response_payload(pairing_payload_encode_buf,
+                                                              sizeof(pairing_payload_encode_buf), &response);
+    if (payload_len == 0 ||
+        !send_protected(conn_handle, "capability_response", strlen("capability_response"),
+                        pairing_payload_encode_buf, payload_len)) {
+        ESP_LOGE(TAG, "failed to build capability_response");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ESP_LOGI(TAG, "sending capability_response");
+}
+
+/* docs/PLAN.md "Wi-Fi scan capability" step: highest-generation PHY string and full-fidelity
+   wifi_auth_mode_t string enum, both per docs/PROTOCOL.md's "`wifi_scan` command and status
+   payloads" table. This ESP-IDF is pinned at v5.5.2 -- checked against
+   esp_wifi_types_generic.h's actual wifi_auth_mode_t values (this board has no 5GHz radio,
+   so phy_11a/phy_11ac never observably set on a real scan here; only 11b/11g/11n/11ax have
+   corresponding wire strings at all, matching PROTOCOL.md's enum exactly). */
+static const char *wifi_scan_phy_str(const wifi_ap_record_t *rec)
+{
+    if (rec->phy_11ax) return "11ax";
+    if (rec->phy_11n) return "11n";
+    if (rec->phy_11g) return "11g";
+    return "11b";
+}
+
+static const char *wifi_scan_auth_str(wifi_auth_mode_t mode)
+{
+    switch (mode) {
+    case WIFI_AUTH_OPEN: return "open";
+    case WIFI_AUTH_WEP: return "wep";
+    case WIFI_AUTH_WPA_PSK: return "wpa_psk";
+    case WIFI_AUTH_WPA2_PSK: return "wpa2_psk";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "wpa_wpa2_psk";
+    case WIFI_AUTH_WPA2_ENTERPRISE: return "wpa2_enterprise"; /* == WIFI_AUTH_ENTERPRISE alias */
+    case WIFI_AUTH_WPA3_PSK: return "wpa3_psk";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "wpa2_wpa3_psk";
+    case WIFI_AUTH_WAPI_PSK: return "wapi_psk";
+    case WIFI_AUTH_OWE: return "owe";
+    case WIFI_AUTH_WPA3_ENT_192: return "wpa3_ent_192";
+    case WIFI_AUTH_WPA3_EXT_PSK: return "wpa3_ext_psk";
+    case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE: return "wpa3_ext_psk_mixed_mode";
+    case WIFI_AUTH_DPP: return "dpp";
+    case WIFI_AUTH_WPA3_ENTERPRISE: return "wpa3_enterprise";
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: return "wpa2_wpa3_enterprise";
+    case WIFI_AUTH_WPA_ENTERPRISE: return "wpa_enterprise";
+    default: return "unknown";
+    }
+}
+
+/* Runs on the default event loop's own task (sys_evt), never the NimBLE host task -- per
+   docs/PLAN.md's scan-execution-model decision, a multi-second blocking scan must not run
+   inside the protected-record dispatch handler on the NimBLE host task. Fetches results,
+   selects the FEB_WIFI_SCAN_MAX_APS_PER_RECORD (32) strongest by RSSI (PROTOCOL.md's result
+   cap), converts them into wire-ready feb_wifi_scan_ap_t entries, then hands off to the
+   NimBLE host task via wifi_scan_done_co (same cross-task-safe callout-scheduling mechanism
+   reassembly_timeout_co uses) to actually build and send status records, since that touches
+   connection_handle/rt_tx_sequence/tx_fragment_* state owned by the NimBLE host task. */
+static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    uint16_t total_found = 0;
+    uint16_t raw_count;
+    uint16_t keep;
+    uint16_t k;
+
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+
+    if (esp_wifi_scan_get_ap_num(&total_found) != ESP_OK) {
+        total_found = 0;
+    }
+    raw_count = (total_found > FEB_WIFI_SCAN_RAW_MAX) ? FEB_WIFI_SCAN_RAW_MAX : total_found;
+    if (raw_count > 0 && esp_wifi_scan_get_ap_records(&raw_count, wifi_scan_raw_records) != ESP_OK) {
+        raw_count = 0;
+    }
+    if (total_found > FEB_WIFI_SCAN_RAW_MAX) {
+        ESP_LOGW(TAG, "wifi_scan found %u APs, exceeding the %u-entry raw-fetch bound; only "
+                      "the first %u (driver order, not RSSI order) are candidates for the "
+                      "top-%u selection", (unsigned)total_found, (unsigned)FEB_WIFI_SCAN_RAW_MAX,
+                 (unsigned)FEB_WIFI_SCAN_RAW_MAX, (unsigned)FEB_WIFI_SCAN_MAX_APS_PER_RECORD);
+    }
+
+    keep = (raw_count < FEB_WIFI_SCAN_MAX_APS_PER_RECORD) ? raw_count : FEB_WIFI_SCAN_MAX_APS_PER_RECORD;
+    for (k = 0; k < keep; k++) {
+        uint16_t best = k;
+        uint16_t j;
+        wifi_ap_record_t *rec;
+        feb_wifi_scan_ap_t *out;
+        const char *phy;
+        const char *auth;
+
+        for (j = (uint16_t)(k + 1); j < raw_count; j++) {
+            if (wifi_scan_raw_records[j].rssi > wifi_scan_raw_records[best].rssi) {
+                best = j;
+            }
+        }
+        if (best != k) {
+            wifi_ap_record_t tmp = wifi_scan_raw_records[k];
+
+            wifi_scan_raw_records[k] = wifi_scan_raw_records[best];
+            wifi_scan_raw_records[best] = tmp;
+        }
+
+        rec = &wifi_scan_raw_records[k];
+        out = &wifi_scan_selected[k];
+        phy = wifi_scan_phy_str(rec);
+        auth = wifi_scan_auth_str(rec->authmode);
+
+        /* ap->ssid aliases rec->ssid directly (wifi_scan_raw_records is file-scope static,
+           not reused until the next scan starts, which can't happen until this scan's
+           results are fully sent -- see wifi_scan_in_progress's comment above). ESP-IDF's
+           wifi_ap_record_t has no separate SSID-length field, only a 33-byte null-padded
+           buffer -- an SSID containing an embedded null byte (legal per 802.11, rare in
+           practice) is reported truncated at that null; this is an ESP-IDF API limitation,
+           not something this code can recover from. */
+        out->ssid = rec->ssid;
+        out->ssid_len = strnlen((const char *)rec->ssid, sizeof(rec->ssid) - 1u);
+        memcpy(out->bssid, rec->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+        out->rssi_offset = (uint64_t)((int)rec->rssi + 128);
+        out->channel = rec->primary;
+        out->phy = phy;
+        out->phy_len = strlen(phy);
+        out->auth = auth;
+        out->auth_len = strlen(auth);
+    }
+
+    wifi_scan_found_count = keep;
+    wifi_scan_send_next_index = 0;
+    ble_npl_callout_reset(&wifi_scan_done_co, 0);
+}
+
+/* Runs on the NimBLE host task (wifi_scan_done_co's queue). */
+static void wifi_scan_done_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        ESP_LOGW(TAG, "wifi_scan completed with no authenticated connection; discarding %u result(s)",
+                 (unsigned)wifi_scan_found_count);
+        wifi_scan_in_progress = false;
+        return;
+    }
+    wifi_scan_send_next_batch(connection_handle);
+}
+
+/* Builds and sends one wifi_scan `status` record starting at wifi_scan_send_next_index,
+   packing as many remaining APs as fit under FEB_CBOR_MAX_PAYLOAD (minus headroom for the
+   status payload's own wrapper fields), then chains the next batch (if any) via
+   TX_DONE_CONTINUE_WIFI_SCAN once this record's fragments finish sending -- fragmentation is
+   single-in-flight (docs/PROTOCOL.md#fragmentation), so the next batch cannot be queued until
+   this one's tx_fragment_* state is free again. */
+static void wifi_scan_send_next_batch(uint16_t conn_handle)
+{
+    /* static, not stack-local: this function (and everything it calls) runs on the
+       ~4084-byte nimble_host task, invoked only from write_complete()'s
+       TX_DONE_CONTINUE_WIFI_SCAN case and wifi_scan_done_cb() -- both on that same task,
+       never reentrant/concurrent (fragmentation is single-in-flight per
+       docs/PROTOCOL.md#fragmentation, and wifi_scan_in_progress gates a second scan from
+       starting). result/trial together are two full 32-entry feb_wifi_scan_result_payload_t
+       arrays (~1.5 KB each); as stack-local automatics they measured 3664 bytes of frame size
+       under -fstack-usage, alone consuming ~90% of the entire task stack budget and the
+       confirmed root cause of the 2026-09-07 nimble_host stack-protection-fault crash.
+       Explicitly reset every call below since static storage only zero-initializes once. */
+    static feb_wifi_scan_result_payload_t result;
+    static feb_wifi_scan_result_payload_t trial;
+    static feb_status_payload_t status_payload;
+    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t result_len;
+    size_t payload_len;
+    bool is_complete;
+
+    memset(&result, 0, sizeof(result));
+    memset(&status_payload, 0, sizeof(status_payload));
+
+    while (wifi_scan_send_next_index < wifi_scan_found_count &&
+           result.ap_count < FEB_WIFI_SCAN_MAX_APS_PER_RECORD) {
+        size_t trial_len;
+
+        trial = result;
+
+        trial.aps[trial.ap_count] = wifi_scan_selected[wifi_scan_send_next_index];
+        trial.ap_count++;
+        trial_len = feb_cbor_encode_wifi_scan_result_payload(result_buf, sizeof(result_buf), &trial);
+        if (trial_len == 0 || trial_len + FEB_WIFI_SCAN_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
+            if (result.ap_count == 0) {
+                /* A single AP's own encoding is already too large to ever fit -- should be
+                   unreachable given this codec's fixed field-size bounds, but skip it rather
+                   than spin forever or send an empty batch that isn't actually the last one. */
+                ESP_LOGE(TAG, "wifi_scan: single AP result too large to encode; dropping it");
+                wifi_scan_send_next_index++;
+                continue;
+            }
+            break;
+        }
+        result = trial;
+        wifi_scan_send_next_index++;
+    }
+
+    result_len = feb_cbor_encode_wifi_scan_result_payload(result_buf, sizeof(result_buf), &result);
+    is_complete = (wifi_scan_send_next_index >= wifi_scan_found_count);
+
+    status_payload.request_id = wifi_scan_request_id;
+    status_payload.state = is_complete ? "complete" : "partial";
+    status_payload.state_len = strlen(status_payload.state);
+    status_payload.result_span = result_buf;
+    status_payload.result_span_len = result_len;
+    status_payload.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+    if (payload_len == 0 ||
+        !queue_and_send_protected(conn_handle, "status", strlen("status"),
+                                  pairing_payload_encode_buf, payload_len,
+                                  is_complete ? TX_DONE_NONE : TX_DONE_CONTINUE_WIFI_SCAN)) {
+        ESP_LOGE(TAG, "failed to build wifi_scan status record");
+        wifi_scan_in_progress = false;
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ESP_LOGI(TAG, "sending wifi_scan status (%s, %u AP(s) this batch)",
+             is_complete ? "complete" : "partial", (unsigned)result.ap_count);
+
+    if (is_complete) {
+        wifi_scan_in_progress = false;
+    }
+}
+
+static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    size_t arg_count;
+    feb_cbor_status_t status;
+    esp_err_t err;
+    wifi_scan_config_t scan_cfg;
+
+    if (cmd->capability_len != strlen("wifi_scan") ||
+        memcmp(cmd->capability, "wifi_scan", cmd->capability_len) != 0) {
+        if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
+        arg_count != 0) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    if (wifi_scan_in_progress) {
+        if (!send_protected_error(conn_handle, "busy", strlen("busy"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    wifi_scan_in_progress = true;
+    wifi_scan_request_id = cmd->request_id;
+    memset(&scan_cfg, 0, sizeof(scan_cfg));
+    err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+        wifi_scan_in_progress = false;
+        if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "wifi_scan started (request_id=%llu)", (unsigned long long)cmd->request_id);
+}
+
+/* docs/PLAN.md "Wi-Fi scan capability" step: esp_netif/default event loop/esp_wifi
+   initialize once at boot, STA mode, never connecting to anything, and stay resident for the
+   device's whole lifetime -- matching the future `wardriving` capability's always-on-radio
+   need and step 4's already-validated Wi-Fi/BLE coexistence behavior. Not lazy-initialized on
+   first wifi_scan command. */
+static void start_wifi_subsystem(void)
+{
+    esp_err_t err = esp_netif_init();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+        return;
+    }
+    (void)esp_netif_create_default_wifi_sta();
+
+    {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+
+        err = esp_wifi_init(&cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+    err = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE,
+                                              &wifi_scan_done_handler, NULL, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi scan-done handler registration failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void fail_pairing_ceremony(uint16_t conn_handle, feb_pairing_error_t err)
 {
     feb_error_payload_t error_payload = {0};
@@ -1014,7 +1479,12 @@ static int write_complete(uint16_t conn_handle,
         break;
     case TX_DONE_RUNTIME_AUTHENTICATED:
         runtime_auth_state = RUNTIME_AUTH_STATE_AUTHENTICATED;
+        rt_tx_sequence = 1;
+        rt_rx_sequence = 1;
         ESP_LOGI(TAG, "client_auth sent; runtime session authenticated");
+        break;
+    case TX_DONE_CONTINUE_WIFI_SCAN:
+        wifi_scan_send_next_batch(conn_handle);
         break;
     default:
         break;
@@ -1073,6 +1543,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
         hello_ack_deadline_ms = 0;
         last_record_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        rt_tx_sequence = 0;
+        rt_rx_sequence = 0;
         tx_done_action = TX_DONE_NONE;
         tx_fragment_total = 0;
         tx_fragment_next = 0;
@@ -1105,6 +1577,22 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         feb_reassembly_reset(&rx_reassembly);
         pairing_attempt_zeroize();
         runtime_auth_zeroize();
+        if (wifi_scan_in_progress) {
+            /* Don't clear wifi_scan_in_progress directly here -- the radio scan this
+               connection started may still be running, and a new connection's `command`
+               could otherwise race a still-in-flight wifi_scan_done_handler() write to
+               wifi_scan_raw_records/wifi_scan_selected from a stale scan. esp_wifi_scan_stop()
+               still fires WIFI_EVENT_SCAN_DONE for the aborted scan; wifi_scan_done_cb() then
+               finds no authenticated connection and clears the flag there, uniformly. */
+            esp_err_t serr = esp_wifi_scan_stop();
+
+            if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
+                ESP_LOGW(TAG, "esp_wifi_scan_stop failed during disconnect cleanup: %s",
+                         esp_err_to_name(serr));
+            }
+            ESP_LOGI(TAG, "wifi_scan was in progress at disconnect; stopping it "
+                          "(pending results will be discarded)");
+        }
 
         if (boot_mode == FEB_BOOT_MODE_PAIRING) {
             /* Any established connection's outcome consumes the one-shot pairing
@@ -1212,6 +1700,64 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
 
             /* boot_mode == FEB_BOOT_MODE_RUNTIME_AUTH */
+            if (runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED) {
+                /* docs/PLAN.md step 7: first protected (AES-256-GCM) record handling. */
+                feb_session_decrypted_record_t decrypted;
+                feb_cbor_status_t decode_status;
+
+                decode_status = feb_session_decrypt_record(rt_session_key, record, record_len,
+                                                           FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+                                                           rt_plaintext_buf, sizeof(rt_plaintext_buf),
+                                                           &decrypted);
+                if (decode_status != FEB_CBOR_OK) {
+                    ESP_LOGW(TAG, "protected record decode/decrypt failed: %d; closing without reply",
+                             (int)decode_status);
+                    ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+                    break;
+                }
+                if (decrypted.version != 2 ||
+                    memcmp(decrypted.session_id, rt_session_id, FEB_SESSION_ID_LEN) != 0 ||
+                    decrypted.board_id_len != board_id_len ||
+                    memcmp(decrypted.board_id, board_id_buf, board_id_len) != 0 ||
+                    decrypted.sequence != rt_rx_sequence) {
+                    ESP_LOGW(TAG, "protected record session/sequence mismatch; closing without reply");
+                    ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+                    break;
+                }
+                rt_rx_sequence++;
+
+                if (decrypted.type_len == strlen("capability_query") &&
+                    memcmp(decrypted.type, "capability_query", decrypted.type_len) == 0) {
+                    feb_capability_query_payload_t query;
+
+                    if (feb_cbor_decode_capability_query_payload(decrypted.plaintext, decrypted.plaintext_len,
+                                                                  &query) != FEB_CBOR_OK) {
+                        ESP_LOGW(TAG, "capability_query payload decode failed; closing without reply");
+                        ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+                        break;
+                    }
+                    handle_capability_query(connection_handle);
+                } else if (decrypted.type_len == strlen("command") &&
+                          memcmp(decrypted.type, "command", decrypted.type_len) == 0) {
+                    feb_command_payload_t cmd;
+
+                    if (feb_cbor_decode_command_payload(decrypted.plaintext, decrypted.plaintext_len,
+                                                        &cmd) != FEB_CBOR_OK) {
+                        ESP_LOGW(TAG, "command payload decode failed; closing without reply");
+                        ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+                        break;
+                    }
+                    handle_command(connection_handle, &cmd);
+                } else {
+                    /* An unrecognized protected-record type (or a well-formed `status`,
+                       which is never sent Flipper->ESP32 per docs/PROTOCOL.md) is logged and
+                       otherwise ignored -- matches step 3's "drop and continue" policy for
+                       malformed input at the layer below this one. */
+                    ESP_LOGW(TAG, "unrecognized protected record type=%.*s while authenticated",
+                             (int)decrypted.type_len, decrypted.type);
+                }
+                break;
+            }
             if (runtime_auth_state != RUNTIME_AUTH_STATE_HELLO_SENT) {
                 ESP_LOGW(TAG, "unexpected runtime record received in state %d", (int)runtime_auth_state);
                 fail_runtime_auth(connection_handle);
@@ -1347,6 +1893,7 @@ static void host_synced(void)
                         reassembly_timeout_cb, NULL);
     ble_npl_callout_reset(&reassembly_timeout_co,
                           ble_npl_time_ms_to_ticks32(FEB_REASSEMBLY_CHECK_INTERVAL_MS));
+    ble_npl_callout_init(&wifi_scan_done_co, nimble_port_get_dflt_eventq(), wifi_scan_done_cb, NULL);
     ESP_LOGI(TAG, "starting v2 service-filtered scan");
     start_scan();
 }
@@ -1386,6 +1933,8 @@ void app_main(void)
         ESP_LOGI(TAG, "board_id=%s: no stored pairing_secret; pairing window open for %u ms",
                  board_id_buf, (unsigned)FEB_PAIRING_WINDOW_MS);
     }
+
+    start_wifi_subsystem();
 
     err = nimble_port_init();
     if (err != ESP_OK) {

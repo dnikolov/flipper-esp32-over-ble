@@ -48,6 +48,14 @@ def cbor_map_header(n: int) -> bytes:
     return _length_prefix(5, n)
 
 
+def cbor_array_header(n: int) -> bytes:
+    return _length_prefix(4, n)
+
+
+def cbor_negint(n: int) -> bytes:
+    return _length_prefix(1, n)
+
+
 def fragment_capacity(mtu: int) -> int:
     return mtu - ATT_WRITE_OVERHEAD - FRAG_HEADER_SIZE
 
@@ -160,6 +168,48 @@ oversized_payload_message = "x" * 500  # pushes the payload map's own encoding p
 oversized_payload = error_payload("internal_error", oversized_payload_message, 42)
 oversized_payload_record = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, oversized_payload)
 assert len(oversized_payload) > 512, "vector must actually exceed FEB_CBOR_MAX_PAYLOAD"
+
+
+# ---- Code-review fix-plan vectors (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6): direct
+# feb_cbor_skip_value() cases plus full-record wrappers exercising the same shapes through
+# feb_cbor_decode_unencrypted(), so a decoder-level regression and a skip_value-level
+# regression are both caught by a status-code equality check on both firmwares. ----
+
+# Bare values for direct feb_cbor_skip_value() calls (docs/PROTOCOL.md's permitted payload
+# value types: unsigned int/bytes/text/array/map only -- major 1 (negative int) and major 7
+# (true/false/null) are both rejected per fix-plan decision D2).
+skip_negint = cbor_negint(0)          # -1, shortest form
+skip_true = bytes([0xF5])             # major 7, ai 21 (true)
+skip_null = bytes([0xF6])             # major 7, ai 22 (null)
+
+# Map header declares 2 entries but the buffer holds only 1 -- W1's repro: an unfixed
+# decoder reads one byte past the buffer end while validating the second entry's key.
+skip_truncated_map = raw(cbor_map_header(2), cbor_text("a"), cbor_uint(1))
+
+# Nesting: payload is validated at depth=2 per fix-plan decision D3 (outer map -> payload map
+# -> array -> element == FEB_CBOR_MAX_NESTING == 4). One array level further per recursion:
+# depth=2 (outer array) -> depth=3 (inner array) -> depth=4 (element, still allowed). One more
+# level of array pushes the element to depth=5, rejected.
+skip_nest_at_limit = raw(cbor_array_header(1), cbor_array_header(1), cbor_uint(1))
+skip_nest_too_deep = raw(cbor_array_header(1), cbor_array_header(1), cbor_array_header(1), cbor_uint(1))
+
+# Same shapes wrapped as an actual payload span and run through the full envelope decoder
+# (feb_cbor_decode_unencrypted), matching how these are actually reachable from a malformed
+# record arriving on the write characteristic, pre-authentication.
+payload_negint = raw(cbor_map_header(1), cbor_text("v"), skip_negint)
+payload_true = raw(cbor_map_header(1), cbor_text("v"), skip_true)
+payload_null = raw(cbor_map_header(1), cbor_text("v"), skip_null)
+
+record_payload_negint = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, payload_negint)
+record_payload_true = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, payload_true)
+record_payload_null = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, payload_null)
+record_truncated_payload_map = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, skip_truncated_map)
+record_nest_at_limit = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, skip_nest_at_limit)
+record_nest_too_deep = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, skip_nest_too_deep)
+
+# A valid record with one trailing byte appended -- must be rejected (W6); neither firmware
+# checks this today.
+record_trailing_byte = RECORD + bytes([0x00])
 
 
 # =====================================================================================
@@ -729,6 +779,109 @@ SESS_PROT1_RECORD_BAD_AAD = protected_record(
     SESS_VERSION, "error", SESS_SESSION_ID, SESS_BOARD_ID, SESS_PROT1_SEQ + 1, SESS_PROT1_CT, SESS_PROT1_TAG)
 
 
+# =====================================================================================
+# wifi_scan command/status payloads (docs/PROTOCOL.md "`wifi_scan` command and status
+# payloads", docs/PLAN.md "wifi_scan implementation decisions"). First real use of the
+# generic `command`/`status` message types; reuses the step 6 golden session (SESS_KEY/
+# SESS_SESSION_ID/SESS_BOARD_ID) to wrap two of these payloads as full protected records,
+# continuing that session's per-direction sequence counters (command is the session's
+# first Flipper->ESP32 protected record; the two status records continue the
+# ESP32->Flipper counter after SESS_PROT1/SESS_PROT2 at sequence 1/2).
+# =====================================================================================
+
+def command_payload(capability: str, request_id: int, arguments: bytes) -> bytes:
+    out = cbor_map_header(3)
+    out += cbor_text("capability") + cbor_text(capability)
+    out += cbor_text("request_id") + cbor_uint(request_id)
+    out += cbor_text("arguments") + arguments
+    return out
+
+
+def status_payload(request_id: int, state: str, result: bytes) -> bytes:
+    out = cbor_map_header(3)
+    out += cbor_text("request_id") + cbor_uint(request_id)
+    out += cbor_text("state") + cbor_text(state)
+    out += cbor_text("result") + result
+    return out
+
+
+def wifi_scan_ap_result(ssid: bytes, bssid: bytes, rssi_dbm: int, channel: int, phy: str, auth: str) -> bytes:
+    assert -128 <= rssi_dbm <= 127, "rssi_dbm must fit the +128 unsigned-offset encoding"
+    assert len(bssid) == 6
+    out = cbor_map_header(6)
+    out += cbor_text("ssid") + cbor_bytes(ssid)
+    out += cbor_text("bssid") + cbor_bytes(bssid)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    out += cbor_text("channel") + cbor_uint(channel)
+    out += cbor_text("phy") + cbor_text(phy)
+    out += cbor_text("auth") + cbor_text(auth)
+    return out
+
+
+def wifi_scan_result(aps) -> bytes:
+    out = cbor_array_header(len(aps))
+    for ap in aps:
+        out += ap
+    return cbor_map_header(1) + cbor_text("aps") + out
+
+
+WIFI_SCAN_REQUEST_ID = 101
+
+# ---- ap-result vectors: AP1 is a normal entry; AP2/AP3 sit at the rssi_offset encoding's
+# two extremes (0 and 255, i.e. rssi_dbm -128 and +127) and also cover a hidden network
+# (zero-length SSID) and a non-UTF-8 SSID (bytes, not text -- the whole reason this field
+# is a byte string, per PROTOCOL.md). AP3's "unknown" auth exercises the fallback string
+# for any wifi_auth_mode_t value not in PROTOCOL.md's enum list. ----
+WIFI_SCAN_AP1 = wifi_scan_ap_result(b"TestNetwork", bytes.fromhex("aabbccddeeff"), -50, 6, "11n", "wpa2_psk")
+WIFI_SCAN_AP2 = wifi_scan_ap_result(b"", bytes.fromhex("112233445566"), -128, 1, "11b", "open")
+WIFI_SCAN_AP3 = wifi_scan_ap_result(bytes([0xff, 0xfe, 0x00, 0x41]), bytes.fromhex("665544332211"), 127, 11, "11ax", "unknown")
+
+WIFI_SCAN_RESULT_SINGLE = wifi_scan_result([WIFI_SCAN_AP1])
+WIFI_SCAN_RESULT_MULTI = wifi_scan_result([WIFI_SCAN_AP1, WIFI_SCAN_AP2, WIFI_SCAN_AP3])
+WIFI_SCAN_RESULT_EMPTY = wifi_scan_result([])
+
+# ---- command payload: valid (empty arguments, per PROTOCOL.md) and malformed (non-empty
+# arguments -- must be rejected with error code invalid_command). ----
+WIFI_SCAN_COMMAND_PAYLOAD = command_payload("wifi_scan", WIFI_SCAN_REQUEST_ID, cbor_map_header(0))
+WIFI_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
+    "wifi_scan", WIFI_SCAN_REQUEST_ID, cbor_map_header(1) + cbor_text("channel") + cbor_uint(6))
+
+# ---- status payloads: a mid-scan partial batch, a final complete batch carrying results,
+# a complete batch with an empty aps array (the "prior partial already delivered
+# everything" case), and a malformed state string (neither "partial" nor "complete"). ----
+WIFI_SCAN_STATUS_PARTIAL_PAYLOAD = status_payload(WIFI_SCAN_REQUEST_ID, "partial", WIFI_SCAN_RESULT_SINGLE)
+WIFI_SCAN_STATUS_COMPLETE_PAYLOAD = status_payload(WIFI_SCAN_REQUEST_ID, "complete", WIFI_SCAN_RESULT_MULTI)
+WIFI_SCAN_STATUS_COMPLETE_EMPTY_PAYLOAD = status_payload(WIFI_SCAN_REQUEST_ID, "complete", WIFI_SCAN_RESULT_EMPTY)
+WIFI_SCAN_STATUS_BAD_STATE_PAYLOAD = status_payload(WIFI_SCAN_REQUEST_ID, "started", WIFI_SCAN_RESULT_EMPTY)
+
+# ---- end-to-end: wrap the valid command and the two real status payloads as protected
+# records under the step 6 golden session, so the assembled path (session AAD/nonce ->
+# AES-256-GCM -> this step's new payload codec) is covered too, not just the payload
+# codec in isolation -- the same rationale as step 5/6's golden vectors. ----
+WIFI_SCAN_CMD_SEQ = 1  # first Flipper->ESP32 protected record of this golden session
+WIFI_SCAN_CMD_AAD = session_aad(SESS_VERSION, "command", SESS_SESSION_ID, WIFI_SCAN_CMD_SEQ, SESS_BOARD_ID)
+WIFI_SCAN_CMD_NONCE = session_nonce(SESS_SESSION_ID, DIR_FLIPPER_TO_ESP32, WIFI_SCAN_CMD_SEQ)
+WIFI_SCAN_CMD_CT, WIFI_SCAN_CMD_TAG = gcm_encrypt(SESS_KEY, WIFI_SCAN_CMD_NONCE, WIFI_SCAN_CMD_AAD, WIFI_SCAN_COMMAND_PAYLOAD)
+WIFI_SCAN_CMD_RECORD = protected_record(SESS_VERSION, "command", SESS_SESSION_ID, SESS_BOARD_ID,
+                                         WIFI_SCAN_CMD_SEQ, WIFI_SCAN_CMD_CT, WIFI_SCAN_CMD_TAG)
+
+WIFI_SCAN_STATUS_PARTIAL_SEQ = 3  # continues SESS_PROT1(seq1)/SESS_PROT2(seq2)'s ESP32->Flipper counter
+WIFI_SCAN_STATUS_PARTIAL_AAD = session_aad(SESS_VERSION, "status", SESS_SESSION_ID, WIFI_SCAN_STATUS_PARTIAL_SEQ, SESS_BOARD_ID)
+WIFI_SCAN_STATUS_PARTIAL_NONCE = session_nonce(SESS_SESSION_ID, DIR_ESP32_TO_FLIPPER, WIFI_SCAN_STATUS_PARTIAL_SEQ)
+WIFI_SCAN_STATUS_PARTIAL_CT, WIFI_SCAN_STATUS_PARTIAL_TAG = gcm_encrypt(
+    SESS_KEY, WIFI_SCAN_STATUS_PARTIAL_NONCE, WIFI_SCAN_STATUS_PARTIAL_AAD, WIFI_SCAN_STATUS_PARTIAL_PAYLOAD)
+WIFI_SCAN_STATUS_PARTIAL_RECORD = protected_record(SESS_VERSION, "status", SESS_SESSION_ID, SESS_BOARD_ID,
+                                                     WIFI_SCAN_STATUS_PARTIAL_SEQ, WIFI_SCAN_STATUS_PARTIAL_CT, WIFI_SCAN_STATUS_PARTIAL_TAG)
+
+WIFI_SCAN_STATUS_COMPLETE_SEQ = 4
+WIFI_SCAN_STATUS_COMPLETE_AAD = session_aad(SESS_VERSION, "status", SESS_SESSION_ID, WIFI_SCAN_STATUS_COMPLETE_SEQ, SESS_BOARD_ID)
+WIFI_SCAN_STATUS_COMPLETE_NONCE = session_nonce(SESS_SESSION_ID, DIR_ESP32_TO_FLIPPER, WIFI_SCAN_STATUS_COMPLETE_SEQ)
+WIFI_SCAN_STATUS_COMPLETE_CT, WIFI_SCAN_STATUS_COMPLETE_TAG = gcm_encrypt(
+    SESS_KEY, WIFI_SCAN_STATUS_COMPLETE_NONCE, WIFI_SCAN_STATUS_COMPLETE_AAD, WIFI_SCAN_STATUS_COMPLETE_PAYLOAD)
+WIFI_SCAN_STATUS_COMPLETE_RECORD = protected_record(SESS_VERSION, "status", SESS_SESSION_ID, SESS_BOARD_ID,
+                                                      WIFI_SCAN_STATUS_COMPLETE_SEQ, WIFI_SCAN_STATUS_COMPLETE_CT, WIFI_SCAN_STATUS_COMPLETE_TAG)
+
+
 def c_bytes(name: str, data: bytes) -> str:
     hex_bytes = ", ".join(f"0x{b:02x}" for b in data)
     wrapped = textwrap.fill(hex_bytes, width=96, initial_indent="    ", subsequent_indent="    ")
@@ -775,6 +928,24 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_MISSING_FIELD", missing_field))
     f.write(c_bytes("FEB_VEC_UNEXPECTED_TYPE", unexpected_type))
     f.write(c_bytes("FEB_VEC_OVERSIZED_PAYLOAD_RECORD", oversized_payload_record))
+    f.write("\n")
+
+    f.write("/* ---- Code-review fix-plan vectors (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6):\n")
+    f.write("   direct feb_cbor_skip_value() cases, plus the same shapes wrapped as a payload\n")
+    f.write("   span and run through feb_cbor_decode_unencrypted(). ---- */\n")
+    f.write(c_bytes("FEB_VEC_SKIP_NEGINT", skip_negint))
+    f.write(c_bytes("FEB_VEC_SKIP_TRUE", skip_true))
+    f.write(c_bytes("FEB_VEC_SKIP_NULL", skip_null))
+    f.write(c_bytes("FEB_VEC_SKIP_TRUNCATED_MAP", skip_truncated_map))
+    f.write(c_bytes("FEB_VEC_SKIP_NEST_AT_LIMIT", skip_nest_at_limit))
+    f.write(c_bytes("FEB_VEC_SKIP_NEST_TOO_DEEP", skip_nest_too_deep))
+    f.write(c_bytes("FEB_VEC_PAYLOAD_NEGINT_RECORD", record_payload_negint))
+    f.write(c_bytes("FEB_VEC_PAYLOAD_TRUE_RECORD", record_payload_true))
+    f.write(c_bytes("FEB_VEC_PAYLOAD_NULL_RECORD", record_payload_null))
+    f.write(c_bytes("FEB_VEC_TRUNCATED_PAYLOAD_MAP_RECORD", record_truncated_payload_map))
+    f.write(c_bytes("FEB_VEC_NEST_AT_LIMIT_RECORD", record_nest_at_limit))
+    f.write(c_bytes("FEB_VEC_NEST_TOO_DEEP_RECORD", record_nest_too_deep))
+    f.write(c_bytes("FEB_VEC_RECORD_TRAILING_BYTE", record_trailing_byte))
     f.write("\n")
 
     f.write("/* ---- Step 5: pairing crypto primitives (docs/PLAN.md step 5) ---- */\n\n")
@@ -925,6 +1096,53 @@ with open("vectors.h", "w") as f:
     f.write("   the AAD from the record it actually received and reject it. */\n")
     f.write(c_bytes("FEB_VEC_SESS_PROT1_RECORD_BAD_CIPHERTEXT", SESS_PROT1_RECORD_BAD_CIPHERTEXT))
     f.write(c_bytes("FEB_VEC_SESS_PROT1_RECORD_BAD_AAD", SESS_PROT1_RECORD_BAD_AAD))
+    f.write("\n")
+
+    f.write("/* ---- wifi_scan command/status payloads (docs/PROTOCOL.md \"`wifi_scan` command\n")
+    f.write("   and status payloads\"). ---- */\n\n")
+
+    f.write("/* ap-result vectors: AP1 is a normal entry. AP2/AP3 sit at the rssi_offset\n")
+    f.write("   encoding's two extremes (rssi_dbm -128 -> offset 0, +127 -> offset 255) and\n")
+    f.write("   also cover a hidden network (zero-length SSID) and a non-UTF-8 SSID (bytes,\n")
+    f.write("   not text). AP3's auth is \"unknown\", the fallback for any wifi_auth_mode_t\n")
+    f.write("   value outside PROTOCOL.md's enum list. */\n")
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_AP1", WIFI_SCAN_AP1))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_AP2", WIFI_SCAN_AP2))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_AP3", WIFI_SCAN_AP3))
+    f.write("\n")
+
+    f.write("/* result maps ({\"aps\": [...]}): one AP, three APs, and the empty-array case\n")
+    f.write("   (a final `complete` status after a prior `partial` already delivered\n")
+    f.write("   everything). */\n")
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_RESULT_SINGLE", WIFI_SCAN_RESULT_SINGLE))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_RESULT_MULTI", WIFI_SCAN_RESULT_MULTI))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_RESULT_EMPTY", WIFI_SCAN_RESULT_EMPTY))
+    f.write("\n")
+
+    f.write("/* command payload: valid (empty arguments) and malformed (non-empty arguments,\n")
+    f.write("   must be rejected with error code invalid_command). */\n")
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD", WIFI_SCAN_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD", WIFI_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* status payloads: mid-scan partial, final complete (with results), final\n")
+    f.write("   complete with an empty aps array, and a malformed state string (neither\n")
+    f.write("   \"partial\" nor \"complete\"). */\n")
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD", WIFI_SCAN_STATUS_PARTIAL_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD", WIFI_SCAN_STATUS_COMPLETE_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_EMPTY_PAYLOAD", WIFI_SCAN_STATUS_COMPLETE_EMPTY_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_BAD_STATE_PAYLOAD", WIFI_SCAN_STATUS_BAD_STATE_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* End-to-end: the valid command and the two real status payloads, wrapped as\n")
+    f.write("   protected records under the step 6 golden session (FEB_VEC_SESS_KEY etc.),\n")
+    f.write("   continuing that session's per-direction sequence counters -- command is the\n")
+    f.write("   session's first Flipper->ESP32 protected record (sequence 1); the two status\n")
+    f.write("   records continue the ESP32->Flipper counter after FEB_VEC_SESS_PROT1/PROT2\n")
+    f.write("   (sequence 3, 4). */\n")
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_CMD_RECORD", WIFI_SCAN_CMD_RECORD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD", WIFI_SCAN_STATUS_PARTIAL_RECORD))
+    f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD", WIFI_SCAN_STATUS_COMPLETE_RECORD))
 
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 

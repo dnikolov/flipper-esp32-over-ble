@@ -284,6 +284,89 @@ static void test_decrypt_record_tamper_rejected(void)
           "feb_session_decrypt_record rejects FEB_VEC_SESS_PROT1_RECORD_BAD_AAD with FEB_CBOR_ERR_AUTH_FAILED");
 }
 
+/* docs/PLAN.md "Wi-Fi scan capability" step: end-to-end protected-record wraps of the
+   wifi_scan command/status payloads, continuing the golden session's per-direction sequence
+   counters after FEB_VEC_SESS_PROT1/PROT2 (sequence 3/4). Placed here rather than
+   tests/esp32/test_framing_cbor.c because these three vectors require AES-256-GCM
+   encrypt/decrypt (session.c/session_crypto.c + mbedtls), which build.ps1 for
+   test_framing_cbor.c does not link -- test_framing_cbor.c instead covers every
+   wifi_scan codec vector that needs only cbor_codec.c (the ap-result/result/command/status
+   payload shapes themselves). See the esp32-developer report for this step. */
+static void test_wifi_scan_command_record(void)
+{
+    uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+    uint8_t out[FEB_MAX_RECORD_SIZE];
+    size_t out_len;
+    uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+    feb_session_decrypted_record_t record;
+    feb_cbor_status_t st;
+
+    out_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY, 2, "command", strlen("command"),
+        FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID, FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32, 1,
+        FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD, FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD_LEN,
+        ciphertext_scratch, sizeof(ciphertext_scratch),
+        out, sizeof(out));
+    check(out_len > 0 && bytes_eq(out, out_len, FEB_VEC_WIFI_SCAN_CMD_RECORD, FEB_VEC_WIFI_SCAN_CMD_RECORD_LEN),
+          "feb_session_encrypt_record(command, seq=1) matches FEB_VEC_WIFI_SCAN_CMD_RECORD byte-for-byte");
+
+    st = feb_session_decrypt_record(FEB_VEC_SESS_KEY, FEB_VEC_WIFI_SCAN_CMD_RECORD, FEB_VEC_WIFI_SCAN_CMD_RECORD_LEN,
+                                    FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32, plaintext, sizeof(plaintext), &record);
+    check(st == FEB_CBOR_OK && record.sequence == 1 &&
+              bytes_eq(record.plaintext, record.plaintext_len,
+                       FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD, FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD_LEN),
+          "feb_session_decrypt_record recovers the wifi_scan command payload at sequence 1");
+}
+
+static void test_wifi_scan_status_records(void)
+{
+    uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+    uint8_t out[FEB_MAX_RECORD_SIZE];
+    size_t out_len;
+    uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+    feb_session_decrypted_record_t record;
+    feb_cbor_status_t st;
+
+    out_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY, 2, "status", strlen("status"),
+        FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID, FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, 3,
+        FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD_LEN,
+        ciphertext_scratch, sizeof(ciphertext_scratch),
+        out, sizeof(out));
+    check(out_len > 0 && bytes_eq(out, out_len, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD,
+                                  FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD_LEN),
+          "feb_session_encrypt_record(status partial, seq=3) matches FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD");
+
+    st = feb_session_decrypt_record(FEB_VEC_SESS_KEY, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD,
+                                    FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD_LEN,
+                                    FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, plaintext, sizeof(plaintext), &record);
+    check(st == FEB_CBOR_OK && record.sequence == 3 &&
+              bytes_eq(record.plaintext, record.plaintext_len,
+                       FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD_LEN),
+          "feb_session_decrypt_record recovers the wifi_scan status(partial) payload at sequence 3");
+
+    out_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY, 2, "status", strlen("status"),
+        FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID, FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, 4,
+        FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD_LEN,
+        ciphertext_scratch, sizeof(ciphertext_scratch),
+        out, sizeof(out));
+    check(out_len > 0 && bytes_eq(out, out_len, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD,
+                                  FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD_LEN),
+          "feb_session_encrypt_record(status complete, seq=4) matches FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD");
+
+    st = feb_session_decrypt_record(FEB_VEC_SESS_KEY, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD,
+                                    FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD_LEN,
+                                    FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, plaintext, sizeof(plaintext), &record);
+    check(st == FEB_CBOR_OK && record.sequence == 4 &&
+              bytes_eq(record.plaintext, record.plaintext_len,
+                       FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD_LEN),
+          "feb_session_decrypt_record recovers the wifi_scan status(complete) payload at sequence 4");
+}
+
 int main(void)
 {
     test_gcm_kat_encrypt();
@@ -309,6 +392,9 @@ int main(void)
     test_encrypt_record_matches_golden();
     test_decrypt_record_prot1_and_prot2();
     test_decrypt_record_tamper_rejected();
+
+    test_wifi_scan_command_record();
+    test_wifi_scan_status_records();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

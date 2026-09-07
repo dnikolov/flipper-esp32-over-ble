@@ -374,6 +374,146 @@ static void test_protected_record_tamper_rejection(void) {
         "protected record: tampered AAD (sequence field) rejected with FEB_CBOR_ERR_AUTH_FAILED");
 }
 
+/* ---- wifi_scan command/status wrapped as protected records under the golden session
+   (docs/PLAN.md's Wi-Fi scan capability follow-on step) -- `command` is the session's first
+   Flipper->ESP32 protected record (sequence 1); the two `status` records continue the
+   ESP32->Flipper counter after FEB_VEC_SESS_PROT1/PROT2 (sequence 3, 4). ---- */
+
+static void test_wifi_scan_command_record(void) {
+    static uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+    static uint8_t record_buf[768];
+
+    size_t record_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY,
+        2,
+        "command",
+        strlen("command"),
+        FEB_VEC_SESS_SESSION_ID,
+        FEB_VEC_SESS_BOARD_ID,
+        FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        1,
+        FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD,
+        FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD_LEN,
+        ciphertext_scratch,
+        sizeof(ciphertext_scratch),
+        record_buf,
+        sizeof(record_buf));
+    CHECK(record_len > 0, "wifi_scan command record: encrypt+encode succeeds (sequence 1)");
+    CHECK(
+        bytes_equal(record_buf, record_len, FEB_VEC_WIFI_SCAN_CMD_RECORD, FEB_VEC_WIFI_SCAN_CMD_RECORD_LEN),
+        "wifi_scan command record: byte-identical to FEB_VEC_WIFI_SCAN_CMD_RECORD");
+
+    static uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+    feb_session_decrypted_record_t decoded;
+    feb_cbor_status_t status = feb_session_decrypt_record(
+        FEB_VEC_SESS_KEY,
+        FEB_VEC_WIFI_SCAN_CMD_RECORD,
+        FEB_VEC_WIFI_SCAN_CMD_RECORD_LEN,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        plaintext,
+        sizeof(plaintext),
+        &decoded);
+    CHECK(status == FEB_CBOR_OK, "wifi_scan command record: decrypt succeeds");
+    CHECK(decoded.sequence == 1, "wifi_scan command record: decoded sequence == 1");
+    CHECK(
+        bytes_equal(
+            decoded.plaintext, decoded.plaintext_len, FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD,
+            FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD_LEN),
+        "wifi_scan command record: decrypted plaintext matches FEB_VEC_WIFI_SCAN_COMMAND_PAYLOAD");
+}
+
+static void test_wifi_scan_status_records(void) {
+    static uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+    static uint8_t record_buf[768];
+
+    size_t partial_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY,
+        2,
+        "status",
+        strlen("status"),
+        FEB_VEC_SESS_SESSION_ID,
+        FEB_VEC_SESS_BOARD_ID,
+        FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+        3,
+        FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD,
+        FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD_LEN,
+        ciphertext_scratch,
+        sizeof(ciphertext_scratch),
+        record_buf,
+        sizeof(record_buf));
+    CHECK(partial_len > 0, "wifi_scan status partial record: encrypt+encode succeeds (sequence 3)");
+    CHECK(
+        bytes_equal(
+            record_buf, partial_len, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD,
+            FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD_LEN),
+        "wifi_scan status partial record: byte-identical to FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD");
+
+    {
+        static uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+        feb_session_decrypted_record_t decoded;
+        feb_cbor_status_t status = feb_session_decrypt_record(
+            FEB_VEC_SESS_KEY,
+            FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD,
+            FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD_LEN,
+            FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+            plaintext,
+            sizeof(plaintext),
+            &decoded);
+        CHECK(status == FEB_CBOR_OK, "wifi_scan status partial record: decrypt succeeds");
+        CHECK(decoded.sequence == 3, "wifi_scan status partial record: decoded sequence == 3");
+        CHECK(
+            bytes_equal(
+                decoded.plaintext, decoded.plaintext_len, FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD,
+                FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_PAYLOAD_LEN),
+            "wifi_scan status partial record: decrypted plaintext matches vector payload");
+    }
+
+    size_t complete_len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY,
+        2,
+        "status",
+        strlen("status"),
+        FEB_VEC_SESS_SESSION_ID,
+        FEB_VEC_SESS_BOARD_ID,
+        FEB_VEC_SESS_BOARD_ID_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+        4,
+        FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD,
+        FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD_LEN,
+        ciphertext_scratch,
+        sizeof(ciphertext_scratch),
+        record_buf,
+        sizeof(record_buf));
+    CHECK(complete_len > 0, "wifi_scan status complete record: encrypt+encode succeeds (sequence 4)");
+    CHECK(
+        bytes_equal(
+            record_buf, complete_len, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD,
+            FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD_LEN),
+        "wifi_scan status complete record: byte-identical to FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD");
+
+    {
+        static uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+        feb_session_decrypted_record_t decoded;
+        feb_cbor_status_t status = feb_session_decrypt_record(
+            FEB_VEC_SESS_KEY,
+            FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD,
+            FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD_LEN,
+            FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+            plaintext,
+            sizeof(plaintext),
+            &decoded);
+        CHECK(status == FEB_CBOR_OK, "wifi_scan status complete record: decrypt succeeds");
+        CHECK(decoded.sequence == 4, "wifi_scan status complete record: decoded sequence == 4");
+        CHECK(
+            bytes_equal(
+                decoded.plaintext, decoded.plaintext_len, FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD,
+                FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_PAYLOAD_LEN),
+            "wifi_scan status complete record: decrypted plaintext matches vector payload");
+    }
+}
+
 int main(void) {
     test_gcm_kat();
     test_golden_transcript_and_proofs();
@@ -383,6 +523,8 @@ int main(void) {
     test_protected_record_encrypt();
     test_protected_record_decrypt();
     test_protected_record_tamper_rejection();
+    test_wifi_scan_command_record();
+    test_wifi_scan_status_records();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

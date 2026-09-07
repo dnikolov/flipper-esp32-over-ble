@@ -193,10 +193,13 @@ feb_cbor_status_t
     if(n == 0) return status;
     pos += n;
     n = feb_cbor_skip_value(
-        in + pos, in_len - pos, 1, &record->payload_span, &record->payload_span_len, &status);
+        in + pos, in_len - pos, 2, &record->payload_span, &record->payload_span_len, &status);
     if(n == 0) return status;
     pos += n;
 
+    if(pos != in_len) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
     return FEB_CBOR_OK;
 }
 
@@ -611,11 +614,18 @@ void feb_pairing_derive_secret(
 
     memcpy(info, info_prefix, sizeof(info_prefix) - 1);
     info_len = sizeof(info_prefix) - 1;
-    /* Callers must uphold board_id_len <= FEB_PAIRING_BOARD_ID_MAX_LEN (enforced by
-       feb_cbor_decode_pairing_envelope() and this module's own encoders); this clamp is
-       a defensive backstop against buffer overflow, not a substitute for that check. */
+    /* Over-length board_id yields an all-zero pairing secret with no error signal (void
+       return), matching the ESP32's behavior: an all-zero secret fails proof/confirmation
+       HMAC checks immediately and visibly, whereas silently truncating board_id would
+       derive a real but wrong secret that presents as an unexplained confirmation
+       mismatch. Callers must uphold board_id_len <= FEB_PAIRING_BOARD_ID_MAX_LEN (enforced
+       by feb_cbor_decode_pairing_envelope() and this module's own encoders); this is
+       defense-in-depth for a shared primitive, not the primary enforcement point. */
     if(board_id_len > FEB_PAIRING_BOARD_ID_MAX_LEN) {
-        board_id_len = FEB_PAIRING_BOARD_ID_MAX_LEN;
+        feb_secure_zero(out, FEB_PAIRING_SECRET_LEN);
+        feb_secure_zero(salt, sizeof(salt));
+        feb_secure_zero(info, sizeof(info));
+        return;
     }
     if(board_id_len > 0) {
         memcpy(info + info_len, board_id, board_id_len);

@@ -390,8 +390,7 @@ size_t feb_cbor_skip_value(
     major = (uint8_t)(in[0] >> 5);
 
     switch (major) {
-    case 0:
-    case 1: {
+    case 0: {
         uint64_t value;
 
         consumed = decode_head(in, in_len, major, &value, &local_status);
@@ -514,6 +513,8 @@ size_t feb_cbor_skip_value(
         break;
     }
     default:
+        /* major 1 (negative int), major 6 (tag), and major 7 (true/false/null) are not
+           used anywhere in this protocol. */
         *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
         return 0;
     }
@@ -777,6 +778,9 @@ feb_cbor_status_t feb_cbor_decode_unencrypted(const uint8_t *in, size_t in_len, 
             return FEB_CBOR_ERR_MISSING_FIELD;
         }
     }
+    if (pos != in_len) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
     return FEB_CBOR_OK;
 }
 
@@ -929,6 +933,9 @@ feb_cbor_status_t feb_cbor_decode_protected(const uint8_t *in, size_t in_len, fe
         if (!seen[i]) {
             return FEB_CBOR_ERR_MISSING_FIELD;
         }
+    }
+    if (pos != in_len) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
     }
     return FEB_CBOR_OK;
 }
@@ -1086,5 +1093,868 @@ feb_cbor_status_t feb_cbor_decode_error_payload(const uint8_t *in, size_t in_len
     if (!seen[0]) {
         return FEB_CBOR_ERR_MISSING_FIELD;
     }
+    return FEB_CBOR_OK;
+}
+
+size_t feb_cbor_encode_capability_query_payload(uint8_t *out, size_t out_cap, const feb_capability_query_payload_t *payload)
+{
+    /* Neither firmware ever encodes a populated `requested` today (docs/PROTOCOL.md's
+       "Notes on capability discovery": the Flipper always omits it) -- this always emits
+       the empty-map wire form regardless of payload->has_requested. */
+    (void)payload;
+    return feb_cbor_encode_map_header(out, out_cap, 0);
+}
+
+feb_cbor_status_t feb_cbor_decode_capability_query_payload(const uint8_t *in, size_t in_len, feb_capability_query_payload_t *payload)
+{
+    size_t count;
+    size_t pos;
+    feb_cbor_status_t status;
+    size_t consumed;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+    payload->has_requested = 0;
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
+    if (consumed == 0) {
+        return status;
+    }
+    if (count > 1) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    pos = consumed;
+
+    if (count == 1) {
+        const char *key_data;
+        size_t key_len;
+        size_t key_consumed;
+        size_t arr_count;
+        size_t arr_consumed;
+        size_t i;
+
+        key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+        if (key_consumed == 0) {
+            return status;
+        }
+        if (key_len != strlen("requested") || memcmp(key_data, "requested", key_len) != 0) {
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        pos += key_consumed;
+
+        arr_consumed = feb_cbor_decode_array_header(in + pos, in_len - pos, &arr_count, &status);
+        if (arr_consumed == 0) {
+            return status;
+        }
+        if (arr_count > FEB_CBOR_MAX_ARRAY_ENTRIES) {
+            return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+        }
+        pos += arr_consumed;
+
+        for (i = 0; i < arr_count; i++) {
+            const char *elem_data;
+            size_t elem_len;
+            size_t elem_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &elem_data, &elem_len,
+                                                        FEB_CBOR_MAX_TEXT_LEN, &status);
+
+            if (elem_consumed == 0) {
+                return status;
+            }
+            pos += elem_consumed;
+        }
+        payload->has_requested = 1;
+    }
+
+    return FEB_CBOR_OK;
+}
+
+size_t feb_cbor_encode_capability_response_payload(uint8_t *out, size_t out_cap, const feb_capability_response_payload_t *payload)
+{
+    size_t pos = 0;
+    size_t n;
+    size_t i;
+
+    if (out == NULL || payload == NULL) {
+        return 0;
+    }
+    if (payload->feature_count > FEB_CAPABILITY_MAX_FEATURES) {
+        return 0;
+    }
+
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 3);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "board", KLEN("board"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->board, payload->board_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "firmware", KLEN("firmware"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->firmware, payload->firmware_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "features", KLEN("features"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_array_header(out + pos, out_cap - pos, payload->feature_count);
+    if (n == 0) return 0;
+    pos += n;
+    for (i = 0; i < payload->feature_count; i++) {
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->features[i], payload->feature_lens[i]);
+        if (n == 0) return 0;
+        pos += n;
+    }
+
+    return pos;
+}
+
+feb_cbor_status_t feb_cbor_decode_capability_response_payload(const uint8_t *in, size_t in_len, feb_capability_response_payload_t *payload)
+{
+    static const char *const names[3] = {"board", "firmware", "features"};
+    size_t count;
+    size_t pos;
+    size_t i;
+    size_t next_min = 0;
+    int seen[3] = {0, 0, 0};
+    feb_cbor_status_t status;
+    size_t consumed;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+    payload->feature_count = 0;
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
+    if (consumed == 0) {
+        return status;
+    }
+    if (count > 3) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    pos = consumed;
+
+    for (i = 0; i < count; i++) {
+        const char *key_data;
+        size_t key_len;
+        size_t key_consumed;
+        int found;
+        size_t j;
+        size_t field_index;
+
+        key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+        if (key_consumed == 0) {
+            return status;
+        }
+        pos += key_consumed;
+
+        found = -1;
+        for (j = 0; j < 3; j++) {
+            if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
+                found = (int)j;
+                break;
+            }
+        }
+        if (found < 0) {
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        field_index = (size_t)found;
+        if (seen[field_index]) {
+            return FEB_CBOR_ERR_DUPLICATE_KEY;
+        }
+        if (field_index < next_min) {
+            return FEB_CBOR_ERR_OUT_OF_ORDER;
+        }
+
+        switch (field_index) {
+        case 0: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+
+            if (n == 0) return status;
+            payload->board = data;
+            payload->board_len = len;
+            pos += n;
+            break;
+        }
+        case 1: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+
+            if (n == 0) return status;
+            payload->firmware = data;
+            payload->firmware_len = len;
+            pos += n;
+            break;
+        }
+        case 2: {
+            size_t arr_count;
+            size_t arr_consumed;
+            size_t k;
+
+            arr_consumed = feb_cbor_decode_array_header(in + pos, in_len - pos, &arr_count, &status);
+            if (arr_consumed == 0) return status;
+            if (arr_count > FEB_CAPABILITY_MAX_FEATURES) {
+                return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+            }
+            pos += arr_consumed;
+            for (k = 0; k < arr_count; k++) {
+                const char *data;
+                size_t len;
+                size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                                 FEB_CBOR_MAX_TEXT_LEN, &status);
+
+                if (n == 0) return status;
+                payload->features[k] = data;
+                payload->feature_lens[k] = len;
+                pos += n;
+            }
+            payload->feature_count = arr_count;
+            break;
+        }
+        default:
+            break;
+        }
+
+        seen[field_index] = 1;
+        next_min = field_index + 1;
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (!seen[i]) {
+            return FEB_CBOR_ERR_MISSING_FIELD;
+        }
+    }
+    return FEB_CBOR_OK;
+}
+
+size_t feb_cbor_encode_command_payload(uint8_t *out, size_t out_cap, const feb_command_payload_t *payload)
+{
+    size_t pos = 0;
+    size_t n;
+
+    if (out == NULL || payload == NULL) {
+        return 0;
+    }
+
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 3);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "capability", KLEN("capability"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->capability, payload->capability_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "request_id", KLEN("request_id"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, payload->request_id);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "arguments", KLEN("arguments"));
+    if (n == 0) return 0;
+    pos += n;
+    if (out_cap - pos < payload->arguments_span_len) {
+        return 0;
+    }
+    memcpy(out + pos, payload->arguments_span, payload->arguments_span_len);
+    pos += payload->arguments_span_len;
+
+    return pos;
+}
+
+feb_cbor_status_t feb_cbor_decode_command_payload(const uint8_t *in, size_t in_len, feb_command_payload_t *payload)
+{
+    static const char *const names[3] = {"capability", "request_id", "arguments"};
+    size_t count;
+    size_t pos;
+    size_t i;
+    size_t next_min = 0;
+    int seen[3] = {0, 0, 0};
+    feb_cbor_status_t status;
+    size_t consumed;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
+    if (consumed == 0) {
+        return status;
+    }
+    if (count > 3) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    pos = consumed;
+
+    for (i = 0; i < count; i++) {
+        const char *key_data;
+        size_t key_len;
+        size_t key_consumed;
+        int found;
+        size_t j;
+        size_t field_index;
+
+        key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+        if (key_consumed == 0) {
+            return status;
+        }
+        pos += key_consumed;
+
+        found = -1;
+        for (j = 0; j < 3; j++) {
+            if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
+                found = (int)j;
+                break;
+            }
+        }
+        if (found < 0) {
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        field_index = (size_t)found;
+        if (seen[field_index]) {
+            return FEB_CBOR_ERR_DUPLICATE_KEY;
+        }
+        if (field_index < next_min) {
+            return FEB_CBOR_ERR_OUT_OF_ORDER;
+        }
+
+        switch (field_index) {
+        case 0: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+
+            if (n == 0) return status;
+            payload->capability = data;
+            payload->capability_len = len;
+            pos += n;
+            break;
+        }
+        case 1: {
+            uint64_t value;
+            size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &status);
+
+            if (n == 0) return status;
+            payload->request_id = value;
+            pos += n;
+            break;
+        }
+        case 2: {
+            const uint8_t *span;
+            size_t span_len;
+            size_t n;
+
+            if (pos >= in_len || (uint8_t)(in[pos] >> 5) != 5) {
+                return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+            }
+            /* Fresh nesting budget (depth 0), not depth 2 -- see cbor_codec.h's
+               `command`/`status` comment for why: `arguments` is its own opaque
+               "second-level payload," not additional depth accumulated from wherever the
+               outer `payload` field itself was positioned. */
+            n = feb_cbor_skip_value(in + pos, in_len - pos, 0, &span, &span_len, &status);
+            if (n == 0) return status;
+            payload->arguments_span = span;
+            payload->arguments_span_len = span_len;
+            pos += n;
+            break;
+        }
+        default:
+            break;
+        }
+
+        seen[field_index] = 1;
+        next_min = field_index + 1;
+    }
+
+    for (i = 0; i < 3; i++) {
+        if (!seen[i]) {
+            return FEB_CBOR_ERR_MISSING_FIELD;
+        }
+    }
+    return FEB_CBOR_OK;
+}
+
+size_t feb_cbor_encode_status_payload(uint8_t *out, size_t out_cap, const feb_status_payload_t *payload)
+{
+    size_t pos = 0;
+    size_t n;
+    size_t count = 2;
+
+    if (out == NULL || payload == NULL) {
+        return 0;
+    }
+    if (payload->has_result) count++;
+
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, count);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "request_id", KLEN("request_id"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, payload->request_id);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "state", KLEN("state"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->state, payload->state_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    if (payload->has_result) {
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, "result", KLEN("result"));
+        if (n == 0) return 0;
+        pos += n;
+        if (out_cap - pos < payload->result_span_len) {
+            return 0;
+        }
+        memcpy(out + pos, payload->result_span, payload->result_span_len);
+        pos += payload->result_span_len;
+    }
+
+    return pos;
+}
+
+feb_cbor_status_t feb_cbor_decode_status_payload(const uint8_t *in, size_t in_len, feb_status_payload_t *payload)
+{
+    static const char *const names[3] = {"request_id", "state", "result"};
+    size_t count;
+    size_t pos;
+    size_t i;
+    size_t next_min = 0;
+    int seen[3] = {0, 0, 0};
+    feb_cbor_status_t status;
+    size_t consumed;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+    payload->has_result = 0;
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
+    if (consumed == 0) {
+        return status;
+    }
+    if (count > 3) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    pos = consumed;
+
+    for (i = 0; i < count; i++) {
+        const char *key_data;
+        size_t key_len;
+        size_t key_consumed;
+        int found;
+        size_t j;
+        size_t field_index;
+
+        key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+        if (key_consumed == 0) {
+            return status;
+        }
+        pos += key_consumed;
+
+        found = -1;
+        for (j = 0; j < 3; j++) {
+            if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
+                found = (int)j;
+                break;
+            }
+        }
+        if (found < 0) {
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        field_index = (size_t)found;
+        if (seen[field_index]) {
+            return FEB_CBOR_ERR_DUPLICATE_KEY;
+        }
+        if (field_index < next_min) {
+            return FEB_CBOR_ERR_OUT_OF_ORDER;
+        }
+
+        switch (field_index) {
+        case 0: {
+            uint64_t value;
+            size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &status);
+
+            if (n == 0) return status;
+            payload->request_id = value;
+            pos += n;
+            break;
+        }
+        case 1: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &status);
+
+            if (n == 0) return status;
+            payload->state = data;
+            payload->state_len = len;
+            pos += n;
+            break;
+        }
+        case 2: {
+            const uint8_t *span;
+            size_t span_len;
+            size_t n;
+
+            if (pos >= in_len || (uint8_t)(in[pos] >> 5) != 5) {
+                return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+            }
+            /* Fresh nesting budget (depth 0) -- see cbor_codec.h's `command`/`status`
+               comment: wifi_scan's own `result` (result -> aps array -> ap-result map ->
+               its scalar fields) needs it, and reusing `payload`'s depth=2 convention here
+               would reject that frozen, spec-mandated shape as FEB_CBOR_ERR_TOO_DEEP. */
+            n = feb_cbor_skip_value(in + pos, in_len - pos, 0, &span, &span_len, &status);
+            if (n == 0) return status;
+            payload->result_span = span;
+            payload->result_span_len = span_len;
+            payload->has_result = 1;
+            pos += n;
+            break;
+        }
+        default:
+            break;
+        }
+
+        seen[field_index] = 1;
+        next_min = field_index + 1;
+    }
+
+    if (!seen[0] || !seen[1]) {
+        return FEB_CBOR_ERR_MISSING_FIELD;
+    }
+    return FEB_CBOR_OK;
+}
+
+size_t feb_cbor_encode_wifi_scan_ap(uint8_t *out, size_t out_cap, const feb_wifi_scan_ap_t *ap)
+{
+    size_t pos = 0;
+    size_t n;
+
+    if (out == NULL || ap == NULL) {
+        return 0;
+    }
+    if (ap->ssid_len > FEB_WIFI_SCAN_SSID_MAX_LEN || ap->rssi_offset > 255u) {
+        return 0;
+    }
+
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 6);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "ssid", KLEN("ssid"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_bytes(out + pos, out_cap - pos, ap->ssid, ap->ssid_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "bssid", KLEN("bssid"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_bytes(out + pos, out_cap - pos, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "rssi_offset", KLEN("rssi_offset"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, ap->rssi_offset);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "channel", KLEN("channel"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, ap->channel);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "phy", KLEN("phy"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, ap->phy, ap->phy_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "auth", KLEN("auth"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, ap->auth, ap->auth_len);
+    if (n == 0) return 0;
+    pos += n;
+
+    return pos;
+}
+
+size_t feb_cbor_decode_wifi_scan_ap(const uint8_t *in, size_t in_len, feb_wifi_scan_ap_t *ap, feb_cbor_status_t *status)
+{
+    static const char *const names[6] = {"ssid", "bssid", "rssi_offset", "channel", "phy", "auth"};
+    size_t count;
+    size_t pos;
+    size_t i;
+    size_t next_min = 0;
+    int seen[6] = {0, 0, 0, 0, 0, 0};
+    feb_cbor_status_t local_status;
+    size_t consumed;
+
+    if (status == NULL) {
+        return 0;
+    }
+    if (in == NULL || ap == NULL) {
+        *status = FEB_CBOR_ERR_TRUNCATED;
+        return 0;
+    }
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &local_status);
+    if (consumed == 0) {
+        *status = local_status;
+        return 0;
+    }
+    if (count > 6) {
+        *status = FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+        return 0;
+    }
+    pos = consumed;
+
+    for (i = 0; i < count; i++) {
+        const char *key_data;
+        size_t key_len;
+        size_t key_consumed;
+        int found;
+        size_t j;
+        size_t field_index;
+
+        key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &local_status);
+        if (key_consumed == 0) {
+            *status = local_status;
+            return 0;
+        }
+        pos += key_consumed;
+
+        found = -1;
+        for (j = 0; j < 6; j++) {
+            if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
+                found = (int)j;
+                break;
+            }
+        }
+        if (found < 0) {
+            *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+            return 0;
+        }
+        field_index = (size_t)found;
+        if (seen[field_index]) {
+            *status = FEB_CBOR_ERR_DUPLICATE_KEY;
+            return 0;
+        }
+        if (field_index < next_min) {
+            *status = FEB_CBOR_ERR_OUT_OF_ORDER;
+            return 0;
+        }
+
+        switch (field_index) {
+        case 0: {
+            const uint8_t *data;
+            size_t len;
+            size_t n = feb_cbor_decode_bytes(in + pos, in_len - pos, &data, &len,
+                                              FEB_WIFI_SCAN_SSID_MAX_LEN, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            ap->ssid = data;
+            ap->ssid_len = len;
+            pos += n;
+            break;
+        }
+        case 1: {
+            const uint8_t *data;
+            size_t len;
+            size_t n = feb_cbor_decode_bytes(in + pos, in_len - pos, &data, &len,
+                                              FEB_WIFI_SCAN_BSSID_LEN, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            if (len != FEB_WIFI_SCAN_BSSID_LEN) { *status = FEB_CBOR_ERR_UNEXPECTED_TYPE; return 0; }
+            memcpy(ap->bssid, data, FEB_WIFI_SCAN_BSSID_LEN);
+            pos += n;
+            break;
+        }
+        case 2: {
+            uint64_t value;
+            size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            if (value > 255u) { *status = FEB_CBOR_ERR_UNEXPECTED_TYPE; return 0; }
+            ap->rssi_offset = value;
+            pos += n;
+            break;
+        }
+        case 3: {
+            uint64_t value;
+            size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            ap->channel = value;
+            pos += n;
+            break;
+        }
+        case 4: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            ap->phy = data;
+            ap->phy_len = len;
+            pos += n;
+            break;
+        }
+        case 5: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_CBOR_MAX_TEXT_LEN, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            ap->auth = data;
+            ap->auth_len = len;
+            pos += n;
+            break;
+        }
+        default:
+            break;
+        }
+
+        seen[field_index] = 1;
+        next_min = field_index + 1;
+    }
+
+    for (i = 0; i < 6; i++) {
+        if (!seen[i]) {
+            *status = FEB_CBOR_ERR_MISSING_FIELD;
+            return 0;
+        }
+    }
+    *status = FEB_CBOR_OK;
+    return pos;
+}
+
+size_t feb_cbor_encode_wifi_scan_result_payload(uint8_t *out, size_t out_cap, const feb_wifi_scan_result_payload_t *payload)
+{
+    size_t pos = 0;
+    size_t n;
+    size_t i;
+
+    if (out == NULL || payload == NULL) {
+        return 0;
+    }
+    if (payload->ap_count > FEB_WIFI_SCAN_MAX_APS_PER_RECORD) {
+        return 0;
+    }
+
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 1);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "aps", KLEN("aps"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_array_header(out + pos, out_cap - pos, payload->ap_count);
+    if (n == 0) return 0;
+    pos += n;
+
+    for (i = 0; i < payload->ap_count; i++) {
+        n = feb_cbor_encode_wifi_scan_ap(out + pos, out_cap - pos, &payload->aps[i]);
+        if (n == 0) return 0;
+        pos += n;
+    }
+
+    return pos;
+}
+
+feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, size_t in_len, feb_wifi_scan_result_payload_t *payload)
+{
+    size_t count;
+    size_t pos;
+    size_t i;
+    feb_cbor_status_t status;
+    size_t consumed;
+    const char *key_data;
+    size_t key_len;
+    size_t key_consumed;
+    size_t arr_count;
+    size_t arr_consumed;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+    payload->ap_count = 0;
+
+    consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
+    if (consumed == 0) {
+        return status;
+    }
+    if (count > 1) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    if (count == 0) {
+        return FEB_CBOR_ERR_MISSING_FIELD;
+    }
+    pos = consumed;
+
+    key_consumed = feb_cbor_decode_text(in + pos, in_len - pos, &key_data, &key_len,
+                                         FEB_CBOR_MAX_TEXT_LEN, &status);
+    if (key_consumed == 0) {
+        return status;
+    }
+    if (key_len != strlen("aps") || memcmp(key_data, "aps", key_len) != 0) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
+    pos += key_consumed;
+
+    arr_consumed = feb_cbor_decode_array_header(in + pos, in_len - pos, &arr_count, &status);
+    if (arr_consumed == 0) {
+        return status;
+    }
+    if (arr_count > FEB_WIFI_SCAN_MAX_APS_PER_RECORD) {
+        return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
+    }
+    pos += arr_consumed;
+
+    for (i = 0; i < arr_count; i++) {
+        size_t ap_consumed = feb_cbor_decode_wifi_scan_ap(in + pos, in_len - pos, &payload->aps[i], &status);
+
+        if (ap_consumed == 0) {
+            return status;
+        }
+        pos += ap_consumed;
+    }
+    payload->ap_count = arr_count;
+
     return FEB_CBOR_OK;
 }

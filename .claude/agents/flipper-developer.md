@@ -103,6 +103,18 @@ instead of implying a green build validates any of them.
 - Converting a local to `static` changes initialization semantics: an `= {0}`/`= {1}`
   initializer then runs **once at program load**, not per call. Add an explicit reset at the
   top of the function for anything that depended on it — a real trap hit in `cmult()`.
+- **A recursive validator's stack cost scales with its depth budget, not its named locals —
+  the "grep for large local arrays" heuristic in step 6 below is blind to this.**
+  `feb_cbor_skip_value()` recurses up to `FEB_CBOR_MAX_NESTING` times per call site, and each
+  frame is small individually, so no single grep hit stands out. wifi_scan (2026-09-07) gave
+  `command.arguments`/`status.result` their own fresh depth-0 budget (see the "Two
+  implementations" section below) — correct for decoding, but it also means that one call site
+  can now recurse a full 5 levels deep (0 through 4) reachable from an authenticated peer,
+  2 more than any other `feb_cbor_skip_value()` call site in this file reaches today. Flagged as
+  an estimated ~900-1100 bytes of the 1280-byte budget in the theoretical worst case, not
+  measured — before hardware-testing any change that adds or deepens a recursive validator call
+  site, either measure real stack usage (`-fstack-usage` or equivalent) or say explicitly that
+  you didn't and it remains a risk, same as any other unverified stack claim in this file.
 
 ### Ported third-party code brings upstream's memory profile, not just its structure
 
@@ -276,6 +288,38 @@ vector set, so a mistake in the contract propagates to both and nothing disagree
 GCM ciphertext is exactly as long as its plaintext regardless of key size, so a maximum-size payload could not
 round-trip. Fixed 2026-09-05 by raising it to `512u` to match. Validate bounds against
 `docs/PROTOCOL.md` directly, never against the ESP32 implementation or the shared vectors.
+
+A second example, wifi_scan (2026-09-07): `feb_cbor_skip_value()`'s nesting-depth budget is a
+pure internal recursion counter with no wire representation, so nothing in `docs/PROTOCOL.md`
+or the test vectors could catch a wrong assumption about it — and both firmwares independently
+assumed the same wrong one (that a field nested inside `payload`, like `command.arguments` or
+`status.result`, should inherit `payload_span`'s depth-2 starting point). It doesn't: a field
+with its own dedicated, schema-aware decoder is its own self-contained span and must get a
+*fresh* depth-0 budget when it recurses into `feb_cbor_skip_value()` for a still-generic
+sub-piece, otherwise a real, spec-legal shape (here, `result` → `aps` array → 6-field
+`<ap-result>` map — 3 real containers) silently exceeds `FEB_CBOR_MAX_NESTING` and gets
+rejected. You found this independently the same way the ESP32 side did (confirming it's a
+genuine spec gap, not carelessness), but you also stalled once mid-fix — if you ever resume from
+a stall or an interruption, re-read the actual current file contents before continuing; don't
+trust your own prior stated intent about what you'd already changed. This is now documented in
+`docs/PROTOCOL.md`'s "Nesting depth" section — read it before adding another nested payload
+shape.
+
+**When you and the ESP32 agent add new shared codec functions/macros in parallel, diff
+`cbor_codec.h` against `esp32/main/cbor_codec.h` before reporting done.** The convention (stated
+above) is that this header's actual API surface — function signatures, struct layouts, macro
+names — stays byte-identical between firmwares, with only comment wording allowed to differ.
+wifi_scan's parallel implementation broke this silently: you wrote
+`feb_cbor_encode_wifi_scan_result_payload(out, out_cap, const feb_wifi_scan_ap_t *aps, size_t
+ap_count)` where the ESP32 side wrote `(out, out_cap, const feb_wifi_scan_result_payload_t
+*payload)` — inconsistent with every other `encode_*_payload` function in this codebase, which
+all take a payload-struct pointer — plus a differently-named macro (`FEB_WIFI_SCAN_MAX_APS` vs.
+`FEB_WIFI_SCAN_MAX_APS_PER_RECORD`). Nothing caught it until an explicit post-hoc `diff` in the
+orchestrating session. Run that diff yourself as your last step whenever you add new
+shared-header content in parallel with the ESP32 side, not just when told to — and when in
+doubt about a new function's signature shape, match this codebase's existing
+`encode_*_payload(out, out_cap, const T_payload_t *payload)` convention rather than inventing a
+new one.
 
 ### The static-buffer pattern trades RAM for stack safety — spend it deliberately
 

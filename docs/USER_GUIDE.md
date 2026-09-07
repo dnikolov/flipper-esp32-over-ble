@@ -1,13 +1,16 @@
 # User guide
 
 What it's actually like to build, flash, and pair this project today. Scoped strictly to
-what's implemented and hardware-verified (steps 1-6 of [PLAN.md](PLAN.md), verified
-2026-09-06) — runtime session authentication now runs after pairing, but there are no
-capability commands yet. An in-firmware factory-reset button-hold gesture now exists on the ESP32 (see below) and has been hardware-verified. For the architecture and wire protocol
+what's implemented and hardware-verified (steps 1-7 of [PLAN.md](PLAN.md) plus the
+wifi_scan follow-on capability, verified 2026-09-07) — runtime session authentication now
+runs after pairing, and after a successful reconnect the Flipper automatically queries and
+caches the ESP32's board identity and capabilities. An in-firmware factory-reset button-hold gesture now exists on the ESP32 (see below) and has been hardware-verified. For the architecture and wire protocol
 behind any of this, see [PROTOCOL.md](PROTOCOL.md) and [PAIRING.md](PAIRING.md); this guide
 only covers using the two devices as they exist right now.
 
 Step 6 (runtime session authentication) was hardware-verified on 2026-09-06. This changed how reconnection and re-pairing work: when a saved pairing already exists for a board, the Flipper app now auto-starts advertising immediately on launch — the OK-press is no longer required for reconnects. The OK-press is now reserved only for pairing a genuinely new board (no saved record). If the ESP32 has a stored secret from a previous pairing, on boot or reset it now attempts a "runtime auth" handshake (hello/hello_ack/client_auth) first, instead of unconditionally opening a new 120-second pairing window. A pairing window now only opens if the ESP32 has no stored secret yet, or if the Flipper rejects the board as unrecognized — and even then, only on the ESP32's *next* connection attempt, not the one that got rejected. This prevents the "stray reset silently re-pairs and overwrites the secret" quirk described further down — a stray reset while both sides already share a valid secret now resumes the session silently by design. The wrong-folder pairing-file storage bug is also fixed: new pairing files are now saved under this app's own correct data folder, `/ext/apps_data/flipper_esp32_over_ble/pairings/<board_id>.dat`, not `/ext/apps_data/bt/pairings/`. Important caveat: pairing records saved *before* this fix (from the step 1-5 era) are now orphaned in the old wrong folder and won't be found — that board needs a fresh pairing ceremony after upgrading to this firmware; this is a one-time thing per already-paired board.
+
+Step 7 (board identity and capability registry) was hardware-verified on 2026-09-07. The first time the Flipper successfully completes runtime auth with a new board (`board_id`), it automatically sends a `capability_query` and caches the response in a new file: `/ext/apps_data/flipper_esp32_over_ble/capabilities/<board_id>.dat`. This query happens only once per board — the cache is keyed by the ESP32's factory-MAC-derived `board_id`, so re-pairing the same physical board (even after an ESP32 factory reset) doesn't force a re-query, since `board_id` doesn't change. The only way to force a fresh query today is to manually delete the cache file; there's no unpair/UI action yet that does this for you (that's future work, [PLAN.md](PLAN.md) step 8). On-screen, after a successful reconnect to a board that now has its capabilities cached, you'll see an additional status line showing the board model and its supported features — for example, `esp32-c6-devkit: wifi_scan`. This display is fully automatic and requires no user action. `wifi_scan` is the first capability with a real, invokable command — see "Scanning for Wi-Fi networks" below; further capabilities remain future work.
 
 ## What you need
 
@@ -65,11 +68,14 @@ unless you mean to** — read-only queries (`flash_id`, log monitoring) are alwa
 
 Once you see `Paired`, both devices have independently derived and saved the same 32-byte
 secret, and the ESP32 disconnects and goes fully idle — it does not scan or connect again
-until its next physical reset. There is currently **no further communication after
-pairing**: no Wi-Fi scan results, no live session, nothing else on screen. That's expected
-— runtime session authentication is now implemented (step 6) and will run on reconnection;
-capability commands are future work (see [PLAN.md](PLAN.md) step 7 onward), not a bug in
-what's built today.
+until its next physical reset. On the next reconnection, runtime session authentication will
+run and you'll see `ESP32 session active`. At that point, the Flipper will also automatically
+query the ESP32's board identity and capabilities (if not already cached), and an additional
+status line will appear on screen showing the board model and its supported features — for
+example, `esp32-c6-devkit: wifi_scan`. This capability line isn't just informational: `wifi_scan`
+is now a real, invokable capability (see "Scanning for Wi-Fi networks" below) — the first
+capability command implemented end to end. Any capability beyond `wifi_scan` is still future
+work (see [PLAN.md](PLAN.md) step 8 onward), not a bug in what's built today.
 
 Pairing records are stored **per board** (one file per `board_id`, derived from the ESP32's
 factory MAC address), so pairing a second ESP32 later won't disturb a pairing you already
@@ -78,7 +84,29 @@ assumed from the design.
 
 ## Idle-connection behavior during an active session
 
-Once `ESP32 session active` (solid blue LED) is established, if 30 seconds pass with no traffic, the ESP32 automatically disconnects and rescans. Upon reconnection, it runs the runtime-auth handshake again — fully automatic, no user action. The Flipper may briefly leave `ESP32 session active` and return. Since capability commands don't yet exist (future step 7), this 30-second idle-reconnect cycle repeats indefinitely while both devices are powered and in range. This is expected behavior, not a malfunction — just something to know if watching the LED or logs.
+Once `ESP32 session active` (solid blue LED) is established, if 30 seconds pass with no traffic, the ESP32 automatically disconnects and rescans. Upon reconnection, it runs the runtime-auth handshake again — fully automatic, no user action. The Flipper may briefly leave `ESP32 session active` and return, though the board identity and capability line cached in step 7 will persist through these reconnections. Since capability commands now exist (wifi_scan is implemented; see below), this 30-second idle-reconnect cycle repeats indefinitely while both devices are powered and in range unless you actively trigger a scan. This is expected behavior, not a malfunction — just something to know if watching the LED or logs.
+
+## Scanning for Wi-Fi networks
+
+Once an authenticated session is active and the Flipper's status line shows the board model and its capabilities (e.g., `esp32-c6-devkit: wifi_scan`), you can trigger a Wi-Fi network scan directly from the Flipper — the first capability command now implemented end to end.
+
+**How to scan:** With the app showing `ESP32 session active`, press **OK** from the main screen to start a Wi-Fi scan on the connected ESP32. The app moves to a new results view showing all detected Wi-Fi access points (APs).
+
+**Results display:** Each line shows:
+- **SSID** — the network's name, or empty if the network is hidden.
+- **Signal strength (dBm)** — the received signal power, ranging from very weak to very strong.
+- **PHY generation** — the highest Wi-Fi standard the AP advertises (e.g., `11n` for 802.11n, `11ax` for Wi-Fi 6).
+- **Auth mode** — the security type the AP uses (e.g., `WPA2_PSK`, `OPEN`).
+
+The results list is scrollable via **Up/Down**. A header line at the top shows the total count of APs found.
+
+**Scan behavior:**
+- The scan runs for roughly 1-2 seconds and reports up to 32 APs. If more networks are present, only the strongest by signal are shown.
+- Pressing **OK** again while a scan is already in progress has no effect — the app prevents sending a second command until the first completes.
+- Pressing **Back** exits the results view and clears all results from the display. Results are not saved, exported, or persisted in any way — they appear on screen only.
+- If the ESP32 disconnects and reconnects (triggered by the 30-second idle timeout or by the Flipper leaving range briefly), the results remain on screen and your scroll position is preserved — you can continue viewing the same scan results before starting a new one.
+
+**Known limitation:** SSIDs containing non-ASCII or non-printable bytes are displayed after sanitization. A real Wi-Fi network with such an SSID has not been tested on real hardware (the required network was not available during verification), so rendering in this case is not confirmed. The protocol and host-side tests cover this case; hardware coverage is a backlog item if it becomes relevant.
 
 ## Factory-resetting the ESP32 without a PC
 
