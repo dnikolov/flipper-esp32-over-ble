@@ -59,7 +59,7 @@ public-key validation (`ecp_check_pubkey_mx()`) rejects `u=0` and a few other lo
 points with an error, which `feb_x25519()` (declared `void`, no error path, and required
 by `pairing_crypto.h` to be a total function matching RFC 7748 for every 32-byte input)
 has no way to signal or safely recover from; see `esp32/main/pairing_crypto.c`'s top
-comment and `docs/SESSION_MEMORY.md`'s step 5 esp32-developer entry for the full
+comment and `docs/PROJECT_HISTORY.md`'s step 5 entry for the full
 investigation. Both `esp32/` and `flipper/` pairing host tests are green; step 5's
 `pairing.c`/`pairing_crypto.c` implementation work is done on both sides. BLE
 window/storage integration into `main.c`/`flipper_esp32_over_ble.c` remains a separate
@@ -117,7 +117,7 @@ backend for that one hardware-only primitive — a known asymmetry, not an overs
 Both firmwares' `main.c`/`flipper_esp32_over_ble.c` now wire the full
 `hello`/`hello_ack`/`client_auth` flow, including the reset-vs-runtime-auth boot decision
 and the Flipper's `unknown_board` fallback and auto-connect-when-a-saved-record-exists UX
-change — see `docs/SESSION_MEMORY.md`'s 2026-09-06 step 6 wiring entries for the full
+change — see `docs/PROJECT_HISTORY.md`'s step 6 entry for the full
 detail, judgment calls made, and gaps found along the way. `idf.py build` and
 `fbt.cmd fap_flipper_esp32_over_ble` both pass clean. Neither board has been flashed with
 this code yet — the hardware verification pass is a separate follow-up requiring explicit

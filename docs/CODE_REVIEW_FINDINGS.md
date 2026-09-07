@@ -134,7 +134,7 @@ supervision timeout.
 ### 8. `uint32_t` millisecond-clock wraparound handled inconsistently
 `esp_timer_get_time() / 1000` wraps at ~49.7 days of uptime — well within the "board left running
 unattended for hours/days" wardriving scenario this project explicitly designed for (see
-`docs/SESSION_MEMORY.md`'s reconnect-policy revision). Two of three deadline checks use an
+`docs/PLAN.md`'s "Revised long-run reconnect policy"). Two of three deadline checks use an
 absolute comparison that breaks on wrap:
 
 - `esp32/main/main.c:292` — `now_ms >= pairing_window_deadline_ms` (in `pairing_window_is_open()`)
@@ -183,7 +183,7 @@ firmwares: `feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, and
 ## Memory & performance (embedded-target relevant)
 
 ### 11. ~3 KB of X25519 intermediate ladder state is left in Flipper `.bss`, unzeroized, for the app's entire lifetime
-The stack-overflow fix (see `docs/SESSION_MEMORY.md`'s 2026-09-03 entries) converted the whole
+The stack-overflow fix (see `docs/PROJECT_HISTORY.md`'s step 3 stack-overflow entry) converted the whole
 curve25519-donna port's locals to function-local `static` arrays to get them off the 1280-byte
 `BleEventWorker` stack. But only the outermost function,
 `x25519_donna_scalarmult()` (`flipper/pairing_crypto.c:762-766`), zeroizes its own five arrays
@@ -225,7 +225,7 @@ both call `xTaskCreate(reconnect_task, "ble_reconnect", 3072, ...)`, where the t
 `vTaskDelay(delay); start_scan(); vTaskDelete(NULL)`. The same file already uses
 `ble_npl_callout` (`reassembly_timeout_co`) to get equivalent one-shot delayed-callback behavior
 with no extra stack allocation at all. Under the now-indefinite slow-cadence retry policy (see
-`docs/SESSION_MEMORY.md`'s `MAX_RECONNECT_RETRIES` fix), this means a 3 KB heap allocation and
+`docs/PROJECT_HISTORY.md`'s post-step-6 `MAX_RECONNECT_RETRIES` fix), this means a 3 KB heap allocation and
 free every 30 seconds during a prolonged outage — exactly the unattended-for-hours scenario the
 retry policy was redesigned around. Worth converting to a second `ble_npl_callout` to remove the
 allocation churn entirely.
@@ -251,7 +251,7 @@ this at no cost.
 4096-byte NimBLE host task stack, so it isn't at risk today, but it's the same "buffer-sized-off-
 a-protocol-constant, stack-local, on a size-constrained thread" pattern that caused three
 separate stack-overflow bugs on the Flipper side this project already had to chase down and fix
-(see `docs/SESSION_MEMORY.md`'s 2026-09-03 entries). Worth a static, on principle, before it ever
+(see `docs/PROJECT_HISTORY.md`'s step 3 and step 5 entries). Worth a static, on principle, before it ever
 becomes a problem on a smaller stack.
 
 ## Gaps against the documented protocol contract
@@ -273,8 +273,8 @@ and `pairing_storage_save()` (`:605`, called from `handle_pair_complete()`) both
 file I/O directly inside `profile_event_handler()`, which runs on the high-priority
 `BleEventWorker` thread that also pumps the BLE stack's own event loop. This can block that
 thread for tens to low-hundreds of milliseconds per call. Given this project's history of
-unexplained post-MTU-negotiation hangs (see `docs/SESSION_MEMORY.md`'s 2026-09-03 investigation,
-ultimately root-caused elsewhere but still open on "what else runs synchronously in this path"),
+unexplained post-MTU-negotiation hangs (see `docs/PROJECT_HISTORY.md`'s step 3 entry for the
+2026-09-03 investigation, ultimately root-caused elsewhere but still open on "what else runs synchronously in this path"),
 this is worth deliberately ruling in or out rather than leaving as an unexamined assumption.
 
 ### 19. Flipper's outgoing-fragment path has no delivery-error detection

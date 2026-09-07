@@ -61,7 +61,7 @@ is the right bucket for both the truncated-map (W1) and trailing-bytes (W6) reje
 
 **D6 — Do these edits in the orchestrating session, not via the firmware subagents.** These are
 cross-firmware convergence edits whose entire purpose is that both copies end up behaving
-identically. `docs/SESSION_MEMORY.md`'s 2026-09-03 `framing.c` stack fix set the precedent: it
+identically. `docs/PROJECT_HISTORY.md`'s 2026-09-03 `framing.c` stack fix entry set the precedent: it
 was done "by the orchestrating session, not a subagent, to guarantee the two copies got the
 identical change." Use `esp32-developer` / `flipper-developer` only for the per-firmware build
 verification in step 4 below, which is toolchain-specific and genuinely per-target.
