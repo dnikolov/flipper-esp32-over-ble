@@ -5,8 +5,9 @@ key exchange, then exposes board capabilities (Wi-Fi scan, GPIO, sensors, ...) t
 an authenticated CBOR protocol. Two independent firmware targets, one shared protocol
 contract.
 
-Not a git repository (no `.git`) — do not offer `git` commands; there is nothing to diff,
-commit, or branch.
+A git repository (initialized 2026-09-06). Roadmap steps are tagged on completion
+(e.g. `step6-complete`) — see `git tag -l` and `git log` for history. Only commit or tag
+when the user explicitly asks; do not push anywhere without explicit confirmation.
 
 ## Read this first
 
@@ -89,7 +90,8 @@ Artifacts: ESP32 image under `esp32/build/`; FAP under
   pairing ceremony it stores is implemented.
 - Match the existing docs' precision: when you learn something about the hardware, protocol, or
   build (a root cause, a pinned commit, a verified measurement), record it in the relevant doc
-  rather than only in a commit message or chat — there is no git history to fall back on.
+  rather than only in a commit message or chat — the docs, not git history, are the source of
+  truth for *why*.
 - No comment-heavy style in either firmware; both existing `.c` files are comment-sparse by
   design, matching the flipper-developer agent's low-level C standards below.
 - **Keep [docs/USER_GUIDE.md](docs/USER_GUIDE.md) in sync with actual behavior.** Any change

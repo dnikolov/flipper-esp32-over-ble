@@ -2151,7 +2151,8 @@ repro entries above) and confirms the `filter_duplicates=0` fix resolves it.
 HARDWARE-VERIFIED and READY FOR PRODUCTION USE.**
 
 Next: `MAX_RECONNECT_RETRIES` hard-stop fix (`schedule_reconnect()`, `esp32/main/main.c`,
-still open — see `docs/PLAN.md` backlog), then step 7 (board identity/capability registry).
+still open at the time — see the dedicated entry below for the fix) — then step 7 (board
+identity/capability registry).
 
 ## 2026-09-06: Flipper LED/screen "blinks intermittently mid-session" diagnosed, not fixed
 
@@ -2188,3 +2189,165 @@ dead link, but it's a wire-protocol change (new message type, both firmwares, a
 its own item, needing a future design/grill-me session before implementation. The small
 cosmetic LED/screen fix remains available independently whenever it's wanted — nothing was
 changed in either firmware this session.
+
+## 2026-09-06: MAX_RECONNECT_RETRIES hard-stop fix
+
+Fixed the last open item flagged in the "scan-stall fix hardware-verified" and
+"idle-connection-timeout hardware-verified" entries above: `schedule_reconnect()`
+(`esp32/main/main.c`) hard-stopped forever after `MAX_RECONNECT_RETRIES` (5) consecutive
+GAP-level `ble_gap_connect()` failures, contradicting `docs/PLAN.md` step 4's documented
+"bounded exponential backoff, then indefinite slow-cadence retry" policy — and mattering more
+now that step 6 made the board scan/reconnect continuously and unattended.
+
+**Fix:** mirrored the existing two-phase shape already used for runtime-auth proof failures
+(`runtime_auth_backoff_delay_ms()` / `schedule_runtime_auth_backoff()`, ~main.c:315-324 and
+~main.c:420-435 before this change). Added:
+- `FEB_RECONNECT_SLOW_CADENCE_MS` (30 s) — a new constant next to
+  `FEB_RUNTIME_AUTH_SLOW_CADENCE_MS`, deliberately **not** reusing the auth path's 5-minute
+  cadence: that long cadence is doing double duty as an anti-hammering throttle against
+  repeated bad credentials, which doesn't apply to a plain link-layer connect failure (the
+  peer could be back and connectable within seconds), and reusing it here would reintroduce a
+  "board goes quiet for a long stretch for no reason" symptom on this path similar to the one
+  the scan-stall fix eliminated on a different one.
+- `reconnect_backoff_delay_ms()` — mirrors `runtime_auth_backoff_delay_ms()`: exponential ramp
+  (1, 2, 4, ... s) while `reconnect_retries <= MAX_RECONNECT_RETRIES`, then flattens to
+  `FEB_RECONNECT_SLOW_CADENCE_MS` indefinitely. `MAX_RECONNECT_RETRIES` (still 5) now means
+  "length of the ramp before flattening," not a hard cap — it's never compared as a stop
+  condition anymore.
+- `schedule_reconnect()` rewritten: dropped the `reconnect_retries >= MAX_RECONNECT_RETRIES`
+  hard-stop branch entirely (only the pre-existing `reconnect_task_active` reentrancy guard
+  remains as an early return), clamped the increment at `0xFFu` the same way
+  `fail_runtime_auth()` clamps `runtime_auth_failure_count` (preventing `uint8_t`
+  wraparound), and switched the log line to a "consecutive failures=%u" phrasing once past
+  the ramp, matching `schedule_runtime_auth_backoff()`'s log style.
+- Updated the comment above `schedule_runtime_auth_backoff()` (which referenced
+  `reconnect_retries`/`MAX_RECONNECT_RETRIES`) to reflect the new "ramp length, not a hard
+  cap" meaning.
+
+Normal disconnects (`BLE_GAP_EVENT_DISCONNECT`, `DISCONNECT_REASON_NORMAL`/`UNKNOWN_BOARD`)
+were not touched — they already bypass `schedule_reconnect()` entirely via `start_scan()`.
+
+**Build-verified only:** `idf.py build` from `esp32/`, clean exit, no errors —
+`flipper_esp32_over_ble.bin` 0xa5740 bytes, smallest app partition 0x180000 bytes, 57% free
+(same percentage as the pre-fix build; absolute size grew negligibly from the new
+helper/constant). See `docs/PLAN.md` backlog's `MAX_RECONNECT_RETRIES` entry for the full
+before/after description.
+
+## 2026-09-07: MAX_RECONNECT_RETRIES fix hardware-verified
+
+Already-flashed build from the entry above was exercised for real on the ESP32-C6 (`COM9`)
+and Flipper Zero (`COM8`), monitored via a real `idf_monitor.py` session
+(`ESP_IDF_MONITOR_TEST=1`, `--timestamps`, per the established no-TTY workaround). Repro:
+with the FAP running, physically moved the Flipper to a marginal-range distance to force real
+link-establishment failures rather than a clean disconnect.
+
+**Two distinct failure shapes turned up, only one of which touches this fix:**
+- Fast NimBLE-internal link-retry cycles (`"Reattempt connection; reason = 0x3e"`, giving up
+  within a few hundred ms) surface as a plain `BLE_GAP_EVENT_DISCONNECT` (`reason=574` =
+  `BLE_HS_HCI_ERR(0x3E)`) and correctly bypass `schedule_reconnect()` — they land in the
+  disconnect-reason switch's `default:` case and just trigger an immediate `start_scan()`,
+  same as any ordinary link-loss disconnect. This is intended behavior (cheap immediate
+  rescan for a transient blip), not a gap.
+- When the link failed to establish within the full 30 s `ble_gap_connect()` timeout, it
+  surfaced instead as `BLE_GAP_EVENT_CONNECT` with `status=13` (`BLE_HS_ETIMEOUT`), logged
+  `connection failed: 13` — **this is the path that actually drives `schedule_reconnect()`.**
+
+**Confirmed the full designed ramp end to end**, all on real hardware: `reconnect retry 1/5
+in 1000 ms` -> `2/5 in 2000 ms` -> `3/5 in 4000 ms` -> `4/5 in 8000 ms` -> `5/5 in 16000 ms` ->
+then, past the point the old code would have hard-stopped forever, `reconnect retry in 30000 ms
+(consecutive failures=6)` — the ramp flattens to the indefinite 30 s slow cadence exactly as
+designed. Moving the Flipper back into range let the very next 30 s-cadence attempt succeed
+(`connected; exchanging MTU` -> `client_auth sent; runtime session authenticated`), confirming
+full recovery with no physical reset needed.
+
+**Live-diagnosis false start, recorded for future sessions:** partway through, a narrower read
+of the log — taken before any `connection failed: 13` timeout had actually occurred yet — looked
+like `schedule_reconnect()` was unreachable for this failure class entirely, which would have
+been a real gap. That read was wrong: it was an artifact of a live `Monitor` grep filter that
+happened to exclude the `connection failed:`/`connect start failed:` log lines, not a real gap
+in the code. Corrected once the fuller raw log was inspected (the ramp was already firing
+correctly in the unfiltered log the whole time); no code change was made or needed. Lesson: when
+live-tailing a filtered log during an on-the-fly hardware repro, treat an unexpected "this code
+path looks unreachable" conclusion as provisional until cross-checked against the complete raw
+log, not just the filtered stream.
+
+**`MAX_RECONNECT_RETRIES` fix is now HARDWARE-VERIFIED and READY FOR PRODUCTION USE.** Both
+items previously blocking step 7 (idle-timeout hardware test, this one) are now done. Step 7
+(board identity/capability registry) is next, and per this project's established pattern
+(steps 3, 5, and 6 each got one), needs its own grill-me design session before implementation
+starts.
+
+## 2026-09-07: step 7 grill-me session — design decisions
+
+A design-review session locked down step 7 scope, storage, and lifecycle before any implementation started (no code written, no board flashed this session). Ten decisions were finalized:
+
+**Step 7 scope:** the step covers only the board-identity/capability-registry plumbing (`capability_query`/`capability_response` wired post-runtime-auth, reporting `board`/`firmware`/`features`). The `command` message type and any real `wifi_scan` command handler are split out into their own separate future roadmap step — result pagination, scan trigger vs. streamed results, argument validation, and payload-size-constraint reasoning all defer there. Step 7's "done when" bar (Flipper renders the authenticated capability list correctly) is satisfiable without any working command handling.
+
+**`capability_query` lifecycle:** the Flipper sends it exactly once per `board_id`, on the first successful runtime auth for that board when no locally persisted capability file exists yet. The result is cached and never automatically re-queried on subsequent reconnects — a deliberate exception to the "distrust and re-verify every session" pattern used for authentication, justified because capability lists are non-sensitive cached metadata, not security credentials. Staleness has no automatic remediation; the only refresh path is full unpair + re-pair (manual "refresh capabilities" without re-pair was considered and explicitly rejected/backlogged).
+
+**Storage:** the Flipper persists each board's capability record in its own separate file per `board_id`, distinct from the pairing-secret file. This separation allows the pairing-secret file to receive atomic-write/versioning hardening in step 8 without forcing the same constraints onto the non-sensitive capability cache. Unpairing a board deletes both its pairing file and its capability file together as one operation — no orphaned files.
+
+**`requested` field:** defined in the protocol but currently unimplemented (ESP32 always returns the full registry, Flipper always omits the field). Backlog item to revisit once there's a real multi-capability use case that would benefit from partial queries.
+
+**`firmware` field:** a hand-maintained constant string per ESP32 firmware build (e.g. `"0.1.0"`), bumped manually by hand. Explicitly not build-injected (e.g. via `git describe` at build time) — unnecessary complexity for a value nothing currently makes decisions based on.
+
+**`board` field:** a hand-maintained opaque constant string per firmware target (e.g. `"esp32-c6-devkit"` for this board; future board targets would define their own strings). The Flipper receives it as a pure display string — no enum, allowlist, or validation. Capability gating is driven entirely by the `features` array, never by the `board` string.
+
+**`features` list:** a hardcoded compile-time array/constant (today: just `["wifi_scan"]`). No runtime hardware-detection abstraction/framework built now — that gets designed later, informed by real hardware specifics, in the GPS phase's own future grill-me session.
+
+**Command-handling scaffolding explicitly deferred:** step 7 does NOT add any generic `command`-message rejection/dispatch scaffold (e.g. a "reject command for unsupported capability" path), even though `unsupported_capability` is already a defined error code in PROTOCOL.md. That entire mechanism is owned by the future `wifi_scan` step, designed together with the real command handler from a clean slate — building rejection-only scaffolding with no handler behind it yet was explicitly rejected as premature.
+
+Full detail, decision rationale, and references to other docs are in `docs/PLAN.md`'s new "### Step 7 implementation decisions (2026-09-07 grill-me session)" section. Next: step 7 implementation itself, split against the scope decision, with the `wifi_scan` follow-on step needing its own future grill-me session before it starts.
+
+## 2026-09-07: full-repository code review, and a fix pass queued ahead of step 7
+
+A full read-through of both firmwares' application and shared-contract code (`esp32/main/`,
+`flipper/`, `tests/`) produced 24 findings, recorded in the new
+**[docs/CODE_REVIEW_FINDINGS.md](CODE_REVIEW_FINDINGS.md)** (10 correctness, 6 embedded
+memory/performance, 8 contract gaps against `docs/PROTOCOL.md`, plus a style/documentation
+section). No code or hardware was touched during the review.
+
+**Six of those findings (#1, #2, #3, #4, #9, #10) are queued to be fixed immediately, in their
+own clean session, before step 7 implementation begins.** The execution plan is
+**[docs/CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)** — self-contained, with the design
+decisions already settled (D1-D6) so the executing session doesn't re-derive them. **Start
+there, not from this entry.** Summary of why these six and not the other eighteen: they all sit
+in the shared CBOR / framing / session-crypto primitives that step 7's payload schemas and the
+protected-record path will be built directly on top of, so fixing them afterwards means
+re-touching code step 7 already depends on.
+
+Headline items:
+
+- **A real out-of-bounds read** in `flipper/cbor_codec.c:373` (`feb_cbor_skip_value()`'s map case
+  is missing the `pos >= in_len` guard the ESP32 has at `esp32/main/cbor_codec.c:485`), reachable
+  today from any malformed `payload` map on the write characteristic, pre-authentication.
+- **The two `feb_cbor_skip_value()` implementations accept different CBOR major types** — the
+  ESP32 accepts negative integers and rejects `true`/`false`/`null`; the Flipper does the exact
+  opposite. `payload_span` is what step 7 will encrypt and cover with AAD, so this had to be
+  converged first. Root cause of the drift: the function has **zero direct test coverage** on
+  either side. The fix plan adds it.
+- **`PROTOCOL.md` never said which CBOR major types a `payload` may contain** — a genuine spec
+  gap, in the same family as the previously-closed "canonical CBOR" and "512/768 byte" ambiguities.
+  Resolved in the fix plan's decision D2 (unsigned ints, byte strings, text strings, arrays, maps;
+  everything else rejected), verified safe against step 7's and Phase 3's actual payload needs.
+- **Four of the six fixes are Flipper-only** — in every divergence except two, the ESP32's copy is
+  already the stricter/correct one and the Flipper's independently-written copy drifted looser.
+  Useful signal for where to aim future review effort.
+- Two findings' scope was **wider than the review first recorded**, both found while planning the
+  fixes: the nesting-depth bug has a second call site (`flipper/pairing.c:196`, not just
+  `cbor_codec.c`), and the clamp-vs-zero `board_id` divergence affects
+  `feb_pairing_derive_secret()` as well as `feb_session_derive_key()`. `flipper/pairing.c` had not
+  been read during the original scan.
+- One severity **correction**: finding #4 (over-length `board_id` deriving an all-zero session key
+  on the ESP32) is **not currently reachable** — both application layers already bound `board_id`
+  before the derivation is called. It's defense-in-depth in a shared primitive, not a live bug.
+
+Also worth knowing from the review, deliberately **not** in the fix pass: the entire AES-256-GCM
+protected-record layer (`feb_session_encrypt_record`/`_decrypt_record`,
+`feb_cbor_encode/decode_protected`, `feb_gcm_encrypt/decrypt`) has **zero call sites in either
+application** today, so it has never run against live hardware. Step 7 activates it. That is the
+single biggest reason the fix pass goes first.
+
+The other eighteen findings are tracked in the findings doc, with #17 (NVS pairing record has no
+version, validity marker, or atomic replacement, contradicting `docs/PROTOCOL.md`'s explicit
+requirement) cross-referenced to step 8, which already owns that work.

@@ -2,6 +2,14 @@
 
 This plan implements the trusted-environment BLE pairing decision in [DECISIONS.md](DECISIONS.md) and protocol v2 in [PROTOCOL.md](PROTOCOL.md). The target board is the ESP32-C6 DevKitC-1-N4.
 
+## Roadmap phases
+
+- **Phase 1 (done):** board/SDK/firmware/build baselines — see `docs/BASELINES.md` and the "Phase 1 status" entry in `docs/SESSION_MEMORY.md`.
+- **Phase 2 (in progress):** core BLE transport, record framing, trusted-environment pairing, and authenticated runtime sessions on the ESP32-C6 — steps 1-9 below are this phase's implementation detail.
+- **Phase 3 (near-term aim, decided 2026-09-07):** production-ready wardriving on the ESP32-C6. Covers finishing step 7 (capability registry), the follow-on `wifi_scan`-command step, the GPS/`ble_scan`/`wardriving` capability, step 8 (hardened persistence for both the pairing record and the wardriving log), and step 9 (full-system validation). "Production-ready" means field-usable unattended for hours, survives power loss without corrupting the wardriving log, and passes step 9's negative-security-test suite — not just "the happy path works once on a bench."
+- **Phase 4 (later, decided 2026-09-07):** Heltec WiFi LoRa 32 V2 board support — a second, structurally different target (classic ESP32/Xtensa, not C6) adding display and LoRa capabilities. Does not start until Phase 3 is complete.
+- **Phase 5 (later, much larger, decided 2026-09-07):** Zigbee/Thread and `gpio_control`. Zigbee/Thread recon (passive scanning, Phase 5a) first, then participation (active stack join / possible border-router role, Phase 5b) as a separately-scoped, order-of-magnitude-larger effort with no committed timeline. `gpio_control` (moved here 2026-09-07, previously a tentative Phase 3 item) rides along in this phase rather than blocking Phase 3's wardriving focus.
+
 ## Confirmed setup choices
 
 - Target board: ESP32-C6-DevKitC-1-N4, connected by USB for flash-size verification.
@@ -662,16 +670,29 @@ screen and LED both confirmed correct on the physical device.
 - Implement `capability_query` and `capability_response` after runtime authentication only.
 - Add commands incrementally, with input validation, request IDs, bounded output, and explicit `unsupported_capability` errors.
 
+### Step 7 implementation decisions (2026-09-07 grill-me session)
+
+- **Step 7 scope split.** Step 7 itself covers only the board-identity/capability-registry plumbing: `capability_query`/`capability_response` wired up post-runtime-auth, reporting `board`/`firmware`/`features`. It does NOT include implementing the `command` message type or any real `wifi_scan` command handler — that is split into its own separate future roadmap step. Result pagination, scan trigger vs. streamed results, argument validation, and all payload-size-constraint reasoning are deferred there. Step 7's "done when" bar (Flipper renders the authenticated capability list correctly) is satisfiable without any working `command` handling.
+- **`capability_query` lifecycle.** The Flipper sends `capability_query` exactly once per `board_id` — specifically, the first time runtime auth succeeds for that `board_id` AND no locally persisted capability file exists for it yet. The result is persisted and never automatically re-queried on subsequent reconnects, even though this differs from the project's usual "distrust and re-verify every session" pattern used for authentication. This is a deliberate, explicit exception because a capability list is non-sensitive cached metadata, not a security credential.
+- **Staleness handling.** Nothing automatically invalidates or refreshes a persisted capability record. The only way to force a fresh `capability_query` is a full unpair + re-pair (a manual "refresh capabilities" UI action without full re-pair was considered and explicitly rejected/backlogged for now).
+- **Storage location (Flipper side).** The persisted capability record is stored in its own separate file per `board_id`, distinct from the pairing-secret file. Rationale: the pairing-secret file is security-sensitive and will get atomic-write/versioning hardening in step 8; the capability-cache file is not sensitive and shouldn't force that hardening work to reason about a second, unrelated write path.
+- **Unpair/factory-reset behavior.** Deletes both the pairing file and the capability file for that `board_id` together, as one operation — no orphaned capability file is left behind.
+- **The `requested` field on `capability_query`** (already defined in PROTOCOL.md's Message payloads table as an optional array-of-text-strings filter): the ESP32 ignores it entirely for now and always returns the full registry regardless of what's sent (or not sent); the Flipper always omits it. This is flagged as an explicit backlog item: revisit later whether this field is even worth keeping once there's a real multi-capability use case that would benefit from partial queries.
+- **The `firmware` field value.** Sourced from a hand-maintained string constant in ESP32 source (e.g. a `FEB_FIRMWARE_VERSION` define, something like `"0.1.0"`), bumped manually by hand. Explicitly NOT build-injected (e.g. not `git describe` at build time) — that was considered and rejected as unnecessary complexity for a value nothing currently makes decisions based on.
+- **The `board` field value.** Also a hand-maintained opaque string constant per firmware target (e.g. `"esp32-c6-devkit"` for this board; a future Heltec firmware target would define its own distinct string). The Flipper treats it as a pure opaque display string — no enum, no allowlist, no validation against known values. Capability gating is driven entirely by the `features` array, never by the `board` string.
+- **`features` list generation (ESP32 side).** A hardcoded compile-time array/constant (today: just containing `"wifi_scan"`). Explicitly no runtime hardware-detection abstraction/framework built now — that gets designed later, informed by real hardware specifics, when the GPS phase is designed in its own future grill-me session.
+- **Command-handling scaffolding.** Step 7 does NOT add any generic `command`-message rejection/dispatch scaffold (e.g. a generic "reject a command naming an unsupported capability" path), even though `unsupported_capability` is already a defined error code in PROTOCOL.md. That entire mechanism, including the `unsupported_capability` rejection path, is owned by the future `wifi_scan` follow-on step, designed together with the real command handler from a clean slate — building rejection-only scaffolding with no real handler behind it yet was explicitly rejected as premature.
+
 ### Capability roadmap
 
-Capabilities ship incrementally, gated on hardware actually present on a given board — see [CAPABILITIES.md](CAPABILITIES.md) for the registry format and the full, current capability list:
+Capabilities ship incrementally, gated on hardware actually present on a given board — see [CAPABILITIES.md](CAPABILITIES.md) for the registry format and the full, current capability list. See "Roadmap phases" above for how these map onto Phase 3/4/5.
 
-1. **`wifi_scan`** — first capability, needs no extra hardware.
-2. **GPS + wardriving phase** (after a GY-NEO6MV2/NEO-6M GPS module is wired to the C6): add `ble_scan` and the composite `wardriving` capability. Wardriving runs autonomously from boot once started — it does not require an active Flipper connection to keep capturing — buffering into a bounded, power-loss-safe on-device log (see step 8), and streams the backlog plus live results to whichever Flipper connects and authenticates. Scan results captured before GPS achieves a fix are discarded (a future Flipper-settable backfill-to-first-fix option is backlogged, not yet implemented).
-3. **Heltec board phase** (later, separate baseline): display and LoRa capabilities on a second, structurally different board — Heltec WiFi LoRa 32 V2, classic ESP32/Xtensa, not the C6 — see `docs/BASELINES.md`. This is a second target platform, not a peripheral addition to the C6.
-4. **Zigbee/Thread recon phase** (later): passive `zigbee`/`thread` scanning/sniffing capabilities, matching the `wifi_scan`/`ble_scan` pattern — no network joining or commissioning.
-5. **Zigbee/Thread participation phase** (much later, separately scoped): active stack participation (joining as an end-device / Thread node, possibly a border-router role) — an order of magnitude larger effort than recon; not committed to a timeline.
-6. **`gpio_control`** (later, after the phases above): generic GPIO control, reserving strapping/JTAG pins (GPIO0, 4, 5, 8, 9, 15) from generic control actions.
+1. **`wifi_scan`** (Phase 3) — first capability, needs no extra hardware.
+2. **GPS + wardriving** (Phase 3, after a GY-NEO6MV2/NEO-6M GPS module is wired to the C6): add `ble_scan` and the composite `wardriving` capability. Wardriving runs autonomously from boot once started — it does not require an active Flipper connection to keep capturing — buffering into a bounded, power-loss-safe on-device log (see step 8), and streams the backlog plus live results to whichever Flipper connects and authenticates. Scan results captured before GPS achieves a fix are discarded (a future Flipper-settable backfill-to-first-fix option is backlogged, not yet implemented). Making this production-ready is Phase 3's stated aim.
+3. **Heltec board support** (Phase 4, separate baseline, starts after Phase 3 completes): display and LoRa capabilities on a second, structurally different board — Heltec WiFi LoRa 32 V2, classic ESP32/Xtensa, not the C6 — see `docs/BASELINES.md`. This is a second target platform, not a peripheral addition to the C6.
+4. **Zigbee/Thread recon** (Phase 5a): passive `zigbee`/`thread` scanning/sniffing capabilities, matching the `wifi_scan`/`ble_scan` pattern — no network joining or commissioning.
+5. **Zigbee/Thread participation** (Phase 5b, much later, separately scoped): active stack participation (joining as an end-device / Thread node, possibly a border-router role) — an order of magnitude larger effort than recon; not committed to a timeline.
+6. **`gpio_control`** (Phase 5): generic GPIO control, reserving strapping/JTAG pins (GPIO0, 4, 5, 8, 9, 15) from generic control actions.
 
 ### Multi-board pairing
 
@@ -732,12 +753,17 @@ unrelated bugfixes into the same build-verify pass.
 
 **Reprioritized same day, later 2026-09-06 diagnosis session, then implemented same day:** the
 idle-connection-timeout item was the immediate next implementation task (ahead of
-`MAX_RECONNECT_RETRIES`, which is still open) — see its entry below for the confirmed
-root-cause chain and the implementation that landed. It stopped being a step-7-readiness
-nicety and became a fix for a real bug the user hit: closing and reopening the Flipper FAP
-mid-session leaves the ESP32 stuck until a physical reset. **Next up: `MAX_RECONNECT_RETRIES`
-hard-stop fix**, then hardware-testing the idle-timeout fix (requires explicit go-ahead),
-then step 7.
+`MAX_RECONNECT_RETRIES`, which was still open at the time) — see its entry below for the
+confirmed root-cause chain and the implementation that landed. It stopped being a
+step-7-readiness nicety and became a fix for a real bug the user hit: closing and reopening
+the Flipper FAP mid-session leaves the ESP32 stuck until a physical reset. The
+`MAX_RECONNECT_RETRIES` hard-stop fix noted as next-up here **has since been implemented,
+build-verified, and hardware-verified (2026-09-07)** — see its own backlog entry above. Both
+items previously blocking step 7 (idle-timeout hardware test, `MAX_RECONNECT_RETRIES` hardware
+test) are now done. **Step 7 (board identity/capability registry) is next**, and per this
+project's convention of a dedicated grill-me design session before implementing a new roadmap
+step (steps 3, 5, and 6 each got one), that design session should happen before writing any
+step 7 code.
 
 - Manual "disconnect current board" Flipper UI action (step 7).
 - Automatic BLE connection arbitration between multiple paired boards — gated on an unresolved BLE-HAL feasibility question (step 7).
@@ -796,6 +822,52 @@ then step 7.
   but now more consequential under step 6's always-scanning runtime-auth mode: a board whose
   *physical link* fails 5 times in a row, as opposed to connecting fine but failing proof
   verification, goes idle forever until a physical reset).
+  **FIXED 2026-09-06** — `esp32/main/main.c` now gives GAP-level connect failures the same
+  two-phase exponential-then-flatten shape already used for runtime-auth proof failures
+  (`runtime_auth_backoff_delay_ms()`/`schedule_runtime_auth_backoff()`): a new
+  `reconnect_backoff_delay_ms()` mirrors `runtime_auth_backoff_delay_ms()`'s structure —
+  exponential ramp (1, 2, 4, ... s) for the first `MAX_RECONNECT_RETRIES` (still 5, now
+  meaning "ramp length" rather than a hard cap) consecutive failures, then a fixed cadence
+  indefinitely. `MAX_RECONNECT_RETRIES` is never compared as a stop condition anymore.
+  Deliberately does **not** reuse the auth path's 5-minute
+  `FEB_RUNTIME_AUTH_SLOW_CADENCE_MS` — that cadence is doing double duty as an
+  anti-hammering throttle against repeated bad credentials, which doesn't apply to a plain
+  link-layer connect failure (the peer could be back and connectable within seconds), and
+  reusing it here would reintroduce a "board goes quiet for a long stretch for no reason"
+  symptom on this path like the one the scan-stall fix just eliminated on a different one.
+  Instead uses its own new constant, `FEB_RECONNECT_SLOW_CADENCE_MS` (30 s). `reconnect_retries`
+  increments are now clamped at `0xFFu` the same way `fail_runtime_auth()` clamps
+  `runtime_auth_failure_count`, preventing `uint8_t` wraparound. Build-verified via
+  `idf.py build` (exit success, `flipper_esp32_over_ble.bin` 0xa5740 bytes, 57% of the app
+  partition free — unchanged from the pre-fix build).
+  **HARDWARE-VERIFIED 2026-09-07** on the real ESP32-C6 (`COM9`)/Flipper (`COM8`) pair, via a
+  real `idf_monitor.py` session. Repro method: with the FAP running, physically separated the
+  two devices to a marginal-range distance. This produced two distinct failure shapes, both
+  worth recording since only one exercises this fix:
+  - Short NimBLE-internal link-establishment retries (`"Reattempt connection; reason = 0x3e"`)
+    that give up within a few hundred ms surface as a plain `BLE_GAP_EVENT_DISCONNECT`
+    (`reason=574` = `BLE_HS_HCI_ERR(0x3E)`) and correctly bypass this fix entirely — they fall
+    into the disconnect-reason switch's `default:` case (`main.c:1132-1137`), which just calls
+    `start_scan()` immediately, same as any plain idle/link-loss disconnect. This is expected,
+    not a gap: cheap immediate rescan is the right behavior for a transient blip.
+  - When the link genuinely couldn't establish within the full 30 s `ble_gap_connect()` timeout
+    (`main.c:1042`), it surfaced as `BLE_GAP_EVENT_CONNECT` with `status=13` (`BLE_HS_ETIMEOUT`),
+    logged `connection failed: 13`, and **this is what actually drives `schedule_reconnect()`**.
+    Confirmed the exact intended ramp end to end: `reconnect retry 1/5 in 1000 ms` -> `2/5 in
+    2000 ms` -> `3/5 in 4000 ms` -> `4/5 in 8000 ms` -> `5/5 in 16000 ms` -> then, past the old
+    hard-stop point, `reconnect retry in 30000 ms (consecutive failures=6)` — confirming the
+    ramp flattens to the indefinite 30 s slow cadence instead of stopping forever, exactly as
+    designed. Bringing the Flipper back into range let the very next 30 s-cadence attempt
+    succeed (`connected; exchanging MTU` -> `client_auth sent; runtime session authenticated`),
+    confirming full recovery.
+  - A live-diagnosis false start along the way, worth noting for future sessions: an early,
+    narrower read of the log (before the 30 s `connection failed: 13` timeout had occurred)
+    looked like `schedule_reconnect()` was unreachable for this failure class at all. That read
+    was wrong — it was based on a monitor filter that happened to exclude the `connection
+    failed:`/`connect start failed:` log lines, not a real gap in the code. Corrected once the
+    fuller log was inspected; no code change was needed.
+  **`MAX_RECONNECT_RETRIES` fix and its ramp-then-flatten behavior are now HARDWARE-VERIFIED and
+  READY FOR PRODUCTION USE.**
 - **New, undiagnosed bug: BLE scan pipeline silently stalls for minutes, then self-recovers**
   — found live during a literal FAP-close/reopen repro, 2026-09-06 (see
   `docs/SESSION_MEMORY.md`'s "literal FAP-close/reopen repro surfaces a new, undiagnosed

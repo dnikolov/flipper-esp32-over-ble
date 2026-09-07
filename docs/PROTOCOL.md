@@ -175,6 +175,8 @@ Outside an open window, `pairing_disabled` is the sole response to a pairing rec
 
 Defined `error.code` values are `unsupported_version`, `malformed_record`, `payload_too_large`, `unsupported_capability`, `invalid_command`, `busy`, `internal_error`, `pairing_disabled`, `pairing_expired`, `pairing_failed`, and `unknown_board` (see "Runtime auth failure handling" above).
 
+**Notes on capability discovery:** The `requested` field on `capability_query` is defined but currently unimplemented — the ESP32 always returns the full registry regardless of what's sent (or not sent), and the Flipper always omits the field. This is flagged as a backlog item to revisit once there's a real multi-capability use case that would benefit from partial queries. The `board` and `firmware` fields in `capability_response` are hand-maintained constant strings per firmware build (not derived or validated), and the Flipper receives them as opaque values — no enum, no allowlist, no validation against known values. Capability gating is driven entirely by the `features` array, never by the `board` string.
+
 ## Reliability and reconnect behavior
 
 - BLE delivery is treated as ordered within an active connection; protocol records are not retransmitted automatically.

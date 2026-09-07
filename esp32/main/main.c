@@ -57,6 +57,14 @@ static const char *TAG = "flipper_esp32_over_ble";
    since a proof failure can recur even when the physical link connects cleanly every time. */
 #define FEB_RUNTIME_AUTH_BACKOFF_MAX_EXP 6u
 #define FEB_RUNTIME_AUTH_SLOW_CADENCE_MS (5u * 60u * 1000u)
+/* docs/PLAN.md backlog fix (2026-09-06): GAP-level connect() failures get the same
+   exponential-then-flatten shape as runtime auth above, but with an independent, much
+   shorter flat cadence -- the auth path's 5-minute cadence is doing double duty as an
+   anti-hammering throttle against repeated bad credentials, which doesn't apply to a plain
+   link-layer connect failure (the peer could be back and connectable within seconds), and
+   reusing 5 minutes here would reintroduce a "goes quiet for no reason" symptom on this
+   path similar to the one the scan-stall fix just eliminated on a different one. */
+#define FEB_RECONNECT_SLOW_CADENCE_MS (30u * 1000u)
 
 /* docs/PROTOCOL.md "Reliability and reconnect behavior": "A peer closes an idle
    authenticated connection after 30 seconds without a record." The Flipper FAP's exit
@@ -386,6 +394,18 @@ static void reconnect_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Mirrors runtime_auth_backoff_delay_ms()'s exponential-then-flatten shape, but with its
+   own independent flat cadence (FEB_RECONNECT_SLOW_CADENCE_MS's comment explains why it's
+   much shorter). reconnect_retries is only ever nonzero when this runs, since
+   schedule_reconnect() increments it before calling this -- no need for a "== 0" branch. */
+static uint32_t reconnect_backoff_delay_ms(void)
+{
+    if (reconnect_retries > MAX_RECONNECT_RETRIES) {
+        return FEB_RECONNECT_SLOW_CADENCE_MS;
+    }
+    return 1000u << (reconnect_retries - 1u);
+}
+
 static void schedule_reconnect(void)
 {
     uint32_t delay_ms;
@@ -394,18 +414,22 @@ static void schedule_reconnect(void)
         ESP_LOGW(TAG, "pairing window closed; not scheduling reconnect");
         return;
     }
-    if (reconnect_task_active || reconnect_retries >= MAX_RECONNECT_RETRIES) {
-        if (reconnect_retries >= MAX_RECONNECT_RETRIES) {
-            ESP_LOGW(TAG, "automatic reconnect limit reached");
-        }
+    if (reconnect_task_active) {
         return;
     }
 
-    reconnect_retries++;
-    delay_ms = 1000U << (reconnect_retries - 1);
+    if (reconnect_retries < 0xFFu) {
+        reconnect_retries++;
+    }
+    delay_ms = reconnect_backoff_delay_ms();
     reconnect_task_active = true;
-    ESP_LOGI(TAG, "reconnect retry %u/%u in %lu ms", reconnect_retries,
-             MAX_RECONNECT_RETRIES, (unsigned long)delay_ms);
+    if (reconnect_retries > MAX_RECONNECT_RETRIES) {
+        ESP_LOGI(TAG, "reconnect retry in %lu ms (consecutive failures=%u)",
+                 (unsigned long)delay_ms, reconnect_retries);
+    } else {
+        ESP_LOGI(TAG, "reconnect retry %u/%u in %lu ms", reconnect_retries,
+                 MAX_RECONNECT_RETRIES, (unsigned long)delay_ms);
+    }
     if (xTaskCreate(reconnect_task, "ble_reconnect", 3072,
                     (void *)(uintptr_t)pdMS_TO_TICKS(delay_ms), 4, NULL) != pdPASS) {
         reconnect_task_active = false;
@@ -413,10 +437,11 @@ static void schedule_reconnect(void)
     }
 }
 
-/* Independent of reconnect_retries/MAX_RECONNECT_RETRIES above (which governs GAP-level
-   connect() failures): a runtime-auth proof failure can recur even when the physical link
-   connects cleanly every time, and per docs/PLAN.md step 6 must never stop retrying
-   outright, only slow down -- see FEB_RUNTIME_AUTH_BACKOFF_MAX_EXP's comment. */
+/* Independent of reconnect_retries/MAX_RECONNECT_RETRIES above (which now means "length of
+   the exponential ramp before flattening," not a hard cap -- reconnect_backoff_delay_ms()
+   governs GAP-level connect() failures): a runtime-auth proof failure can recur even when
+   the physical link connects cleanly every time, and per docs/PLAN.md step 6 must never
+   stop retrying outright, only slow down -- see FEB_RUNTIME_AUTH_BACKOFF_MAX_EXP's comment. */
 static void schedule_runtime_auth_backoff(void)
 {
     uint32_t delay_ms = runtime_auth_backoff_delay_ms();
