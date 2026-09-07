@@ -882,6 +882,192 @@ WIFI_SCAN_STATUS_COMPLETE_RECORD = protected_record(SESS_VERSION, "status", SESS
                                                       WIFI_SCAN_STATUS_COMPLETE_SEQ, WIFI_SCAN_STATUS_COMPLETE_CT, WIFI_SCAN_STATUS_COMPLETE_TAG)
 
 
+# =====================================================================================
+# ble_scan command/status payloads (docs/PROTOCOL.md "`ble_scan` command and status
+# payloads"). Mirrors wifi_scan's vector strategy above; payload-codec-only (no protected-
+# record end-to-end wrap -- the codec-layer round-trip is what this pass verifies).
+# =====================================================================================
+
+def ble_scan_device_result(address: bytes, name, rssi_dbm: int, addr_type: str) -> bytes:
+    assert -128 <= rssi_dbm <= 127, "rssi_dbm must fit the +128 unsigned-offset encoding"
+    assert len(address) == 6
+    count = 4 if name is not None else 3
+    out = cbor_map_header(count)
+    out += cbor_text("address") + cbor_bytes(address)
+    if name is not None:
+        out += cbor_text("name") + cbor_text(name)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    out += cbor_text("addr_type") + cbor_text(addr_type)
+    return out
+
+
+def ble_scan_result(devices) -> bytes:
+    out = cbor_array_header(len(devices))
+    for d in devices:
+        out += d
+    return cbor_map_header(1) + cbor_text("devices") + out
+
+
+BLE_SCAN_REQUEST_ID = 401
+
+# ---- device-result vectors: DEVICE1 has a name (normal entry); DEVICE2 has no name at all
+# (tests the optional-field omission -- encoded map has 3 entries, not 4 with an empty
+# string) and sits at the rssi_offset encoding's low extreme. ----
+BLE_SCAN_DEVICE1 = ble_scan_device_result(bytes.fromhex("aabbccddeeff"), "MyPhone", -60, "public")
+BLE_SCAN_DEVICE2 = ble_scan_device_result(bytes.fromhex("112233445566"), None, -128, "random")
+
+BLE_SCAN_RESULT_SINGLE = ble_scan_result([BLE_SCAN_DEVICE1])
+BLE_SCAN_RESULT_MULTI = ble_scan_result([BLE_SCAN_DEVICE1, BLE_SCAN_DEVICE2])
+BLE_SCAN_RESULT_EMPTY = ble_scan_result([])
+
+# ---- command payload: valid (empty arguments) and malformed (non-empty arguments -- must
+# be rejected with error code invalid_command, same split as wifi_scan's). ----
+BLE_SCAN_COMMAND_PAYLOAD = command_payload("ble_scan", BLE_SCAN_REQUEST_ID, cbor_map_header(0))
+BLE_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
+    "ble_scan", BLE_SCAN_REQUEST_ID, cbor_map_header(1) + cbor_text("foo") + cbor_uint(1))
+
+# ---- status payloads: a mid-scan partial batch and a final complete batch. ----
+BLE_SCAN_STATUS_PARTIAL_PAYLOAD = status_payload(BLE_SCAN_REQUEST_ID, "partial", BLE_SCAN_RESULT_SINGLE)
+BLE_SCAN_STATUS_COMPLETE_PAYLOAD = status_payload(BLE_SCAN_REQUEST_ID, "complete", BLE_SCAN_RESULT_MULTI)
+
+
+# =====================================================================================
+# wardriving command/status payloads (docs/PROTOCOL.md "`wardriving` command and status
+# payloads"). Payload-codec-only, same rationale as ble_scan above. Also exercises the
+# nesting-depth question PROTOCOL.md flags as the highest-risk part of this shape
+# (result -> records -> <wardriving-record> -> payload, 4 container levels): the ESP32/
+# Flipper host-native test suites decode/re-encode WARDRIVING_STATUS_DATA_PAYLOAD (below)
+# through the real status_payload -> feb_cbor_skip_value()-based `result` span capture,
+# not just this module's own record-level encoder, to prove the shape survives the
+# capability-agnostic generic validation pass, not only this file's from-scratch encoder.
+# =====================================================================================
+
+def wardriving_command_start(sources, wifi_interval_ms=None, ble_window_ms=None, ble_interval_ms=None) -> bytes:
+    fields = [("action", cbor_text("start"))]
+    fields.append(("sources", cbor_array_header(len(sources)) + b"".join(cbor_text(s) for s in sources)))
+    if wifi_interval_ms is not None:
+        fields.append(("wifi_interval_ms", cbor_uint(wifi_interval_ms)))
+    if ble_window_ms is not None:
+        fields.append(("ble_window_ms", cbor_uint(ble_window_ms)))
+    if ble_interval_ms is not None:
+        fields.append(("ble_interval_ms", cbor_uint(ble_interval_ms)))
+    out = cbor_map_header(len(fields))
+    for k, v in fields:
+        out += cbor_text(k) + v
+    return out
+
+
+def wardriving_command_stop() -> bytes:
+    return cbor_map_header(1) + cbor_text("action") + cbor_text("stop")
+
+
+def wardriving_wifi_payload(ssid: bytes, bssid: bytes, rssi_dbm: int, channel: int, auth: str) -> bytes:
+    assert -128 <= rssi_dbm <= 127
+    assert len(bssid) == 6
+    out = cbor_map_header(5)
+    out += cbor_text("ssid") + cbor_bytes(ssid)
+    out += cbor_text("bssid") + cbor_bytes(bssid)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    out += cbor_text("channel") + cbor_uint(channel)
+    out += cbor_text("auth") + cbor_text(auth)
+    return out
+
+
+def wardriving_ble_payload(address: bytes, name, rssi_dbm: int) -> bytes:
+    assert -128 <= rssi_dbm <= 127
+    assert len(address) == 6
+    count = 3 if name is not None else 2
+    out = cbor_map_header(count)
+    out += cbor_text("address") + cbor_bytes(address)
+    if name is not None:
+        out += cbor_text("name") + cbor_text(name)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    return out
+
+
+def wardriving_record(timestamp_ms: int, lat: float, lon: float, source: str, payload: bytes) -> bytes:
+    lat_e7_offset = int(round(lat * 1e7)) + 900000000
+    lon_e7_offset = int(round(lon * 1e7)) + 1800000000
+    assert 1 <= lat_e7_offset <= 1800000001
+    assert 1 <= lon_e7_offset <= 3600000001
+    out = cbor_map_header(5)
+    out += cbor_text("timestamp_ms") + cbor_uint(timestamp_ms)
+    out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
+    out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
+    out += cbor_text("source") + cbor_text(source)
+    out += cbor_text("payload") + payload
+    return out
+
+
+def wardriving_status_result(records, backlog_remaining: int) -> bytes:
+    out = cbor_array_header(len(records))
+    for r in records:
+        out += r
+    body = cbor_map_header(2)
+    body += cbor_text("records") + out
+    body += cbor_text("backlog_remaining") + cbor_uint(backlog_remaining)
+    return body
+
+
+WARDRIVING_START_REQUEST_ID = 501
+WARDRIVING_STOP_REQUEST_ID = 502
+WARDRIVING_DATA_REQUEST_ID = 0  # unsolicited backlog-drain sentinel per docs/PROTOCOL.md
+
+# ---- command.arguments vectors: a start with both sources and explicit intervals, a
+# plain stop, and a start missing wifi_interval_ms despite "wifi" being in sources (a
+# real-world malformed combination -- decodes structurally OK per this module's
+# documented caller-validation split; see cbor_codec.h's wardriving comment). ----
+WARDRIVING_START_BOTH_SOURCES = wardriving_command_start(
+    ["wifi", "ble"], wifi_interval_ms=30000, ble_window_ms=30, ble_interval_ms=30)
+WARDRIVING_STOP_ARGS = wardriving_command_stop()
+WARDRIVING_START_MISSING_INTERVAL = wardriving_command_start(["wifi"])  # no wifi_interval_ms
+
+WARDRIVING_START_COMMAND_PAYLOAD = command_payload("wardriving", WARDRIVING_START_REQUEST_ID, WARDRIVING_START_BOTH_SOURCES)
+WARDRIVING_STOP_COMMAND_PAYLOAD = command_payload("wardriving", WARDRIVING_STOP_REQUEST_ID, WARDRIVING_STOP_ARGS)
+WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD = command_payload(
+    "wardriving", WARDRIVING_START_REQUEST_ID, WARDRIVING_START_MISSING_INTERVAL)
+
+# ---- a genuinely codec-level-malformed arguments map: an unrecognized field name, which
+# feb_cbor_decode_wardriving_command_payload() must hard-reject (FEB_CBOR_ERR_UNEXPECTED_TYPE),
+# unlike the semantic cases above. ----
+WARDRIVING_BAD_FIELD_ARGS = cbor_map_header(2) + cbor_text("action") + cbor_text("start") + \
+    cbor_text("bogus_field") + cbor_uint(1)
+WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD = command_payload(
+    "wardriving", WARDRIVING_START_REQUEST_ID, WARDRIVING_BAD_FIELD_ARGS)
+
+# ---- <wardriving-record> vectors: one wifi-sourced record, one ble-sourced record (with a
+# name), one ble-sourced record with no name (optional-field omission). Fixed-coordinate
+# stub location per docs/PLAN.md -- same lat/lon on every record today. ----
+WARDRIVING_STUB_LAT = 42.3601
+WARDRIVING_STUB_LON = -71.0589
+
+WARDRIVING_WIFI_PAYLOAD = wardriving_wifi_payload(
+    b"TestNetwork", bytes.fromhex("aabbccddeeff"), -55, 6, "wpa2_psk")
+WARDRIVING_BLE_PAYLOAD = wardriving_ble_payload(bytes.fromhex("112233445566"), "MyPhone", -70)
+WARDRIVING_BLE_PAYLOAD_NO_NAME = wardriving_ble_payload(bytes.fromhex("665544332211"), None, -85)
+
+WARDRIVING_RECORD_WIFI = wardriving_record(
+    1000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "wifi", WARDRIVING_WIFI_PAYLOAD)
+WARDRIVING_RECORD_BLE = wardriving_record(
+    2000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD)
+WARDRIVING_RECORD_BLE_NO_NAME = wardriving_record(
+    3000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD_NO_NAME)
+
+# ---- status.result vectors: a data batch with one wifi record and one ble record
+# (exercises the nesting-depth-critical shape end to end), and an empty-records batch
+# (backlog fully drained, "live" case per PROTOCOL.md's backlog_remaining=0 convention). ----
+WARDRIVING_RESULT_MIXED = wardriving_status_result([WARDRIVING_RECORD_WIFI, WARDRIVING_RECORD_BLE], 3)
+WARDRIVING_RESULT_EMPTY = wardriving_status_result([], 0)
+
+WARDRIVING_STATUS_DATA_PAYLOAD = status_payload(WARDRIVING_DATA_REQUEST_ID, "data", WARDRIVING_RESULT_MIXED)
+WARDRIVING_STATUS_STARTED_PAYLOAD = raw(
+    cbor_map_header(2), cbor_text("request_id"), cbor_uint(WARDRIVING_START_REQUEST_ID),
+    cbor_text("state"), cbor_text("started"))
+WARDRIVING_STATUS_STOPPED_PAYLOAD = raw(
+    cbor_map_header(2), cbor_text("request_id"), cbor_uint(WARDRIVING_STOP_REQUEST_ID),
+    cbor_text("state"), cbor_text("stopped"))
+
+
 def c_bytes(name: str, data: bytes) -> str:
     hex_bytes = ", ".join(f"0x{b:02x}" for b in data)
     wrapped = textwrap.fill(hex_bytes, width=96, initial_indent="    ", subsequent_indent="    ")
@@ -1143,6 +1329,73 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_WIFI_SCAN_CMD_RECORD", WIFI_SCAN_CMD_RECORD))
     f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_PARTIAL_RECORD", WIFI_SCAN_STATUS_PARTIAL_RECORD))
     f.write(c_bytes("FEB_VEC_WIFI_SCAN_STATUS_COMPLETE_RECORD", WIFI_SCAN_STATUS_COMPLETE_RECORD))
+    f.write("\n")
+
+    f.write("/* ---- ble_scan command/status payloads (docs/PROTOCOL.md \"`ble_scan` command\n")
+    f.write("   and status payloads\"). ---- */\n\n")
+
+    f.write("/* device-result vectors: DEVICE1 has a name (normal entry); DEVICE2 has no name\n")
+    f.write("   at all (optional-field omission, not an empty string) and sits at the\n")
+    f.write("   rssi_offset encoding's low extreme. */\n")
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_DEVICE1", BLE_SCAN_DEVICE1))
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_DEVICE2", BLE_SCAN_DEVICE2))
+    f.write("\n")
+
+    f.write("/* result maps ({\"devices\": [...]}): one device, two devices, and empty. */\n")
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_RESULT_SINGLE", BLE_SCAN_RESULT_SINGLE))
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_RESULT_MULTI", BLE_SCAN_RESULT_MULTI))
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_RESULT_EMPTY", BLE_SCAN_RESULT_EMPTY))
+    f.write("\n")
+
+    f.write("/* command payload: valid (empty arguments) and malformed (non-empty arguments,\n")
+    f.write("   must be rejected with error code invalid_command -- same split as wifi_scan). */\n")
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_COMMAND_PAYLOAD", BLE_SCAN_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD", BLE_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* status payloads: mid-scan partial and final complete. */\n")
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_STATUS_PARTIAL_PAYLOAD", BLE_SCAN_STATUS_PARTIAL_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_BLE_SCAN_STATUS_COMPLETE_PAYLOAD", BLE_SCAN_STATUS_COMPLETE_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* ---- wardriving command/status payloads (docs/PROTOCOL.md \"`wardriving`\n")
+    f.write("   command and status payloads\"). ---- */\n\n")
+
+    f.write("/* command.arguments: start (both sources, explicit intervals), stop, a start\n")
+    f.write("   missing wifi_interval_ms despite \"wifi\" in sources (decodes structurally OK;\n")
+    f.write("   the action/sources-dependent requiredness check is a caller-layer concern --\n")
+    f.write("   see cbor_codec.h's wardriving comment), and a hard-malformed arguments map\n")
+    f.write("   (unrecognized field name, must be rejected FEB_CBOR_ERR_UNEXPECTED_TYPE). */\n")
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_ARGS", WARDRIVING_START_BOTH_SOURCES))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_STOP_ARGS", WARDRIVING_STOP_ARGS))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_ARGS", WARDRIVING_START_MISSING_INTERVAL))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_COMMAND_PAYLOAD", WARDRIVING_START_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_STOP_COMMAND_PAYLOAD", WARDRIVING_STOP_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD",
+                     WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD", WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* <wardriving-record> vectors: one wifi-sourced record, one ble-sourced record\n")
+    f.write("   with a name, one ble-sourced record with no name (optional-field omission). */\n")
+    f.write(c_bytes("FEB_VEC_WARDRIVING_RECORD_WIFI", WARDRIVING_RECORD_WIFI))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_RECORD_BLE", WARDRIVING_RECORD_BLE))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME", WARDRIVING_RECORD_BLE_NO_NAME))
+    f.write("\n")
+
+    f.write("/* status.result vectors: a data batch with one wifi record and one ble record\n")
+    f.write("   (the nesting-depth-critical shape: result -> records -> <record> -> payload,\n")
+    f.write("   4 container levels == FEB_CBOR_MAX_NESTING), and an empty-records batch\n")
+    f.write("   (backlog fully drained, backlog_remaining=0 per PROTOCOL.md's \"live\" case). */\n")
+    f.write(c_bytes("FEB_VEC_WARDRIVING_RESULT_MIXED", WARDRIVING_RESULT_MIXED))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_RESULT_EMPTY", WARDRIVING_RESULT_EMPTY))
+    f.write("\n")
+
+    f.write("/* status payloads: \"data\" (request_id=0, the unsolicited backlog-drain\n")
+    f.write("   sentinel), \"started\" (no result field), \"stopped\" (no result field). */\n")
+    f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD", WARDRIVING_STATUS_DATA_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_STARTED_PAYLOAD", WARDRIVING_STATUS_STARTED_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_STOPPED_PAYLOAD", WARDRIVING_STATUS_STOPPED_PAYLOAD))
 
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 

@@ -617,14 +617,47 @@ confirmed the results screen renders correctly on real hardware, closing out wif
 verification (one accepted gap: no non-ASCII SSID was available nearby to exercise that specific
 render path on real hardware, though it's covered by host-native tests).
 
+## 2026-09-08: ble_scan capability implemented and hardware-verified
+
+The second real capability, a passive BLE advertisement scan manually triggered from the Flipper
+(mirroring the existing `wifi_scan` "Scan now" pattern). Implementation matched the frozen wire
+protocol from [PROTOCOL.md](PROTOCOL.md)'s "`ble_scan` command and status payloads" section.
+
+### Implementation and hardware verification
+
+Both firmwares implemented against the frozen contract: ESP32 (`esp32/main/main.c`)'s
+`handle_ble_scan_command`, `ble_scan_send_next_batch`, `ble_scan_window_close_cb`, etc.; Flipper
+(`flipper/flipper_esp32_over_ble.c`)'s `send_ble_scan_command`, `draw_ble_scan_results`, results
+view. Both `cbor_codec` implementations (`esp32/main/cbor_codec.c/.h`, `flipper/cbor_codec.c/.h`)
+gained the `ble_scan` command/status/result CBOR shapes. Host-side tests (`tests/esp32/test_framing_cbor.c`,
+`tests/flipper/test_flipper_codec.c`, `tests/vectors/`) were extended to cover them. A new
+`esp32/main/location.c` / `esp32/main/location.h` provides the fixed-coordinate GPS-stub
+`location_get_fix()` interface per the "`ble_scan`, `wardriving`, and the GPS-stub reorder"
+design — groundwork for the future `wardriving` capability but not itself wired into any
+capability yet. Its host tests (`tests/esp32/test_location.c`) are included.
+
+The Flipper's capability cache is queried only once ever per board (a pre-existing,
+already-documented limitation) — since it was cached before `ble_scan` existed, the Flipper
+initially showed a stale wifi_scan-only capability list and the Right button did nothing.
+Deleting the stale cache file and relaunching forced a fresh `capability_response` including
+`ble_scan`. After that: runtime session re-authenticated cleanly, the Right-button trigger sent
+the `ble_scan` command, the ESP32 logged `ble_scan started (request_id=1)` then completed with
+`sending ble_scan status (complete, 9 device(s) this batch)`, no crashes/reboots on either device.
+The user then visually confirmed on the physical Flipper screen that the 9 results rendered
+correctly (address, name, RSSI, address type, scrollable). This capability-cache staleness is
+expected/already-documented behavior, not a new bug — the existing USER_GUIDE.md already describes
+it as a known limitation.
+
+Per existing design decision: **Left triggers `wifi_scan`, Right triggers `ble_scan`** on the main
+screen when the connected board's capability line advertises it.
+
 ## Current project state and handoff
 
-As of 2026-09-07 (commit `63ec936`, "Through wifi_scan: step 7 capability registry and wifi_scan
-capability, hardware-verified"): Phase 2 (core BLE transport through authenticated runtime
+As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime
 sessions) is complete, and Phase 3 (production-ready wardriving) is underway. Steps 1 through 7 are
-implemented and hardware-verified, including the follow-on `wifi_scan` capability. See
-`docs/SESSION_MEMORY.md` for exactly what's next and any open backlog items, and `docs/PLAN.md` for
-the full roadmap and per-step "done when" criteria.
+implemented and hardware-verified, along with the follow-on `wifi_scan` and `ble_scan` capabilities.
+See `docs/SESSION_MEMORY.md` for exactly what's next and any open backlog items, and `docs/PLAN.md`
+for the full roadmap and per-step "done when" criteria.
 
 Preserve these constraints going forward:
 

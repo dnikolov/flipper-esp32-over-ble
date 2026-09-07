@@ -406,6 +406,317 @@ static void test_wifi_scan_status_payload(void)
               "the partial/complete enum check is a main.c/peer semantic concern, not a codec error");
 }
 
+/* docs/PLAN.md wardriving/ble_scan wire-format step: ble_scan codec vectors, mirroring
+   wifi_scan's own test structure exactly. */
+static void test_ble_scan_device_roundtrip(const uint8_t *vec, size_t vec_len,
+                                            const uint8_t *expected_addr,
+                                            int expected_has_name, const char *expected_name,
+                                            uint64_t expected_rssi_offset,
+                                            const char *expected_addr_type,
+                                            const char *name)
+{
+    feb_ble_scan_device_t device;
+    feb_cbor_status_t status;
+    size_t consumed;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+    char check_name[160];
+
+    consumed = feb_cbor_decode_ble_scan_device(vec, vec_len, &device, &status);
+    ok = (consumed == vec_len && status == FEB_CBOR_OK);
+    ok = ok && memcmp(device.address, expected_addr, FEB_BLE_SCAN_ADDRESS_LEN) == 0;
+    ok = ok && device.has_name == expected_has_name;
+    if (expected_has_name) {
+        ok = ok && device.name_len == strlen(expected_name) &&
+             memcmp(device.name, expected_name, device.name_len) == 0;
+    }
+    ok = ok && device.rssi_offset == expected_rssi_offset;
+    ok = ok && device.addr_type_len == strlen(expected_addr_type) &&
+         memcmp(device.addr_type, expected_addr_type, device.addr_type_len) == 0;
+    snprintf(check_name, sizeof(check_name), "%s: decode matches expected fields", name);
+    check(ok, check_name);
+
+    encoded_len = feb_cbor_encode_ble_scan_device(encode_buf, sizeof(encode_buf), &device);
+    snprintf(check_name, sizeof(check_name), "%s: encode round-trip byte-identical", name);
+    check(bytes_eq(encode_buf, encoded_len, vec, vec_len), check_name);
+}
+
+static void test_ble_scan_result_payload(void)
+{
+    feb_ble_scan_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+
+    status = feb_cbor_decode_ble_scan_result_payload(FEB_VEC_BLE_SCAN_RESULT_SINGLE,
+                                                       FEB_VEC_BLE_SCAN_RESULT_SINGLE_LEN, &result);
+    check(status == FEB_CBOR_OK && result.device_count == 1, "ble_scan result (single): decodes 1 device");
+    encoded_len = feb_cbor_encode_ble_scan_result_payload(encode_buf, sizeof(encode_buf), &result);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_RESULT_SINGLE, FEB_VEC_BLE_SCAN_RESULT_SINGLE_LEN),
+          "ble_scan result (single): encode round-trip byte-identical");
+
+    status = feb_cbor_decode_ble_scan_result_payload(FEB_VEC_BLE_SCAN_RESULT_MULTI,
+                                                       FEB_VEC_BLE_SCAN_RESULT_MULTI_LEN, &result);
+    check(status == FEB_CBOR_OK && result.device_count == 2, "ble_scan result (multi): decodes 2 devices");
+    check(result.devices[1].has_name == 0, "ble_scan result (multi): device 2 has_name is 0 (no name advertised)");
+    encoded_len = feb_cbor_encode_ble_scan_result_payload(encode_buf, sizeof(encode_buf), &result);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_RESULT_MULTI, FEB_VEC_BLE_SCAN_RESULT_MULTI_LEN),
+          "ble_scan result (multi): encode round-trip byte-identical");
+
+    status = feb_cbor_decode_ble_scan_result_payload(FEB_VEC_BLE_SCAN_RESULT_EMPTY,
+                                                       FEB_VEC_BLE_SCAN_RESULT_EMPTY_LEN, &result);
+    check(status == FEB_CBOR_OK && result.device_count == 0, "ble_scan result (empty): decodes 0 devices");
+    encoded_len = feb_cbor_encode_ble_scan_result_payload(encode_buf, sizeof(encode_buf), &result);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_RESULT_EMPTY, FEB_VEC_BLE_SCAN_RESULT_EMPTY_LEN),
+          "ble_scan result (empty): encode round-trip byte-identical");
+}
+
+static void test_ble_scan_command_payload(void)
+{
+    feb_command_payload_t cmd;
+    feb_cbor_status_t status;
+    size_t arg_count;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_BLE_SCAN_COMMAND_PAYLOAD,
+                                              FEB_VEC_BLE_SCAN_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && cmd.capability_len == strlen("ble_scan") && memcmp(cmd.capability, "ble_scan", cmd.capability_len) == 0;
+    ok = ok && cmd.request_id == 401;
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 0;
+    check(ok, "ble_scan command payload: decodes capability/request_id/empty arguments");
+
+    encoded_len = feb_cbor_encode_command_payload(encode_buf, sizeof(encode_buf), &cmd);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_COMMAND_PAYLOAD, FEB_VEC_BLE_SCAN_COMMAND_PAYLOAD_LEN),
+          "ble_scan command payload: encode round-trip byte-identical");
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_BLE_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD,
+                                              FEB_VEC_BLE_SCAN_COMMAND_BAD_ARGUMENTS_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 1;
+    check(ok, "ble_scan command payload (non-empty arguments): decodes structurally OK; "
+              "rejection is a main.c dispatch-layer concern (invalid_command), not a codec error");
+}
+
+static void test_ble_scan_status_payload(void)
+{
+    feb_status_payload_t st;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_BLE_SCAN_STATUS_PARTIAL_PAYLOAD,
+                                             FEB_VEC_BLE_SCAN_STATUS_PARTIAL_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 401 && st.has_result;
+    ok = ok && st.state_len == strlen("partial") && memcmp(st.state, "partial", st.state_len) == 0;
+    check(ok, "ble_scan status (partial): decodes request_id/state/result");
+    encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_STATUS_PARTIAL_PAYLOAD,
+                   FEB_VEC_BLE_SCAN_STATUS_PARTIAL_PAYLOAD_LEN),
+          "ble_scan status (partial): encode round-trip byte-identical");
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_BLE_SCAN_STATUS_COMPLETE_PAYLOAD,
+                                             FEB_VEC_BLE_SCAN_STATUS_COMPLETE_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 401 && st.has_result;
+    ok = ok && st.state_len == strlen("complete") && memcmp(st.state, "complete", st.state_len) == 0;
+    check(ok, "ble_scan status (complete): decodes request_id/state/result");
+    encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_STATUS_COMPLETE_PAYLOAD,
+                   FEB_VEC_BLE_SCAN_STATUS_COMPLETE_PAYLOAD_LEN),
+          "ble_scan status (complete): encode round-trip byte-identical");
+}
+
+/* wardriving codec vectors -- docs/PLAN.md's highest-risk item is the nesting depth of
+   status.result's <wardriving-record>.payload shape; test_wardriving_status_result_payload()
+   below decodes it through feb_cbor_decode_status_payload()'s real feb_cbor_skip_value()-based
+   `result` span capture (fresh depth-0 budget), not just this module's own direct
+   record-level decoder, to prove the whole capability-agnostic path accepts it. */
+static void test_wardriving_command_payload(void)
+{
+    feb_command_payload_t cmd;
+    feb_wardriving_command_payload_t wc;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+
+    /* start, both sources, explicit intervals */
+    status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_START_COMMAND_PAYLOAD,
+                                              FEB_VEC_WARDRIVING_START_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK) && cmd.capability_len == strlen("wardriving") &&
+         memcmp(cmd.capability, "wardriving", cmd.capability_len) == 0 && cmd.request_id == 501;
+    if (ok) {
+        status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
+        ok = (status == FEB_CBOR_OK);
+        ok = ok && wc.action_len == strlen("start") && memcmp(wc.action, "start", wc.action_len) == 0;
+        ok = ok && wc.has_sources && wc.source_count == 2;
+        ok = ok && wc.source_lens[0] == strlen("wifi") && memcmp(wc.sources[0], "wifi", wc.source_lens[0]) == 0;
+        ok = ok && wc.source_lens[1] == strlen("ble") && memcmp(wc.sources[1], "ble", wc.source_lens[1]) == 0;
+        ok = ok && wc.has_wifi_interval_ms && wc.wifi_interval_ms == 30000;
+        ok = ok && wc.has_ble_window_ms && wc.ble_window_ms == 30;
+        ok = ok && wc.has_ble_interval_ms && wc.ble_interval_ms == 30;
+    }
+    check(ok, "wardriving command (start, both sources): decodes action/sources/intervals");
+    if (ok) {
+        encoded_len = feb_cbor_encode_wardriving_command_payload(encode_buf, sizeof(encode_buf), &wc);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_START_ARGS, FEB_VEC_WARDRIVING_START_ARGS_LEN),
+              "wardriving command (start, both sources): encode round-trip byte-identical");
+    } else {
+        check(0, "wardriving command (start, both sources): encode round-trip byte-identical");
+    }
+
+    /* stop: action only */
+    status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_STOP_COMMAND_PAYLOAD,
+                                              FEB_VEC_WARDRIVING_STOP_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK) && cmd.request_id == 502;
+    if (ok) {
+        status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
+        ok = (status == FEB_CBOR_OK);
+        ok = ok && wc.action_len == strlen("stop") && memcmp(wc.action, "stop", wc.action_len) == 0;
+        ok = ok && !wc.has_sources && !wc.has_wifi_interval_ms && !wc.has_ble_window_ms && !wc.has_ble_interval_ms;
+    }
+    check(ok, "wardriving command (stop): decodes action only, no other fields present");
+    if (ok) {
+        encoded_len = feb_cbor_encode_wardriving_command_payload(encode_buf, sizeof(encode_buf), &wc);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_STOP_ARGS, FEB_VEC_WARDRIVING_STOP_ARGS_LEN),
+              "wardriving command (stop): encode round-trip byte-identical");
+    } else {
+        check(0, "wardriving command (stop): encode round-trip byte-identical");
+    }
+
+    /* start missing wifi_interval_ms despite "wifi" in sources: decodes structurally OK;
+       the action/sources-dependent requiredness check is a caller (main.c) concern, not a
+       codec error -- see cbor_codec.h's wardriving comment, same split as wifi_scan's
+       non-empty-arguments case above. */
+    status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD,
+                                              FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    if (ok) {
+        status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
+        ok = (status == FEB_CBOR_OK) && wc.has_sources && wc.source_count == 1 && !wc.has_wifi_interval_ms;
+    }
+    check(ok, "wardriving command (start missing wifi_interval_ms): decodes structurally OK; "
+              "rejection is a main.c dispatch-layer concern (invalid_command), not a codec error");
+
+    /* hard-malformed arguments: unrecognized field name must be rejected by the codec
+       itself, unlike the semantic case above. */
+    status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD,
+                                              FEB_VEC_WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    if (ok) {
+        status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
+    }
+    check(status == FEB_CBOR_ERR_UNEXPECTED_TYPE,
+          "wardriving command (unrecognized field name): hard-rejected by the codec itself");
+}
+
+static void test_wardriving_record_roundtrip(void)
+{
+    feb_wardriving_record_t record;
+    feb_cbor_status_t status;
+    size_t consumed;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+    int ok;
+
+    consumed = feb_cbor_decode_wardriving_record(FEB_VEC_WARDRIVING_RECORD_WIFI,
+                                                  FEB_VEC_WARDRIVING_RECORD_WIFI_LEN, &record, &status);
+    ok = (consumed == FEB_VEC_WARDRIVING_RECORD_WIFI_LEN && status == FEB_CBOR_OK);
+    ok = ok && record.timestamp_ms == 1000 && record.payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI;
+    ok = ok && record.payload.wifi.ssid_len == strlen("TestNetwork") &&
+         memcmp(record.payload.wifi.ssid, "TestNetwork", record.payload.wifi.ssid_len) == 0;
+    ok = ok && record.payload.wifi.channel == 6;
+    check(ok, "wardriving record (wifi-sourced): decodes timestamp/coords/source/payload");
+    encoded_len = feb_cbor_encode_wardriving_record(encode_buf, sizeof(encode_buf), &record);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_RECORD_WIFI, FEB_VEC_WARDRIVING_RECORD_WIFI_LEN),
+          "wardriving record (wifi-sourced): encode round-trip byte-identical");
+
+    consumed = feb_cbor_decode_wardriving_record(FEB_VEC_WARDRIVING_RECORD_BLE,
+                                                  FEB_VEC_WARDRIVING_RECORD_BLE_LEN, &record, &status);
+    ok = (consumed == FEB_VEC_WARDRIVING_RECORD_BLE_LEN && status == FEB_CBOR_OK);
+    ok = ok && record.payload_kind == FEB_WARDRIVING_PAYLOAD_BLE && record.payload.ble.has_name;
+    ok = ok && record.payload.ble.name_len == strlen("MyPhone") &&
+         memcmp(record.payload.ble.name, "MyPhone", record.payload.ble.name_len) == 0;
+    check(ok, "wardriving record (ble-sourced, named): decodes timestamp/coords/source/payload");
+    encoded_len = feb_cbor_encode_wardriving_record(encode_buf, sizeof(encode_buf), &record);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_RECORD_BLE, FEB_VEC_WARDRIVING_RECORD_BLE_LEN),
+          "wardriving record (ble-sourced, named): encode round-trip byte-identical");
+
+    consumed = feb_cbor_decode_wardriving_record(FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME,
+                                                  FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME_LEN, &record, &status);
+    ok = (consumed == FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME_LEN && status == FEB_CBOR_OK);
+    ok = ok && record.payload_kind == FEB_WARDRIVING_PAYLOAD_BLE && !record.payload.ble.has_name;
+    check(ok, "wardriving record (ble-sourced, no name): has_name is 0 (optional-field omission)");
+    encoded_len = feb_cbor_encode_wardriving_record(encode_buf, sizeof(encode_buf), &record);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME,
+                   FEB_VEC_WARDRIVING_RECORD_BLE_NO_NAME_LEN),
+          "wardriving record (ble-sourced, no name): encode round-trip byte-identical");
+}
+
+static void test_wardriving_status_result_payload(void)
+{
+    feb_status_payload_t st;
+    feb_wardriving_status_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    /* "data" state: decode through the real generic status_payload decoder first --
+       this is what exercises feb_cbor_skip_value()'s fresh depth-0 budget against the
+       4-container-level <wardriving-record>.payload shape, not just this module's own
+       direct record decoder. */
+    status = feb_cbor_decode_status_payload(FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD,
+                                             FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 0 && st.has_result;
+    ok = ok && st.state_len == strlen("data") && memcmp(st.state, "data", st.state_len) == 0;
+    check(ok, "wardriving status (data): request_id=0 (unsolicited sentinel), state, result "
+              "captured through feb_cbor_skip_value()'s fresh depth-0 budget without FEB_CBOR_ERR_TOO_DEEP");
+
+    if (ok) {
+        status = feb_cbor_decode_wardriving_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.record_count == 2 && result.backlog_remaining == 3;
+        ok = ok && result.records[0].payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI;
+        ok = ok && result.records[1].payload_kind == FEB_WARDRIVING_PAYLOAD_BLE;
+    }
+    check(ok, "wardriving status (data): result decodes 1 wifi record + 1 ble record, "
+              "backlog_remaining matches");
+
+    if (ok) {
+        encoded_len = feb_cbor_encode_wardriving_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_RESULT_MIXED, FEB_VEC_WARDRIVING_RESULT_MIXED_LEN),
+              "wardriving status (data): result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD,
+                       FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD_LEN),
+              "wardriving status (data): full status payload encode round-trip byte-identical");
+    } else {
+        check(0, "wardriving status (data): result encode round-trip byte-identical");
+        check(0, "wardriving status (data): full status payload encode round-trip byte-identical");
+    }
+
+    /* "started"/"stopped": no result field at all (state model distinct from
+       wifi_scan/ble_scan's partial/complete pair -- see docs/PROTOCOL.md). */
+    status = feb_cbor_decode_status_payload(FEB_VEC_WARDRIVING_STATUS_STARTED_PAYLOAD,
+                                             FEB_VEC_WARDRIVING_STATUS_STARTED_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 501 && !st.has_result;
+    ok = ok && st.state_len == strlen("started") && memcmp(st.state, "started", st.state_len) == 0;
+    check(ok, "wardriving status (started): decodes request_id/state, no result field");
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_WARDRIVING_STATUS_STOPPED_PAYLOAD,
+                                             FEB_VEC_WARDRIVING_STATUS_STOPPED_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 502 && !st.has_result;
+    ok = ok && st.state_len == strlen("stopped") && memcmp(st.state, "stopped", st.state_len) == 0;
+    check(ok, "wardriving status (stopped): decodes request_id/state, no result field");
+}
+
 int main(void)
 {
     test_fragment_record(23, FEB_VEC_FRAGS_MTU23, FEB_VEC_FRAGS_MTU23_LENS,
@@ -466,6 +777,25 @@ int main(void)
     test_wifi_scan_result_payload();
     test_wifi_scan_command_payload();
     test_wifi_scan_status_payload();
+
+    {
+        static const uint8_t device1_addr[] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+        static const uint8_t device2_addr[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+
+        test_ble_scan_device_roundtrip(FEB_VEC_BLE_SCAN_DEVICE1, FEB_VEC_BLE_SCAN_DEVICE1_LEN,
+                                        device1_addr, 1, "MyPhone", 68, "public",
+                                        "ble_scan DEVICE1 (normal entry, named)");
+        test_ble_scan_device_roundtrip(FEB_VEC_BLE_SCAN_DEVICE2, FEB_VEC_BLE_SCAN_DEVICE2_LEN,
+                                        device2_addr, 0, NULL, 0, "random",
+                                        "ble_scan DEVICE2 (no name, rssi_offset=0 boundary)");
+    }
+    test_ble_scan_result_payload();
+    test_ble_scan_command_payload();
+    test_ble_scan_status_payload();
+
+    test_wardriving_command_payload();
+    test_wardriving_record_roundtrip();
+    test_wardriving_status_result_payload();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

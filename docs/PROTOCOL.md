@@ -179,7 +179,7 @@ Outside an open window, `pairing_disabled` is the sole response to a pairing rec
 | `status` | ESP32 -> Flipper | `request_id`: unsigned integer, `state`: text, `result`: map, optional | Reports command progress, completion, or data. |
 | `error` | either | `code`: text, `message`: text, optional `request_id`: unsigned integer | Reports a recoverable application or protocol error. |
 
-Defined `error.code` values are `unsupported_version`, `malformed_record`, `payload_too_large`, `unsupported_capability`, `invalid_command`, `busy`, `internal_error`, `pairing_disabled`, `pairing_expired`, `pairing_failed`, and `unknown_board` (see "Runtime auth failure handling" above).
+Defined `error.code` values are `unsupported_version`, `malformed_record`, `payload_too_large`, `unsupported_capability`, `invalid_command`, `busy`, `not_running`, `internal_error`, `pairing_disabled`, `pairing_expired`, `pairing_failed`, and `unknown_board` (see "Runtime auth failure handling" above). `not_running` is specific to `wardriving`'s `stop` action (see below) — a `stop` received while wardriving is genuinely idle.
 
 **Notes on capability discovery:** The `requested` field on `capability_query` is defined but currently unimplemented — the ESP32 always returns the full registry regardless of what's sent (or not sent), and the Flipper always omits the field. This is flagged as a backlog item to revisit once there's a real multi-capability use case that would benefit from partial queries. The `board` and `firmware` fields in `capability_response` are hand-maintained constant strings per firmware build (not derived or validated), and the Flipper receives them as opaque values — no enum, no allowlist, no validation against known values. Capability gating is driven entirely by the `features` array, never by the `board` string.
 
@@ -218,7 +218,149 @@ rejected immediately with `error` code `busy` and the same `request_id`. `wifi_s
 read-only, side-effect-free capability, so the ESP32 does not keep a `request_id` dedup cache
 for it — PROTOCOL.md's general dedup-cache guidance under "Reliability and reconnect behavior"
 exists to avoid repeating non-idempotent work, which does not apply here; a retried
-`request_id` simply triggers a normal fresh scan.
+`request_id` simply triggers a normal fresh scan. A `wifi_scan` command is also rejected `busy`
+if `wardriving`'s Wi-Fi source (see below) is currently active — the ESP32 has one physical
+Wi-Fi radio and does not interleave two callers' scan result sets.
+
+### `ble_scan` command and status payloads
+
+The `ble_scan` capability (see [CAPABILITIES.md](CAPABILITIES.md)) mirrors `wifi_scan`'s
+shapes, substituting a device list for an AP list:
+
+- `command` for `ble_scan`: `capability = "ble_scan"`, `arguments = {}` (always an empty map —
+  a non-empty `arguments` map is rejected as `invalid_command`).
+- `status` for `ble_scan`: `state` is `"partial"` or `"complete"` only, same two-state shape as
+  `wifi_scan`. `result` is `{ "devices": [ <device-result>, ... ] }`. The ESP32 sends one or
+  more `partial` records followed by exactly one `complete` record, each sized to fit within
+  the 512-byte payload cap.
+
+Each `<device-result>` map has this fixed field order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `address` | byte string, 6 bytes | BLE device address, raw, as advertised. |
+| `name` | text string, 0-31 bytes, optional | The device's local/complete name from its advertisement data, if any. Omitted from the map entirely (not encoded as an empty string) when the peer advertised no name — the same optional-field convention `error.message` already uses (a caller-side flag controls whether the field is encoded at all, so the map's field count varies; a decoder must treat "field absent" as a legal, distinct case from "field present and empty"). |
+| `rssi_offset` | unsigned integer | Signal strength encoded as `rssi_dbm + 128`, same convention as `wifi_scan`'s `rssi_offset`. |
+| `addr_type` | text string | `"public"` or `"random"` — NimBLE's resolved-private-address variants of a random address both collapse to `"random"`. |
+
+`ble_scan` deliberately carries no advertised-service-UUID field in this version — adding one
+would require a nested array-of-byte-strings per device, pushing real payload weight against
+the 512-byte cap and shrinking how many devices fit per record. Revisit as a protocol revision
+if BLE fingerprinting by advertised service ever becomes a real use case.
+
+**Result cap.** If a scan finds more than 32 devices, the ESP32 reports only the 32 with the
+strongest RSSI and silently drops the rest — same convention as `wifi_scan`.
+
+**Busy handling.** Same as `wifi_scan`: rejected immediately with `error` code `busy` and the
+same `request_id` if a manual `ble_scan` is already in progress; no `request_id` dedup cache
+(read-only, side-effect-free). A `ble_scan` command is also rejected `busy` if `wardriving`'s
+BLE source (see below) is currently active — the ESP32 has one NimBLE discovery state machine
+and does not run two independently-parameterized concurrent scans.
+
+### `wardriving` command and status payloads
+
+The `wardriving` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is a composite capability:
+it runs an autonomous background capture engine (Wi-Fi scanning, BLE observation, and a location
+reading per captured record) that continues across BLE disconnects, buffering results to an
+on-device flash log and streaming them to the Flipper whenever a session is connected and
+authenticated. Its `command`/`status` shapes differ from `wifi_scan`/`ble_scan`'s in ways that
+follow directly from this: there is no natural "complete" state (capture runs indefinitely once
+started), and the ESP32 may send `status` records the Flipper never explicitly requested (the
+buffered backlog accumulated while disconnected).
+
+**`command` for `wardriving`** uses a single `capability = "wardriving"` with an `action` field
+inside `arguments` distinguishing start from stop, rather than two capability strings or a new
+envelope — `arguments` already exists as a map for exactly this kind of extension.
+
+`arguments` field order: `action`, `sources`, `wifi_interval_ms`, `ble_window_ms`,
+`ble_interval_ms`. `sources` and the interval fields are present only when `action = "start"`;
+`arguments = { "action": "stop" }` (that field alone) when stopping.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `action` | text string | `"start"` or `"stop"`. Any other value is `invalid_command`. |
+| `sources` | array of text strings | `["wifi"]`, `["ble"]`, or `["wifi", "ble"]`. Required when `action = "start"`; must be absent when `action = "stop"`. A source the board does not advertise is `invalid_command`. |
+| `wifi_interval_ms` | unsigned integer | Wi-Fi scan cadence in milliseconds. Required when `"wifi"` is in `sources`; absent otherwise. Bounds: see "Interval bounds and defaults" below. Out-of-bounds values are rejected `invalid_command`. |
+| `ble_window_ms` | unsigned integer | BLE observer scan window in milliseconds. Required together with `ble_interval_ms` when `"ble"` is in `sources`; absent otherwise. |
+| `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` is in `sources`; absent otherwise. |
+
+**Interval bounds and defaults.** Bounds and the default are the interval/duty-cycle values
+validated in [PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is
+step 4's "point 1" values (`ble_window_ms=100, ble_interval_ms=1000`, `wifi_interval_ms=30000`);
+maximum (most aggressive) is step 4's "point 4" values (`ble_window_ms=30, ble_interval_ms=30`
+— NimBLE's own default fast-scan parameters — with continuous, back-to-back Wi-Fi scanning).
+**The default when a `start` omits these fields is the maximum/point-4 values** — this project's
+Phase 3 wardriving use case prioritizes capture thoroughness, and step 4 already proved this
+configuration stable indefinitely. A future per-session override remains available via the
+fields above.
+
+**Busy/not-running handling.** `action = "start"` while wardriving is already running is
+rejected `busy`. `action = "stop"` while wardriving is genuinely idle is rejected `not_running`.
+A manual `wifi_scan`/`ble_scan` command received while the matching wardriving source is active
+is rejected `busy` (documented under each of those capabilities above) — starting wardriving
+does not itself reject anything already in progress; there is no scenario where wardriving's
+`start` races a manual scan, since wardriving's `start` is itself rejected `busy` if a manual
+scan using the same radio is mid-operation, and vice versa (whichever operation is already
+running wins; the later request is the one rejected).
+
+**`status` for `wardriving`** uses a state model distinct from `wifi_scan`/`ble_scan`'s
+`partial`/`complete` pair, since wardriving does not run to completion:
+
+| `state` | Meaning |
+| --- | --- |
+| `"started"` | Acknowledges a `start` action. Sent exactly once per successful start. |
+| `"data"` | Carries a batch of captured records — see `result` below. No wire distinction exists between backlog-drain records and live records; `result.backlog_remaining` (below) is how a receiver tells them apart. |
+| `"stopped"` | Acknowledges a `stop` action, or is sent proactively if the engine self-stops for an internal reason (e.g. a persistent flash-write failure) — in the self-stop case, an `error` record accompanies it. |
+
+`result` (present only on `state = "data"`) is `{ "records": [ <wardriving-record>, ... ],
+"backlog_remaining": unsigned integer }`. `backlog_remaining` is the count of buffered records
+still waiting to be drained after this batch — `0` once the ESP32 has caught up to live capture,
+letting the Flipper distinguish "draining backlog: N left" from "live" without a separate state
+value.
+
+**Unsolicited backlog drain.** On every authenticated session establishment, if the ESP32 holds
+any buffered wardriving records (regardless of whether wardriving is currently running — the
+flash log persists independent of run state), it proactively begins draining them via
+`status(state="data")` records without waiting for the Flipper to send a `command`. Because
+`status.request_id` is otherwise defined as echoing an earlier `command`'s `request_id`, these
+unsolicited records use the reserved sentinel **`request_id = 0`** (both firmwares' request-id
+counters begin at `1`, so `0` is never a genuine value) — a Flipper implementation must accept
+a `status` record whose `request_id` is `0` as this unsolicited case, not as a malformed or
+unmatched reply.
+
+`<wardriving-record>` fixed field order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `timestamp_ms` | unsigned integer | Milliseconds since ESP32 boot (`esp_timer_get_time() / 1000`) — this board has no real-time clock, so this is boot-relative, not wall-clock. See CAPABILITIES.md for how the Flipper reconstructs an approximate wall-clock time for WiGLE export. |
+| `lat_e7_offset` | unsigned integer | Latitude, scaled by `1e7` and offset to stay positive: `(int32_t)(lat * 1e7) + 900000000`. Latitude's ±90° range scales to ±900,000,000, so the offset keeps the encoded value in `[1, 1800000001]`, comfortably within an unsigned 32-bit range. The Flipper recovers real latitude as `(lat_e7_offset - 900000000) / 1e7`. |
+| `lon_e7_offset` | unsigned integer | Longitude, same treatment: `(int32_t)(lon * 1e7) + 1800000000`. Longitude's ±180° range scales to ±1,800,000,000; the offset keeps the encoded value in `[1, 3600000001]`. Recovered as `(lon_e7_offset - 1800000000) / 1e7`. |
+| `source` | text string | `"wifi"` or `"ble"` — discriminates `payload`'s shape below. |
+| `payload` | map | A cut-down `wifi_scan`-like map (`ssid`, `bssid`, `rssi_offset`, `channel`, `auth` — the same fields and encodings as `<ap-result>` above, minus `phy`, which wardriving does not need) when `source = "wifi"`; a cut-down `ble_scan`-like map (`address`, `name` optional, `rssi_offset` — the same fields/encodings as `<device-result>` above, minus `addr_type`) when `source = "ble"`. |
+
+**Location source.** Until real GPS hardware is wired to the board, `lat_e7_offset`/
+`lon_e7_offset` come from a fixed, hardcoded coordinate stub behind a swappable location-source
+interface (see [PLAN.md](PLAN.md)) — every record currently carries the same coordinate. This
+is a deliberate, temporary simplification: the wire format already carries a real per-record
+location field, so wiring up real GPS later is a location-source implementation change only,
+with no wire-format or Flipper-side change required.
+
+**Nesting depth.** This shape is `result` (depth 0) -> `records` array (depth 1) ->
+`<wardriving-record>` map (depth 2) -> `payload` map (depth 3) -> `payload`'s own scalar fields
+(depth 4) — exactly at `FEB_CBOR_MAX_NESTING`, using the same fresh-depth-budget convention
+`status.result` already uses (see "Nesting depth" under "Canonical CBOR encoding (definition)"
+above). This has been verified against the shared host-native test vectors; if a future field
+addition needs to nest deeper, flatten `payload`'s fields directly into `<wardriving-record>`
+with a `payload_kind` discriminator instead of a nested map, rather than exceeding the budget.
+
+**Flash log eviction.** The ESP32 buffers captured records in a checksummed, append-only
+circular log on a dedicated flash partition (see [PLAN.md](PLAN.md) step 8). Because raw NOR
+flash can only be erased a whole sector at a time, "drop the oldest records when the buffer is
+full" evicts one erase-sector's worth of records at once (tens of records in a batch), not
+strictly the single oldest record — a true single-record eviction would require a
+wear-levelling translation layer this project deliberately avoids. This has no wire-format
+effect (the Flipper only ever sees whatever records the ESP32 still has), but is a real,
+documented behavioral property of the capability.
 
 ## Reliability and reconnect behavior
 

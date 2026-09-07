@@ -2,7 +2,7 @@
 
 What it's actually like to build, flash, and pair this project today. Scoped strictly to
 what's implemented and hardware-verified (steps 1-7 of [PLAN.md](PLAN.md) plus the
-wifi_scan follow-on capability, verified 2026-09-07) — runtime session authentication now
+wifi_scan and ble_scan follow-on capabilities, both verified by 2026-09-08) — runtime session authentication now
 runs after pairing, and after a successful reconnect the Flipper automatically queries and
 caches the ESP32's board identity and capabilities. An in-firmware factory-reset button-hold gesture now exists on the ESP32 (see below) and has been hardware-verified. For the architecture and wire protocol
 behind any of this, see [PROTOCOL.md](PROTOCOL.md) and [PAIRING.md](PAIRING.md); this guide
@@ -72,10 +72,11 @@ until its next physical reset. On the next reconnection, runtime session authent
 run and you'll see `ESP32 session active`. At that point, the Flipper will also automatically
 query the ESP32's board identity and capabilities (if not already cached), and an additional
 status line will appear on screen showing the board model and its supported features — for
-example, `esp32-c6-devkit: wifi_scan`. This capability line isn't just informational: `wifi_scan`
-is now a real, invokable capability (see "Scanning for Wi-Fi networks" below) — the first
-capability command implemented end to end. Any capability beyond `wifi_scan` is still future
-work (see [PLAN.md](PLAN.md) step 8 onward), not a bug in what's built today.
+example, `esp32-c6-devkit: wifi_scan ble_scan`. This capability line isn't just informational:
+both `wifi_scan` and `ble_scan` are now real, invokable capabilities (see "Scanning for Wi-Fi
+networks" and "Scanning for BLE devices" below) — the first two capability commands implemented
+end to end. Any capability beyond these is still future work (see [PLAN.md](PLAN.md) step 8
+onward), not a bug in what's built today.
 
 Pairing records are stored **per board** (one file per `board_id`, derived from the ESP32's
 factory MAC address), so pairing a second ESP32 later won't disturb a pairing you already
@@ -90,7 +91,7 @@ Once `ESP32 session active` (solid blue LED) is established, if 30 seconds pass 
 
 Once an authenticated session is active and the Flipper's status line shows the board model and its capabilities (e.g., `esp32-c6-devkit: wifi_scan`), you can trigger a Wi-Fi network scan directly from the Flipper — the first capability command now implemented end to end.
 
-**How to scan:** With the app showing `ESP32 session active`, press **OK** from the main screen to start a Wi-Fi scan on the connected ESP32. The app moves to a new results view showing all detected Wi-Fi access points (APs).
+**How to scan:** With the app showing `ESP32 session active`, press **Left** from the main screen to start a Wi-Fi scan on the connected ESP32 (if the board advertises `ble_scan` too, **Right** triggers that instead — see the status line's feature list). The app moves to a new results view showing all detected Wi-Fi access points (APs). From inside that results view, pressing **OK** re-triggers another scan.
 
 **Results display:** Each line shows:
 - **SSID** — the network's name, or empty if the network is hidden.
@@ -107,6 +108,26 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 - If the ESP32 disconnects and reconnects (triggered by the 30-second idle timeout or by the Flipper leaving range briefly), the results remain on screen and your scroll position is preserved — you can continue viewing the same scan results before starting a new one.
 
 **Known limitation:** SSIDs containing non-ASCII or non-printable bytes are displayed after sanitization. A real Wi-Fi network with such an SSID has not been tested on real hardware (the required network was not available during verification), so rendering in this case is not confirmed. The protocol and host-side tests cover this case; hardware coverage is a backlog item if it becomes relevant.
+
+## Scanning for BLE devices
+
+Once an authenticated session is active and the Flipper's status line shows the board model and its capabilities (e.g., `esp32-c6-devkit: wifi_scan ble_scan`), you can trigger a BLE advertisement scan directly from the Flipper — the second capability command now implemented end to end.
+
+**How to scan:** With the app showing `ESP32 session active`, press **Right** from the main screen to start a BLE scan on the connected ESP32 (if the board advertises only `wifi_scan`, the Right button does nothing — **Left** triggers `wifi_scan` instead). The app moves to a new results view showing all detected BLE devices. From inside that results view, pressing **OK** re-triggers another scan.
+
+**Results display:** Each line shows:
+- **Address** — the device's Bluetooth MAC address.
+- **Name** — the device's advertised name, if present in its advertisement.
+- **Signal strength (dBm)** — the received signal power.
+- **Address type** — either `public` or `random`.
+
+The results list is scrollable via **Up/Down**. A header line at the top shows the total count of devices found.
+
+**Scan behavior:**
+- The scan runs for roughly 1-2 seconds and reports up to 32 devices. If more devices are present, only the strongest by signal are shown.
+- Pressing **OK** again while a scan is already in progress has no effect — the app prevents sending a second command until the first completes.
+- Pressing **Back** exits the results view and clears all results from the display. Results are not saved, exported, or persisted in any way — they appear on screen only.
+- If the ESP32 disconnects and reconnects (triggered by the 30-second idle timeout or by the Flipper leaving range briefly), the results remain on screen and your scroll position is preserved — you can continue viewing the same scan results before starting a new one.
 
 ## Factory-resetting the ESP32 without a PC
 

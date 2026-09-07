@@ -148,7 +148,7 @@ Two findings from the hardware-verification pass were backlogged rather than fix
 Capabilities ship incrementally, gated on hardware actually present on a given board — see [CAPABILITIES.md](CAPABILITIES.md) for the registry format and the full, current capability list. See "Roadmap phases" above for how these map onto Phase 3/4/5.
 
 1. **`wifi_scan`** (Phase 3) — first capability, needs no extra hardware. ✅ Implemented and hardware-verified 2026-09-07.
-2. **GPS + wardriving** (Phase 3, after a GY-NEO6MV2/NEO-6M GPS module is wired to the C6): add `ble_scan` and the composite `wardriving` capability. Not yet started — see [CAPABILITIES.md](CAPABILITIES.md) for the full design (autonomous capture from boot, power-loss-safe on-device log, WiGLE CSV export).
+2. **`ble_scan` + `wardriving`** (Phase 3): add `ble_scan` and the composite `wardriving` capability. **Reordered 2026-09-07 to no longer wait on GPS hardware** — see "`ble_scan`, `wardriving`, and the GPS-stub reorder" below for why and how. **`ble_scan` implemented and hardware-verified 2026-09-08** (manual on-device scan trigger via Right button on the main screen, results in a scrollable view, capped at 32 devices by RSSI); `wardriving` (the composite capability and its flash-backed log) not yet started — see [CAPABILITIES.md](CAPABILITIES.md) for the full design (autonomous capture from boot, power-loss-safe on-device log, WiGLE CSV export).
 3. **Heltec board support** (Phase 4, separate baseline, starts after Phase 3 completes): display and LoRa capabilities on a second, structurally different board — see `docs/BASELINES.md`.
 4. **Zigbee/Thread recon** (Phase 5a): passive `zigbee`/`thread` scanning/sniffing capabilities, matching the `wifi_scan`/`ble_scan` pattern — no network joining or commissioning.
 5. **Zigbee/Thread participation** (Phase 5b, much later, separately scoped): active stack participation — an order of magnitude larger effort; not committed to a timeline.
@@ -167,9 +167,10 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 - Store the C6 pairing record in a dedicated encrypted NVS namespace with a version, validity marker, and atomic replacement procedure. Cross-referenced from `docs/CODE_REVIEW_FINDINGS.md` finding #17: today's ESP32 storage (`persist_pairing_secret`/`load_pairing_secret`) is a bare `nvs_set_blob()` with none of version/validity-marker/atomicity — a real, currently-uncosted gap against the written contract that this step owns closing.
 - Implement explicit local unpair/factory-reset behavior and define which pairing record is removed on each side (unpairing one board must not disturb other stored pairing records — see step 7).
 - Store the Flipper pairing record through an atomic app-owned storage update (temporary file, exact write verification, `storage_file_sync()`, close, rename) and do not log it. Treat local SD-card, debug, and modified-firmware access as outside the standalone FAP protection boundary (see [PROTOCOL.md](PROTOCOL.md) "Implementation security requirements" — this is an accepted limitation, not a gap to close in this phase).
-- The wardriving buffer (once that capability exists) uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — drop the oldest record when the buffer is full.
+- The wardriving buffer uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — when full, evicts the oldest **erase-sector's worth** of records at once (raw NOR flash only erases a whole sector at a time; true single-record eviction would need a wear-levelling translation layer, which this bullet's own "not a FAT-based wear-levelling filesystem" already rules out) — not literally the single oldest record. See [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction" note.
+- **Scope note (added 2026-09-07):** the wardriving-log half of this step is being built now, ahead of the rest of Phase 3, as part of "`ble_scan`, `wardriving`, and the GPS-stub reorder" above — not deferred to a later pass through step 8. The pairing-record/capability-file persistence hardening (the first two bullets above) remains deferred; this step isn't "done" until those land too.
 
-**Done when:** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state, for both the pairing record and the wardriving log. Not yet started.
+**Done when:** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state, for both the pairing record and the wardriving log. Wardriving-log persistence: not yet started (see the reorder section above). Pairing-record/capability-file hardening: not yet started.
 
 **See also:** "Deferred: hardware hardening" below — Secure Boot, flash encryption, and related eFuse-dependent work are explicitly out of scope for this phase and are not part of this step's "done when" bar.
 
@@ -212,6 +213,43 @@ The first real use of the generic `command`/`status` message types (defined in [
 **Done when** (the wire-format/build bar): ✅ Met 2026-09-07, both firmwares build- and host-test-verified against the frozen contract and shared vectors.
 
 **Hardware verification:** ✅ Complete 2026-09-07. See `docs/PROJECT_HISTORY.md` for the full narrative, including two real bugs found and fixed during the first hardware test — a Flipper-side send-buffer size bug (deterministic, fixed) and a new ESP32-side `nimble_host`-task stack overflow (same bug class as steps 3/5/7, fixed with the same static-storage pattern) — and a real stack-usage measurement/fix on the Flipper's CBOR-skip recursion (headroom raised from ~20% to ~50% against this project's 30% bar). One accepted gap: no non-ASCII SSID was available nearby to exercise that render path on real hardware (covered by host-native tests).
+
+## `ble_scan`, `wardriving`, and the GPS-stub reorder (Phase 3, decided 2026-09-07)
+
+The original roadmap gated `ble_scan`/`wardriving` on a GY-NEO6MV2/NEO-6M GPS module being
+physically wired to the C6 first. The user decided to unblock this work now instead: implement
+both capabilities using a **fixed-coordinate GPS stub** behind a clean location-source interface
+(`location_get_fix()`), so wiring up real GPS later is a small, localized swap — not a rewrite
+— rather than continuing to wait on hardware bring-up. This also pulls forward the
+wardriving-log half of step 8 below (the hardened flash-backed persistence), built for real now
+scoped to just the wardriving log; the pairing-record/capability-file persistence hardening
+that's the other half of step 8 stays deferred (see step 8's note).
+
+Full design (wire protocol, ESP32 engine including the productionized merged-reconnect-scan
+mechanism, the raw-flash circular log, and the Flipper UI/WiGLE export) is captured in
+[PROTOCOL.md](PROTOCOL.md)'s `ble_scan`/`wardriving` sections and [CAPABILITIES.md](CAPABILITIES.md).
+Key decisions from that design pass, made explicitly with the user:
+
+- **`ble_scan` ships as its own standalone manually-triggered capability** (mirrors `wifi_scan`'s
+  "Scan now" pattern), in addition to being used internally by `wardriving`'s capture engine.
+- **Flash-log eviction is batch-by-sector**, not strict single-record drop-oldest — raw NOR
+  flash's erase-block constraint means true single-record eviction would need a wear-levelling
+  translation layer this project deliberately avoids (see step 8's "not a FAT-based
+  wear-levelling filesystem" framing, and [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction"
+  note). This corrects step 8's original "drop the oldest record" wording below.
+- **Wardriving's default cadence is the most aggressive/thorough validated point from step 4**
+  (continuous-ish Wi-Fi scanning, ~90-100% BLE observer duty — also NimBLE's own default
+  fast-scan parameters), prioritizing capture thoroughness. Fully configurable per-session via
+  the wire protocol regardless.
+- **The Flipper's wardriving control screen ships with fixed defaults only for v1** — one-tap
+  start/stop, no source-selection or interval-entry UI. The app has no form/settings-entry
+  widget anywhere yet; building one is a separate, larger scope addition than anything else here.
+
+**Done when:** matches `wifi_scan`'s bar — both capabilities build- and host-test-verified
+against the frozen wire contract with shared vectors, then hardware-verified on real devices,
+including a forced-disconnect test of the newly-productionized merged-reconnect-scan mechanism
+(closing step 4's long-open "never exercised" gap) and an extended unattended run validating the
+flash log's wraparound and power-loss behavior. Not yet started.
 
 ## Backlog
 

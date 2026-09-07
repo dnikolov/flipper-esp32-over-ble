@@ -10,8 +10,11 @@
    generic `command`/`status` payload schemas (capability-agnostic; `arguments`/`result`
    stay opaque CBOR-map spans captured via feb_cbor_skip_value(), same treatment
    `capability_query`'s `requested` field got) plus the `wifi_scan`-specific `<ap-result>`
-   element and `result` map shapes. It does NOT implement hello/pair_* (those live in
-   session.h/pairing.h). */
+   element and `result` map shapes. The `ble_scan`/`wardriving` step (docs/PROTOCOL.md
+   "`ble_scan` command and status payloads" / "`wardriving` command and status payloads",
+   frozen wire spec) added `<device-result>`/`ble_scan` result shapes and the `wardriving`
+   command/status/`<wardriving-record>` shapes -- wire-format codec layer only, no
+   dispatch/UI. It does NOT implement hello/pair_* (those live in session.h/pairing.h). */
 #ifndef FEB_CBOR_CODEC_H
 #define FEB_CBOR_CODEC_H
 
@@ -278,5 +281,158 @@ typedef struct {
 
 size_t feb_cbor_encode_wifi_scan_result_payload(uint8_t *out, size_t out_cap, const feb_wifi_scan_result_payload_t *payload);
 feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, size_t in_len, feb_wifi_scan_result_payload_t *payload);
+
+/* ---- `ble_scan`-specific `<device-result>` element and `result` map
+   (docs/PROTOCOL.md "`ble_scan` command and status payloads") ----
+   Field order per `<device-result>`: address, name (optional), rssi_offset, addr_type --
+   matches PROTOCOL.md's table exactly. `name` is omitted from the map entirely (not an
+   empty string) when the peer advertised no name -- same has_*-flag optional-field
+   convention as feb_error_payload_t.has_message; a decoder distinguishes "absent" (map has
+   3 entries) from "present and empty" (map has 4 entries, name_len == 0) by the map's own
+   entry count, same technique feb_cbor_decode_status_payload() already uses for its
+   optional `result` field. `rssi_offset` is `rssi_dbm + 128`, same convention as
+   `wifi_scan`'s field of the same name. `address`/`addr_type` follow this header's usual
+   exact-length-copy / caller-owned-text conventions (see `bssid`/`phy`/`auth` above). */
+#define FEB_BLE_SCAN_ADDRESS_LEN 6u
+#define FEB_BLE_SCAN_NAME_MAX_LEN 31u
+/* Per-status-record `devices[]` bound; same generic array cap FEB_WIFI_SCAN_MAX_APS_PER_RECORD
+   reuses. PROTOCOL.md's 32-total-devices-per-scan cap is a separate ESP32-side
+   scan-result-selection concern, not a codec-layer bound. */
+#define FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD FEB_CBOR_MAX_ARRAY_ENTRIES
+
+typedef struct {
+    uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN];
+    const char *name; /* NULL if absent; see has_name */
+    size_t name_len;
+    int has_name;
+    uint64_t rssi_offset; /* rssi_dbm + 128; encoder/decoder reject a value > 255 */
+    const char *addr_type; /* "public" or "random"; caller-owned, not validated here --
+                               same treatment as feb_wifi_scan_ap_t's phy/auth */
+    size_t addr_type_len;
+} feb_ble_scan_device_t;
+
+size_t feb_cbor_encode_ble_scan_device(uint8_t *out, size_t out_cap, const feb_ble_scan_device_t *device);
+size_t feb_cbor_decode_ble_scan_device(const uint8_t *in, size_t in_len, feb_ble_scan_device_t *device, feb_cbor_status_t *status);
+
+typedef struct {
+    feb_ble_scan_device_t devices[FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD];
+    size_t device_count;
+} feb_ble_scan_result_payload_t;
+
+size_t feb_cbor_encode_ble_scan_result_payload(uint8_t *out, size_t out_cap, const feb_ble_scan_result_payload_t *payload);
+feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload(const uint8_t *in, size_t in_len, feb_ble_scan_result_payload_t *payload);
+
+/* ---- `wardriving` command/status payloads (docs/PROTOCOL.md "`wardriving` command and
+   status payloads") ----
+
+   `command.arguments` field order: action, sources, wifi_interval_ms, ble_window_ms,
+   ble_interval_ms -- matches PROTOCOL.md exactly. `sources`/`wifi_interval_ms`/
+   `ble_window_ms`+`ble_interval_ms` are present only for `action = "start"`, and their
+   presence is derived purely from the map's own field count at this layer (0, 1, 2, or 3
+   trailing fields after action+sources) -- this codec does NOT itself validate `action`'s
+   or `sources`' element values against "start"/"stop"/"wifi"/"ble" (that is a dispatch-layer
+   concern, same split as feb_wifi_scan_ap_t's phy/auth not being validated here). Internal
+   representation choice (flag for ESP32-side cross-check): `sources` is captured as a small
+   array of caller-owned text pointers (FEB_WARDRIVING_MAX_SOURCES == 2, the only two
+   defined values today), not as pre-resolved has_wifi_source/has_ble_source booleans --
+   dispatch-layer code inspects the captured strings itself. */
+#define FEB_WARDRIVING_MAX_SOURCES 2u
+
+typedef struct {
+    const char *action;
+    size_t action_len;
+    const char *sources[FEB_WARDRIVING_MAX_SOURCES];
+    size_t source_lens[FEB_WARDRIVING_MAX_SOURCES];
+    size_t source_count;
+    int has_sources; /* absent for action="stop" */
+    uint64_t wifi_interval_ms;
+    int has_wifi_interval_ms;
+    uint64_t ble_window_ms;
+    uint64_t ble_interval_ms;
+    int has_ble_params; /* ble_window_ms/ble_interval_ms are always present or absent
+                            together per PROTOCOL.md */
+} feb_wardriving_command_payload_t;
+
+size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, const feb_wardriving_command_payload_t *payload);
+feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, size_t in_len, feb_wardriving_command_payload_t *payload);
+
+/* `<wardriving-record>.payload` cut-down sub-shapes (docs/PROTOCOL.md: "the same
+   fields/encodings as <ap-result>/<device-result> above, minus phy/addr_type"). Deliberately
+   NOT feb_wifi_scan_ap_t/feb_ble_scan_device_t -- their wire field sets differ (this is
+   PROTOCOL.md's own explicit "cut-down" framing), so reusing those structs would either
+   silently encode a field the wire shape doesn't have or require a wasted/ignored member. */
+typedef struct {
+    const uint8_t *ssid; /* 0..FEB_WIFI_SCAN_SSID_MAX_LEN bytes; not guaranteed valid UTF-8 */
+    size_t ssid_len;
+    uint8_t bssid[FEB_WIFI_SCAN_BSSID_LEN];
+    uint64_t rssi_offset; /* rssi_dbm + 128 */
+    uint64_t channel;
+    const char *auth; /* caller-owned, not validated here */
+    size_t auth_len;
+} feb_wardriving_wifi_payload_t;
+
+typedef struct {
+    uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN];
+    const char *name; /* NULL if absent; see has_name */
+    size_t name_len;
+    int has_name;
+    uint64_t rssi_offset; /* rssi_dbm + 128 */
+} feb_wardriving_ble_payload_t;
+
+size_t feb_cbor_encode_wardriving_wifi_payload(uint8_t *out, size_t out_cap, const feb_wardriving_wifi_payload_t *payload);
+size_t feb_cbor_decode_wardriving_wifi_payload(const uint8_t *in, size_t in_len, feb_wardriving_wifi_payload_t *payload, feb_cbor_status_t *status);
+size_t feb_cbor_encode_wardriving_ble_payload(uint8_t *out, size_t out_cap, const feb_wardriving_ble_payload_t *payload);
+size_t feb_cbor_decode_wardriving_ble_payload(const uint8_t *in, size_t in_len, feb_wardriving_ble_payload_t *payload, feb_cbor_status_t *status);
+
+/* `<wardriving-record>` fixed field order: timestamp_ms, lat_e7_offset, lon_e7_offset,
+   source, payload -- matches PROTOCOL.md exactly. `payload`'s shape is picked by `source`
+   ("wifi" -> wifi_payload, "ble" -> ble_payload); any other `source` value is rejected
+   FEB_CBOR_ERR_UNEXPECTED_TYPE by the decoder (this field IS validated here, unlike
+   action/sources above, because it is structurally required to know which payload shape
+   to decode next -- there is no way to defer it to a dispatch layer). Internal
+   representation choice (flag for ESP32-side cross-check): both wifi_payload and
+   ble_payload are present as named struct members (not a real C union) so a caller can
+   read whichever matches `source` without a type-punning cast; only the member matching
+   `source` is populated/encoded. This struct is large relative to this codec's other
+   per-element types (two full sub-payloads); any code holding an array of these on the
+   BLE event path must keep it file-scope `static`, never a stack local -- see
+   flipper_esp32_over_ble.c's existing static-buffer convention for wifi_scan_result. */
+typedef struct {
+    uint64_t timestamp_ms;
+    uint64_t lat_e7_offset;
+    uint64_t lon_e7_offset;
+    const char *source;
+    size_t source_len;
+    feb_wardriving_wifi_payload_t wifi_payload;
+    feb_wardriving_ble_payload_t ble_payload;
+} feb_wardriving_record_t;
+
+size_t feb_cbor_encode_wardriving_record(uint8_t *out, size_t out_cap, const feb_wardriving_record_t *record);
+size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_wardriving_record_t *record, feb_cbor_status_t *status);
+
+/* `status.result` for `wardriving`: `{ "records": [<wardriving-record>, ...],
+   "backlog_remaining": uint }`, field order records then backlog_remaining, matching
+   PROTOCOL.md. Reached via feb_cbor_decode_status_payload()'s existing fresh-depth-0
+   feb_cbor_skip_value() capture of `result` (unchanged, capability-agnostic) -- this
+   payload's own real structure (result map -> records array -> <wardriving-record> map ->
+   payload map -> payload's own scalar fields) is 4 container levels below `result` itself,
+   landing exactly at FEB_CBOR_MAX_NESTING; verified against a host-native round-trip
+   vector (tests/flipper/test_flipper_codec.c) rather than assumed. This module's own
+   encode/decode functions for `<wardriving-record>`/its sub-payloads are fully
+   schema-aware (direct feb_cbor_decode_map_header/_text/_uint calls, same as
+   feb_cbor_decode_wifi_scan_ap) and never call feb_cbor_skip_value() themselves -- the
+   depth accounting above belongs entirely to the one generic skip_value() call already
+   made by feb_cbor_decode_status_payload() to capture `result`'s span in the first place,
+   not to any recursion introduced by this section. */
+#define FEB_WARDRIVING_MAX_RECORDS_PER_BATCH FEB_CBOR_MAX_ARRAY_ENTRIES
+
+typedef struct {
+    feb_wardriving_record_t records[FEB_WARDRIVING_MAX_RECORDS_PER_BATCH];
+    size_t record_count;
+    uint64_t backlog_remaining;
+} feb_wardriving_status_result_payload_t;
+
+size_t feb_cbor_encode_wardriving_status_result_payload(uint8_t *out, size_t out_cap, const feb_wardriving_status_result_payload_t *payload);
+feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload(const uint8_t *in, size_t in_len, feb_wardriving_status_result_payload_t *payload);
 
 #endif /* FEB_CBOR_CODEC_H */

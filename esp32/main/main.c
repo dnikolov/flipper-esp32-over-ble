@@ -112,6 +112,23 @@ static const char *TAG = "flipper_esp32_over_ble";
    not a tight bound). */
 #define FEB_WIFI_SCAN_STATUS_ENCODE_HEADROOM 32u
 
+/* `ble_scan` capability (docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder").
+   Unlike wifi_scan, there is no driver-reported "total found" count to bound against --
+   NimBLE just keeps delivering BLE_GAP_EVENT_DISC as long as discovery runs -- so
+   FEB_BLE_SCAN_RAW_MAX is the sole bound on the per-window catalog; a window that discovers
+   more distinct addresses than this silently stops cataloging new ones (existing entries
+   keep updating their strongest-seen RSSI). Same self-imposed-bound rationale as
+   FEB_WIFI_SCAN_RAW_MAX. */
+#define FEB_BLE_SCAN_RAW_MAX 64u
+/* Fixed passive-discovery window duration for a manual ble_scan command (docs/PROTOCOL.md
+   doesn't pin an exact number for this capability's scan duration; ~10s is long enough to
+   observe multiple advertising intervals from most nearby peripherals without making a
+   manual "scan now" trigger feel unresponsive). */
+#define FEB_BLE_SCAN_WINDOW_MS 10000u
+/* Same headroom rationale as FEB_WIFI_SCAN_STATUS_ENCODE_HEADROOM, applied to ble_scan's
+   `status` record packing. */
+#define FEB_BLE_SCAN_STATUS_ENCODE_HEADROOM 32u
+
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x9c, 0x3f, 0x7e, 0x6a, 0xf4, 0x03, 0x4c, 0x31,
     0x9e, 0xa2, 0x58, 0xa7, 0xa2, 0x0f, 0xb8, 0x11);
@@ -164,6 +181,7 @@ typedef enum {
     TX_DONE_AWAIT_HELLO_ACK,
     TX_DONE_RUNTIME_AUTHENTICATED,
     TX_DONE_CONTINUE_WIFI_SCAN, /* another wifi_scan status batch is queued behind this one */
+    TX_DONE_CONTINUE_BLE_SCAN,  /* another ble_scan status batch is queued behind this one */
 } tx_done_action_t;
 static tx_done_action_t tx_done_action = TX_DONE_NONE;
 
@@ -215,7 +233,7 @@ static uint64_t rt_rx_sequence;
 static uint8_t rt_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
 static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
 
-static const char *const feb_features[] = {"wifi_scan"};
+static const char *const feb_features[] = {"wifi_scan", "ble_scan"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
 
 /* docs/PLAN.md "Wi-Fi scan capability" step. wifi_scan_raw_records/wifi_scan_selected are
@@ -234,6 +252,30 @@ static uint16_t wifi_scan_send_next_index;
 static volatile bool wifi_scan_in_progress;
 static uint64_t wifi_scan_request_id;
 static struct ble_npl_callout wifi_scan_done_co;
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": per-window BLE device
+   catalog, written only from gap_event()'s BLE_GAP_EVENT_DISC case (NimBLE host task) while
+   ble_scan_in_progress is set, and read only from ble_scan_window_close_cb() /
+   ble_scan_send_next_batch() -- both also on the NimBLE host task via the same callout
+   mechanism reassembly_timeout_co/wifi_scan_done_co already use. Unlike wifi_scan, there is
+   no separate task handoff here: BLE discovery events already arrive on the NimBLE host
+   task, so the window-close callout is the only synchronization primitive needed. */
+typedef struct {
+    uint8_t addr[FEB_BLE_SCAN_ADDRESS_LEN];
+    uint8_t addr_type; /* raw ble_addr_t.type (BLE_ADDR_PUBLIC/RANDOM/PUBLIC_ID/RANDOM_ID) */
+    int8_t rssi;
+    char name[FEB_BLE_SCAN_NAME_MAX_LEN];
+    size_t name_len;
+    bool has_name;
+} ble_scan_raw_device_t;
+static ble_scan_raw_device_t ble_scan_raw_devices[FEB_BLE_SCAN_RAW_MAX];
+static uint16_t ble_scan_raw_count;
+static feb_ble_scan_device_t ble_scan_selected[FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD];
+static uint16_t ble_scan_found_count;
+static uint16_t ble_scan_send_next_index;
+static volatile bool ble_scan_in_progress;
+static uint64_t ble_scan_request_id;
+static struct ble_npl_callout ble_scan_done_co;
 
 static uint8_t esp32_private_key[FEB_X25519_KEY_LEN];
 static uint8_t esp32_public_key[FEB_X25519_KEY_LEN];
@@ -283,10 +325,15 @@ static void schedule_runtime_auth_backoff(void);
 static bool connecting_permitted(void);
 static void handle_capability_query(uint16_t conn_handle);
 static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wifi_scan_send_next_batch(uint16_t conn_handle);
 static void wifi_scan_done_cb(struct ble_npl_event *ev);
 static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
 static void start_wifi_subsystem(void);
+static void ble_scan_catalog_advertisement(const struct ble_gap_disc_desc *disc);
+static void ble_scan_send_next_batch(uint16_t conn_handle);
+static void ble_scan_window_close_cb(struct ble_npl_event *ev);
 
 static void compute_board_id(void)
 {
@@ -878,6 +925,23 @@ static const char *wifi_scan_auth_str(wifi_auth_mode_t mode)
     }
 }
 
+/* docs/PROTOCOL.md "`ble_scan` command and status payloads": "NimBLE's resolved-private-
+   address variants of a random address both collapse to `random`" -- BLE_ADDR_PUBLIC_ID is
+   the resolved-identity counterpart of BLE_ADDR_PUBLIC, so it collapses to "public" the same
+   way BLE_ADDR_RANDOM_ID collapses to "random". */
+static const char *ble_scan_addr_type_str(uint8_t addr_type)
+{
+    switch (addr_type) {
+    case BLE_ADDR_PUBLIC:
+    case BLE_ADDR_PUBLIC_ID:
+        return "public";
+    case BLE_ADDR_RANDOM:
+    case BLE_ADDR_RANDOM_ID:
+    default:
+        return "random";
+    }
+}
+
 /* Runs on the default event loop's own task (sys_evt), never the NimBLE host task -- per
    docs/PLAN.md's scan-execution-model decision, a multi-second blocking scan must not run
    inside the protected-record dispatch handler on the NimBLE host task. Fetches results,
@@ -1058,21 +1122,15 @@ static void wifi_scan_send_next_batch(uint16_t conn_handle)
     }
 }
 
-static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+/* docs/PLAN.md "Wi-Fi scan capability" step. Extracted unmodified from what used to be the
+   whole body of handle_command() (docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub
+   reorder": that function is now a capability-name dispatcher -- see below). */
+static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
 {
     size_t arg_count;
     feb_cbor_status_t status;
     esp_err_t err;
     wifi_scan_config_t scan_cfg;
-
-    if (cmd->capability_len != strlen("wifi_scan") ||
-        memcmp(cmd->capability, "wifi_scan", cmd->capability_len) != 0) {
-        if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
-                                  1, cmd->request_id)) {
-            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        }
-        return;
-    }
 
     if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
         arg_count != 0) {
@@ -1090,6 +1148,10 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
         return;
     }
 
+    /* TODO(wardriving): also reject `busy` here once wardriving's Wi-Fi source can be
+       active concurrently -- docs/PROTOCOL.md's wifi_scan busy-handling rule already
+       specifies this; wardriving doesn't exist yet, so there's nothing to check against. */
+
     wifi_scan_in_progress = true;
     wifi_scan_request_id = cmd->request_id;
     memset(&scan_cfg, 0, sizeof(scan_cfg));
@@ -1104,6 +1166,274 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
         return;
     }
     ESP_LOGI(TAG, "wifi_scan started (request_id=%llu)", (unsigned long long)cmd->request_id);
+}
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": mirrors
+   handle_wifi_scan_command()'s validation/busy-check/start shape exactly (arguments must be
+   an empty map; busy guard; own_addr_type-scoped discovery start), substituting a fixed-
+   duration passive BLE discovery window for a Wi-Fi scan. The window itself is closed by
+   ble_scan_done_co (armed here), not by any GAP "discovery complete" callback -- NimBLE
+   passive discovery with BLE_HS_FOREVER runs until explicitly cancelled. */
+static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    size_t arg_count;
+    feb_cbor_status_t status;
+    struct ble_gap_disc_params params = {0};
+    int rc;
+
+    if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
+        arg_count != 0) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    if (ble_scan_in_progress) {
+        if (!send_protected_error(conn_handle, "busy", strlen("busy"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    /* TODO(wardriving): also reject `busy` here once wardriving's BLE source can be active
+       concurrently -- docs/PROTOCOL.md's ble_scan busy-handling rule already specifies this;
+       wardriving doesn't exist yet, so there's nothing to check against. */
+
+    ble_scan_in_progress = true;
+    ble_scan_request_id = cmd->request_id;
+    ble_scan_raw_count = 0;
+
+    params.passive = 1;
+    /* No controller dup-filtering here (unlike start_scan()'s reconnect-scan concern) --
+       ble_scan wants every advertisement so it can track each address's strongest RSSI
+       itself; see ble_scan_catalog_advertisement()'s own dedup-by-address handling. */
+    params.filter_duplicates = 0;
+    params.itvl = 0;
+    params.window = 0;
+    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "ble_scan: ble_gap_disc start failed: %d", rc);
+        ble_scan_in_progress = false;
+        if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+    ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(FEB_BLE_SCAN_WINDOW_MS));
+    ESP_LOGI(TAG, "ble_scan started (request_id=%llu)", (unsigned long long)cmd->request_id);
+}
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": capability-name
+   dispatch. A lookup table isn't earned yet at two entries (docs/SESSION_MEMORY.md's design
+   note). */
+static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    if (cmd->capability_len == strlen("wifi_scan") &&
+        memcmp(cmd->capability, "wifi_scan", cmd->capability_len) == 0) {
+        handle_wifi_scan_command(conn_handle, cmd);
+    } else if (cmd->capability_len == strlen("ble_scan") &&
+              memcmp(cmd->capability, "ble_scan", cmd->capability_len) == 0) {
+        handle_ble_scan_command(conn_handle, cmd);
+    } else if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
+                                     1, cmd->request_id)) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": parses one
+   BLE_GAP_EVENT_DISC advertisement's fields (reusing ble_hs_adv_parse_fields(), the same
+   primitive scan_record_matches() already uses in this same call path -- no duplicated
+   parsing) and folds it into ble_scan_raw_devices[], deduping by address within the current
+   window and keeping the strongest RSSI seen. `struct ble_hs_adv_fields` is a small,
+   pointer/scalar-only local (no embedded arrays) -- the same stack footprint
+   scan_record_matches() already carries on this exact call path, so this adds no new stack
+   risk beyond what's already accepted there. */
+static void ble_scan_catalog_advertisement(const struct ble_gap_disc_desc *disc)
+{
+    struct ble_hs_adv_fields fields;
+    uint16_t index;
+    ble_scan_raw_device_t *dev;
+
+    memset(&fields, 0, sizeof(fields));
+    if (ble_hs_adv_parse_fields(&fields, disc->data, disc->length_data) != 0) {
+        return;
+    }
+
+    for (index = 0; index < ble_scan_raw_count; index++) {
+        if (memcmp(ble_scan_raw_devices[index].addr, disc->addr.val, FEB_BLE_SCAN_ADDRESS_LEN) == 0) {
+            break;
+        }
+    }
+
+    if (index == ble_scan_raw_count) {
+        if (ble_scan_raw_count >= FEB_BLE_SCAN_RAW_MAX) {
+            /* Raw catalog full for this window -- drop silently, matching
+               FEB_WIFI_SCAN_RAW_MAX's accepted-limitation treatment. */
+            return;
+        }
+        dev = &ble_scan_raw_devices[index];
+        memcpy(dev->addr, disc->addr.val, FEB_BLE_SCAN_ADDRESS_LEN);
+        dev->addr_type = disc->addr.type;
+        dev->rssi = disc->rssi;
+        dev->has_name = false;
+        dev->name_len = 0;
+        ble_scan_raw_count++;
+    } else {
+        dev = &ble_scan_raw_devices[index];
+        if (disc->rssi > dev->rssi) {
+            dev->rssi = disc->rssi;
+        }
+    }
+
+    if (fields.name_len > 0 && !dev->has_name) {
+        uint8_t copy_len = fields.name_len;
+
+        if (copy_len > FEB_BLE_SCAN_NAME_MAX_LEN) {
+            copy_len = FEB_BLE_SCAN_NAME_MAX_LEN;
+        }
+        memcpy(dev->name, fields.name, copy_len);
+        dev->name_len = copy_len;
+        dev->has_name = true;
+    }
+}
+
+/* Builds and sends one ble_scan `status` record starting at ble_scan_send_next_index,
+   mirroring wifi_scan_send_next_batch()'s under-512-byte packing/chaining exactly --
+   see that function's comment for why result/trial/status_payload/result_buf are static,
+   not stack-local (same nimble_host task, same ~4084-byte budget, same
+   single-in-flight-fragmentation reentrancy argument). */
+static void ble_scan_send_next_batch(uint16_t conn_handle)
+{
+    static feb_ble_scan_result_payload_t result;
+    static feb_ble_scan_result_payload_t trial;
+    static feb_status_payload_t status_payload;
+    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t result_len;
+    size_t payload_len;
+    bool is_complete;
+
+    memset(&result, 0, sizeof(result));
+    memset(&status_payload, 0, sizeof(status_payload));
+
+    while (ble_scan_send_next_index < ble_scan_found_count &&
+           result.device_count < FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD) {
+        size_t trial_len;
+
+        trial = result;
+        trial.devices[trial.device_count] = ble_scan_selected[ble_scan_send_next_index];
+        trial.device_count++;
+        trial_len = feb_cbor_encode_ble_scan_result_payload(result_buf, sizeof(result_buf), &trial);
+        if (trial_len == 0 || trial_len + FEB_BLE_SCAN_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
+            if (result.device_count == 0) {
+                ESP_LOGE(TAG, "ble_scan: single device result too large to encode; dropping it");
+                ble_scan_send_next_index++;
+                continue;
+            }
+            break;
+        }
+        result = trial;
+        ble_scan_send_next_index++;
+    }
+
+    result_len = feb_cbor_encode_ble_scan_result_payload(result_buf, sizeof(result_buf), &result);
+    is_complete = (ble_scan_send_next_index >= ble_scan_found_count);
+
+    status_payload.request_id = ble_scan_request_id;
+    status_payload.state = is_complete ? "complete" : "partial";
+    status_payload.state_len = strlen(status_payload.state);
+    status_payload.result_span = result_buf;
+    status_payload.result_span_len = result_len;
+    status_payload.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+    if (payload_len == 0 ||
+        !queue_and_send_protected(conn_handle, "status", strlen("status"),
+                                  pairing_payload_encode_buf, payload_len,
+                                  is_complete ? TX_DONE_NONE : TX_DONE_CONTINUE_BLE_SCAN)) {
+        ESP_LOGE(TAG, "failed to build ble_scan status record");
+        ble_scan_in_progress = false;
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ESP_LOGI(TAG, "sending ble_scan status (%s, %u device(s) this batch)",
+             is_complete ? "complete" : "partial", (unsigned)result.device_count);
+
+    if (is_complete) {
+        ble_scan_in_progress = false;
+    }
+}
+
+/* Fires once FEB_BLE_SCAN_WINDOW_MS after handle_ble_scan_command() armed this callout --
+   same ble_npl_callout mechanism as reassembly_timeout_co/wifi_scan_done_co, running on the
+   NimBLE host task. Cancels the still-running discovery, selection-sorts the top
+   FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD by RSSI (mirrors wifi_scan_done_handler()'s pattern),
+   then sends -- or, if the connection that requested this scan is gone, discards, exactly
+   like wifi_scan_done_cb()'s "no authenticated connection" branch. */
+static void ble_scan_window_close_cb(struct ble_npl_event *ev)
+{
+    uint16_t keep;
+    uint16_t k;
+    int rc;
+
+    (void)ev;
+
+    rc = ble_gap_disc_cancel();
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "ble_scan: ble_gap_disc_cancel at window close failed: %d", rc);
+    }
+
+    keep = (ble_scan_raw_count < FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD) ?
+           ble_scan_raw_count : FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD;
+    for (k = 0; k < keep; k++) {
+        uint16_t best = k;
+        uint16_t j;
+        ble_scan_raw_device_t *rec;
+        feb_ble_scan_device_t *out;
+
+        for (j = (uint16_t)(k + 1); j < ble_scan_raw_count; j++) {
+            if (ble_scan_raw_devices[j].rssi > ble_scan_raw_devices[best].rssi) {
+                best = j;
+            }
+        }
+        if (best != k) {
+            ble_scan_raw_device_t tmp = ble_scan_raw_devices[k];
+
+            ble_scan_raw_devices[k] = ble_scan_raw_devices[best];
+            ble_scan_raw_devices[best] = tmp;
+        }
+
+        rec = &ble_scan_raw_devices[k];
+        out = &ble_scan_selected[k];
+        memcpy(out->address, rec->addr, FEB_BLE_SCAN_ADDRESS_LEN);
+        if (rec->has_name) {
+            out->name = rec->name;
+            out->name_len = rec->name_len;
+            out->has_name = 1;
+        } else {
+            out->name = NULL;
+            out->name_len = 0;
+            out->has_name = 0;
+        }
+        out->rssi_offset = (uint64_t)((int)rec->rssi + 128);
+        out->addr_type = ble_scan_addr_type_str(rec->addr_type);
+        out->addr_type_len = strlen(out->addr_type);
+    }
+
+    ble_scan_found_count = keep;
+    ble_scan_send_next_index = 0;
+
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        ESP_LOGW(TAG, "ble_scan window closed with no authenticated connection; discarding %u result(s)",
+                 (unsigned)ble_scan_found_count);
+        ble_scan_in_progress = false;
+        return;
+    }
+    ble_scan_send_next_batch(connection_handle);
 }
 
 /* docs/PLAN.md "Wi-Fi scan capability" step: esp_netif/default event loop/esp_wifi
@@ -1486,6 +1816,9 @@ static int write_complete(uint16_t conn_handle,
     case TX_DONE_CONTINUE_WIFI_SCAN:
         wifi_scan_send_next_batch(conn_handle);
         break;
+    case TX_DONE_CONTINUE_BLE_SCAN:
+        ble_scan_send_next_batch(conn_handle);
+        break;
     default:
         break;
     }
@@ -1500,6 +1833,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC:
         scan_report_window_count++;
         scan_report_lifetime_total++;
+
+        /* TODO(wardriving): also gate on wardriving_ble_capture_active once that exists --
+           this task only wires the manual ble_scan busy-guard condition. */
+        if (ble_scan_in_progress) {
+            ble_scan_catalog_advertisement(&event->disc);
+        }
+
         if (connection_handle == BLE_HS_CONN_HANDLE_NONE &&
             scan_record_matches(event->disc.data, event->disc.length_data)) {
             if (!connecting_permitted()) {
@@ -1591,6 +1931,23 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                          esp_err_to_name(serr));
             }
             ESP_LOGI(TAG, "wifi_scan was in progress at disconnect; stopping it "
+                          "(pending results will be discarded)");
+        }
+
+        if (ble_scan_in_progress) {
+            /* Same disconnect-safety shape as wifi_scan_in_progress above: stop the radio
+               scan immediately, but don't clear ble_scan_in_progress here -- the
+               already-armed ble_scan_done_co window-close callout will observe "no
+               authenticated connection" when it fires and clear the flag there, uniformly
+               (avoids a race with a new connection's `command` reusing
+               ble_scan_raw_devices/ble_scan_selected while this window's data is still being
+               finalized). */
+            int derr = ble_gap_disc_cancel();
+
+            if (derr != 0 && derr != BLE_HS_EALREADY) {
+                ESP_LOGW(TAG, "ble_gap_disc_cancel failed during disconnect cleanup: %d", derr);
+            }
+            ESP_LOGI(TAG, "ble_scan was in progress at disconnect; stopping discovery "
                           "(pending results will be discarded)");
         }
 
@@ -1894,6 +2251,7 @@ static void host_synced(void)
     ble_npl_callout_reset(&reassembly_timeout_co,
                           ble_npl_time_ms_to_ticks32(FEB_REASSEMBLY_CHECK_INTERVAL_MS));
     ble_npl_callout_init(&wifi_scan_done_co, nimble_port_get_dflt_eventq(), wifi_scan_done_cb, NULL);
+    ble_npl_callout_init(&ble_scan_done_co, nimble_port_get_dflt_eventq(), ble_scan_window_close_cb, NULL);
     ESP_LOGI(TAG, "starting v2 service-filtered scan");
     start_scan();
 }

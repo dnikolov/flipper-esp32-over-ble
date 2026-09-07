@@ -577,6 +577,461 @@ static void test_status_payload_codec(void) {
     }
 }
 
+/* ---- ble_scan payload codecs (docs/PROTOCOL.md "`ble_scan` command and status
+   payloads") ----
+   No shared FEB_VEC_* vectors exist for these yet (this pass is scoped to the codec layer
+   only, and a parallel ESP32-side task is producing its own vectors from the same frozen
+   PROTOCOL.md spec) -- these tests build their own inputs directly via this file's own
+   encode functions and hand-assembled raw CBOR, rather than extending
+   tests/vectors/generate_vectors.py, to avoid a concurrent-edit collision with that
+   parallel task on a shared generated file. */
+
+static void test_ble_scan_device_codec(void) {
+    /* device with a name */
+    {
+        feb_ble_scan_device_t device;
+        memset(&device, 0, sizeof(device));
+        static const uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+        memcpy(device.address, address, FEB_BLE_SCAN_ADDRESS_LEN);
+        device.name = "TestDevice";
+        device.name_len = strlen(device.name);
+        device.has_name = 1;
+        device.rssi_offset = 78; /* rssi_dbm -50 */
+        device.addr_type = "public";
+        device.addr_type_len = strlen(device.addr_type);
+
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_ble_scan_device(out, sizeof(out), &device);
+        CHECK(out_len > 0, "BLE_DEVICE_NAMED: encode succeeds");
+
+        feb_cbor_status_t status;
+        feb_ble_scan_device_t decoded;
+        size_t n = feb_cbor_decode_ble_scan_device(out, out_len, &decoded, &status);
+        CHECK(n == out_len && status == FEB_CBOR_OK, "BLE_DEVICE_NAMED: decode consumes whole buffer");
+        CHECK(memcmp(decoded.address, address, FEB_BLE_SCAN_ADDRESS_LEN) == 0, "BLE_DEVICE_NAMED: address matches");
+        CHECK(decoded.has_name == 1, "BLE_DEVICE_NAMED: has_name set");
+        CHECK(
+            decoded.name_len == strlen("TestDevice") && memcmp(decoded.name, "TestDevice", decoded.name_len) == 0,
+            "BLE_DEVICE_NAMED: name matches");
+        CHECK(decoded.rssi_offset == 78, "BLE_DEVICE_NAMED: rssi_offset matches");
+        CHECK(
+            decoded.addr_type_len == strlen("public") && memcmp(decoded.addr_type, "public", decoded.addr_type_len) == 0,
+            "BLE_DEVICE_NAMED: addr_type matches");
+
+        uint8_t reencoded[128];
+        size_t reencoded_len = feb_cbor_encode_ble_scan_device(reencoded, sizeof(reencoded), &decoded);
+        CHECK(
+            bytes_equal(reencoded, reencoded_len, out, out_len),
+            "BLE_DEVICE_NAMED: re-encode byte-identical");
+    }
+
+    /* device with no advertised name -- optional-field omission, same convention as
+       feb_error_payload_t.has_message */
+    {
+        feb_ble_scan_device_t device;
+        memset(&device, 0, sizeof(device));
+        static const uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+        memcpy(device.address, address, FEB_BLE_SCAN_ADDRESS_LEN);
+        device.has_name = 0;
+        device.rssi_offset = 0; /* rssi_dbm -128, extreme low */
+        device.addr_type = "random";
+        device.addr_type_len = strlen(device.addr_type);
+
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_ble_scan_device(out, sizeof(out), &device);
+        CHECK(out_len > 0, "BLE_DEVICE_NO_NAME: encode succeeds");
+
+        feb_cbor_status_t status;
+        feb_ble_scan_device_t decoded;
+        size_t n = feb_cbor_decode_ble_scan_device(out, out_len, &decoded, &status);
+        CHECK(n == out_len && status == FEB_CBOR_OK, "BLE_DEVICE_NO_NAME: decode consumes whole buffer");
+        CHECK(decoded.has_name == 0, "BLE_DEVICE_NO_NAME: has_name not set");
+        CHECK(decoded.rssi_offset == 0, "BLE_DEVICE_NO_NAME: rssi_offset matches");
+        CHECK(
+            decoded.addr_type_len == strlen("random") && memcmp(decoded.addr_type, "random", decoded.addr_type_len) == 0,
+            "BLE_DEVICE_NO_NAME: addr_type matches");
+    }
+
+    /* malformed: only 2 fields present (address, rssi_offset) -- missing addr_type */
+    {
+        uint8_t buf[64];
+        size_t pos = 0;
+        size_t n;
+        static const uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN] = {0, 1, 2, 3, 4, 5};
+        n = feb_cbor_encode_map_header(buf, sizeof(buf), 2);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "address", sizeof("address") - 1);
+        pos += n;
+        n = feb_cbor_encode_bytes(buf + pos, sizeof(buf) - pos, address, FEB_BLE_SCAN_ADDRESS_LEN);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "rssi_offset", sizeof("rssi_offset") - 1);
+        pos += n;
+        n = feb_cbor_encode_uint(buf + pos, sizeof(buf) - pos, 50);
+        pos += n;
+
+        feb_cbor_status_t status;
+        feb_ble_scan_device_t decoded;
+        size_t decode_n = feb_cbor_decode_ble_scan_device(buf, pos, &decoded, &status);
+        CHECK(
+            decode_n == 0 && status == FEB_CBOR_ERR_MISSING_FIELD,
+            "BLE_DEVICE_MISSING_ADDR_TYPE: rejected with MISSING_FIELD");
+    }
+}
+
+static void test_ble_scan_result_payload_codec(void) {
+    static feb_ble_scan_device_t device1, device2;
+    memset(&device1, 0, sizeof(device1));
+    memset(&device2, 0, sizeof(device2));
+    static const uint8_t addr1[FEB_BLE_SCAN_ADDRESS_LEN] = {1, 2, 3, 4, 5, 6};
+    static const uint8_t addr2[FEB_BLE_SCAN_ADDRESS_LEN] = {6, 5, 4, 3, 2, 1};
+    memcpy(device1.address, addr1, FEB_BLE_SCAN_ADDRESS_LEN);
+    device1.name = "Alpha";
+    device1.name_len = strlen(device1.name);
+    device1.has_name = 1;
+    device1.rssi_offset = 90;
+    device1.addr_type = "public";
+    device1.addr_type_len = strlen(device1.addr_type);
+
+    memcpy(device2.address, addr2, FEB_BLE_SCAN_ADDRESS_LEN);
+    device2.has_name = 0;
+    device2.rssi_offset = 40;
+    device2.addr_type = "random";
+    device2.addr_type_len = strlen(device2.addr_type);
+
+    /* two devices */
+    {
+        static feb_ble_scan_result_payload_t payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.devices[0] = device1;
+        payload.devices[1] = device2;
+        payload.device_count = 2;
+
+        static uint8_t out[256];
+        size_t out_len = feb_cbor_encode_ble_scan_result_payload(out, sizeof(out), &payload);
+        CHECK(out_len > 0, "BLE_RESULT_TWO: encode succeeds");
+
+        static feb_ble_scan_result_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_ble_scan_result_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "BLE_RESULT_TWO: decode status OK");
+        CHECK(decoded.device_count == 2, "BLE_RESULT_TWO: device_count == 2");
+        CHECK(decoded.devices[0].has_name == 1, "BLE_RESULT_TWO: device0 has_name");
+        CHECK(decoded.devices[1].has_name == 0, "BLE_RESULT_TWO: device1 has no name");
+    }
+
+    /* empty */
+    {
+        feb_ble_scan_result_payload_t empty;
+        memset(&empty, 0, sizeof(empty));
+        uint8_t out[16];
+        size_t out_len = feb_cbor_encode_ble_scan_result_payload(out, sizeof(out), &empty);
+        CHECK(out_len > 0, "BLE_RESULT_EMPTY: encode succeeds");
+
+        feb_ble_scan_result_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_ble_scan_result_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "BLE_RESULT_EMPTY: decode status OK");
+        CHECK(decoded.device_count == 0, "BLE_RESULT_EMPTY: device_count == 0");
+    }
+}
+
+/* ---- wardriving payload codecs (docs/PROTOCOL.md "`wardriving` command and status
+   payloads") ---- */
+
+static void test_wardriving_command_payload_codec(void) {
+    /* start, both sources, aggressive/point-4 defaults */
+    {
+        feb_wardriving_command_payload_t payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.action = "start";
+        payload.action_len = strlen(payload.action);
+        payload.sources[0] = "wifi";
+        payload.source_lens[0] = strlen("wifi");
+        payload.sources[1] = "ble";
+        payload.source_lens[1] = strlen("ble");
+        payload.source_count = 2;
+        payload.has_sources = 1;
+        payload.wifi_interval_ms = 30; /* continuous-ish, step 4 point 4 */
+        payload.has_wifi_interval_ms = 1;
+        payload.ble_window_ms = 30;
+        payload.ble_interval_ms = 30;
+        payload.has_ble_params = 1;
+
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
+        CHECK(out_len > 0, "WARDRIVING_CMD_START_BOTH: encode succeeds");
+
+        feb_wardriving_command_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_wardriving_command_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "WARDRIVING_CMD_START_BOTH: decode status OK");
+        CHECK(
+            decoded.action_len == strlen("start") && memcmp(decoded.action, "start", decoded.action_len) == 0,
+            "WARDRIVING_CMD_START_BOTH: action == \"start\"");
+        CHECK(decoded.has_sources == 1 && decoded.source_count == 2, "WARDRIVING_CMD_START_BOTH: 2 sources");
+        CHECK(decoded.has_wifi_interval_ms == 1 && decoded.wifi_interval_ms == 30, "WARDRIVING_CMD_START_BOTH: wifi_interval_ms == 30");
+        CHECK(
+            decoded.has_ble_params == 1 && decoded.ble_window_ms == 30 && decoded.ble_interval_ms == 30,
+            "WARDRIVING_CMD_START_BOTH: ble params == 30/30");
+
+        uint8_t reencoded[128];
+        size_t reencoded_len = feb_cbor_encode_wardriving_command_payload(reencoded, sizeof(reencoded), &decoded);
+        CHECK(bytes_equal(reencoded, reencoded_len, out, out_len), "WARDRIVING_CMD_START_BOTH: re-encode byte-identical");
+    }
+
+    /* start, wifi source only, conservative point-1 interval */
+    {
+        feb_wardriving_command_payload_t payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.action = "start";
+        payload.action_len = strlen(payload.action);
+        payload.sources[0] = "wifi";
+        payload.source_lens[0] = strlen("wifi");
+        payload.source_count = 1;
+        payload.has_sources = 1;
+        payload.wifi_interval_ms = 30000;
+        payload.has_wifi_interval_ms = 1;
+
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
+        CHECK(out_len > 0, "WARDRIVING_CMD_START_WIFI_ONLY: encode succeeds");
+
+        feb_wardriving_command_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_wardriving_command_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "WARDRIVING_CMD_START_WIFI_ONLY: decode status OK");
+        CHECK(decoded.source_count == 1, "WARDRIVING_CMD_START_WIFI_ONLY: 1 source");
+        CHECK(decoded.has_wifi_interval_ms == 1 && decoded.wifi_interval_ms == 30000, "WARDRIVING_CMD_START_WIFI_ONLY: wifi_interval_ms == 30000");
+        CHECK(decoded.has_ble_params == 0, "WARDRIVING_CMD_START_WIFI_ONLY: no ble params");
+    }
+
+    /* start, ble source only */
+    {
+        feb_wardriving_command_payload_t payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.action = "start";
+        payload.action_len = strlen(payload.action);
+        payload.sources[0] = "ble";
+        payload.source_lens[0] = strlen("ble");
+        payload.source_count = 1;
+        payload.has_sources = 1;
+        payload.ble_window_ms = 100;
+        payload.ble_interval_ms = 1000;
+        payload.has_ble_params = 1;
+
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
+        CHECK(out_len > 0, "WARDRIVING_CMD_START_BLE_ONLY: encode succeeds");
+
+        feb_wardriving_command_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_wardriving_command_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "WARDRIVING_CMD_START_BLE_ONLY: decode status OK");
+        CHECK(decoded.has_wifi_interval_ms == 0, "WARDRIVING_CMD_START_BLE_ONLY: no wifi_interval_ms");
+        CHECK(
+            decoded.has_ble_params == 1 && decoded.ble_window_ms == 100 && decoded.ble_interval_ms == 1000,
+            "WARDRIVING_CMD_START_BLE_ONLY: ble params == 100/1000");
+    }
+
+    /* stop */
+    {
+        feb_wardriving_command_payload_t payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.action = "stop";
+        payload.action_len = strlen(payload.action);
+
+        uint8_t out[32];
+        size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
+        CHECK(out_len > 0, "WARDRIVING_CMD_STOP: encode succeeds");
+
+        feb_wardriving_command_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_wardriving_command_payload(out, out_len, &decoded);
+        CHECK(status == FEB_CBOR_OK, "WARDRIVING_CMD_STOP: decode status OK");
+        CHECK(
+            decoded.action_len == strlen("stop") && memcmp(decoded.action, "stop", decoded.action_len) == 0,
+            "WARDRIVING_CMD_STOP: action == \"stop\"");
+        CHECK(decoded.has_sources == 0, "WARDRIVING_CMD_STOP: no sources");
+        CHECK(decoded.has_wifi_interval_ms == 0 && decoded.has_ble_params == 0, "WARDRIVING_CMD_STOP: no interval fields");
+    }
+
+    /* malformed: field at position 1 is "wifi_interval_ms", not the required "sources"
+       -- fixed field order violation. */
+    {
+        uint8_t buf[64];
+        size_t pos = 0;
+        size_t n;
+        n = feb_cbor_encode_map_header(buf, sizeof(buf), 2);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "action", sizeof("action") - 1);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "start", sizeof("start") - 1);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "wifi_interval_ms", sizeof("wifi_interval_ms") - 1);
+        pos += n;
+        n = feb_cbor_encode_uint(buf + pos, sizeof(buf) - pos, 30000);
+        pos += n;
+
+        feb_wardriving_command_payload_t decoded;
+        feb_cbor_status_t status = feb_cbor_decode_wardriving_command_payload(buf, pos, &decoded);
+        CHECK(
+            status == FEB_CBOR_ERR_OUT_OF_ORDER,
+            "WARDRIVING_CMD_BAD_ORDER: rejected (sources skipped, out of order)");
+    }
+}
+
+static void test_wardriving_record_and_status_result_codec(void) {
+    feb_wardriving_record_t wifi_record;
+    memset(&wifi_record, 0, sizeof(wifi_record));
+    wifi_record.timestamp_ms = 12345;
+    wifi_record.lat_e7_offset = 900000000u + 12345678u;
+    wifi_record.lon_e7_offset = 1800000000u + 98765432u;
+    wifi_record.source = "wifi";
+    wifi_record.source_len = strlen(wifi_record.source);
+    static const uint8_t bssid[FEB_WIFI_SCAN_BSSID_LEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    wifi_record.wifi_payload.ssid = (const uint8_t*)"TestAP";
+    wifi_record.wifi_payload.ssid_len = strlen("TestAP");
+    memcpy(wifi_record.wifi_payload.bssid, bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    wifi_record.wifi_payload.rssi_offset = 78;
+    wifi_record.wifi_payload.channel = 6;
+    wifi_record.wifi_payload.auth = "wpa2_psk";
+    wifi_record.wifi_payload.auth_len = strlen(wifi_record.wifi_payload.auth);
+
+    feb_wardriving_record_t ble_record;
+    memset(&ble_record, 0, sizeof(ble_record));
+    ble_record.timestamp_ms = 67890;
+    ble_record.lat_e7_offset = 900000000u + 11111111u;
+    ble_record.lon_e7_offset = 1800000000u + 22222222u;
+    ble_record.source = "ble";
+    ble_record.source_len = strlen(ble_record.source);
+    static const uint8_t ble_addr[FEB_BLE_SCAN_ADDRESS_LEN] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    memcpy(ble_record.ble_payload.address, ble_addr, FEB_BLE_SCAN_ADDRESS_LEN);
+    ble_record.ble_payload.name = "Widget";
+    ble_record.ble_payload.name_len = strlen(ble_record.ble_payload.name);
+    ble_record.ble_payload.has_name = 1;
+    ble_record.ble_payload.rssi_offset = 100;
+
+    /* per-record round trip */
+    {
+        uint8_t out[256];
+        size_t out_len = feb_cbor_encode_wardriving_record(out, sizeof(out), &wifi_record);
+        CHECK(out_len > 0, "WARDRIVING_RECORD_WIFI: encode succeeds");
+        feb_cbor_status_t status;
+        feb_wardriving_record_t decoded;
+        size_t n = feb_cbor_decode_wardriving_record(out, out_len, &decoded, &status);
+        CHECK(n == out_len && status == FEB_CBOR_OK, "WARDRIVING_RECORD_WIFI: decode consumes whole buffer");
+        CHECK(decoded.timestamp_ms == 12345, "WARDRIVING_RECORD_WIFI: timestamp_ms matches");
+        CHECK(
+            decoded.wifi_payload.ssid_len == strlen("TestAP") &&
+                memcmp(decoded.wifi_payload.ssid, "TestAP", decoded.wifi_payload.ssid_len) == 0,
+            "WARDRIVING_RECORD_WIFI: ssid matches");
+        CHECK(decoded.wifi_payload.channel == 6, "WARDRIVING_RECORD_WIFI: channel matches");
+    }
+    {
+        uint8_t out[128];
+        size_t out_len = feb_cbor_encode_wardriving_record(out, sizeof(out), &ble_record);
+        CHECK(out_len > 0, "WARDRIVING_RECORD_BLE: encode succeeds");
+        feb_cbor_status_t status;
+        feb_wardriving_record_t decoded;
+        size_t n = feb_cbor_decode_wardriving_record(out, out_len, &decoded, &status);
+        CHECK(n == out_len && status == FEB_CBOR_OK, "WARDRIVING_RECORD_BLE: decode consumes whole buffer");
+        CHECK(decoded.ble_payload.has_name == 1, "WARDRIVING_RECORD_BLE: has_name set");
+        CHECK(
+            decoded.ble_payload.name_len == strlen("Widget") &&
+                memcmp(decoded.ble_payload.name, "Widget", decoded.ble_payload.name_len) == 0,
+            "WARDRIVING_RECORD_BLE: name matches");
+        CHECK(decoded.ble_payload.rssi_offset == 100, "WARDRIVING_RECORD_BLE: rssi_offset matches");
+    }
+
+    /* malformed: unknown source value -- rejected at this codec's own layer, unlike
+       command's action/sources which are left to the dispatch layer. */
+    {
+        uint8_t buf[128];
+        size_t pos = 0;
+        size_t n;
+        n = feb_cbor_encode_map_header(buf, sizeof(buf), 5);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "timestamp_ms", sizeof("timestamp_ms") - 1);
+        pos += n;
+        n = feb_cbor_encode_uint(buf + pos, sizeof(buf) - pos, 1);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "lat_e7_offset", sizeof("lat_e7_offset") - 1);
+        pos += n;
+        n = feb_cbor_encode_uint(buf + pos, sizeof(buf) - pos, 900000000u);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "lon_e7_offset", sizeof("lon_e7_offset") - 1);
+        pos += n;
+        n = feb_cbor_encode_uint(buf + pos, sizeof(buf) - pos, 1800000000u);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "source", sizeof("source") - 1);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "cellular", sizeof("cellular") - 1);
+        pos += n;
+        n = feb_cbor_encode_text(buf + pos, sizeof(buf) - pos, "payload", sizeof("payload") - 1);
+        pos += n;
+        n = feb_cbor_encode_map_header(buf + pos, sizeof(buf) - pos, 0);
+        pos += n;
+
+        feb_cbor_status_t status;
+        feb_wardriving_record_t decoded;
+        size_t decode_n = feb_cbor_decode_wardriving_record(buf, pos, &decoded, &status);
+        CHECK(
+            decode_n == 0 && status == FEB_CBOR_ERR_UNEXPECTED_TYPE,
+            "WARDRIVING_RECORD_BAD_SOURCE: rejected (unknown source value)");
+    }
+
+    /* status_result_payload: one wifi record + one ble record, non-zero backlog_remaining */
+    static feb_wardriving_status_result_payload_t result_payload;
+    memset(&result_payload, 0, sizeof(result_payload));
+    result_payload.records[0] = wifi_record;
+    result_payload.records[1] = ble_record;
+    result_payload.record_count = 2;
+    result_payload.backlog_remaining = 5;
+
+    static uint8_t result_out[512];
+    size_t result_out_len =
+        feb_cbor_encode_wardriving_status_result_payload(result_out, sizeof(result_out), &result_payload);
+    CHECK(result_out_len > 0, "WARDRIVING_STATUS_RESULT: encode succeeds");
+
+    static feb_wardriving_status_result_payload_t result_decoded;
+    feb_cbor_status_t result_status =
+        feb_cbor_decode_wardriving_status_result_payload(result_out, result_out_len, &result_decoded);
+    CHECK(result_status == FEB_CBOR_OK, "WARDRIVING_STATUS_RESULT: decode status OK");
+    CHECK(result_decoded.record_count == 2, "WARDRIVING_STATUS_RESULT: record_count == 2");
+    CHECK(result_decoded.backlog_remaining == 5, "WARDRIVING_STATUS_RESULT: backlog_remaining == 5");
+
+    /* Nesting-depth check (docs/PROTOCOL.md "wardriving command and status payloads" ->
+       "Nesting depth"): wrap this exact nested result as status.result (state="data",
+       request_id=0 per the unsolicited-backlog-drain convention) and decode through the
+       full generic feb_cbor_decode_status_payload() path, which captures `result` via a
+       fresh depth-0 feb_cbor_skip_value() call -- this is the actual call site whose depth
+       budget PROTOCOL.md documents landing exactly at FEB_CBOR_MAX_NESTING (result map(0)
+       -> records array(1) -> <wardriving-record> map(2) -> payload map(3) -> payload's own
+       scalar fields(4)). A regression here would surface as FEB_CBOR_ERR_TOO_DEEP. */
+    {
+        feb_status_payload_t status_payload;
+        memset(&status_payload, 0, sizeof(status_payload));
+        status_payload.request_id = 0;
+        status_payload.state = "data";
+        status_payload.state_len = strlen(status_payload.state);
+        status_payload.has_result = 1;
+        status_payload.result_span = result_out;
+        status_payload.result_span_len = result_out_len;
+
+        static uint8_t status_out[600];
+        size_t status_out_len = feb_cbor_encode_status_payload(status_out, sizeof(status_out), &status_payload);
+        CHECK(status_out_len > 0, "WARDRIVING_STATUS_DATA: encode succeeds");
+
+        feb_status_payload_t status_decoded;
+        feb_cbor_status_t decode_status =
+            feb_cbor_decode_status_payload(status_out, status_out_len, &status_decoded);
+        CHECK(
+            decode_status == FEB_CBOR_OK,
+            "WARDRIVING_STATUS_DATA: full nested result decodes without exceeding FEB_CBOR_MAX_NESTING");
+        CHECK(status_decoded.request_id == 0, "WARDRIVING_STATUS_DATA: request_id == 0 (unsolicited sentinel)");
+
+        static feb_wardriving_status_result_payload_t reparsed;
+        feb_cbor_status_t reparsed_status = feb_cbor_decode_wardriving_status_result_payload(
+            status_decoded.result_span, status_decoded.result_span_len, &reparsed);
+        CHECK(reparsed_status == FEB_CBOR_OK, "WARDRIVING_STATUS_DATA: nested result re-decodes OK");
+        CHECK(reparsed.record_count == 2, "WARDRIVING_STATUS_DATA: nested result has 2 records");
+    }
+}
+
 int main(void) {
     test_fragmentation_at_mtu(
         23,
@@ -653,6 +1108,11 @@ int main(void) {
     test_wifi_scan_result_payload_codec();
     test_command_payload_codec();
     test_status_payload_codec();
+
+    test_ble_scan_device_codec();
+    test_ble_scan_result_payload_codec();
+    test_wardriving_command_payload_codec();
+    test_wardriving_record_and_status_result_codec();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

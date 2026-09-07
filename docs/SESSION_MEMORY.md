@@ -6,7 +6,7 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-07, commit `63ec936`)
+## Current state (as of 2026-09-08, commit TBD)
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete.** Steps 1-7 —
 build baselines, BLE transport, record framing, radio-coexistence validation, trusted-environment
@@ -14,11 +14,18 @@ X25519 pairing, authenticated AES-256-GCM runtime sessions, and the board-identi
 registry — are implemented **and hardware-verified** on real devices (ESP32-C6-DevKitC-1-N4 +
 Flipper Zero).
 
-**Phase 3 (production-ready wardriving) is underway.** The first real capability, `wifi_scan`, is
-implemented and hardware-verified: manual on-device scan trigger, results rendered in a scrollable
-view, capped at the 32 strongest APs by RSSI. Still to come in Phase 3: a GPS module needs to be
-physically wired to the board before `ble_scan`/`wardriving` can start (not yet begun), then step 8
-(hardened persistence for the pairing record and the wardriving log), then step 9 (full-system
+**Phase 3 (production-ready wardriving) is underway.** The first two real capabilities, `wifi_scan`
+and `ble_scan`, are implemented and hardware-verified: both manual on-device scan triggers with
+results rendered in scrollable views, each capped at the 32 strongest results by RSSI. **Reordered
+2026-09-07**: `ble_scan`/`wardriving` no longer wait on GPS hardware being wired up — they're
+being implemented using a fixed-coordinate GPS stub behind a swappable location-source interface,
+with the wardriving-log half of step 8's hardened persistence (a checksummed circular log on raw
+flash) pulled forward and built for real as part of this same work. See [docs/PLAN.md](PLAN.md)'s
+"`ble_scan`, `wardriving`, and the GPS-stub reorder" section for the full design and decisions
+(wire protocol frozen in [docs/PROTOCOL.md](PROTOCOL.md), capability behavior in
+[docs/CAPABILITIES.md](CAPABILITIES.md)). `ble_scan` is now done; `wardriving` (the composite
+capability and its flash-backed log) remains to be implemented. After that: the
+pairing-record/capability-file half of step 8 (still deferred), then step 9 (full-system
 validation).
 
 For the full roadmap, phase boundaries, and each step's "done when" criteria, see
@@ -28,8 +35,13 @@ implemented, and debugged — including every bug's root cause — see
 
 ## Known open items (check before starting related work)
 
-- **GPS / `ble_scan` / `wardriving` capability**: not started. Needs a GY-NEO6MV2/NEO-6M GPS
-  module physically wired to the C6 first.
+- **`ble_scan` capability**: implemented and hardware-verified 2026-09-08 (manual on-device scan
+  trigger via Right button on the main screen, results in a scrollable view, capped at 32 devices
+  by RSSI). See [docs/USER_GUIDE.md](USER_GUIDE.md) "Scanning for BLE devices" section.
+- **`wardriving` capability**: not yet started (the composite capability and its flash-backed log,
+  part of the 2026-09-07 reorder — see "Current state" above). Real GPS hardware (a
+  GY-NEO6MV2/NEO-6M module) is no longer a prerequisite; a fixed-coordinate stub is used until
+  it's wired up.
 - **Idle-connection heartbeat/keep-alive redesign**: backlogged by explicit user choice. The
   current 30-second idle-timeout disconnect-and-reconnect cycle works correctly but causes a
   cosmetic LED/screen flicker roughly every 30 seconds during an otherwise-healthy idle session.

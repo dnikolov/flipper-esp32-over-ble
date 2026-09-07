@@ -76,6 +76,7 @@ typedef enum {
 typedef enum {
     AppScreenMain,
     AppScreenWifiScanResults,
+    AppScreenBleScanResults,
 } AppScreen;
 
 typedef enum {
@@ -86,6 +87,9 @@ typedef enum {
     AppEventWifiScanAp,
     AppEventWifiScanDone,
     AppEventWifiScanError,
+    AppEventBleScanDevice,
+    AppEventBleScanDone,
+    AppEventBleScanError,
 } AppEventType;
 
 /* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
@@ -110,6 +114,13 @@ typedef struct {
     char wifi_scan_ap_phy[8];
     char wifi_scan_ap_auth[24];
     char wifi_scan_error_message[48];
+    bool capability_has_ble_scan;
+    uint8_t ble_scan_device_address[FEB_BLE_SCAN_ADDRESS_LEN];
+    bool ble_scan_device_has_name;
+    char ble_scan_device_name[FEB_BLE_SCAN_NAME_MAX_LEN + 1];
+    int32_t ble_scan_device_rssi_dbm;
+    char ble_scan_device_addr_type[8];
+    char ble_scan_error_message[48];
 } AppEvent;
 
 typedef struct {
@@ -130,6 +141,11 @@ typedef struct {
     bool wifi_scan_complete;
     size_t wifi_scan_scroll_offset;
     char wifi_scan_error_message[48];
+    bool capability_has_ble_scan;
+    bool ble_scan_in_progress;
+    bool ble_scan_complete;
+    size_t ble_scan_scroll_offset;
+    char ble_scan_error_message[48];
 } Esp32App;
 
 typedef struct {
@@ -884,6 +900,30 @@ static uint8_t wifi_scan_cmd_ciphertext_buf[FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN];
 static uint8_t wifi_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
 static uint64_t wifi_scan_next_request_id = 1;
 
+/* ble_scan mirrors wifi_scan's command scratch buffers exactly -- same sizing rationale
+   (see FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN's comment above), "ble_scan" (8 bytes) being one
+   byte shorter than "wifi_scan" (9 bytes) leaves even more margin against the same 64-byte
+   cap. Kept as its own dedicated set of statics, not shared with wifi_scan's, for the same
+   independent-sender reasoning given above. */
+#define FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN 64u
+static uint8_t ble_scan_cmd_payload_buf[FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN];
+static uint8_t ble_scan_cmd_ciphertext_buf[FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN];
+static uint8_t ble_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+static uint64_t ble_scan_next_request_id = 1;
+
+/* `status`/`error` records carry no capability field (docs/PROTOCOL.md) -- only one manual
+   scan command can be in flight at a time (each results screen gates its own trigger on its
+   own *_in_progress flag, and the ESP32-side busy rule enforces the same). This flag records
+   which of the two scan commands was most recently sent, so the BLE thread's dispatch
+   (profile_event_handler, further below) can route an incoming `status`/`error` record to the
+   right decoder. Written only by send_wifi_scan_command()/send_ble_scan_command(), on this
+   app's own main thread, immediately before the send that could provoke a reply; read only by
+   the BLE thread once that reply actually arrives. This is the same cross-thread-without-a-lock
+   argument send_wifi_scan_command()'s own comment already makes for session_key/
+   session_seq_out: a reply cannot physically arrive before the send that provoked it has
+   returned on this thread, so there is no window where both threads touch this flag at once. */
+static bool pending_scan_is_ble;
+
 /* Per-AP display state, accumulated across one or more `status` records for the results
    view. Not reachable from profile_event_handler (BLE-thread callbacks only ever post one
    AP's worth of data at a time through app->queue -- see post_wifi_scan_ap() below), but
@@ -907,6 +947,25 @@ typedef struct {
 
 static WifiScanApDisplay wifi_scan_aps[WIFI_SCAN_MAX_DISPLAY_APS];
 static size_t wifi_scan_ap_count;
+
+/* Per-device display state for ble_scan, mirroring wifi_scan_aps/wifi_scan_ap_count above --
+   same off-stack-struct/static rationale (this app's own main-thread stack size isn't
+   documented/pinned), populated ONLY from the main loop's event handler, never touched
+   directly from the BLE thread. */
+#define BLE_SCAN_NAME_DISPLAY_LEN (FEB_BLE_SCAN_NAME_MAX_LEN + 1)
+#define BLE_SCAN_ADDR_TYPE_DISPLAY_LEN 8
+#define BLE_SCAN_MAX_DISPLAY_DEVICES FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD
+
+typedef struct {
+    uint8_t address[FEB_BLE_SCAN_ADDRESS_LEN];
+    bool has_name;
+    char name[BLE_SCAN_NAME_DISPLAY_LEN];
+    int32_t rssi_dbm;
+    char addr_type[BLE_SCAN_ADDR_TYPE_DISPLAY_LEN];
+} BleScanDeviceDisplay;
+
+static BleScanDeviceDisplay ble_scan_devices[BLE_SCAN_MAX_DISPLAY_DEVICES];
+static size_t ble_scan_device_count;
 
 static void session_reset_state(void) {
     session_stage = SessionStageNone;
@@ -1120,6 +1179,7 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
         event.capability_features,
         sizeof(event.capability_features));
     event.capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
+    event.capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -1298,10 +1358,99 @@ static void
     }
 }
 
+/* ---- ble_scan capability (mirrors wifi_scan capability above, docs/PROTOCOL.md's
+   "`ble_scan` command and status payloads") ---- */
+
+/* Sanitizes and posts one decoded device for display -- `name`, while declared as a CBOR
+   text string on the wire (docs/PROTOCOL.md), is still peer-controlled data with no
+   structural guarantee every byte is printable/renderable by this canvas's font, so the same
+   non-printable-ASCII-to-'.' treatment post_wifi_scan_ap() gives `ssid` is applied here too,
+   once, rather than deferring sanitization to every later draw call. */
+static void post_ble_scan_device(Esp32App* app, const feb_ble_scan_device_t* device) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventBleScanDevice;
+    memcpy(event.ble_scan_device_address, device->address, FEB_BLE_SCAN_ADDRESS_LEN);
+    event.ble_scan_device_has_name = device->has_name;
+    if(device->has_name) {
+        size_t name_len =
+            device->name_len > FEB_BLE_SCAN_NAME_MAX_LEN ? FEB_BLE_SCAN_NAME_MAX_LEN : device->name_len;
+        for(size_t i = 0; i < name_len; i++) {
+            uint8_t b = (uint8_t)device->name[i];
+            event.ble_scan_device_name[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+        }
+        event.ble_scan_device_name[name_len] = '\0';
+    }
+    event.ble_scan_device_rssi_dbm = (int32_t)device->rssi_offset - 128;
+    copy_clamped_text(
+        event.ble_scan_device_addr_type,
+        sizeof(event.ble_scan_device_addr_type),
+        device->addr_type,
+        device->addr_type_len);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_ble_scan_complete(Esp32App* app) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventBleScanDone;
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_ble_scan_error(Esp32App* app, const char* message) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventBleScanError;
+    strncpy(event.ble_scan_error_message, message, sizeof(event.ble_scan_error_message) - 1);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* `status` (docs/PROTOCOL.md's "`ble_scan` command and status payloads") -- same two-state
+   ("partial"/"complete") contract as wifi_scan, enforced here for the same reason
+   handle_wifi_scan_status() enforces it (the generic status codec does not validate `state`,
+   by design). `result` decodes to the ble_scan-specific `{"devices": [...]}` shape. */
+static void
+    handle_ble_scan_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_status_payload_t status_payload;
+    feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "ble_scan status payload decode failed: %d; dropping", status);
+        return;
+    }
+    bool is_partial = text_matches(status_payload.state, status_payload.state_len, "partial");
+    bool is_complete = text_matches(status_payload.state, status_payload.state_len, "complete");
+    if(!is_partial && !is_complete) {
+        FURI_LOG_W(
+            TAG,
+            "ble_scan status: unexpected state '%.*s'; dropping",
+            (int)status_payload.state_len,
+            status_payload.state);
+        return;
+    }
+    if(status_payload.has_result) {
+        static feb_ble_scan_result_payload_t result;
+        feb_cbor_status_t result_status = feb_cbor_decode_ble_scan_result_payload(
+            status_payload.result_span, status_payload.result_span_len, &result);
+        if(result_status != FEB_CBOR_OK) {
+            FURI_LOG_W(TAG, "ble_scan status.result decode failed: %d; dropping", result_status);
+            return;
+        }
+        for(size_t i = 0; i < result.device_count; i++) {
+            post_ble_scan_device(app, &result.devices[i]);
+        }
+    }
+    if(is_complete) {
+        post_ble_scan_complete(app);
+    }
+}
+
 /* Protected-record `error` (post-session-establishment shape, docs/PROTOCOL.md "Runtime
-   auth failure handling" / message-payloads table) -- today only surfaced for wifi_scan's
-   `busy` response (docs/PROTOCOL.md's "Busy handling"); any other code is logged and
-   otherwise ignored, since no other capability/command exists yet to react to one. */
+   auth failure handling" / message-payloads table) -- surfaced for wifi_scan's and
+   ble_scan's `busy` response (docs/PROTOCOL.md's "Busy handling"); any other code is logged
+   and otherwise ignored, since no other capability/command exists yet to react to one.
+   `busy` carries no capability field either, so pending_scan_is_ble (see its own declaration
+   comment above) picks which of the two in-flight results screens this reply belongs to. */
 static void
     handle_runtime_error(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
     Esp32App* app = profile->app;
@@ -1314,13 +1463,18 @@ static void
     FURI_LOG_W(
         TAG, "runtime error received: code='%.*s'", (int)error_payload.code_len, error_payload.code);
     if(text_matches(error_payload.code, error_payload.code_len, "busy")) {
-        post_wifi_scan_error(app, "ESP32 busy, try again");
+        if(pending_scan_is_ble) {
+            post_ble_scan_error(app, "ESP32 busy, try again");
+        } else {
+            post_wifi_scan_error(app, "ESP32 busy, try again");
+        }
     }
 }
 
 /* Sends the wifi_scan `command` (capability="wifi_scan", fresh request_id, always-empty
    arguments per docs/PROTOCOL.md). Unlike every other sender in this file, this one runs on
-   this app's own main thread (triggered by a user OK-press in the main loop below), not
+   this app's own main thread (triggered by a user Left-press on the main screen, or an
+   Ok-press to re-trigger from inside the results screen, in the main loop below), not
    synchronously from inside a BLE-thread callback -- there is no incoming BLE event to key
    it off of, since "start a scan" is a user-initiated action, not a response to the peer.
    This is safe against the `session_key`/`session_seq_out`/`outgoing_message_id` statics
@@ -1378,12 +1532,82 @@ static bool send_wifi_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wifi_scan command: record encode failed");
         return false;
     }
+    pending_scan_is_ble = false;
     if(!send_pairing_record(profile, wifi_scan_cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wifi_scan command: send failed");
         return false;
     }
     session_seq_out++;
     FURI_LOG_I(TAG, "wifi_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    return true;
+}
+
+/* Sends the ble_scan `command` (capability="ble_scan", fresh request_id, always-empty
+   arguments per docs/PROTOCOL.md); mirrors send_wifi_scan_command() above exactly, including
+   its main-thread/ordering-safety argument: this also runs on this app's own main thread
+   (triggered by a user Right-press on the main screen, or an Ok-press to re-trigger from
+   inside the results screen), not synchronously from inside a BLE-thread callback, and is
+   safe against the `session_key`/`session_seq_out` statics it shares with the BLE-thread-driven
+   senders (capability_bootstrap() etc.) specifically because every call site gates this
+   function on app->capability_has_ble_scan, which can only become true after processing a
+   real capability_response -- and that can only happen strictly after capability_bootstrap()'s
+   own send (if it took the query-not-cached branch) has already returned on the BLE thread,
+   since the response is itself a later, separate BLE event. If this gating condition is ever
+   loosened, this reasoning needs re-examining. */
+static bool send_ble_scan_command(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    uint8_t arguments_buf[2];
+    size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "ble_scan command: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "ble_scan",
+        .capability_len = sizeof("ble_scan") - 1,
+        .request_id = ble_scan_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        ble_scan_cmd_payload_buf, sizeof(ble_scan_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "ble_scan command: payload encode failed");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        ble_scan_cmd_payload_buf,
+        payload_len,
+        ble_scan_cmd_ciphertext_buf,
+        sizeof(ble_scan_cmd_ciphertext_buf),
+        ble_scan_cmd_record_buf,
+        sizeof(ble_scan_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "ble_scan command: record encode failed");
+        return false;
+    }
+    pending_scan_is_ble = true;
+    if(!send_pairing_record(profile, ble_scan_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "ble_scan command: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(TAG, "ble_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
     return true;
 }
 
@@ -1605,7 +1829,11 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                     if(text_matches(decrypted.type, decrypted.type_len, "capability_response")) {
                         handle_capability_response(profile, decrypted.plaintext, decrypted.plaintext_len);
                     } else if(text_matches(decrypted.type, decrypted.type_len, "status")) {
-                        handle_wifi_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        if(pending_scan_is_ble) {
+                            handle_ble_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        } else {
+                            handle_wifi_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        }
                     } else if(text_matches(decrypted.type, decrypted.type_len, "error")) {
                         handle_runtime_error(profile, decrypted.plaintext, decrypted.plaintext_len);
                     } else {
@@ -1779,10 +2007,90 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, WIFI_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
+/* ble_scan results view, mirroring draw_wifi_scan_results() above exactly. `address` is
+   formatted as the conventional colon-separated hex pairs; `name` shows a placeholder when
+   the peer advertised none (docs/PROTOCOL.md: `name` is an optional field, distinct from an
+   advertised empty string). */
+#define BLE_SCAN_RESULTS_ROW_HEIGHT 10
+#define BLE_SCAN_RESULTS_MAX_ROWS 4
+#define BLE_SCAN_RESULTS_FIRST_ROW_Y 22
+#define BLE_SCAN_RESULTS_FOOTER_Y 62
+
+static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    char header[32];
+    if(app->ble_scan_in_progress) {
+        snprintf(header, sizeof(header), "Scanning...");
+    } else {
+        snprintf(header, sizeof(header), "Ble scan: %u found", (unsigned)ble_scan_device_count);
+    }
+    canvas_draw_str(canvas, 2, 11, header);
+    canvas_set_font(canvas, FontSecondary);
+
+    uint8_t y = BLE_SCAN_RESULTS_FIRST_ROW_Y;
+    size_t max_rows = BLE_SCAN_RESULTS_MAX_ROWS;
+    if(app->ble_scan_error_message[0] != '\0') {
+        canvas_draw_str(canvas, 2, y, app->ble_scan_error_message);
+        y += BLE_SCAN_RESULTS_ROW_HEIGHT;
+        max_rows--;
+    }
+
+    for(size_t row = 0; row < max_rows; row++) {
+        size_t index = app->ble_scan_scroll_offset + row;
+        if(index >= ble_scan_device_count) {
+            break;
+        }
+        const BleScanDeviceDisplay* device = &ble_scan_devices[index];
+        char address_str[18];
+        snprintf(
+            address_str,
+            sizeof(address_str),
+            "%02x:%02x:%02x:%02x:%02x:%02x",
+            device->address[0],
+            device->address[1],
+            device->address[2],
+            device->address[3],
+            device->address[4],
+            device->address[5]);
+        /* Worst case: 17-byte address_str + ' ' + up to 31-byte name + ' ' + up to 5-byte
+           signed rssi ("-128m") + NUL == 56 bytes; sized with margin (unlike wifi_scan's
+           48-byte line, whose ssid/channel/rssi worst case is smaller) so this doesn't
+           trip -Werror=format-truncation. The canvas still visually clips at screen width
+           regardless of this buffer's capacity. */
+        char line[64];
+        snprintf(
+            line,
+            sizeof(line),
+            "%s %s %ldm",
+            address_str,
+            device->has_name && device->name[0] != '\0' ? device->name : "(no name)",
+            (long)device->rssi_dbm);
+        canvas_draw_str(canvas, 2, (uint8_t)(y + row * BLE_SCAN_RESULTS_ROW_HEIGHT), line);
+    }
+
+    char footer[32];
+    if(ble_scan_device_count == 0) {
+        snprintf(footer, sizeof(footer), "Back: exit view");
+    } else {
+        snprintf(
+            footer,
+            sizeof(footer),
+            "%u/%u  Back: exit",
+            (unsigned)(app->ble_scan_scroll_offset + 1),
+            (unsigned)ble_scan_device_count);
+    }
+    canvas_draw_str(canvas, 2, BLE_SCAN_RESULTS_FOOTER_Y, footer);
+}
+
 static void draw_callback(Canvas* canvas, void* context) {
     Esp32App* app = context;
     if(app->screen == AppScreenWifiScanResults) {
         draw_wifi_scan_results(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenBleScanResults) {
+        draw_ble_scan_results(canvas, app);
         return;
     }
     canvas_clear(canvas);
@@ -1804,11 +2112,18 @@ static void draw_callback(Canvas* canvas, void* context) {
         snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
         canvas_draw_str(canvas, 2, 44, line);
     }
-    if(app->capability_has_wifi_scan && app->pairing_phase == PairingPhaseSessionActive) {
-        canvas_draw_str(canvas, 2, 56, "OK: scan  Back: exit");
+    char footer[32];
+    if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wifi_scan &&
+       app->capability_has_ble_scan) {
+        snprintf(footer, sizeof(footer), "L:WiFi R:BLE  Back: exit");
+    } else if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wifi_scan) {
+        snprintf(footer, sizeof(footer), "Left: WiFi scan  Back: exit");
+    } else if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_ble_scan) {
+        snprintf(footer, sizeof(footer), "Right: BLE scan  Back: exit");
     } else {
-        canvas_draw_str(canvas, 2, 56, "Back: exit");
+        snprintf(footer, sizeof(footer), "Back: exit");
     }
+    canvas_draw_str(canvas, 2, 56, footer);
 }
 
 static void input_callback(InputEvent* input, void* context) {
@@ -1819,16 +2134,23 @@ static void input_callback(InputEvent* input, void* context) {
 
 /* Returns to the main screen and discards any in-progress/completed scan results (docs/PLAN.md's
    Wi-Fi scan capability follow-on step: "results... cleared when the user leaves the results
-   view"). Also called whenever the underlying session/connection goes away (disconnect,
-   reconnect, profile teardown) -- a lost session can never deliver the rest of an in-flight
-   scan's status records, so leaving stale partial results on screen would be misleading. */
-static void reset_wifi_scan_ui_state(Esp32App* app) {
+   view"), for both wifi_scan and ble_scan (mirrored capabilities, same results-view lifecycle).
+   Also called whenever the underlying session/connection goes away (disconnect, reconnect,
+   profile teardown) -- a lost session can never deliver the rest of an in-flight scan's status
+   records, so leaving stale partial results on screen would be misleading, regardless of which
+   of the two capabilities was in flight. */
+static void reset_scan_ui_state(Esp32App* app) {
     app->screen = AppScreenMain;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
     app->wifi_scan_scroll_offset = 0;
     app->wifi_scan_error_message[0] = '\0';
     wifi_scan_ap_count = 0;
+    app->ble_scan_in_progress = false;
+    app->ble_scan_complete = false;
+    app->ble_scan_scroll_offset = 0;
+    app->ble_scan_error_message[0] = '\0';
+    ble_scan_device_count = 0;
 }
 
 static void stop_service(Esp32App* app) {
@@ -1841,7 +2163,7 @@ static void stop_service(Esp32App* app) {
     }
     pairing_reset_state();
     session_reset_state();
-    reset_wifi_scan_ui_state(app);
+    reset_scan_ui_state(app);
     if(app->notifications) {
         notification_message(app->notifications, &sequence_blink_stop);
         notification_message(app->notifications, &sequence_reset_blue);
@@ -1932,13 +2254,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 if(event.bt_status == BtStatusConnected) {
                     pairing_reset_state();
                     session_reset_state();
-                    reset_wifi_scan_ui_state(&app);
+                    reset_scan_ui_state(&app);
                     app.pairing_phase = PairingPhaseExchanging;
                 } else if(event.bt_status == BtStatusAdvertising) {
                     if(app.pairing_phase != PairingPhaseDone) {
                         pairing_reset_state();
                         session_reset_state();
-                        reset_wifi_scan_ui_state(&app);
+                        reset_scan_ui_state(&app);
                         notification_message(app.notifications, &sequence_blink_start_blue);
                         app.pairing_phase = PairingPhaseWaiting;
                     }
@@ -1962,6 +2284,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.capability_features, event.capability_features, sizeof(app.capability_features) - 1);
             app.capability_features[sizeof(app.capability_features) - 1] = '\0';
             app.capability_has_wifi_scan = event.capability_has_wifi_scan;
+            app.capability_has_ble_scan = event.capability_has_ble_scan;
         } else if(event.type == AppEventWifiScanAp) {
             if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
                 WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
@@ -1985,10 +2308,31 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 event.wifi_scan_error_message,
                 sizeof(app.wifi_scan_error_message) - 1);
             app.wifi_scan_error_message[sizeof(app.wifi_scan_error_message) - 1] = '\0';
+        } else if(event.type == AppEventBleScanDevice) {
+            if(ble_scan_device_count < BLE_SCAN_MAX_DISPLAY_DEVICES) {
+                BleScanDeviceDisplay* slot = &ble_scan_devices[ble_scan_device_count++];
+                memcpy(slot->address, event.ble_scan_device_address, sizeof(slot->address));
+                slot->has_name = event.ble_scan_device_has_name;
+                strncpy(slot->name, event.ble_scan_device_name, sizeof(slot->name) - 1);
+                slot->name[sizeof(slot->name) - 1] = '\0';
+                slot->rssi_dbm = event.ble_scan_device_rssi_dbm;
+                strncpy(slot->addr_type, event.ble_scan_device_addr_type, sizeof(slot->addr_type) - 1);
+                slot->addr_type[sizeof(slot->addr_type) - 1] = '\0';
+            }
+        } else if(event.type == AppEventBleScanDone) {
+            app.ble_scan_in_progress = false;
+            app.ble_scan_complete = true;
+        } else if(event.type == AppEventBleScanError) {
+            app.ble_scan_in_progress = false;
+            strncpy(
+                app.ble_scan_error_message,
+                event.ble_scan_error_message,
+                sizeof(app.ble_scan_error_message) - 1);
+            app.ble_scan_error_message[sizeof(app.ble_scan_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
             if(app.screen == AppScreenWifiScanResults) {
                 if(event.input.key == InputKeyBack) {
-                    reset_wifi_scan_ui_state(&app);
+                    reset_scan_ui_state(&app);
                 } else if(event.input.key == InputKeyUp) {
                     if(app.wifi_scan_scroll_offset > 0) {
                         app.wifi_scan_scroll_offset--;
@@ -2008,15 +2352,40 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.wifi_scan_error_message[0] = '\0';
                     app.wifi_scan_in_progress = send_wifi_scan_command(&app);
                 }
+            } else if(app.screen == AppScreenBleScanResults) {
+                if(event.input.key == InputKeyBack) {
+                    reset_scan_ui_state(&app);
+                } else if(event.input.key == InputKeyUp) {
+                    if(app.ble_scan_scroll_offset > 0) {
+                        app.ble_scan_scroll_offset--;
+                    }
+                } else if(event.input.key == InputKeyDown) {
+                    size_t visible_rows = BLE_SCAN_RESULTS_MAX_ROWS;
+                    if(ble_scan_device_count > visible_rows &&
+                       app.ble_scan_scroll_offset < ble_scan_device_count - visible_rows) {
+                        app.ble_scan_scroll_offset++;
+                    }
+                } else if(event.input.key == InputKeyOk && !app.ble_scan_in_progress) {
+                    /* Re-trigger from inside the results view too, e.g. after a completed
+                       scan -- "Scan now" is a repeatable manual action, not one-shot. */
+                    ble_scan_device_count = 0;
+                    app.ble_scan_scroll_offset = 0;
+                    app.ble_scan_complete = false;
+                    app.ble_scan_error_message[0] = '\0';
+                    app.ble_scan_in_progress = send_ble_scan_command(&app);
+                }
             } else {
                 if(event.input.key == InputKeyBack) {
                     running = false;
                 } else if(event.input.key == InputKeyOk && !app.profile) {
                     start_profile(&app);
                 } else if(
-                    event.input.key == InputKeyOk && app.profile &&
+                    event.input.key == InputKeyLeft && app.profile &&
                     app.pairing_phase == PairingPhaseSessionActive && app.capability_has_wifi_scan &&
                     !app.wifi_scan_in_progress) {
+                    /* User decision: Left triggers wifi_scan, Right triggers ble_scan --
+                       replaces the old single-Ok-press behavior, which picked wifi_scan first
+                       and left ble_scan unreachable whenever both capabilities were present. */
                     wifi_scan_ap_count = 0;
                     app.wifi_scan_scroll_offset = 0;
                     app.wifi_scan_complete = false;
@@ -2024,6 +2393,19 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.screen = AppScreenWifiScanResults;
                     app.wifi_scan_in_progress = send_wifi_scan_command(&app);
                     if(!app.wifi_scan_in_progress) {
+                        app.screen = AppScreenMain;
+                    }
+                } else if(
+                    event.input.key == InputKeyRight && app.profile &&
+                    app.pairing_phase == PairingPhaseSessionActive && app.capability_has_ble_scan &&
+                    !app.ble_scan_in_progress) {
+                    ble_scan_device_count = 0;
+                    app.ble_scan_scroll_offset = 0;
+                    app.ble_scan_complete = false;
+                    app.ble_scan_error_message[0] = '\0';
+                    app.screen = AppScreenBleScanResults;
+                    app.ble_scan_in_progress = send_ble_scan_command(&app);
+                    if(!app.ble_scan_in_progress) {
                         app.screen = AppScreenMain;
                     }
                 }
