@@ -5,6 +5,7 @@
 
 #include "framing.h"
 #include "cbor_codec.h"
+#include "wardriving_csv.h"
 #include "vectors.h"
 
 static int g_total = 0;
@@ -883,13 +884,14 @@ static void test_wardriving_record_and_status_result_codec(void) {
     wifi_record.source = "wifi";
     wifi_record.source_len = strlen(wifi_record.source);
     static const uint8_t bssid[FEB_WIFI_SCAN_BSSID_LEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
-    wifi_record.wifi_payload.ssid = (const uint8_t*)"TestAP";
-    wifi_record.wifi_payload.ssid_len = strlen("TestAP");
-    memcpy(wifi_record.wifi_payload.bssid, bssid, FEB_WIFI_SCAN_BSSID_LEN);
-    wifi_record.wifi_payload.rssi_offset = 78;
-    wifi_record.wifi_payload.channel = 6;
-    wifi_record.wifi_payload.auth = "wpa2_psk";
-    wifi_record.wifi_payload.auth_len = strlen(wifi_record.wifi_payload.auth);
+    wifi_record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+    wifi_record.payload.wifi.ssid = (const uint8_t*)"TestAP";
+    wifi_record.payload.wifi.ssid_len = strlen("TestAP");
+    memcpy(wifi_record.payload.wifi.bssid, bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    wifi_record.payload.wifi.rssi_offset = 78;
+    wifi_record.payload.wifi.channel = 6;
+    wifi_record.payload.wifi.auth = "wpa2_psk";
+    wifi_record.payload.wifi.auth_len = strlen(wifi_record.payload.wifi.auth);
 
     feb_wardriving_record_t ble_record;
     memset(&ble_record, 0, sizeof(ble_record));
@@ -899,11 +901,12 @@ static void test_wardriving_record_and_status_result_codec(void) {
     ble_record.source = "ble";
     ble_record.source_len = strlen(ble_record.source);
     static const uint8_t ble_addr[FEB_BLE_SCAN_ADDRESS_LEN] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
-    memcpy(ble_record.ble_payload.address, ble_addr, FEB_BLE_SCAN_ADDRESS_LEN);
-    ble_record.ble_payload.name = "Widget";
-    ble_record.ble_payload.name_len = strlen(ble_record.ble_payload.name);
-    ble_record.ble_payload.has_name = 1;
-    ble_record.ble_payload.rssi_offset = 100;
+    ble_record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+    memcpy(ble_record.payload.ble.address, ble_addr, FEB_BLE_SCAN_ADDRESS_LEN);
+    ble_record.payload.ble.name = "Widget";
+    ble_record.payload.ble.name_len = strlen(ble_record.payload.ble.name);
+    ble_record.payload.ble.has_name = 1;
+    ble_record.payload.ble.rssi_offset = 100;
 
     /* per-record round trip */
     {
@@ -916,10 +919,13 @@ static void test_wardriving_record_and_status_result_codec(void) {
         CHECK(n == out_len && status == FEB_CBOR_OK, "WARDRIVING_RECORD_WIFI: decode consumes whole buffer");
         CHECK(decoded.timestamp_ms == 12345, "WARDRIVING_RECORD_WIFI: timestamp_ms matches");
         CHECK(
-            decoded.wifi_payload.ssid_len == strlen("TestAP") &&
-                memcmp(decoded.wifi_payload.ssid, "TestAP", decoded.wifi_payload.ssid_len) == 0,
+            decoded.payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI,
+            "WARDRIVING_RECORD_WIFI: payload_kind matches");
+        CHECK(
+            decoded.payload.wifi.ssid_len == strlen("TestAP") &&
+                memcmp(decoded.payload.wifi.ssid, "TestAP", decoded.payload.wifi.ssid_len) == 0,
             "WARDRIVING_RECORD_WIFI: ssid matches");
-        CHECK(decoded.wifi_payload.channel == 6, "WARDRIVING_RECORD_WIFI: channel matches");
+        CHECK(decoded.payload.wifi.channel == 6, "WARDRIVING_RECORD_WIFI: channel matches");
     }
     {
         uint8_t out[128];
@@ -929,12 +935,15 @@ static void test_wardriving_record_and_status_result_codec(void) {
         feb_wardriving_record_t decoded;
         size_t n = feb_cbor_decode_wardriving_record(out, out_len, &decoded, &status);
         CHECK(n == out_len && status == FEB_CBOR_OK, "WARDRIVING_RECORD_BLE: decode consumes whole buffer");
-        CHECK(decoded.ble_payload.has_name == 1, "WARDRIVING_RECORD_BLE: has_name set");
         CHECK(
-            decoded.ble_payload.name_len == strlen("Widget") &&
-                memcmp(decoded.ble_payload.name, "Widget", decoded.ble_payload.name_len) == 0,
+            decoded.payload_kind == FEB_WARDRIVING_PAYLOAD_BLE,
+            "WARDRIVING_RECORD_BLE: payload_kind matches");
+        CHECK(decoded.payload.ble.has_name == 1, "WARDRIVING_RECORD_BLE: has_name set");
+        CHECK(
+            decoded.payload.ble.name_len == strlen("Widget") &&
+                memcmp(decoded.payload.ble.name, "Widget", decoded.payload.ble.name_len) == 0,
             "WARDRIVING_RECORD_BLE: name matches");
-        CHECK(decoded.ble_payload.rssi_offset == 100, "WARDRIVING_RECORD_BLE: rssi_offset matches");
+        CHECK(decoded.payload.ble.rssi_offset == 100, "WARDRIVING_RECORD_BLE: rssi_offset matches");
     }
 
     /* malformed: unknown source value -- rejected at this codec's own layer, unlike
@@ -1032,6 +1041,130 @@ static void test_wardriving_record_and_status_result_codec(void) {
     }
 }
 
+/* ---- wardriving_csv (docs/CAPABILITIES.md's wardriving bullet: WiGLE CSV export) ----
+   Pure formatting/arithmetic only (no Furi/Storage dependency) -- see wardriving_csv.h's
+   own scope note for why this is host-testable at all. */
+
+static void test_wardriving_backdate_first_seen(void) {
+    /* Anchor record itself: delta 0, FirstSeen == anchor wall-clock exactly. */
+    CHECK(
+        feb_wardriving_backdate_first_seen(50000, 50000, 1700000000) == 1700000000,
+        "BACKDATE: anchor record maps to anchor wall-clock exactly");
+
+    /* A record 10000ms (10s) older than the anchor backdates by exactly 10 seconds. */
+    CHECK(
+        feb_wardriving_backdate_first_seen(40000, 50000, 1700000000) == 1699999990,
+        "BACKDATE: 10s-older record backdates by 10s");
+
+    /* Sub-second deltas truncate toward 0 whole seconds (integer ms/1000), not round up. */
+    CHECK(
+        feb_wardriving_backdate_first_seen(49001, 50000, 1700000000) == 1700000000,
+        "BACKDATE: 999ms delta truncates to 0s, not rounds up to 1s"); /* 999/1000 == 0 */
+    CHECK(
+        feb_wardriving_backdate_first_seen(49000, 50000, 1700000000) == 1699999999,
+        "BACKDATE: exactly-1000ms delta backdates by 1s");
+
+    /* record_timestamp_ms > anchor_timestamp_ms (should not happen if the caller always
+       updates the anchor to the running maximum first, but defensively treated the same as
+       a zero delta rather than wrapping to a huge unsigned backdate). */
+    CHECK(
+        feb_wardriving_backdate_first_seen(60000, 50000, 1700000000) == 1700000000,
+        "BACKDATE: record newer than anchor does not wrap/underflow");
+
+    /* Saturates at 0 (UNIX epoch) instead of underflowing past it. */
+    CHECK(
+        feb_wardriving_backdate_first_seen(0, 100000, 50) == 0,
+        "BACKDATE: saturates at 0 instead of underflowing when anchor_unix_time is small");
+}
+
+static void test_wardriving_csv_format_header(void) {
+    char out[FEB_WARDRIVING_CSV_HEADER_MAX_LEN];
+    size_t n = feb_wardriving_csv_format_header(out, sizeof(out));
+    CHECK(n > 0, "CSV_HEADER: format succeeds");
+    CHECK(
+        n >= 14 && memcmp(out, "WigleWifi-1.4,", 14) == 0,
+        "CSV_HEADER: metadata line starts with WigleWifi-1.4,");
+    CHECK(
+        strstr(out, "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+                    "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type") != NULL,
+        "CSV_HEADER: contains the WigleWifi-1.4 column header line");
+    CHECK(out[n - 1] == '\n', "CSV_HEADER: ends with a newline");
+
+    /* Too-small out_cap fails cleanly rather than writing a truncated/corrupt header. */
+    char tiny[4];
+    CHECK(
+        feb_wardriving_csv_format_header(tiny, sizeof(tiny)) == 0,
+        "CSV_HEADER: too-small out_cap returns 0, not a truncated line");
+}
+
+static void test_wardriving_csv_format_row(void) {
+    /* wifi record: SSID containing a comma (must be quoted), auth lowercased on the wire,
+       uppercased in the CSV AuthMode column. */
+    feb_wardriving_record_t wifi_record;
+    memset(&wifi_record, 0, sizeof(wifi_record));
+    wifi_record.timestamp_ms = 12345;
+    wifi_record.lat_e7_offset = 900000000u + 12345678u; /* -> 1.2345678 */
+    wifi_record.lon_e7_offset = 1800000000u - 98765432u; /* -> -9.8765432 */
+    wifi_record.source = "wifi";
+    wifi_record.source_len = strlen(wifi_record.source);
+    wifi_record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+    static const uint8_t bssid[FEB_WIFI_SCAN_BSSID_LEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    memcpy(wifi_record.payload.wifi.bssid, bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    wifi_record.payload.wifi.ssid = (const uint8_t*)"Cafe, Free WiFi";
+    wifi_record.payload.wifi.ssid_len = strlen("Cafe, Free WiFi");
+    wifi_record.payload.wifi.rssi_offset = 78; /* -50 dBm */
+    wifi_record.payload.wifi.channel = 6;
+    wifi_record.payload.wifi.auth = "wpa2_psk";
+    wifi_record.payload.wifi.auth_len = strlen("wpa2_psk");
+
+    static const char first_seen[] = "2026-09-08 12:00:00";
+    char out[FEB_WARDRIVING_CSV_ROW_MAX_LEN];
+    size_t n = feb_wardriving_csv_format_row(
+        out, sizeof(out), &wifi_record, first_seen, strlen(first_seen));
+    CHECK(n > 0, "CSV_ROW_WIFI: format succeeds");
+    out[n] = '\0';
+    CHECK(strstr(out, "aa:bb:cc:dd:ee:ff") != NULL, "CSV_ROW_WIFI: MAC formatted as hex pairs");
+    CHECK(strstr(out, "\"Cafe, Free WiFi\"") != NULL, "CSV_ROW_WIFI: comma-bearing SSID is quoted");
+    CHECK(strstr(out, "WPA2_PSK") != NULL, "CSV_ROW_WIFI: AuthMode uppercased");
+    CHECK(strstr(out, "2026-09-08 12:00:00") != NULL, "CSV_ROW_WIFI: FirstSeen carried through verbatim");
+    CHECK(strstr(out, ",6,") != NULL, "CSV_ROW_WIFI: channel field present");
+    CHECK(strstr(out, "-50") != NULL, "CSV_ROW_WIFI: RSSI decoded from offset (78-128=-50)");
+    CHECK(strstr(out, "1.2345678") != NULL, "CSV_ROW_WIFI: latitude decoded from lat_e7_offset");
+    CHECK(strstr(out, "-9.8765432") != NULL, "CSV_ROW_WIFI: longitude decoded from lon_e7_offset");
+    CHECK(strstr(out, ",WIFI") != NULL, "CSV_ROW_WIFI: Type == WIFI");
+    CHECK(out[n - 1] == '\n', "CSV_ROW_WIFI: row ends with a newline");
+
+    /* ble record: no name (blank SSID field), no channel (blank Channel field), no auth. */
+    feb_wardriving_record_t ble_record;
+    memset(&ble_record, 0, sizeof(ble_record));
+    ble_record.timestamp_ms = 67890;
+    ble_record.lat_e7_offset = 900000000u;
+    ble_record.lon_e7_offset = 1800000000u;
+    ble_record.source = "ble";
+    ble_record.source_len = strlen(ble_record.source);
+    ble_record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+    static const uint8_t ble_addr[FEB_BLE_SCAN_ADDRESS_LEN] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    memcpy(ble_record.payload.ble.address, ble_addr, FEB_BLE_SCAN_ADDRESS_LEN);
+    ble_record.payload.ble.has_name = 0;
+    ble_record.payload.ble.rssi_offset = 100; /* -28 dBm */
+
+    size_t ble_n = feb_wardriving_csv_format_row(
+        out, sizeof(out), &ble_record, first_seen, strlen(first_seen));
+    CHECK(ble_n > 0, "CSV_ROW_BLE: format succeeds");
+    out[ble_n] = '\0';
+    CHECK(strstr(out, "11:12:13:14:15:16") != NULL, "CSV_ROW_BLE: MAC formatted as hex pairs");
+    CHECK(strstr(out, ",,,") != NULL, "CSV_ROW_BLE: blank SSID/AuthMode fields for a no-name device");
+    CHECK(strstr(out, "-28") != NULL, "CSV_ROW_BLE: RSSI decoded from offset (100-128=-28)");
+    CHECK(strstr(out, ",BLE") != NULL, "CSV_ROW_BLE: Type == BLE");
+
+    /* Too-small out_cap fails cleanly. */
+    char tiny[4];
+    CHECK(
+        feb_wardriving_csv_format_row(tiny, sizeof(tiny), &wifi_record, first_seen, strlen(first_seen)) ==
+            0,
+        "CSV_ROW: too-small out_cap returns 0, not a truncated row");
+}
+
 int main(void) {
     test_fragmentation_at_mtu(
         23,
@@ -1113,6 +1246,10 @@ int main(void) {
     test_ble_scan_result_payload_codec();
     test_wardriving_command_payload_codec();
     test_wardriving_record_and_status_result_codec();
+
+    test_wardriving_backdate_first_seen();
+    test_wardriving_csv_format_header();
+    test_wardriving_csv_format_row();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

@@ -10,6 +10,10 @@ that pairs with a Flipper Zero over BLE and exposes board capabilities through a
 authenticated CBOR protocol. Treat `esp32/`, the checked-out ESP-IDF, and the project docs
 as the source of truth over generic ESP32 knowledge.
 
+**Read discipline:** `esp32/main/main.c` and `esp32/main/cbor_codec.c` are large
+(2300+/3100+ lines). `Grep` for the symbol you need first, then `Read` with `offset`/`limit`
+around it — don't read either file whole unless you're doing a full-file review.
+
 ## Board — do not substitute a different board's assumptions
 
 Target: **ESP32-C6-DevKitC-1-N4** (ESP32-C6-WROOM-1-N4 module, 4 MB flash — verified
@@ -33,84 +37,51 @@ Key facts worth internalizing rather than re-deriving each time:
 ## Project role and constraints
 
 - **BLE role: ESP32-C6 is the central/GATT client; Flipper is the peripheral/GATT server.**
-  This is fixed by a Flipper external-app ABI limitation (see
-  [docs/STANDALONE_FAP.md](../../docs/STANDALONE_FAP.md)), not a preference — don't propose
-  swapping it.
+  Fixed by a Flipper external-app ABI limitation ([docs/STANDALONE_FAP.md](../../docs/STANDALONE_FAP.md)),
+  not a preference — don't propose swapping it.
 - The wire contract is [docs/PROTOCOL.md](../../docs/PROTOCOL.md); the pairing ceremony is
   [docs/PAIRING.md](../../docs/PAIRING.md). Both firmwares must agree byte-for-byte on CBOR
   shapes, UUIDs, and crypto derivations — check the Flipper side
   ([flipper/flipper_esp32_over_ble.c](../../flipper/flipper_esp32_over_ble.c)) before
   changing anything protocol-shaped.
-- Current implementation status and immediate next step: read
-  [docs/SESSION_MEMORY.md](../../docs/SESSION_MEMORY.md) first — this project moves in
-  discrete, ordered roadmap steps ([docs/PLAN.md](../../docs/PLAN.md)); don't implement a
-  later step's behavior (capabilities, persistence) before an earlier one (session auth) is
-  done.
-- Toolchain: ESP-IDF **v5.5.2** at `C:\Users\Deyan\esp\esp-idf`, target `esp32c6`. Do not
-  upgrade ESP-IDF or change the target without flagging it — it's a pinned baseline recorded
-  in [docs/BASELINES.md](../../docs/BASELINES.md).
-- Crypto requirements are exact, not advisory: X25519 for pairing, HKDF-SHA-256 for key
-  derivation, AES-256-GCM (only) for runtime records, HMAC-SHA-256 for transcript
-  confirmation. Reject an all-zero X25519 shared secret. Compare tags/proofs in constant
-  time. Zeroize ephemeral secrets (private keys, shared secrets, session keys) on every
-  success and failure path.
-  **Note:** runtime records were originally specified as AES-128-GCM; revised to
-  AES-256-GCM during step 6 design because the Flipper's only exported raw-key AES-GCM
-  primitive is hardcoded to a 256-bit key at the hardware level (see
-  [docs/PLAN.md](../../docs/PLAN.md) step 6). `mbedtls_gcm_*` on this side already supports
-  256-bit keys with no new code — just pass the full 32-byte derived session key.
+- Read [docs/SESSION_MEMORY.md](../../docs/SESSION_MEMORY.md) first for current status and
+  next step — this project moves in discrete, ordered roadmap steps
+  ([docs/PLAN.md](../../docs/PLAN.md)); don't implement a later step's behavior
+  (capabilities, persistence) before an earlier one (session auth) is done.
+- Toolchain: ESP-IDF **v5.5.2** at `C:\Users\Deyan\esp\esp-idf`, target `esp32c6`. Don't
+  upgrade or change the target without flagging it — it's a pinned baseline in
+  [docs/BASELINES.md](../../docs/BASELINES.md).
+- Crypto is exact, not advisory: X25519 for pairing, HKDF-SHA-256 for key derivation,
+  AES-256-GCM (only) for runtime records, HMAC-SHA-256 for transcript confirmation. Reject
+  an all-zero X25519 shared secret. Compare tags/proofs in constant time. Zeroize ephemeral
+  secrets on every success and failure path.
+  **Note:** runtime records were originally 128-bit; revised to AES-256-GCM during step 6
+  because the Flipper's only exported raw-key AES-GCM primitive hardcodes a 256-bit key —
+  pass the full 32-byte derived session key, `mbedtls_gcm_*` already supports it.
 
-## Known failure modes — these reached real hardware despite clean builds
+## Known failure modes — read before touching transport sizing or the Flipper boundary
 
 **A clean `idf.py build` plus passing host-native tests is close to zero evidence about BLE
-behavior against the real peer.** Bugs in this section all shipped with both green. Report
-build results as build results, not as validation of transport or peer interaction.
+behavior against the real peer.** Report build results as build results, not as validation
+of transport or peer interaction. Full incident writeups: [docs/LESSONS.md](../../docs/LESSONS.md).
 
-### ATT MTU is an upper bound, not the write limit — the peer's characteristic size is separate
-
-The negotiated ATT MTU (256 here) tells you what the *link* can carry. It says nothing about
-what the peer's *attribute* will accept: a GATT characteristic's declared max value length is
-an independent cap enforced regardless of MTU headroom, and exceeding it fails with ATT error
-0x0D (`ATT_ERR_INVALID_ATTR_VALUE_LEN`, surfaced by NimBLE as status **269** =
-`BLE_HS_ATT_BASE` + 13).
-
-The Flipper's Write characteristic is fixed at **64 bytes** (`PAYLOAD_MAX` in
-`flipper/flipper_esp32_over_ble.c`), so outgoing fragments are sized against
-`FEB_FLIPPER_WRITE_EFFECTIVE_MTU`, not `negotiated_att_mtu`. Don't "improve" this back into
-using the raw MTU. More generally: before choosing any outgoing size, read the peer's actual
-characteristic declaration — it lives in the other firmware's source and is always readable.
-
-### Facts about the Flipper must be read from its source, not assumed
-
-The two firmwares are implemented independently against frozen shared contracts, which is
-deliberate and has caught real bugs. Its blind spot: **an invariant that isn't in the shared
-contract is checked by nobody.** The 64-byte characteristic cap was exactly that — a
-Flipper-side implementation detail that was silently also a wire constraint.
-
-So: when your code depends on any fact about the Flipper (buffer sizes, characteristic
-properties, handle layout, timing), (a) confirm it by reading `flipper/*.c`, and (b) say in
-your report that the dependency should be promoted into `framing.h`/`docs/PROTOCOL.md` rather
-than left implicit. Treat "protocol-shaped" as including transport sizing, not just CBOR field
-shapes — that misclassification is what let this bug through.
-
-### `sdkconfig.defaults` does not retroactively update an existing `sdkconfig`
-
-ESP-IDF seeds new keys from `sdkconfig.defaults` only into a *fresh* sdkconfig; an
-already-answered option keeps its old value. `CONFIG_MBEDTLS_HKDF_C=y` was added to defaults
-and the build passed immediately — while the generated `sdkconfig` still said `is not set`,
-because nothing called `mbedtls_hkdf()` yet and `--gc-sections` stripped the path before it
-could fail to link. After changing `sdkconfig.defaults`, grep the generated `sdkconfig` to
-confirm the value actually took, and regenerate it (delete + rebuild) if it didn't. A clean
-exit code proves nothing about code no one calls yet.
-
-### A test that forces an artificial parameter proves nothing about the real one
-
-Step 3's on-device smoke test hardcoded `feb_fragment_capacity(23)` (16-byte fragments) to
-exercise multi-fragment reassembly. It worked, and in doing so guaranteed the oversized-write
-path was never once exercised — the bug above sat latent until the first real record went out
-at the real negotiated MTU. When a test pins a parameter to a conservative value, state
-explicitly which failure modes that pinning *excludes*, and make sure something else covers
-the real value before calling the behavior validated.
+- **Size outgoing fragments against `FEB_FLIPPER_WRITE_EFFECTIVE_MTU`, never the negotiated
+  ATT MTU.** The peer's GATT characteristic has its own declared max length, enforced
+  independently of MTU headroom — exceeding it is ATT error 0x0D / NimBLE status 269. This
+  is live and easy to reintroduce; see `docs/LESSONS.md#att-mtu-vs-attribute-length`.
+- **Any fact about the Flipper's implementation must be confirmed by reading `flipper/*.c`,
+  never assumed.** An invariant that isn't in the shared contract is checked by nobody — the
+  64-byte characteristic cap above was exactly that. Flag such dependencies for promotion
+  into `framing.h`/`docs/PROTOCOL.md`. See `docs/LESSONS.md#flipper-facts-must-be-read-not-assumed`.
+- After editing `sdkconfig.defaults`, grep the generated `sdkconfig` to confirm the value
+  took, and regenerate (delete + rebuild) if it didn't — defaults only seed a *fresh*
+  sdkconfig. See `docs/LESSONS.md#sdkconfig-defaults-not-retroactive`.
+- When you change a sizing constant, grep for every comment/derivation that depends on it and
+  update them in the same edit — a stale derivation comment is a false claim. See
+  `docs/LESSONS.md#fragment-count-comment-rot`.
+- When a test pins a parameter to a conservative value, state which failure modes that
+  pinning excludes — see `docs/LESSONS.md#att-mtu-vs-attribute-length` for how this let a
+  real bug ship.
 
 ## Build and validate
 
@@ -130,18 +101,11 @@ Read-only diagnostics (`flash_id`, `idf.py monitor` to observe, not to send) are
 without asking. Known port from prior sessions: `COM9` — reconfirm, it isn't stable across
 reboots.
 
-**`esptool` read commands are not actually reset-free.** `read_flash` (and most other
-commands) default to `--after hard_reset`, which reboots the chip into the running app the
-moment the "read-only" operation finishes — a real state change on this project, since every
-boot unconditionally opens a fresh 120-second pairing window (see
-[docs/PAIRING.md](../../docs/PAIRING.md)). This silently triggered an unplanned second
-pairing ceremony during the 2026-09-05 step-5 hardware verification (the still-live Flipper
-app answered the new window with no user interaction), corrupting what was meant to be a
-clean before/after NVS snapshot — see `docs/SESSION_MEMORY.md`'s "Step 5 hardware
-verification executed" entry. Pin `--before default_reset --after no_reset` explicitly for
-any dump meant to be a true read-only snapshot, and note that `no_reset` leaves the chip
-sitting in the ROM bootloader afterward (not running app code) — a deliberate
-`--after hard_reset` or bare `chip_id` call is needed to resume normal operation.
+**`esptool` read commands are not reset-free** — most default to `--after hard_reset`,
+which boots the running app (and, on this project, opens a fresh pairing window). Pin
+`--before default_reset --after no_reset` for a true read-only snapshot; that leaves the
+chip in the ROM bootloader, so a deliberate `--after hard_reset` or bare `chip_id` call is
+needed afterward to resume normal operation. See `docs/LESSONS.md#esptool-read-commands-are-not-reset-free`.
 
 ## Working method
 
@@ -150,19 +114,20 @@ sitting in the ROM bootloader afterward (not running app code) — a deliberate
 2. Read the relevant doc (PROTOCOL/PAIRING/CAPABILITIES) before writing protocol-adjacent
    code — don't invent a field shape or derivation that isn't specified there.
 3. Make the smallest change consistent with the current roadmap step. Don't pull forward
-   later-phase behavior (pairing, persistence, capabilities) into a transport-only change,
-   or vice versa.
-4. Validate with `idf.py build` at minimum after every substantive change — and report it as
-   a build result only. Per "Known failure modes" above, don't let it imply the BLE or
-   peer-facing behavior works.
-5. State board/pin/power assumptions explicitly when they matter to the change — and any
-   assumption about the *Flipper's* implementation, which must be confirmed by reading
-   `flipper/*.c` rather than inferred.
-6. If you learn a new hardware fact, root cause, or verified measurement, note that it
-   belongs in the relevant `docs/*.md` file — this project keeps its docs as the durable
-   record (no git history to fall back on). **If the root cause repeats a bug class already
-   recorded in `docs/SESSION_MEMORY.md`, also propose an update to this agent file** — the log
-   records history, but only this file changes future behavior.
+   later-phase behavior into a transport-only change, or vice versa.
+4. Validate with `idf.py build` at minimum after every substantive change, and report it as
+   a build result only — per "Known failure modes," don't let it imply BLE/peer behavior works.
+5. State board/pin/power assumptions explicitly when they matter, and confirm (don't infer)
+   any assumption about the Flipper's implementation by reading `flipper/*.c`.
+6. Record new hardware facts, root causes, or verified measurements in the relevant
+   `docs/*.md` file. If a root cause repeats a bug class already in `docs/LESSONS.md`, also
+   propose an update to this agent file — the log records history, only this file changes
+   future behavior.
+7. **When you add new shared codec functions/macros/structs in parallel with the Flipper
+   agent**, run `python tools/check_shared_headers.py` before reporting done. It catches
+   macro/prototype drift automatically but not struct-body shape divergence (a tagged union
+   vs. named fields, say) — for any new composite or optional-field shape, also read the
+   struct definition on both sides. See `docs/LESSONS.md#wardriving-struct-shape-divergence`.
 
 ## Embedded standards
 
@@ -174,84 +139,13 @@ sitting in the ROM bootloader afterward (not running app code) — a deliberate
 - Match integer widths and format specifiers; avoid one-letter variable names.
 - Keep comments rare — only for non-obvious hardware constraints or control flow, matching
   the existing `main.c` style.
-
-### Maintainability rules earned from this project's own latent bugs
-
-All three examples below were **live defects until fixed and build-verified on 2026-09-05**
-(see `docs/PLAN.md`'s "Live code-health defect fixes"). Kept here as the pattern to recognize
-next time, not a current TODO — don't let a fourth accumulate the same way these three did.
-
-- **A comment stating a derivation is a claim, and claims rot.** `FEB_TX_MAX_FRAGMENTS` was
-  `48u`, still documented as `ceil(FEB_MAX_RECORD_SIZE / feb_fragment_capacity(23))` — a
-  capacity this firmware had stopped using once fragment sizing moved to
-  `FEB_FLIPPER_WRITE_EFFECTIVE_MTU` (capacity 60, so 13 fragments suffice), leaving the three
-  `tx_fragment_*` arrays ~3.7x oversized and the derivation false. Fixed to `13u` with a
-  corrected comment. When you change a sizing parameter, grep for every constant and comment
-  derived from it and update them in the same edit.
-- **A declared API that nobody calls is a silent gap.** `feb_reassembly_check_timeout()` was
-  specified in `framing.h` with a 2-second timeout but never called from `main.c`, so a
-  stalled partial fragment sequence held the reassembly buffer until the next complete
-  message or a disconnect. Fixed by wiring it to a periodic NimBLE `ble_npl_callout`. The
-  Flipper side had the identical unwired gap, independently discovered while fixing this one
-  (see `flipper-developer.md`) — a declared shared-contract API is a silent gap on *both*
-  implementations until something proves otherwise, not just the one you're looking at.
-  Adding an API to a shared contract means wiring a caller on both sides in the same change,
-  or recording explicitly why not.
-- **Header contract and implementation can disagree indefinitely.** `framing.h` described
-  `feb_fragment_record()` as writing "into a caller-owned buffer sized >=
-  `FEB_FRAG_HEADER_SIZE` + capacity — no dynamic allocation," but the function took no buffer
-  parameter and used a file-scope static — contradicting each other since 2026-09-03 until
-  the comment was rewritten to match. A header comment is part of the contract you must keep
-  true, not decoration.
-
-### Two implementations agreeing is not two implementations being right
-
-Independent implementation genuinely works here — in step 3 both sides found the same two
-`framing.c` defects separately. But both derive from *one* shared contract and *one* shared
-vector set, so a mistake in the contract propagates to both and nothing disagrees. Example:
-`FEB_CBOR_MAX_BYTES_LEN` bounded `ciphertext` to 256 while `FEB_CBOR_MAX_PAYLOAD` was 512, and
-GCM ciphertext is exactly as long as its plaintext regardless of key size — so a
-maximum-size payload could not round-trip. Identical on both firmwares, exercised by no
-vector, latent since step 3;
-fixed 2026-09-05 by raising it to `512u` to match. Validate bounds against `docs/PROTOCOL.md`
-directly, never against the other implementation or the vectors.
-
-A second example, wifi_scan (2026-09-07): `feb_cbor_skip_value()`'s nesting-depth budget is a
-pure internal recursion counter with no wire representation, so nothing in `docs/PROTOCOL.md`
-or the test vectors could catch a wrong assumption about it — and both firmwares independently
-assumed the same wrong one (that a field nested inside `payload`, like `command.arguments` or
-`status.result`, should inherit `payload_span`'s depth-2 starting point). It doesn't: a field
-with its own dedicated, schema-aware decoder is its own self-contained span and must get a
-*fresh* depth-0 budget when it recurses into `feb_cbor_skip_value()` for a still-generic
-sub-piece, otherwise a real, spec-legal shape (here, `result` → `aps` array → 6-field
-`<ap-result>` map — 3 real containers) silently exceeds `FEB_CBOR_MAX_NESTING` and gets
-rejected. Both agents hit this the same way, independently, confirming it's a genuine spec gap
-and not implementation carelessness — but also confirming the general point: **when you add a
-new schema-aware decoder for a field that itself sits inside another generically-validated
-field, explicitly decide and state what depth budget it starts from; don't silently inherit
-whatever the outer call site happened to be at.** This is now documented in `docs/PROTOCOL.md`'s
-"Nesting depth" section — read it before adding another nested payload shape.
-
-**When you and the Flipper agent add new shared codec functions/macros in parallel, diff
-`cbor_codec.h` against `flipper/cbor_codec.h` before reporting done.** The convention (stated
-above) is that this header's actual API surface — function signatures, struct layouts, macro
-names — stays byte-identical between firmwares, with only comment wording allowed to differ.
-wifi_scan's parallel implementation broke this silently: the two agents wrote genuinely
-different signatures for `feb_cbor_encode_wifi_scan_result_payload()` and a differently-named
-macro, and nothing caught it until an explicit post-hoc `diff` in the orchestrating session.
-Run that diff yourself as your last step whenever you add new shared-header content in
-parallel with the Flipper side, not just when told to.
-
-### Efficiency: fix the constraint rather than paying for it on every record
-
-The 64-byte Write characteristic means each record costs ~4x the ATT round trips it needs at
-the negotiated 256-byte MTU, and fragments are written sequentially (each waiting on the prior
-write-completion callback), so latency is round-trips x connection interval — `pair_init` took
-~110 ms across 3 fragments. Irrelevant for a once-per-reset ceremony; it will matter for step
-7's wardriving bulk transfer. The right fix is raising the Flipper's characteristic
-declaration (a cross-firmware change — see the backlog in `docs/PLAN.md`), **not** switching to
-write-without-response, which would give up the ordered reliable delivery the framing layer
-assumes. Before optimizing a transfer path, check whether a declared limit is the real cost.
+- Keep a header's declaration comment in sync with its implementation whenever you touch
+  either — see `docs/LESSONS.md#header-contract-vs-implementation-drift`.
+- A declared shared-contract API left uncalled is a bug on both firmwares, not just a TODO —
+  see `docs/LESSONS.md#unwired-declared-api`.
+- Don't validate a bound (array size, nesting depth, buffer cap) against the other
+  firmware's implementation or the shared test vectors — validate against
+  `docs/PROTOCOL.md` directly. See `docs/LESSONS.md#two-implementations-agreeing-is-not-two-implementations-being-right`.
 
 ## Response style
 

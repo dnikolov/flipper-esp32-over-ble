@@ -24,6 +24,8 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/PAIRING.md](docs/PAIRING.md) | The reset-gated X25519 pairing ceremony, step by step. |
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
+| [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |
+| [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) | Backlog of codebase/agent cost-efficiency splits not yet done (file sizes, read cost). |
 | [docs/STANDALONE_FAP.md](docs/STANDALONE_FAP.md) | What the Flipper external-app ABI can and can't do; feasibility evidence with file citations. |
 | [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) | Dated narrative log of setup/debugging (toolchain repairs, root causes). Reference, don't duplicate. |
 | [docs/hardware/esp32-c6-devkitc-1/README.md](docs/hardware/esp32-c6-devkitc-1/README.md) | Board pinout, strapping pins, USB paths, vendor datasheets. |
@@ -92,6 +94,16 @@ Artifacts: ESP32 image under `esp32/build/`; FAP under
   build (a root cause, a pinned commit, a verified measurement), record it in the relevant doc
   rather than only in a commit message or chat — the docs, not git history, are the source of
   truth for *why*.
+- **`docs/PLAN.md` and `docs/SESSION_MEMORY.md` keep re-drifting into narrative dumping
+  grounds** (fixed once already 2026-09-07, found re-bloated to ~48K again by 2026-09-09 —
+  a recurring failure mode, not a one-off). When you're about to add a paragraph to either
+  file describing something that already happened and is finished (a bug found+fixed, a
+  hardware-verification pass, a wire-format re-derivation that's already frozen in
+  [docs/PROTOCOL.md](docs/PROTOCOL.md)), it belongs in
+  [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) instead, with only a one-line "✅ done,
+  see PROJECT_HISTORY.md" pointer left behind. `SESSION_MEMORY.md` is current-state-only
+  (read every session, keep it a fast read); `PLAN.md` is roadmap + binding "done when"
+  criteria/specs only; PROJECT_HISTORY.md is the only file allowed to carry dated narrative.
 - No comment-heavy style in either firmware; both existing `.c` files are comment-sparse by
   design, matching the flipper-developer agent's low-level C standards below.
 - **Keep [docs/USER_GUIDE.md](docs/USER_GUIDE.md) in sync with actual behavior.** Any change

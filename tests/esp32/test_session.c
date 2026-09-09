@@ -1,6 +1,7 @@
 /* Host-native test driver for esp32/main/session_crypto.c + esp32/main/session.c
-   (plus their esp32/main/cbor_codec.c + esp32/main/pairing_crypto.c dependencies),
-   compiled directly (not copies) against the shared vectors in tests/vectors/vectors.h.
+   (plus their split cbor_*.c codec dependency (docs/OPTIMIZATION.md item 1) +
+   esp32/main/pairing_crypto.c dependency), compiled directly (not copies) against the
+   shared vectors in tests/vectors/vectors.h.
    See docs/PLAN.md step 6 and tests/esp32/test_pairing.c for the established pattern
    this mirrors. */
 #include <stdio.h>
@@ -290,8 +291,9 @@ static void test_decrypt_record_tamper_rejected(void)
    tests/esp32/test_framing_cbor.c because these three vectors require AES-256-GCM
    encrypt/decrypt (session.c/session_crypto.c + mbedtls), which build.ps1 for
    test_framing_cbor.c does not link -- test_framing_cbor.c instead covers every
-   wifi_scan codec vector that needs only cbor_codec.c (the ap-result/result/command/status
-   payload shapes themselves). See the esp32-developer report for this step. */
+   wifi_scan codec vector that needs only the split cbor_*.c codec (the
+   ap-result/result/command/status payload shapes themselves). See the esp32-developer
+   report for this step. */
 static void test_wifi_scan_command_record(void)
 {
     uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];

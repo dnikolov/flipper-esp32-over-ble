@@ -129,6 +129,61 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 - Pressing **Back** exits the results view and clears all results from the display. Results are not saved, exported, or persisted in any way — they appear on screen only.
 - If the ESP32 disconnects and reconnects (triggered by the 30-second idle timeout or by the Flipper leaving range briefly), the results remain on screen and your scroll position is preserved — you can continue viewing the same scan results before starting a new one.
 
+## Wardriving
+
+**Hardware-verification status:** unlike every other section in this guide, this one is
+**not yet hardware-verified** — it documents behavior that builds cleanly and passes host-
+native tests against the frozen wire contract (see [PROTOCOL.md](PROTOCOL.md)/
+[CAPABILITIES.md](CAPABILITIES.md)), but has not yet been exercised on a real Flipper +
+ESP32-C6. Treat the specifics below (exact screen layout, button behavior) as accurate to
+the current code, not as a confirmed-on-hardware guarantee.
+
+Once an authenticated session is active and the Flipper's status line shows the board
+advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving`), press **Up**
+from the main screen to open the wardriving control/status screen.
+
+**Starting and stopping:** Press **OK** to start wardriving. Unlike `wifi_scan`/`ble_scan`,
+there's no source-picker or interval-entry screen — the app automatically requests every
+source the connected board actually advertises (`wifi_scan`, `ble_scan`, or both) and lets
+the ESP32 apply its own default capture cadence (the most thorough setting validated during
+this project's radio-coexistence testing). Once running, pressing **OK** again sends a stop
+command. **Back** always returns to the main screen without stopping the capture — wardriving
+runs autonomously on the ESP32 regardless of whether this screen is open or the Flipper is
+even connected, so leaving the screen is pure navigation, not an implicit stop.
+
+**Screen contents:**
+- **Header** — `Wardriving: unknown`, `Wardriving: RUNNING`, or `Wardriving: stopped`. The
+  `unknown` state appears right after connecting: the wire protocol has no "is it currently
+  running?" query, so until this Flipper either starts/stops it itself or gets a `busy`/
+  `not_running` response correcting a guess, it genuinely doesn't know the ESP32's current
+  state — this is deliberate, not a bug, and OK will always try to start it from `unknown`.
+- **Records/backlog line** — a running count of records received this connected session, plus
+  either `Backlog: N` (still draining previously-buffered results from the ESP32's flash log)
+  or `Live` (caught up).
+- **Last result line** — the most recently received record's kind (WiFi/BLE) and a short
+  summary (SSID or BLE address).
+- **Error line** — appears only when something needs attention (e.g. the board reports it's
+  already running, or a CSV write failed).
+
+**Backlog drain:** Whenever the Flipper connects and authenticates, the ESP32 automatically
+sends any wardriving records it has buffered since the last connection — this happens whether
+or not wardriving is currently running, and whether or not you've opened this screen. These
+records are captured and exported the same as live results (see below).
+
+**Location data:** every record currently carries the same fixed placeholder coordinate — real
+GPS hardware is not yet wired to the board (see [CAPABILITIES.md](CAPABILITIES.md)).
+
+**SD card export:** every wardriving record (both backlog-drained and live) is appended,
+incrementally and in WiGLE CSV format, to a timestamped file under
+`/ext/apps_data/flipper_esp32_over_ble/wardriving/` on the Flipper's SD card. One file covers
+one connected session (from the first record received after connecting to disconnect/exit) —
+starting and stopping wardriving within the same session does not create separate files.
+Records are written to the file as they arrive rather than held in memory, so a capture
+session can run for hours without growing the app's RAM usage. Because the ESP32 has no
+real-time clock, each record's exported timestamp is an approximation: the most recently
+received record is anchored to the Flipper's current clock, and older records are backdated
+from it using their reported time-since-boot — not a true wall-clock record.
+
 ## Factory-resetting the ESP32 without a PC
 
 If you don't have a PC handy for the `esptool`/`parttool` NVS-erase method described elsewhere

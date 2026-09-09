@@ -1,6 +1,8 @@
-/* Host-native test driver for esp32/main/framing.c + esp32/main/cbor_codec.c, compiled
-   directly (not copies) against the shared vectors in tests/vectors/vectors.h. See
-   docs/PLAN.md step 3 "Validation gate is host-native, not on-device". */
+/* Host-native test driver for esp32/main/framing.c + the split cbor_*.c codec (docs/
+   OPTIMIZATION.md item 1: cbor_primitives.c/cbor_records.c/cbor_wifi_scan.c/
+   cbor_ble_scan.c/cbor_wardriving.c), compiled directly (not copies) against the shared
+   vectors in tests/vectors/vectors.h. See docs/PLAN.md step 3 "Validation gate is
+   host-native, not on-device". */
 #include <stdio.h>
 #include <string.h>
 
@@ -270,8 +272,9 @@ static void test_payload_type_depth_and_trailing(void)
 /* docs/PLAN.md "Wi-Fi scan capability" step: pure-codec wifi_scan vectors (no session
    crypto involved -- the end-to-end protected-record wraps of FEB_VEC_WIFI_SCAN_CMD_RECORD/
    STATUS_PARTIAL_RECORD/STATUS_COMPLETE_RECORD are tested in tests/esp32/test_session.c
-   instead, since this binary's build.ps1 only links framing.c+cbor_codec.c and has no
-   session.c/mbedtls AES-GCM dependency -- see the esp32-developer report for this step). */
+   instead, since this binary's build.ps1 only links framing.c and the split cbor_*.c codec
+   files (docs/OPTIMIZATION.md item 1) and has no session.c/mbedtls AES-GCM dependency --
+   see the esp32-developer report for this step). */
 static void test_wifi_scan_ap_roundtrip(const uint8_t *vec, size_t vec_len,
                                          const uint8_t *expected_ssid, size_t expected_ssid_len,
                                          uint64_t expected_rssi_offset, uint64_t expected_channel,
@@ -559,8 +562,7 @@ static void test_wardriving_command_payload(void)
         ok = ok && wc.source_lens[0] == strlen("wifi") && memcmp(wc.sources[0], "wifi", wc.source_lens[0]) == 0;
         ok = ok && wc.source_lens[1] == strlen("ble") && memcmp(wc.sources[1], "ble", wc.source_lens[1]) == 0;
         ok = ok && wc.has_wifi_interval_ms && wc.wifi_interval_ms == 30000;
-        ok = ok && wc.has_ble_window_ms && wc.ble_window_ms == 30;
-        ok = ok && wc.has_ble_interval_ms && wc.ble_interval_ms == 30;
+        ok = ok && wc.has_ble_params && wc.ble_window_ms == 30 && wc.ble_interval_ms == 30;
     }
     check(ok, "wardriving command (start, both sources): decodes action/sources/intervals");
     if (ok) {
@@ -579,7 +581,7 @@ static void test_wardriving_command_payload(void)
         status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
         ok = (status == FEB_CBOR_OK);
         ok = ok && wc.action_len == strlen("stop") && memcmp(wc.action, "stop", wc.action_len) == 0;
-        ok = ok && !wc.has_sources && !wc.has_wifi_interval_ms && !wc.has_ble_window_ms && !wc.has_ble_interval_ms;
+        ok = ok && !wc.has_sources && !wc.has_wifi_interval_ms && !wc.has_ble_params;
     }
     check(ok, "wardriving command (stop): decodes action only, no other fields present");
     if (ok) {
@@ -592,7 +594,7 @@ static void test_wardriving_command_payload(void)
 
     /* start missing wifi_interval_ms despite "wifi" in sources: decodes structurally OK;
        the action/sources-dependent requiredness check is a caller (main.c) concern, not a
-       codec error -- see cbor_codec.h's wardriving comment, same split as wifi_scan's
+       codec error -- see cbor_wardriving.h's wardriving comment, same split as wifi_scan's
        non-empty-arguments case above. */
     status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD,
                                               FEB_VEC_WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD_LEN, &cmd);

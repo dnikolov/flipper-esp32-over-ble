@@ -1,7 +1,8 @@
 /* Host-native test driver for esp32/main/pairing_crypto.c + esp32/main/pairing.c
-   (plus their esp32/main/cbor_codec.c dependency), compiled directly (not copies)
-   against the shared vectors in tests/vectors/vectors.h. See docs/PLAN.md step 5
-   and tests/esp32/test_framing_cbor.c for the established pattern this mirrors. */
+   (plus their split cbor_*.c codec dependency (docs/OPTIMIZATION.md item 1)), compiled
+   directly (not copies) against the shared vectors in tests/vectors/vectors.h. See
+   docs/PLAN.md step 5 and tests/esp32/test_framing_cbor.c for the established pattern
+   this mirrors. */
 #include <stdio.h>
 #include <string.h>
 

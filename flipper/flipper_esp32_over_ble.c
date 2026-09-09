@@ -1,6 +1,7 @@
 #include <furi.h>
 #include <furi_hal_bt.h>
 #include <furi_hal_random.h>
+#include <furi_hal_rtc.h>
 #include <bt/bt_service/bt.h>
 #include <ble/ble.h>
 #include <ble_glue.h>
@@ -15,6 +16,7 @@
 #include <furi/core/string.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
+#include <datetime/datetime.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +26,7 @@
 #include "pairing.h"
 #include "pairing_crypto.h"
 #include "session.h"
+#include "wardriving_csv.h"
 
 #define TAG "Esp32OverBle"
 #define PAYLOAD_MAX 64
@@ -38,6 +41,13 @@
    "pairings", same atomic-write pattern, one file per board_id. */
 #define CAPABILITY_DIR_NAME "capabilities"
 #define FEB_CAPABILITIES_PATH_MAX_LEN 96
+/* wardriving WiGLE CSV export directory (docs/CAPABILITIES.md's wardriving bullet), own
+   subdirectory next to "pairings"/"capabilities", same resolve-once-from-this-app's-own-
+   thread pattern -- see resolve_pairings_dir_path()'s comment for why. Unlike those two,
+   files here are append-only exports, not atomically-replaced state, so there is no
+   "*.tmp"/rename pattern for them (see wardriving_csv_ensure_open()). */
+#define WARDRIVING_EXPORT_DIR_NAME "wardriving"
+#define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 96
 /* Compact on-screen capability line: "<board>: <features>". Real values today are short
    ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
    full 64 bytes -- a real scrollable capability view is backlogged for when `features`
@@ -77,6 +87,7 @@ typedef enum {
     AppScreenMain,
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
+    AppScreenWardriving,
 } AppScreen;
 
 typedef enum {
@@ -90,6 +101,21 @@ typedef enum {
     AppEventBleScanDevice,
     AppEventBleScanDone,
     AppEventBleScanError,
+    /* wardriving (docs/PROTOCOL.md "`wardriving` command and status payloads"): unlike
+       wifi_scan/ble_scan, records are not posted one-per-event -- a single `status`(data)
+       record can carry up to 32 records (FEB_WARDRIVING_MAX_RECORDS_PER_BATCH), and this
+       app's queue only holds 8 events total (furi_message_queue_alloc(8, ...) below), so
+       posting one event per record risks silently dropping records past the queue's depth
+       under a large/fast backlog drain (the same latent risk already exists for
+       wifi_scan/ble_scan's own per-AP/per-device posts, just less likely to bite there given
+       their smaller typical result counts and one-shot nature -- see this project's docs/
+       PLAN.md Backlog). AppEventWardrivingBatch instead posts ONE summary event per `status`
+       record; the CSV file write for every record in the batch happens synchronously inside
+       handle_wardriving_status() on the BLE thread itself (see that function), not deferred
+       through this queue at all. */
+    AppEventWardrivingRunState,
+    AppEventWardrivingBatch,
+    AppEventWardrivingError,
 } AppEventType;
 
 /* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
@@ -121,6 +147,23 @@ typedef struct {
     int32_t ble_scan_device_rssi_dbm;
     char ble_scan_device_addr_type[8];
     char ble_scan_error_message[48];
+    bool capability_has_wardriving;
+    /* wardriving fields: AppEventWardrivingRunState uses wardriving_running/
+       wardriving_is_fresh_start; AppEventWardrivingBatch uses the batch_count, the
+       backlog_remaining, and the last_* fields; AppEventWardrivingError uses
+       wardriving_error_message. Fields are shared across these three event types (like
+       pairing_reason above) rather than a union, matching this struct's existing style. */
+    bool wardriving_running;
+    bool wardriving_is_fresh_start; /* true only for a real "started" ack -- see this event's
+                                        own AppEventType comment; distinguishes a genuine new
+                                        capture (reset the on-screen record counter) from a
+                                        `busy`-error-inferred "it was already running"
+                                        correction (do not reset the counter). */
+    uint32_t wardriving_batch_count;
+    uint64_t wardriving_backlog_remaining;
+    bool wardriving_last_is_ble;
+    char wardriving_last_summary[40];
+    char wardriving_error_message[48];
 } AppEvent;
 
 typedef struct {
@@ -146,6 +189,20 @@ typedef struct {
     bool ble_scan_complete;
     size_t ble_scan_scroll_offset;
     char ble_scan_error_message[48];
+    bool capability_has_wardriving;
+    /* wardriving_running_known is false until this connected session has actual evidence
+       either way (a "started"/"stopped" ack, or a `busy`/`not_running` error correcting a
+       start/stop guess) -- there is no wire query for "is wardriving currently running"
+       (docs/PROTOCOL.md has no such message), so on every fresh session this Flipper
+       genuinely does not know the ESP32's current run state until it learns it one of those
+       ways (docs/LESSONS.md "UI must derive from real state"). */
+    bool wardriving_running_known;
+    bool wardriving_running;
+    uint32_t wardriving_records_this_session;
+    uint64_t wardriving_backlog_remaining;
+    bool wardriving_last_is_ble;
+    char wardriving_last_summary[40];
+    char wardriving_error_message[48];
 } Esp32App;
 
 typedef struct {
@@ -299,6 +356,8 @@ static char pairings_dir_path[FEB_PAIRINGS_PATH_MAX_LEN];
 static bool pairings_dir_ready;
 static char capabilities_dir_path[FEB_CAPABILITIES_PATH_MAX_LEN];
 static bool capabilities_dir_ready;
+static char wardriving_export_dir_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+static bool wardriving_export_dir_ready;
 
 static bool resolve_pairings_dir_path(Storage* storage) {
     FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(PAIRING_DIR_NAME));
@@ -390,6 +449,37 @@ static bool build_capability_path(
         board_id,
         tmp ? ".dat.tmp" : ".dat");
     return written > 0 && (size_t)written < out_cap;
+}
+
+/* Same resolve-once-from-this-app's-own-thread rationale as resolve_pairings_dir_path()
+   above. Unlike the pairings/capabilities directories, this one holds append-only CSV export
+   files (wardriving_csv_ensure_open() below), not atomically-replaced per-board state -- no
+   board_id-keyed path builder is needed here, since export files are named by timestamp, not
+   by board. */
+static bool resolve_wardriving_export_dir_path(Storage* storage) {
+    FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(WARDRIVING_EXPORT_DIR_NAME));
+    storage_common_resolve_path_and_ensure_app_directory(storage, resolved);
+    bool ok = furi_string_size(resolved) < sizeof(wardriving_export_dir_path);
+    if(ok) {
+        strncpy(
+            wardriving_export_dir_path,
+            furi_string_get_cstr(resolved),
+            sizeof(wardriving_export_dir_path) - 1);
+        wardriving_export_dir_path[sizeof(wardriving_export_dir_path) - 1] = '\0';
+    } else {
+        FURI_LOG_E(TAG, "Resolved wardriving export path too long to cache");
+    }
+    furi_string_free(resolved);
+    if(!ok) {
+        return false;
+    }
+
+    FS_Error mkdir_err = storage_common_mkdir(storage, wardriving_export_dir_path);
+    if(mkdir_err != FSE_OK && mkdir_err != FSE_EXIST) {
+        FURI_LOG_E(TAG, "mkdir wardriving export dir failed: %d", mkdir_err);
+        return false;
+    }
+    return true;
 }
 
 /* Atomic per-board persistence: temp-file write, exact-length verification,
@@ -911,18 +1001,31 @@ static uint8_t ble_scan_cmd_ciphertext_buf[FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN];
 static uint8_t ble_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
 static uint64_t ble_scan_next_request_id = 1;
 
-/* `status`/`error` records carry no capability field (docs/PROTOCOL.md) -- only one manual
-   scan command can be in flight at a time (each results screen gates its own trigger on its
-   own *_in_progress flag, and the ESP32-side busy rule enforces the same). This flag records
-   which of the two scan commands was most recently sent, so the BLE thread's dispatch
-   (profile_event_handler, further below) can route an incoming `status`/`error` record to the
-   right decoder. Written only by send_wifi_scan_command()/send_ble_scan_command(), on this
-   app's own main thread, immediately before the send that could provoke a reply; read only by
-   the BLE thread once that reply actually arrives. This is the same cross-thread-without-a-lock
-   argument send_wifi_scan_command()'s own comment already makes for session_key/
-   session_seq_out: a reply cannot physically arrive before the send that provoked it has
-   returned on this thread, so there is no window where both threads touch this flag at once. */
-static bool pending_scan_is_ble;
+/* `error` records (busy/not_running/invalid_command) carry no capability field
+   (docs/PROTOCOL.md) -- only one manual command (wifi_scan, ble_scan, or a wardriving
+   start/stop) can be in flight at a time (each gates its own trigger on its own
+   *_in_progress-equivalent state, and the ESP32-side busy/not_running rules enforce the same
+   radio-sharing serialization). This records which command was most recently sent, so
+   handle_runtime_error() (further below) can route an incoming `error` record to the right
+   capability's error display -- and, for wifi_scan/ble_scan specifically, so the BLE thread's
+   `status` dispatch can pick between their two otherwise-identical "partial"/"complete"
+   states (wardriving's own states are unambiguous by text alone -- see profile_event_handler's
+   status routing -- so this flag is never consulted for a wardriving status). Written only by
+   send_wifi_scan_command()/send_ble_scan_command()/send_wardriving_start_command()/
+   send_wardriving_stop_command(), on this app's own main thread, immediately before the send
+   that could provoke a reply; read only by the BLE thread once that reply actually arrives.
+   This is the same cross-thread-without-a-lock argument send_wifi_scan_command()'s own
+   comment already makes for session_key/session_seq_out: a reply cannot physically arrive
+   before the send that provoked it has returned on this thread, so there is no window where
+   both threads touch this flag at once. */
+typedef enum {
+    PendingCommandNone,
+    PendingCommandWifiScan,
+    PendingCommandBleScan,
+    PendingCommandWardrivingStart,
+    PendingCommandWardrivingStop,
+} PendingCommandKind;
+static PendingCommandKind pending_command_kind = PendingCommandNone;
 
 /* Per-AP display state, accumulated across one or more `status` records for the results
    view. Not reachable from profile_event_handler (BLE-thread callbacks only ever post one
@@ -1180,6 +1283,7 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
         sizeof(event.capability_features));
     event.capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
     event.capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
+    event.capability_has_wardriving = capability_has_feature(payload, "wardriving");
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -1445,12 +1549,294 @@ static void
     }
 }
 
+/* ---- wardriving capability (docs/PROTOCOL.md "`wardriving` command and status payloads",
+   docs/CAPABILITIES.md's wardriving bullet) ---- */
+
+static void post_wardriving_run_state(Esp32App* app, bool running, bool is_fresh_start) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWardrivingRunState;
+    event.wardriving_running = running;
+    event.wardriving_is_fresh_start = is_fresh_start;
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_wardriving_batch(
+    Esp32App* app,
+    uint32_t batch_count,
+    uint64_t backlog_remaining,
+    bool last_is_ble,
+    const char* last_summary) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWardrivingBatch;
+    event.wardriving_batch_count = batch_count;
+    event.wardriving_backlog_remaining = backlog_remaining;
+    event.wardriving_last_is_ble = last_is_ble;
+    strncpy(
+        event.wardriving_last_summary, last_summary, sizeof(event.wardriving_last_summary) - 1);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_wardriving_error(Esp32App* app, const char* message) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventWardrivingError;
+    strncpy(event.wardriving_error_message, message, sizeof(event.wardriving_error_message) - 1);
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* CSV export file state -- BLE-thread-only (handle_wardriving_status(), further below, runs
+   synchronously inside profile_event_handler, the same single-threaded-BLE-dispatch
+   assumption every other BLE-callback-only static in this file already relies on; nothing
+   outside that call chain touches these, so -- unlike `reassembly` above, which really is
+   touched from two threads -- no mutex is needed here). One export file spans one
+   authenticated BLE session: opened lazily on the first wardriving record this session sees
+   (whether from an unsolicited backlog drain or a live capture after an explicit start), kept
+   open and appended to for the rest of the session regardless of any stop/restart within it,
+   and closed on disconnect/profile-teardown/app-exit (reset_scan_ui_state(), further below).
+   Judgment call: this is simpler than slicing a file per start/stop, and a single connection's
+   backlog-drain-then-maybe-live-capture reads naturally as one contiguous export rather than
+   several fragments. */
+static File* wardriving_csv_file;
+static char wardriving_csv_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+static uint64_t wardriving_csv_anchor_timestamp_ms;
+static uint32_t wardriving_csv_anchor_unix_time;
+static uint32_t wardriving_csv_records_since_sync;
+static bool wardriving_csv_write_failed;
+
+/* storage_file_sync() every Nth record rather than every record (durability against a mid-
+   session power loss vs. flash-write overhead) or only at close (would lose the whole
+   session's writes since the last sync on a power loss) -- 8 chosen to match this app's
+   existing message-queue depth, no other significance. */
+#define FEB_WARDRIVING_CSV_SYNC_EVERY_N_RECORDS 8u
+
+static void wardriving_csv_reset_state(void) {
+    wardriving_csv_anchor_timestamp_ms = 0;
+    wardriving_csv_anchor_unix_time = 0;
+    wardriving_csv_records_since_sync = 0;
+    wardriving_csv_write_failed = false;
+}
+
+static void wardriving_csv_close(void) {
+    if(wardriving_csv_file) {
+        storage_file_sync(wardriving_csv_file);
+        storage_file_close(wardriving_csv_file);
+        storage_file_free(wardriving_csv_file);
+        wardriving_csv_file = NULL;
+    }
+    wardriving_csv_reset_state();
+}
+
+/* Filename is timestamped at creation (docs/CAPABILITIES.md: "one timestamped file per flush
+   session"); FSOM_OPEN_APPEND creates-if-absent and seeks to EOF, matching this file's
+   append-only, not atomically-replaced, write pattern (contrast with pairing_storage_save()'s
+   temp-file/rename dance, which does not fit an incrementally-appended, potentially
+   hours-long export). */
+static bool wardriving_csv_ensure_open(Storage* storage) {
+    if(wardriving_csv_file) {
+        return true;
+    }
+    if(!wardriving_export_dir_ready) {
+        return false;
+    }
+    DateTime now;
+    furi_hal_rtc_get_datetime(&now);
+    int written = snprintf(
+        wardriving_csv_path,
+        sizeof(wardriving_csv_path),
+        "%s/wardriving_%04u%02u%02u_%02u%02u%02u.csv",
+        wardriving_export_dir_path,
+        (unsigned)now.year,
+        (unsigned)now.month,
+        (unsigned)now.day,
+        (unsigned)now.hour,
+        (unsigned)now.minute,
+        (unsigned)now.second);
+    if(written <= 0 || (size_t)written >= sizeof(wardriving_csv_path)) {
+        FURI_LOG_E(TAG, "wardriving CSV: path build failed");
+        return false;
+    }
+
+    File* file = storage_file_alloc(storage);
+    bool ok = storage_file_open(file, wardriving_csv_path, FSAM_WRITE, FSOM_OPEN_APPEND);
+    if(ok) {
+        static char header_buf[FEB_WARDRIVING_CSV_HEADER_MAX_LEN];
+        size_t header_len = feb_wardriving_csv_format_header(header_buf, sizeof(header_buf));
+        ok = header_len > 0 && storage_file_write(file, header_buf, header_len) == header_len;
+    }
+    if(!ok) {
+        FURI_LOG_E(TAG, "wardriving CSV: failed to create '%s'", wardriving_csv_path);
+        storage_file_close(file);
+        storage_file_free(file);
+        return false;
+    }
+    wardriving_csv_file = file;
+    FURI_LOG_I(TAG, "wardriving CSV: writing to '%s'", wardriving_csv_path);
+    return true;
+}
+
+/* FirstSeen reconstruction (docs/CAPABILITIES.md): tracks the largest timestamp_ms seen so
+   far this export session and the Flipper wall-clock time at the moment it was seen, then
+   backdates every record (including, trivially, the anchor record itself) from that pair --
+   see feb_wardriving_backdate_first_seen()'s own comment (wardriving_csv.h) for the exact
+   arithmetic. Records normally arrive in non-decreasing timestamp_ms order (the ESP32's flash
+   log is itself sequential), so in practice the anchor advances roughly once per record and
+   tracks close to "now" for the most recent data; a real reorder would just mean an older
+   anchor briefly persists, backdating slightly less accurately, not a crash or corrupt row. */
+static bool
+    wardriving_csv_write_record(Storage* storage, const feb_wardriving_record_t* record) {
+    if(!wardriving_csv_ensure_open(storage)) {
+        return false;
+    }
+    if(record->timestamp_ms >= wardriving_csv_anchor_timestamp_ms) {
+        wardriving_csv_anchor_timestamp_ms = record->timestamp_ms;
+        DateTime now;
+        furi_hal_rtc_get_datetime(&now);
+        wardriving_csv_anchor_unix_time = datetime_datetime_to_timestamp(&now);
+    }
+    uint32_t first_seen_unix = feb_wardriving_backdate_first_seen(
+        record->timestamp_ms, wardriving_csv_anchor_timestamp_ms, wardriving_csv_anchor_unix_time);
+    DateTime first_seen_dt;
+    datetime_timestamp_to_datetime(first_seen_unix, &first_seen_dt);
+    static char first_seen_str[FEB_WARDRIVING_CSV_FIRST_SEEN_LEN];
+    snprintf(
+        first_seen_str,
+        sizeof(first_seen_str),
+        "%04u-%02u-%02u %02u:%02u:%02u",
+        (unsigned)first_seen_dt.year,
+        (unsigned)first_seen_dt.month,
+        (unsigned)first_seen_dt.day,
+        (unsigned)first_seen_dt.hour,
+        (unsigned)first_seen_dt.minute,
+        (unsigned)first_seen_dt.second);
+
+    static char row_buf[FEB_WARDRIVING_CSV_ROW_MAX_LEN];
+    size_t row_len = feb_wardriving_csv_format_row(
+        row_buf, sizeof(row_buf), record, first_seen_str, strlen(first_seen_str));
+    if(row_len == 0 || storage_file_write(wardriving_csv_file, row_buf, row_len) != row_len) {
+        return false;
+    }
+    wardriving_csv_records_since_sync++;
+    if(wardriving_csv_records_since_sync >= FEB_WARDRIVING_CSV_SYNC_EVERY_N_RECORDS) {
+        storage_file_sync(wardriving_csv_file);
+        wardriving_csv_records_since_sync = 0;
+    }
+    return true;
+}
+
+/* `status` (docs/PROTOCOL.md "`wardriving` command and status payloads") -- unlike
+   wifi_scan/ble_scan's `partial`/`complete` pair, wardriving's own states ("started"/"data"/
+   "stopped") are never ambiguous with those or each other by text alone, so no
+   pending_command_kind check is needed to route here (see profile_event_handler's status
+   dispatch, further below) or within this function. Every state is handled regardless of
+   `request_id`, including the `request_id == 0` unsolicited-backlog-drain sentinel
+   (docs/PROTOCOL.md "Unsolicited backlog drain") -- this function never inspects
+   status_payload.request_id at all, so there is nothing to special-case for it. CSV writes
+   for a "data" batch happen synchronously here, one record at a time as each is decoded, on
+   the BLE thread itself -- not deferred through app->queue -- so the export file is genuinely
+   appended-to incrementally even under an hours-long capture (docs/CAPABILITIES.md), and a
+   32-record batch can never overrun the main-thread event queue's depth (see
+   AppEventWardrivingBatch's own comment). */
+static void
+    handle_wardriving_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_status_payload_t status_payload;
+    feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "wardriving status payload decode failed: %d; dropping", status);
+        return;
+    }
+
+    if(text_matches(status_payload.state, status_payload.state_len, "started")) {
+        wardriving_csv_reset_state();
+        post_wardriving_run_state(app, true, true);
+        return;
+    }
+    if(text_matches(status_payload.state, status_payload.state_len, "stopped")) {
+        if(wardriving_csv_file) {
+            storage_file_sync(wardriving_csv_file);
+        }
+        post_wardriving_run_state(app, false, false);
+        return;
+    }
+    if(!text_matches(status_payload.state, status_payload.state_len, "data")) {
+        FURI_LOG_W(
+            TAG,
+            "wardriving status: unexpected state '%.*s'; dropping",
+            (int)status_payload.state_len,
+            status_payload.state);
+        return;
+    }
+    if(!status_payload.has_result) {
+        return;
+    }
+
+    static feb_wardriving_status_result_payload_t result;
+    feb_cbor_status_t result_status = feb_cbor_decode_wardriving_status_result_payload(
+        status_payload.result_span, status_payload.result_span_len, &result);
+    if(result_status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "wardriving status.result decode failed: %d; dropping", result_status);
+        return;
+    }
+
+    bool last_is_ble = false;
+    static char last_summary[40];
+    last_summary[0] = '\0';
+    for(size_t i = 0; i < result.record_count; i++) {
+        const feb_wardriving_record_t* record = &result.records[i];
+        if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
+            wardriving_csv_write_failed = true;
+            FURI_LOG_E(
+                TAG, "wardriving CSV: write failed, no further records written this session");
+            post_wardriving_error(app, "CSV export write failed");
+        }
+        last_is_ble = record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE;
+        if(last_is_ble) {
+            const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
+            snprintf(
+                last_summary,
+                sizeof(last_summary),
+                "%02x:%02x:%02x:%02x:%02x:%02x",
+                ble->address[0],
+                ble->address[1],
+                ble->address[2],
+                ble->address[3],
+                ble->address[4],
+                ble->address[5]);
+        } else {
+            const feb_wardriving_wifi_payload_t* wifi = &record->payload.wifi;
+            size_t n =
+                wifi->ssid_len > sizeof(last_summary) - 1 ? sizeof(last_summary) - 1 : wifi->ssid_len;
+            for(size_t j = 0; j < n; j++) {
+                uint8_t b = wifi->ssid[j];
+                last_summary[j] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+            }
+            last_summary[n] = '\0';
+            if(n == 0) {
+                strncpy(last_summary, "(hidden)", sizeof(last_summary) - 1);
+                last_summary[sizeof(last_summary) - 1] = '\0';
+            }
+        }
+    }
+
+    post_wardriving_batch(
+        app, (uint32_t)result.record_count, result.backlog_remaining, last_is_ble, last_summary);
+}
+
 /* Protected-record `error` (post-session-establishment shape, docs/PROTOCOL.md "Runtime
-   auth failure handling" / message-payloads table) -- surfaced for wifi_scan's and
-   ble_scan's `busy` response (docs/PROTOCOL.md's "Busy handling"); any other code is logged
-   and otherwise ignored, since no other capability/command exists yet to react to one.
-   `busy` carries no capability field either, so pending_scan_is_ble (see its own declaration
-   comment above) picks which of the two in-flight results screens this reply belongs to. */
+   auth failure handling" / message-payloads table) -- surfaced for wifi_scan's/ble_scan's
+   `busy` response (docs/PROTOCOL.md's "Busy handling") and wardriving's `busy`/`not_running`/
+   `invalid_command` responses (docs/PROTOCOL.md's "Busy/not-running handling"); any other code
+   is logged and otherwise ignored. `error` carries no capability field, so
+   pending_command_kind (see its own declaration comment above) picks which capability's
+   in-flight command this reply belongs to. A `busy` on a wardriving start means it was
+   already running -- corrected here rather than left "unknown" (docs/LESSONS.md "UI must
+   derive from real state"); symmetrically, `not_running` on a stop confirms it was already
+   stopped. `internal_error` is treated as a wardriving self-stop notice (docs/PROTOCOL.md:
+   "an error record accompanies" a proactive `stopped` sent when "the engine self-stops for an
+   internal reason") -- the only capability with a self-stop concept today; revisit this
+   special case if a future capability also needs `internal_error` routed elsewhere. */
 static void
     handle_runtime_error(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
     Esp32App* app = profile->app;
@@ -1463,11 +1849,27 @@ static void
     FURI_LOG_W(
         TAG, "runtime error received: code='%.*s'", (int)error_payload.code_len, error_payload.code);
     if(text_matches(error_payload.code, error_payload.code_len, "busy")) {
-        if(pending_scan_is_ble) {
+        if(pending_command_kind == PendingCommandBleScan) {
             post_ble_scan_error(app, "ESP32 busy, try again");
-        } else {
+        } else if(pending_command_kind == PendingCommandWifiScan) {
             post_wifi_scan_error(app, "ESP32 busy, try again");
+        } else if(pending_command_kind == PendingCommandWardrivingStart) {
+            post_wardriving_run_state(app, true, false);
+            post_wardriving_error(app, "Already running");
         }
+    } else if(text_matches(error_payload.code, error_payload.code_len, "not_running")) {
+        if(pending_command_kind == PendingCommandWardrivingStop) {
+            post_wardriving_run_state(app, false, false);
+            post_wardriving_error(app, "Already stopped");
+        }
+    } else if(text_matches(error_payload.code, error_payload.code_len, "invalid_command")) {
+        if(pending_command_kind == PendingCommandWardrivingStart ||
+           pending_command_kind == PendingCommandWardrivingStop) {
+            post_wardriving_error(app, "Invalid command");
+        }
+    } else if(text_matches(error_payload.code, error_payload.code_len, "internal_error")) {
+        post_wardriving_run_state(app, false, false);
+        post_wardriving_error(app, "Engine stopped (internal error)");
     }
 }
 
@@ -1532,7 +1934,7 @@ static bool send_wifi_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wifi_scan command: record encode failed");
         return false;
     }
-    pending_scan_is_ble = false;
+    pending_command_kind = PendingCommandWifiScan;
     if(!send_pairing_record(profile, wifi_scan_cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wifi_scan command: send failed");
         return false;
@@ -1601,13 +2003,187 @@ static bool send_ble_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "ble_scan command: record encode failed");
         return false;
     }
-    pending_scan_is_ble = true;
+    pending_command_kind = PendingCommandBleScan;
     if(!send_pairing_record(profile, ble_scan_cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "ble_scan command: send failed");
         return false;
     }
     session_seq_out++;
     FURI_LOG_I(TAG, "ble_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    return true;
+}
+
+/* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
+   values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see
+   FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN's own comment for why this project no longer shaves
+   these to the byte). */
+#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 96u
+static uint8_t wardriving_cmd_payload_buf[FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN];
+static uint8_t wardriving_cmd_ciphertext_buf[FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN];
+static uint8_t wardriving_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+static uint64_t wardriving_next_request_id = 1;
+
+/* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
+   payloads"). `sources` is built from whichever of wifi_scan/ble_scan the connected board
+   actually advertises -- a source the board doesn't have is rejected `invalid_command` per
+   PROTOCOL.md, so this only ever requests what capability_bootstrap() already confirmed
+   present via app->capability_has_wifi_scan/ble_scan. Always requests every source the board
+   has (no source-picker UI in v1, docs/PLAN.md's explicit decision). Interval fields
+   (wifi_interval_ms/ble_window_ms/ble_interval_ms) are omitted entirely so the ESP32 applies
+   its own documented default (the most-aggressive/point-4 values) -- v1 has no
+   interval-entry UI either. Runs on this app's own main thread (OK-press on the wardriving
+   screen), same session_key/session_seq_out cross-thread-safety argument as
+   send_wifi_scan_command()'s own comment (gated on app->capability_has_wifi_scan/ble_scan,
+   which can only become true strictly after capability_bootstrap()'s send, if any, has
+   already returned on the BLE thread). */
+static bool send_wardriving_start_command(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    feb_wardriving_command_payload_t command_args;
+    memset(&command_args, 0, sizeof(command_args));
+    command_args.action = "start";
+    command_args.action_len = sizeof("start") - 1;
+    command_args.has_sources = 1;
+    size_t source_count = 0;
+    if(app->capability_has_wifi_scan) {
+        command_args.sources[source_count] = "wifi";
+        command_args.source_lens[source_count] = sizeof("wifi") - 1;
+        source_count++;
+    }
+    if(app->capability_has_ble_scan) {
+        command_args.sources[source_count] = "ble";
+        command_args.source_lens[source_count] = sizeof("ble") - 1;
+        source_count++;
+    }
+    command_args.source_count = source_count;
+    if(source_count == 0) {
+        FURI_LOG_W(TAG, "wardriving start: no wifi_scan/ble_scan source available");
+        return false;
+    }
+
+    uint8_t arguments_buf[FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN];
+    size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
+        arguments_buf, sizeof(arguments_buf), &command_args);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "wardriving start: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "wardriving",
+        .capability_len = sizeof("wardriving") - 1,
+        .request_id = wardriving_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "wardriving start: payload encode failed");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        wardriving_cmd_payload_buf,
+        payload_len,
+        wardriving_cmd_ciphertext_buf,
+        sizeof(wardriving_cmd_ciphertext_buf),
+        wardriving_cmd_record_buf,
+        sizeof(wardriving_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "wardriving start: record encode failed");
+        return false;
+    }
+    pending_command_kind = PendingCommandWardrivingStart;
+    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "wardriving start: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(
+        TAG,
+        "wardriving start command sent (request_id=%llu)",
+        (unsigned long long)command.request_id);
+    return true;
+}
+
+/* Sends the wardriving `stop` command (arguments = {action:"stop"} alone, per PROTOCOL.md);
+   mirrors send_wardriving_start_command() above, same ordering-safety argument. */
+static bool send_wardriving_stop_command(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    feb_wardriving_command_payload_t command_args;
+    memset(&command_args, 0, sizeof(command_args));
+    command_args.action = "stop";
+    command_args.action_len = sizeof("stop") - 1;
+
+    uint8_t arguments_buf[32];
+    size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
+        arguments_buf, sizeof(arguments_buf), &command_args);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "wardriving stop: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "wardriving",
+        .capability_len = sizeof("wardriving") - 1,
+        .request_id = wardriving_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "wardriving stop: payload encode failed");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        wardriving_cmd_payload_buf,
+        payload_len,
+        wardriving_cmd_ciphertext_buf,
+        sizeof(wardriving_cmd_ciphertext_buf),
+        wardriving_cmd_record_buf,
+        sizeof(wardriving_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "wardriving stop: record encode failed");
+        return false;
+    }
+    pending_command_kind = PendingCommandWardrivingStop;
+    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "wardriving stop: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(
+        TAG,
+        "wardriving stop command sent (request_id=%llu)",
+        (unsigned long long)command.request_id);
     return true;
 }
 
@@ -1829,7 +2405,27 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                     if(text_matches(decrypted.type, decrypted.type_len, "capability_response")) {
                         handle_capability_response(profile, decrypted.plaintext, decrypted.plaintext_len);
                     } else if(text_matches(decrypted.type, decrypted.type_len, "status")) {
-                        if(pending_scan_is_ble) {
+                        /* `status` carries no capability field either (docs/PROTOCOL.md);
+                           wardriving's own states ("started"/"data"/"stopped") are never
+                           ambiguous with wifi_scan/ble_scan's ("partial"/"complete") by text
+                           alone, so a cheap state-only peek is enough to route correctly --
+                           including a wardriving status(state="data", request_id=0)
+                           unsolicited backlog-drain record, since nothing here (or inside
+                           handle_wardriving_status()) ever inspects request_id at all. This
+                           peek's own decode failure is logged and dropped here rather than
+                           silently falling through to a wifi_scan/ble_scan handler that would
+                           just fail the exact same decode again. */
+                        static feb_status_payload_t status_peek;
+                        feb_cbor_status_t peek_status = feb_cbor_decode_status_payload(
+                            decrypted.plaintext, decrypted.plaintext_len, &status_peek);
+                        if(peek_status != FEB_CBOR_OK) {
+                            FURI_LOG_W(TAG, "status payload decode failed: %d; dropping", peek_status);
+                        } else if(
+                            text_matches(status_peek.state, status_peek.state_len, "started") ||
+                            text_matches(status_peek.state, status_peek.state_len, "data") ||
+                            text_matches(status_peek.state, status_peek.state_len, "stopped")) {
+                            handle_wardriving_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        } else if(pending_command_kind == PendingCommandBleScan) {
                             handle_ble_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else {
                             handle_wifi_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
@@ -2083,6 +2679,68 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, BLE_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
+/* wardriving control/status screen (docs/CAPABILITIES.md's wardriving bullet; docs/PLAN.md's
+   "no source-selection or interval-entry UI in v1" decision) -- a third fixed-layout screen
+   alongside the main screen and the two scan-results views, not a scrollable list (there is
+   nothing to scroll: one running/stopped state plus a handful of session counters).
+   wardriving_running_known is deliberately displayed as its own distinct "unknown" state
+   (docs/LESSONS.md "UI must derive from real state") rather than defaulting to "stopped" --
+   this Flipper genuinely has no evidence either way until a "started"/"stopped" ack or a
+   busy/not_running error arrives this session (see Esp32App's own field comment). */
+static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    const char* state_text;
+    if(!app->wardriving_running_known) {
+        state_text = "Wardriving: unknown";
+    } else if(app->wardriving_running) {
+        state_text = "Wardriving: RUNNING";
+    } else {
+        state_text = "Wardriving: stopped";
+    }
+    canvas_draw_str(canvas, 2, 11, state_text);
+    canvas_set_font(canvas, FontSecondary);
+
+    /* Sized with margin over the two longest fields (wardriving_last_summary and
+       wardriving_error_message, both up to ~40-48 real bytes) plus their literal prefixes,
+       so -Werror=format-truncation's static worst-case analysis is satisfied -- see this
+       project's docs/LESSONS.md for why a value that "can't really" overflow at runtime
+       still needs a buffer GCC can prove is large enough. */
+    char line[80];
+    if(app->wardriving_backlog_remaining > 0) {
+        snprintf(
+            line,
+            sizeof(line),
+            "Recs: %lu  Backlog: %llu",
+            (unsigned long)app->wardriving_records_this_session,
+            (unsigned long long)app->wardriving_backlog_remaining);
+    } else {
+        snprintf(
+            line, sizeof(line), "Recs: %lu  Live", (unsigned long)app->wardriving_records_this_session);
+    }
+    canvas_draw_str(canvas, 2, 22, line);
+
+    if(app->wardriving_last_summary[0] != '\0') {
+        snprintf(
+            line,
+            sizeof(line),
+            "Last %s: %s",
+            app->wardriving_last_is_ble ? "BLE" : "WiFi",
+            app->wardriving_last_summary);
+        canvas_draw_str(canvas, 2, 33, line);
+    }
+
+    if(app->wardriving_error_message[0] != '\0') {
+        snprintf(line, sizeof(line), "! %s", app->wardriving_error_message);
+        canvas_draw_str(canvas, 2, 44, line);
+    }
+
+    const char* footer =
+        (app->wardriving_running_known && app->wardriving_running) ? "OK: stop  Back: exit" :
+                                                                       "OK: start  Back: exit";
+    canvas_draw_str(canvas, 2, 56, footer);
+}
+
 static void draw_callback(Canvas* canvas, void* context) {
     Esp32App* app = context;
     if(app->screen == AppScreenWifiScanResults) {
@@ -2091,6 +2749,10 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
     if(app->screen == AppScreenBleScanResults) {
         draw_ble_scan_results(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenWardriving) {
+        draw_wardriving_screen(canvas, app);
         return;
     }
     canvas_clear(canvas);
@@ -2112,17 +2774,27 @@ static void draw_callback(Canvas* canvas, void* context) {
         snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
         canvas_draw_str(canvas, 2, 44, line);
     }
-    char footer[32];
-    if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wifi_scan &&
-       app->capability_has_ble_scan) {
-        snprintf(footer, sizeof(footer), "L:WiFi R:BLE  Back: exit");
-    } else if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wifi_scan) {
-        snprintf(footer, sizeof(footer), "Left: WiFi scan  Back: exit");
-    } else if(app->pairing_phase == PairingPhaseSessionActive && app->capability_has_ble_scan) {
-        snprintf(footer, sizeof(footer), "Right: BLE scan  Back: exit");
-    } else {
-        snprintf(footer, sizeof(footer), "Back: exit");
+    /* Footer hints are built incrementally (rather than one snprintf per combination, as
+       step 7's original two-capability version did) now that a third capability-gated
+       action (wardriving) can also appear -- three independent booleans would otherwise be
+       2^3 combinations to enumerate by hand. */
+    char footer[40];
+    size_t pos = 0;
+    if(app->pairing_phase == PairingPhaseSessionActive) {
+        if(app->capability_has_wifi_scan) {
+            int n = snprintf(footer + pos, sizeof(footer) - pos, "L:WiFi ");
+            if(n > 0) pos += (size_t)n;
+        }
+        if(app->capability_has_ble_scan) {
+            int n = snprintf(footer + pos, sizeof(footer) - pos, "R:BLE ");
+            if(n > 0) pos += (size_t)n;
+        }
+        if(app->capability_has_wardriving) {
+            int n = snprintf(footer + pos, sizeof(footer) - pos, "U:War ");
+            if(n > 0) pos += (size_t)n;
+        }
     }
+    snprintf(footer + pos, sizeof(footer) - pos, "Back: exit");
     canvas_draw_str(canvas, 2, 56, footer);
 }
 
@@ -2134,11 +2806,15 @@ static void input_callback(InputEvent* input, void* context) {
 
 /* Returns to the main screen and discards any in-progress/completed scan results (docs/PLAN.md's
    Wi-Fi scan capability follow-on step: "results... cleared when the user leaves the results
-   view"), for both wifi_scan and ble_scan (mirrored capabilities, same results-view lifecycle).
-   Also called whenever the underlying session/connection goes away (disconnect, reconnect,
-   profile teardown) -- a lost session can never deliver the rest of an in-flight scan's status
-   records, so leaving stale partial results on screen would be misleading, regardless of which
-   of the two capabilities was in flight. */
+   view"), for wifi_scan, ble_scan, and wardriving alike. Also called whenever the underlying
+   session/connection goes away (disconnect, reconnect, profile teardown) -- a lost session can
+   never deliver the rest of an in-flight scan's status records, so leaving stale partial
+   results on screen would be misleading, regardless of which capability was in flight.
+   For wardriving specifically, this is also the CSV export session boundary: closing the
+   file here (not on a "stopped" ack -- see wardriving_csv_file's own declaration comment)
+   and resetting wardriving_running_known to false, since this Flipper's knowledge of the
+   ESP32's run state does not survive a lost session (docs/LESSONS.md "UI must derive from
+   real state") -- the next authenticated session starts genuinely not knowing either way. */
 static void reset_scan_ui_state(Esp32App* app) {
     app->screen = AppScreenMain;
     app->wifi_scan_in_progress = false;
@@ -2151,6 +2827,13 @@ static void reset_scan_ui_state(Esp32App* app) {
     app->ble_scan_scroll_offset = 0;
     app->ble_scan_error_message[0] = '\0';
     ble_scan_device_count = 0;
+    app->wardriving_running_known = false;
+    app->wardriving_running = false;
+    app->wardriving_records_this_session = 0;
+    app->wardriving_backlog_remaining = 0;
+    app->wardriving_last_summary[0] = '\0';
+    app->wardriving_error_message[0] = '\0';
+    wardriving_csv_close();
 }
 
 static void stop_service(Esp32App* app) {
@@ -2222,6 +2905,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     if(!capabilities_dir_ready) {
         FURI_LOG_E(TAG, "Failed to resolve capabilities directory path");
     }
+    wardriving_export_dir_ready = resolve_wardriving_export_dir_path(app.storage);
+    if(!wardriving_export_dir_ready) {
+        FURI_LOG_E(TAG, "Failed to resolve wardriving export directory path");
+    }
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
 
@@ -2285,6 +2972,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.capability_features[sizeof(app.capability_features) - 1] = '\0';
             app.capability_has_wifi_scan = event.capability_has_wifi_scan;
             app.capability_has_ble_scan = event.capability_has_ble_scan;
+            app.capability_has_wardriving = event.capability_has_wardriving;
         } else if(event.type == AppEventWifiScanAp) {
             if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
                 WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
@@ -2329,6 +3017,35 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 event.ble_scan_error_message,
                 sizeof(app.ble_scan_error_message) - 1);
             app.ble_scan_error_message[sizeof(app.ble_scan_error_message) - 1] = '\0';
+        } else if(event.type == AppEventWardrivingRunState) {
+            app.wardriving_running_known = true;
+            app.wardriving_running = event.wardriving_running;
+            if(event.wardriving_is_fresh_start) {
+                /* A genuine new "started" ack -- reset this session's own counters, distinct
+                   from a `busy`-error-inferred "it was already running" correction (which
+                   must NOT reset counts we may already be accumulating this connection). */
+                app.wardriving_records_this_session = 0;
+                app.wardriving_backlog_remaining = 0;
+                app.wardriving_last_summary[0] = '\0';
+            }
+            app.wardriving_error_message[0] = '\0';
+        } else if(event.type == AppEventWardrivingBatch) {
+            app.wardriving_records_this_session += event.wardriving_batch_count;
+            app.wardriving_backlog_remaining = event.wardriving_backlog_remaining;
+            if(event.wardriving_last_summary[0] != '\0') {
+                app.wardriving_last_is_ble = event.wardriving_last_is_ble;
+                strncpy(
+                    app.wardriving_last_summary,
+                    event.wardriving_last_summary,
+                    sizeof(app.wardriving_last_summary) - 1);
+                app.wardriving_last_summary[sizeof(app.wardriving_last_summary) - 1] = '\0';
+            }
+        } else if(event.type == AppEventWardrivingError) {
+            strncpy(
+                app.wardriving_error_message,
+                event.wardriving_error_message,
+                sizeof(app.wardriving_error_message) - 1);
+            app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
             if(app.screen == AppScreenWifiScanResults) {
                 if(event.input.key == InputKeyBack) {
@@ -2374,11 +3091,32 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.ble_scan_error_message[0] = '\0';
                     app.ble_scan_in_progress = send_ble_scan_command(&app);
                 }
+            } else if(app.screen == AppScreenWardriving) {
+                if(event.input.key == InputKeyBack) {
+                    /* Unlike wifi_scan/ble_scan's Back, this does NOT stop wardriving --
+                       capture runs autonomously server-side regardless of whether this
+                       screen is open (docs/CAPABILITIES.md), so leaving it is pure
+                       navigation, not a discard of unconfirmed state (there is none: start/
+                       stop are already-sent, already-acked actions by the time this screen
+                       reflects them). */
+                    app.screen = AppScreenMain;
+                } else if(event.input.key == InputKeyOk) {
+                    if(app.wardriving_running_known && app.wardriving_running) {
+                        send_wardriving_stop_command(&app);
+                    } else {
+                        send_wardriving_start_command(&app);
+                    }
+                }
             } else {
                 if(event.input.key == InputKeyBack) {
                     running = false;
                 } else if(event.input.key == InputKeyOk && !app.profile) {
                     start_profile(&app);
+                } else if(
+                    event.input.key == InputKeyUp && app.profile &&
+                    app.pairing_phase == PairingPhaseSessionActive &&
+                    app.capability_has_wardriving) {
+                    app.screen = AppScreenWardriving;
                 } else if(
                     event.input.key == InputKeyLeft && app.profile &&
                     app.pairing_phase == PairingPhaseSessionActive && app.capability_has_wifi_scan &&

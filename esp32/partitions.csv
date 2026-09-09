@@ -2,3 +2,16 @@
 nvs,        data, nvs,     0x9000,  0x6000,
 phy_init,   data, phy,     0xf000,  0x1000,
 factory,    app,  factory, 0x10000, 0x180000,
+# `wardriving` capability's raw-flash circular log (esp32/main/wardriving_log.c,
+# docs/PLAN.md step 8 pulled forward per the 2026-09-07 reorder). Custom "data" subtype
+# 0x40 (first available custom data subtype per the ESP-IDF partition-table spec) -- a
+# dedicated esp_partition, not NVS/FAT/SPIFFS, since NOR flash only erases a whole sector
+# at a time and this log needs its own sector-eviction/checksum scheme (see
+# docs/PROTOCOL.md's "Flash log eviction" note). Sized to use essentially all flash left
+# after `factory` (ends at 0x190000) on this board's verified 4 MB part, up to the 4 MB
+# boundary (0x400000): 0x270000 = 2,555,904 bytes = exactly 624 x 4096-byte erase sectors,
+# no partial trailing sector. At ~150-190 bytes/record on-flash (wardriving_record_format.h),
+# this holds tens of thousands of records -- comfortably "hours unattended" per
+# docs/PLAN.md's Phase 3 bar, not a tight fit requiring a size tradeoff against anything
+# else on this partition table.
+wardrive,   data, 0x40,    0x190000,0x270000,

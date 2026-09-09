@@ -651,6 +651,183 @@ it as a known limitation.
 Per existing design decision: **Left triggers `wifi_scan`, Right triggers `ble_scan`** on the main
 screen when the connected board's capability line advertises it.
 
+## 2026-09-09: `wardriving` implemented on both firmwares (build/host-test-verified, hardware pending)
+
+The composite capability tying `wifi_scan`/`ble_scan` into an autonomous capture loop with
+flash-backed persistence, per the "`ble_scan`, `wardriving`, and the GPS-stub reorder" design
+in [PLAN.md](PLAN.md).
+
+**ESP32 side:** `handle_wardriving_command()` (start/stop, full field-presence/bounds
+validation, a bidirectional busy guard shared with manual `wifi_scan`/`ble_scan` via the same
+`wifi_scan_in_progress`/`ble_scan_in_progress` flags), an autonomous interval/window-driven
+Wi-Fi/BLE capture engine reusing `wifi_scan_done_handler()`/`ble_scan_catalog_advertisement()`'s
+collection logic and the existing merged-reconnect-scan event path (no second dedicated scan
+runs), a checksummed append-only circular log on a new `wardrive` raw-flash partition
+(`esp32/main/wardriving_log.c`/`wardriving_record_format.c`, sector-generation-ordered FIFO
+eviction, a per-record "undrained" flag cleared via a single crash-safe 1→0 flash write instead
+of a separately-persisted head/tail pointer), and unsolicited backlog-drain-on-session-establish.
+`idf.py build` is clean; a new host-native suite (`tests/esp32/test_wardriving_log.c`) covers the
+flash log's checksum/header-packing/eviction-ordering logic and the interval-field
+validation/default-substitution rule (`wardriving_resolve_start_intervals()`,
+`esp32/main/wardriving_validate.h`/`.c`).
+
+One real interpretation ambiguity was resolved during implementation: whether a requested
+source's interval field(s) may be omitted on `start`. Resolved in favor of
+[PROTOCOL.md](PROTOCOL.md)'s "Interval bounds and defaults" section (which states the
+point-4/most-aggressive default is substituted on omission — `wifi_interval_ms=0` i.e.
+continuous, `ble_window_ms=30`, `ble_interval_ms=30`) over the field table's terser "required
+when X in sources" wording, confirmed correct by cross-checking the Flipper's
+`send_wardriving_start_command()`, which always omits these fields (no interval-entry UI in v1)
+and relies on exactly this ESP32-side default. PROTOCOL.md itself is unambiguous on this point
+going forward; this paragraph exists only to record how the ambiguity was found and closed.
+
+**Flipper side:** a one-tap start/stop control/status screen (`AppScreenWardriving`, reachable
+via Up from the main screen when the board advertises `wardriving`; no source-picker or
+interval-entry UI, per the v1 design decision — requested `sources` are derived from whichever
+of `wifi_scan`/`ble_scan` the board actually advertises, and interval fields are omitted so the
+ESP32 applies its own documented default); `status` dispatch now routes by the decoded `state`
+string (wifi_scan/ble_scan's `partial`/`complete` vs. wardriving's `started`/`data`/`stopped`),
+correctly accepting an unsolicited `status(state="data", request_id=0)` backlog-drain record
+without treating it as unmatched; and incremental WiGLE CSV export
+(`flipper/wardriving_csv.c`/`.h`, a pure/host-testable formatting module separate from the
+Furi-dependent file-I/O in `flipper_esp32_over_ble.c`) writing one timestamped file per
+connected session, appended record-by-record (never buffered in RAM), with `FirstSeen`
+timestamps reconstructed by anchoring the newest-seen record to the Flipper's wall clock and
+backdating the rest from their reported boot-relative delta. `fbt.cmd fap_flipper_esp32_over_ble`
+is clean; `tests/flipper/test_flipper_codec.c` covers the CSV row/header formatting and the
+timestamp-backdating arithmetic.
+
+**ESP32-side design decisions made where the docs left specifics open** (full rationale comments
+in `esp32/main/wardriving_record_format.h`/`wardriving_log.c`/`main.c`'s
+`handle_wardriving_command()`):
+
+- `wardrive` partition: custom "data" subtype `0x40`, offset `0x190000`, size `0x270000` (624 x
+  4096-byte sectors, exactly using the rest of this board's verified 4 MB flash after `factory`).
+- On-flash record checksum: CRC-32/ISO-HDLC ("zlib" variant), over the encoded CBOR payload only
+  (not the record header).
+- `ble_window_ms <= ble_interval_ms` is enforced as a structural sanity check beyond
+  [PROTOCOL.md](PROTOCOL.md)'s literal text, and a duplicate `sources` entry (e.g.
+  `["wifi","wifi"]`) is rejected `invalid_command` — neither is a PROTOCOL.md sentence, both are
+  judgment calls.
+- A persistent flash-write failure (`FEB_WARDRIVING_FLASH_FAILURE_LIMIT` = 3 consecutive
+  `wardriving_log_append()` failures) triggers an unprompted self-stop with an accompanying
+  `error`/`status(state="stopped")` pair, per PROTOCOL.md's state-model table.
+
+**Flipper-side stack risk, only partially measured.** While implementing WiGLE CSV export,
+large formatter locals reachable from `BleEventWorker` (`handle_wardriving_status()` ->
+`wardriving_csv_write_record()` -> `feb_wardriving_csv_format_row()` -> `csv_write_field()`)
+were proactively converted to file-scope `static` per this project's established convention
+(`docs/LESSONS.md#ble-event-worker-stack-budget`) — a fifth instance of the same bug class this
+project has hit four times as an actual hardware crash (steps 3, 5, 7, wifi_scan), this time
+caught by convention before it became one. What remains **unmeasured**: the full reachable
+chain's real stack cost, since it also passes through the reused
+`feb_cbor_decode_wardriving_record()` decode path (not written for this feature, inherited as
+is). No `-fstack-usage` check was run — do this before or during hardware verification, not
+after a crash.
+
+**Not yet exercised on real hardware** on either side — no forced-disconnect test of the
+merged-reconnect-scan path under live wardriving BLE capture, no extended unattended run
+validating flash-log wraparound/power-loss on the physical board, and no on-device confirmation
+of the Flipper's control screen, backlog-drain/live-data dispatch, or exported CSV contents
+against a real capture.
+
+## 2026-09-10: wardriving hardware-verified (stack overflow + GATT-write-flood/EBUSY bugs found and fixed)
+
+### Hardware verification attempt
+
+The first real-device test of the `wardriving` capability implemented 2026-09-09 was launched
+with `sources=[wifi,ble]` and live serial monitoring (`idf_monitor.py --port COM9 --timestamps`).
+The test ran a steady capture session (~24 seconds, ~4 records per batch, backlog growing from 0
+to ~185 as collection outpaced send rate), then a clean user-initiated stop. Two real bugs
+surfaced during this run, found and fixed in the same session before a re-verification pass.
+
+### Bug 1 — `nimble_host` task stack overflow (recurring class)
+
+**Symptom:** starting wardriving crashed with `Guru Meditation Error: Core 0 panic'ed (Stack
+protection fault)` in FreeRTOS task `"nimble_host"`. The crash wrote one record to the flash log
+before failing, which meant every subsequent reboot re-triggered the documented
+unsolicited-backlog-drain-on-session-establish behavior, hitting the same overflow and trapping
+the board in a self-sustaining crash loop independent of further user action, until the
+Flipper's BLE link was broken.
+
+**Root cause:** `wardriving_send_next_batch()` in `esp32/main/main.c` declared its trial-encode
+scratch variable (`feb_wardriving_status_result_payload_t trial`, which embeds a 32-entry record
+array) as a plain stack-local — measured via `-fstack-usage` at 2608 bytes, ~64% of `nimble_host`'s
+4096-byte task stack (`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096`). Its sibling function
+`ble_scan_send_next_batch()` already had this exact pattern fixed (declared `static`);
+`wardriving_send_next_batch()` was simply never converged with its already-fixed twin. This is
+the **fifth** instance of the recurring `nimble_host`/task-stack-overflow bug class (previously
+steps 3, 5, 7, and `wifi_scan` — see `docs/LESSONS.md#nimble-host-stack-budget` for the
+structural problem).
+
+**Fix:** moved `trial` to file-scope `static`, matching `ble_scan_send_next_batch()`. Re-measured
+via `-fstack-usage`: 2608 → 32 bytes.
+
+**Confirmed NOT a recursion/re-entrancy bug:** all `ble_gap_disc()` re-arms route through
+`ble_npl_callout_reset()` onto the NimBLE host's own event queue, not synchronous recursive
+calls (verified against ESP-IDF's `components/bt/porting/npl/freertos/src/npl_os_freertos.c`).
+
+### Bug 2 — GATT-write flood + scan-restart collision (latent pattern, wardriving-triggered)
+
+**Symptom:** with the stack-overflow fix flashed and confirmed fixed, starting wardriving no
+longer crashed, but instead: a burst of `sending wardriving status(data)` GATT writes fired
+back-to-back, then `pairing fragment 1 write failed: 6` (NimBLE `BLE_HS_ENOMEM`), several more
+`GATT write failed: 7` (`BLE_HS_ENOTCONN`), then `disconnected: reason=534`, then on reconnect:
+`wardriving: re-trigger ble_gap_disc failed: 15` (`BLE_HS_EBUSY`) and `wardriving self-stopped
+(internal_error)`. The board recovered and reconnected fine afterward; wardriving just stopped
+itself and required a restart.
+
+**Root cause 1 (the write flood):** `wardriving_send_next_batch()` cleared its
+`wardriving_tx_in_flight` flag (and called `wardriving_log_mark_drained()`) as soon as a
+record's **first** BLE fragment was handed to NimBLE via `queue_and_send_protected()`, not after
+the whole record was actually delivered — only `write_complete()`'s `tx_done_action` dispatch
+confirms full delivery of all fragments. `wifi_scan`/`ble_scan` have the byte-identical pattern
+but never manifested it, because nothing re-triggers a new send except a slow, user-initiated
+`command`. `wardriving`'s own capture-completion timers fire automatically every
+`wardriving_ble_window_ms`/`wardriving_wifi_interval_ms` (as low as 30 ms at the default
+"point-4" cadence), so a new batch could be kicked off before the previous record's tail
+fragments were still in flight, clobbering the single shared `tx_fragment_*` state with a
+concurrent send — an **actual violation of `docs/PROTOCOL.md#fragmentation`'s
+single-in-flight invariant**, not just a config-tuning issue. A mid-record write failure also
+silently lost records: marking "drained" before delivery was confirmed meant that record was
+discarded forever if any fragment failed.
+
+**Root cause 2 (the EBUSY/self-stop):** the reconnect-scan restart was correctly gated on
+`!wardriving_ble_active` in one of its three call sites (`BLE_GAP_EVENT_DISC_COMPLETE`) per the
+existing docs/PLAN.md "Revised long-run reconnect policy" (the "merged-reconnect-scan" invariant
+— never run a dedicated reconnect scan while wardriving's BLE source owns discovery), but NOT in
+the other two (`BLE_GAP_EVENT_DISCONNECT`'s reconnect branches, and `reconnect_task()`). A
+disconnect during active wardriving capture raced two `ble_gap_disc()` calls, one losing with
+`EBUSY` — which wardriving's then-unconditional handling treated as fatal and self-stopped on.
+
+**Fix:** (1) `wardriving_send_next_batch()` now always chains through a `TX_DONE_CONTINUE_WARDRIVING`
+path (never clears in-flight/marks-drained early) — a new file-scope `wardriving_pending_drain_count`
+tracks what to mark drained, applied only once `write_complete()` confirms full delivery, reset on
+`BLE_GAP_EVENT_CONNECT`. (2) Moved the `!wardriving_ble_active` guard inside `start_scan()`
+itself so all three callers are covered by construction, and made `wardriving_ble_interval_cb()`
+retry after a short delay on `BLE_HS_EBUSY` specifically (a connect attempt from `gap_event()`'s
+own merged-reconnect match can transiently own GAP master state), instead of self-stopping
+outright per the general principle that `BLE_HS_EBUSY` from a resource genuinely owned by *this
+firmware's own code* is a coordination bug to fix, not a peer condition to surrender on.
+
+A related `docs/LESSONS.md` entry already existed for this pattern (`wardriving-tx-in-flight-cleared-before-delivery-confirmed`);
+the stack-overflow bug (Bug 1 above) is a **new recurring class** now documented.
+
+### Hardware re-verification pass
+
+Both fixes were flashed together, and a full retry was run: `idf_monitor.py --port COM9` live
+capture, started wardriving with `sources=[wifi,ble]` (request_id=1), ran ~24 seconds sending
+steady batches of ~4 records at a time (backlog draining progressively, growing from 0 to ~185),
+then user-initiated exit with `wardriving stopped (request_id=2)` and normal disconnect. **Zero
+crashes, zero `GATT write failed`, zero `EBUSY`/self-stop during this run. Both bugs confirmed
+fixed on real hardware.**
+
+### Still open (NOT yet "done when" per PLAN.md)
+
+Three items remain before wardriving's "done when" bar is fully met (forced-disconnect test
+under live BLE capture, extended unattended flash-log wraparound/power-loss run, and CSV export
+SD-card confirmation) — see `docs/SESSION_MEMORY.md`'s "Known open items" for current status.
+
 ## Current project state and handoff
 
 As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime

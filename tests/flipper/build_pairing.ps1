@@ -36,7 +36,11 @@ $sources = @(
     (Join-Path $scriptDir "test_pairing.c"),
     (Join-Path $flipperDir "pairing_crypto.c"),
     (Join-Path $flipperDir "pairing.c"),
-    (Join-Path $flipperDir "cbor_codec.c")
+    (Join-Path $flipperDir "cbor_primitives.c"),
+    (Join-Path $flipperDir "cbor_records.c"),
+    (Join-Path $flipperDir "cbor_wifi_scan.c"),
+    (Join-Path $flipperDir "cbor_ble_scan.c"),
+    (Join-Path $flipperDir "cbor_wardriving.c")
 ) -join " "
 
 $includeDirs = "/I `"$flipperDir`" /I `"$vectorsDir`""

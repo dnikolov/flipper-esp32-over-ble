@@ -24,10 +24,14 @@
 #include "cbor_codec.h"
 #include "factory_reset.h"
 #include "framing.h"
+#include "location.h"
 #include "pairing.h"
 #include "pairing_crypto.h"
 #include "session.h"
 #include "session_crypto.h"
+#include "wardriving_log.h"
+#include "wardriving_record_format.h"
+#include "wardriving_validate.h"
 
 static const char *TAG = "flipper_esp32_over_ble";
 
@@ -129,6 +133,29 @@ static const char *TAG = "flipper_esp32_over_ble";
    `status` record packing. */
 #define FEB_BLE_SCAN_STATUS_ENCODE_HEADROOM 32u
 
+/* `wardriving` capability (docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub
+   reorder"; docs/PROTOCOL.md "`wardriving` command and status payloads"). Interval
+   bounds/defaults (FEB_WARDRIVING_WIFI_INTERVAL_MIN_MS et al.) live in wardriving_validate.h,
+   next to wardriving_resolve_start_intervals(), the pure/host-testable function that
+   implements the "required vs. default when omitted" resolution -- see that header's top
+   comment and handle_wardriving_command()'s comment for the interpretation this codebase
+   settled on (resolved 2026-09-09: an omitted interval field for a requested source
+   substitutes the point-4 default, matching the v1 Flipper client's no-interval-entry-UI
+   behavior). */
+/* Same headroom rationale as FEB_WIFI_SCAN_STATUS_ENCODE_HEADROOM, applied to wardriving's
+   status(state="data") record packing. */
+#define FEB_WARDRIVING_STATUS_ENCODE_HEADROOM 32u
+/* wardriving_send_next_batch()'s peek-scratch buffer: one on-flash-payload-sized slot per
+   possible batch entry (see wardriving_log.h's peek/scratch_buf contract). */
+#define FEB_WARDRIVING_PEEK_SCRATCH_LEN (FEB_WARDRIVING_MAX_RECORDS_PER_BATCH * WD_RECORD_MAX_PAYLOAD)
+/* Judgment call (not numerically specified anywhere): how many consecutive
+   wardriving_log_append() failures constitute the "persistent flash-write failure" self-stop
+   condition docs/PROTOCOL.md's `status` state-model table names as an example trigger for
+   an unprompted "stopped" (see wardriving_self_stop()). One-off transient failures are
+   logged and tolerated; three in a row past the wear-out/hardware-fault range this project
+   is willing to silently absorb. */
+#define FEB_WARDRIVING_FLASH_FAILURE_LIMIT 3u
+
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x9c, 0x3f, 0x7e, 0x6a, 0xf4, 0x03, 0x4c, 0x31,
     0x9e, 0xa2, 0x58, 0xa7, 0xa2, 0x0f, 0xb8, 0x11);
@@ -182,6 +209,13 @@ typedef enum {
     TX_DONE_RUNTIME_AUTHENTICATED,
     TX_DONE_CONTINUE_WIFI_SCAN, /* another wifi_scan status batch is queued behind this one */
     TX_DONE_CONTINUE_BLE_SCAN,  /* another ble_scan status batch is queued behind this one */
+    TX_DONE_CONTINUE_WARDRIVING, /* wardriving_send_next_batch()'s own re-entry point -- always
+                                     used (not just when a follow-up batch is already known to
+                                     exist) so full delivery of the just-sent batch is confirmed
+                                     before it's marked drained; see wardriving_send_next_batch()
+                                     and wardriving_pending_drain_count's comments. */
+    TX_DONE_SEND_WARDRIVING_STOPPED, /* wardriving_self_stop()'s error record just went out;
+                                         send the accompanying status(state="stopped") next */
 } tx_done_action_t;
 static tx_done_action_t tx_done_action = TX_DONE_NONE;
 
@@ -233,8 +267,83 @@ static uint64_t rt_rx_sequence;
 static uint8_t rt_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
 static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
 
-static const char *const feb_features[] = {"wifi_scan", "ble_scan"};
+static const char *const feb_features[] = {"wifi_scan", "ble_scan", "wardriving"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": wardriving's Wi-Fi/BLE
+   capture sources deliberately reuse the manual wifi_scan/ble_scan capabilities' own
+   wifi_scan_in_progress/ble_scan_in_progress busy flags and done-callout plumbing below,
+   rather than a second parallel set of state -- this is what makes the bidirectional busy
+   guard (docs/PROTOCOL.md: manual scan rejected busy while wardriving's matching source is
+   active, and vice versa) hold by construction instead of needing a separate cross-check:
+   there is exactly one "who currently owns the Wi-Fi radio scan" flag and one "who currently
+   owns the NimBLE discovery state machine" flag, each shared by both callers. Each *_active_source
+   selects which of the two callers' completion behavior (wifi_scan_done_cb()/
+   ble_scan_window_close_cb()) runs when a pass finishes. */
+typedef enum {
+    WIFI_SCAN_SOURCE_MANUAL = 0,
+    WIFI_SCAN_SOURCE_WARDRIVING,
+} wifi_scan_source_t;
+static wifi_scan_source_t wifi_scan_active_source;
+
+typedef enum {
+    BLE_SCAN_SOURCE_MANUAL = 0,
+    BLE_SCAN_SOURCE_WARDRIVING,
+} ble_scan_source_t;
+static ble_scan_source_t ble_scan_active_source;
+
+/* wardriving's own start/stop state and configured cadence, independent of BLE connection
+   state per docs/PROTOCOL.md ("continues across BLE disconnects, buffering results to an
+   on-device flash log"). wardriving_{wifi,ble}_active track whether each source's capture
+   loop is currently supposed to be running -- distinct from wifi_scan_in_progress/
+   ble_scan_in_progress, which track whether the underlying radio resource is claimed *right
+   now* (true for the source's entire enabled lifetime, not just mid-pass, since a manual
+   scan must stay locked out for as long as wardriving holds that source, not just while a
+   scan/window is actually in flight). */
+static bool wardriving_wifi_active;
+static bool wardriving_ble_active;
+static uint32_t wardriving_wifi_interval_ms;
+static uint32_t wardriving_ble_window_ms;
+static uint32_t wardriving_ble_interval_ms;
+static struct ble_npl_callout wardriving_wifi_interval_co;
+static struct ble_npl_callout wardriving_ble_interval_co;
+/* True while a wardriving status(state="data") batch's fragments are still going out (or
+   another is chained behind it via TX_DONE_CONTINUE_WARDRIVING) -- gates
+   wardriving_maybe_kick_send() so a live capture event during an in-flight batch doesn't
+   start a second, overlapping send (fragmentation is single-in-flight per
+   docs/PROTOCOL.md#fragmentation); the in-flight chain itself re-checks the log for new
+   data every time it finishes a batch, so nothing is lost by waiting.
+
+   Root cause of the 2026-09-10 GATT-write-flood hardware bug (docs/LESSONS.md): this flag
+   used to be cleared as soon as queue_and_send_protected() returned true, i.e. as soon as
+   the record's *first* fragment was handed to NimBLE -- not once write_complete() confirmed
+   every fragment of a multi-fragment record actually went out. wardriving's own ~30ms
+   capture-completion cadence (unlike wifi_scan/ble_scan, which only ever get re-kicked by a
+   slow, user-initiated `command`) could then fire again before the prior record's tail
+   fragments finished sending, clobbering the single shared tx_fragment_* state with a second
+   concurrent send and flooding NimBLE's write-buffer pool. Fixed by always chaining through
+   TX_DONE_CONTINUE_WARDRIVING (see wardriving_send_next_batch()) so this flag (and
+   wardriving_pending_drain_count below) are only ever touched once write_complete() has
+   confirmed full delivery of the record currently in flight. */
+static bool wardriving_tx_in_flight;
+/* Count of records included in the batch currently in flight, marked drained from the flash
+   log only on the *next* wardriving_send_next_batch() re-entry (which only happens after
+   write_complete() confirms every fragment of that batch was actually delivered) -- not at
+   send time. Marking a record drained before delivery is confirmed would silently lose it
+   forever on a mid-record write failure (the flash log's only copy would already be gone).
+   Reset alongside wardriving_tx_in_flight on every new connection (BLE_GAP_EVENT_CONNECT):
+   an abandoned in-flight count from a prior, now-dead connection must not later mark-drain
+   records that were never actually delivered. */
+static size_t wardriving_pending_drain_count;
+static uint8_t wardriving_flash_failure_count;
+/* Set from wifi_scan_done_handler()/ble_scan_catalog_advertisement()'s window-close path
+   (sys_evt task / NimBLE host task respectively) when FEB_WARDRIVING_FLASH_FAILURE_LIMIT is
+   reached; consumed by wifi_scan_done_cb()/ble_scan_window_close_cb() on the NimBLE host
+   task, which is where wardriving_self_stop() is actually safe to run from (it touches
+   connection_handle/tx_fragment_* state owned by that task, matching every other
+   cross-task handoff in this file). */
+static bool wardriving_wifi_self_stop_pending;
+static bool wardriving_ble_self_stop_pending;
 
 /* docs/PLAN.md "Wi-Fi scan capability" step. wifi_scan_raw_records/wifi_scan_selected are
    written exactly once per scan by wifi_scan_done_handler() (runs on the default event
@@ -334,6 +443,12 @@ static void start_wifi_subsystem(void);
 static void ble_scan_catalog_advertisement(const struct ble_gap_disc_desc *disc);
 static void ble_scan_send_next_batch(uint16_t conn_handle);
 static void ble_scan_window_close_cb(struct ble_npl_event *ev);
+static void handle_wardriving_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void wardriving_send_next_batch(uint16_t conn_handle);
+static void wardriving_maybe_kick_send(uint16_t conn_handle);
+static void wardriving_self_stop(const char *error_code);
+static void wardriving_wifi_interval_cb(struct ble_npl_event *ev);
+static void wardriving_ble_interval_cb(struct ble_npl_event *ev);
 
 static void compute_board_id(void)
 {
@@ -472,6 +587,19 @@ static void start_scan(void)
     int rc;
 
     if (connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    /* docs/PLAN.md "Revised long-run reconnect policy": never run a second, dedicated
+       reconnect scan while wardriving's BLE source owns discovery -- its own re-arm
+       (wardriving_ble_interval_cb()) already delivers every advertisement through the same
+       gap_event()/BLE_GAP_EVENT_DISC handler this scan would use, including the merged
+       reconnect-match check. BLE_GAP_EVENT_DISC_COMPLETE already guarded its own call this
+       way; root-caused 2026-09-10 (docs/LESSONS.md) that every *other* caller of this
+       function (BLE_GAP_EVENT_DISCONNECT's two reconnect paths, reconnect_task()) did not,
+       so a reconnect landing while wardriving's BLE capture was active raced its own
+       ble_gap_disc() re-arm and failed one of the two with BLE_HS_EBUSY. Centralized here so
+       every caller is covered by construction instead of needing its own guard. */
+    if (wardriving_ble_active) {
         return;
     }
     if (!connecting_permitted()) {
@@ -976,6 +1104,55 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
                  (unsigned)FEB_WIFI_SCAN_RAW_MAX, (unsigned)FEB_WIFI_SCAN_MAX_APS_PER_RECORD);
     }
 
+    if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
+        /* wardriving logs every discovered AP (up to the same FEB_WIFI_SCAN_RAW_MAX
+           self-imposed raw-fetch bound above), not just the top
+           FEB_WIFI_SCAN_MAX_APS_PER_RECORD by RSSI -- that 32-result cap is specific to
+           wifi_scan's one-shot *reporting* contract (docs/PROTOCOL.md's "Result cap"),
+           which wardriving's persistent capture log has no equivalent of; its own bound is
+           flash capacity (sector eviction), not a wire-result count. */
+        feb_location_t fix;
+        bool have_fix = location_get_fix(&fix);
+        uint16_t k;
+
+        if (!have_fix) {
+            ESP_LOGW(TAG, "wardriving: discarding %u wifi result(s), no GPS fix yet", (unsigned)raw_count);
+        } else {
+            for (k = 0; k < raw_count; k++) {
+                wifi_ap_record_t *rec = &wifi_scan_raw_records[k];
+                const char *auth = wifi_scan_auth_str(rec->authmode);
+                feb_wardriving_record_t record;
+
+                memset(&record, 0, sizeof(record));
+                record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+                record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
+                record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
+                record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+                record.payload.wifi.ssid = rec->ssid;
+                record.payload.wifi.ssid_len = strnlen((const char *)rec->ssid, sizeof(rec->ssid) - 1u);
+                memcpy(record.payload.wifi.bssid, rec->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+                record.payload.wifi.rssi_offset = (uint64_t)((int)rec->rssi + 128);
+                record.payload.wifi.channel = rec->primary;
+                record.payload.wifi.auth = auth;
+                record.payload.wifi.auth_len = strlen(auth);
+                if (!wardriving_log_append(&record)) {
+                    ESP_LOGW(TAG, "wardriving: failed to append wifi record to flash log");
+                    if (wardriving_flash_failure_count < 0xFFu) {
+                        wardriving_flash_failure_count++;
+                    }
+                    if (wardriving_flash_failure_count >= FEB_WARDRIVING_FLASH_FAILURE_LIMIT) {
+                        wardriving_wifi_self_stop_pending = true;
+                        break;
+                    }
+                } else {
+                    wardriving_flash_failure_count = 0;
+                }
+            }
+        }
+        ble_npl_callout_reset(&wifi_scan_done_co, 0);
+        return;
+    }
+
     keep = (raw_count < FEB_WIFI_SCAN_MAX_APS_PER_RECORD) ? raw_count : FEB_WIFI_SCAN_MAX_APS_PER_RECORD;
     for (k = 0; k < keep; k++) {
         uint16_t best = k;
@@ -1029,6 +1206,23 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
 static void wifi_scan_done_cb(struct ble_npl_event *ev)
 {
     (void)ev;
+
+    if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
+        if (wardriving_wifi_self_stop_pending) {
+            wardriving_wifi_self_stop_pending = false;
+            wardriving_self_stop("internal_error");
+            return;
+        }
+        if (!wardriving_wifi_active) {
+            /* A stop() raced this scan's completion -- handle_wardriving_command()'s stop
+               path already cleared wifi_scan_in_progress; nothing else to do. */
+            return;
+        }
+        wardriving_maybe_kick_send(connection_handle);
+        ble_npl_callout_reset(&wardriving_wifi_interval_co,
+                              ble_npl_time_ms_to_ticks32(wardriving_wifi_interval_ms));
+        return;
+    }
 
     if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
         runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
@@ -1148,11 +1342,13 @@ static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_pay
         return;
     }
 
-    /* TODO(wardriving): also reject `busy` here once wardriving's Wi-Fi source can be
-       active concurrently -- docs/PROTOCOL.md's wifi_scan busy-handling rule already
-       specifies this; wardriving doesn't exist yet, so there's nothing to check against. */
+    /* docs/PROTOCOL.md's wifi_scan busy-handling rule ("also rejected busy if wardriving's
+       Wi-Fi source is currently active") is already satisfied by the wifi_scan_in_progress
+       check above -- wardriving's Wi-Fi source sets that same flag for its entire enabled
+       lifetime (see wifi_scan_source_t's comment), so there is nothing extra to check here. */
 
     wifi_scan_in_progress = true;
+    wifi_scan_active_source = WIFI_SCAN_SOURCE_MANUAL;
     wifi_scan_request_id = cmd->request_id;
     memset(&scan_cfg, 0, sizeof(scan_cfg));
     err = esp_wifi_scan_start(&scan_cfg, false);
@@ -1197,11 +1393,13 @@ static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payl
         return;
     }
 
-    /* TODO(wardriving): also reject `busy` here once wardriving's BLE source can be active
-       concurrently -- docs/PROTOCOL.md's ble_scan busy-handling rule already specifies this;
-       wardriving doesn't exist yet, so there's nothing to check against. */
+    /* docs/PROTOCOL.md's ble_scan busy-handling rule ("also rejected busy if wardriving's
+       BLE source is currently active") is already satisfied by the ble_scan_in_progress
+       check above -- wardriving's BLE source sets that same flag for its entire enabled
+       lifetime (see ble_scan_source_t's comment), so there is nothing extra to check here. */
 
     ble_scan_in_progress = true;
+    ble_scan_active_source = BLE_SCAN_SOURCE_MANUAL;
     ble_scan_request_id = cmd->request_id;
     ble_scan_raw_count = 0;
 
@@ -1237,6 +1435,9 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
     } else if (cmd->capability_len == strlen("ble_scan") &&
               memcmp(cmd->capability, "ble_scan", cmd->capability_len) == 0) {
         handle_ble_scan_command(conn_handle, cmd);
+    } else if (cmd->capability_len == strlen("wardriving") &&
+              memcmp(cmd->capability, "wardriving", cmd->capability_len) == 0) {
+        handle_wardriving_command(conn_handle, cmd);
     } else if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
                                      1, cmd->request_id)) {
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -1386,6 +1587,71 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
         ESP_LOGW(TAG, "ble_scan: ble_gap_disc_cancel at window close failed: %d", rc);
     }
 
+    if (ble_scan_active_source == BLE_SCAN_SOURCE_WARDRIVING) {
+        /* wardriving logs every cataloged device this window (up to the same
+           FEB_BLE_SCAN_RAW_MAX self-imposed bound ble_scan_catalog_advertisement() already
+           applies), not just the top FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD by RSSI -- that cap
+           is specific to ble_scan's one-shot *reporting* contract, which this persistent
+           capture log has no equivalent of. */
+        feb_location_t fix;
+        bool have_fix = location_get_fix(&fix);
+        uint16_t k;
+
+        if (!have_fix) {
+            ESP_LOGW(TAG, "wardriving: discarding %u ble result(s), no GPS fix yet",
+                     (unsigned)ble_scan_raw_count);
+        } else {
+            for (k = 0; k < ble_scan_raw_count; k++) {
+                ble_scan_raw_device_t *rec = &ble_scan_raw_devices[k];
+                feb_wardriving_record_t record;
+
+                memset(&record, 0, sizeof(record));
+                record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+                record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
+                record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
+                record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+                memcpy(record.payload.ble.address, rec->addr, FEB_BLE_SCAN_ADDRESS_LEN);
+                if (rec->has_name) {
+                    record.payload.ble.name = rec->name;
+                    record.payload.ble.name_len = rec->name_len;
+                    record.payload.ble.has_name = 1;
+                }
+                record.payload.ble.rssi_offset = (uint64_t)((int)rec->rssi + 128);
+                if (!wardriving_log_append(&record)) {
+                    ESP_LOGW(TAG, "wardriving: failed to append ble record to flash log");
+                    if (wardriving_flash_failure_count < 0xFFu) {
+                        wardriving_flash_failure_count++;
+                    }
+                    if (wardriving_flash_failure_count >= FEB_WARDRIVING_FLASH_FAILURE_LIMIT) {
+                        wardriving_ble_self_stop_pending = true;
+                        break;
+                    }
+                } else {
+                    wardriving_flash_failure_count = 0;
+                }
+            }
+        }
+
+        if (wardriving_ble_self_stop_pending) {
+            wardriving_ble_self_stop_pending = false;
+            wardriving_self_stop("internal_error");
+            return;
+        }
+        if (!wardriving_ble_active) {
+            /* A stop() raced this window's completion -- handle_wardriving_command()'s stop
+               path already cleared ble_scan_in_progress; nothing else to do. */
+            return;
+        }
+        wardriving_maybe_kick_send(connection_handle);
+        {
+            uint32_t gap_ms = (wardriving_ble_interval_ms > wardriving_ble_window_ms) ?
+                              (wardriving_ble_interval_ms - wardriving_ble_window_ms) : 0u;
+
+            ble_npl_callout_reset(&wardriving_ble_interval_co, ble_npl_time_ms_to_ticks32(gap_ms));
+        }
+        return;
+    }
+
     keep = (ble_scan_raw_count < FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD) ?
            ble_scan_raw_count : FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD;
     for (k = 0; k < keep; k++) {
@@ -1434,6 +1700,553 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
         return;
     }
     ble_scan_send_next_batch(connection_handle);
+}
+
+/* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder" / docs/PROTOCOL.md
+   "`wardriving` command and status payloads". Re-arms the next Wi-Fi capture pass after
+   wardriving_wifi_interval_ms (0 = immediate/continuous) -- runs on the NimBLE host task
+   (wardriving_wifi_interval_co's queue), consistent with handle_wardriving_command() and
+   handle_wifi_scan_command() both already calling esp_wifi_scan_start() from that same
+   task. */
+static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
+{
+    wifi_scan_config_t scan_cfg;
+    esp_err_t err;
+
+    (void)ev;
+    if (!wardriving_wifi_active) {
+        return;
+    }
+    memset(&scan_cfg, 0, sizeof(scan_cfg));
+    err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wardriving: re-trigger esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+        wardriving_self_stop("internal_error");
+    }
+}
+
+/* Same re-arming role as wardriving_wifi_interval_cb() above, for the BLE source: opens the
+   next discovery window after the configured gap (ble_interval_ms - ble_window_ms, or 0 for
+   back-to-back per docs/PROTOCOL.md's window<=interval invariant). */
+static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
+{
+    struct ble_gap_disc_params params = {0};
+    int rc;
+
+    (void)ev;
+    if (!wardriving_ble_active) {
+        return;
+    }
+    ble_scan_raw_count = 0;
+    params.passive = 1;
+    params.filter_duplicates = 0;
+    params.itvl = 0;
+    params.window = 0;
+    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
+    if (rc == BLE_HS_EBUSY) {
+        /* GAP master state is owned by someone else right now -- not start_scan() (guarded
+           against wardriving_ble_active, docs/LESSONS.md 2026-09-10), but this can still
+           happen transiently when gap_event()'s own merged-reconnect path
+           (BLE_GAP_EVENT_DISC's "found v2 peer, connecting" branch) has just cancelled
+           discovery to issue ble_gap_connect(). That resolves itself once the connect
+           attempt succeeds or fails, so retry opening this window after the same short
+           window duration rather than tearing wardriving down over a transient condition. */
+        ble_npl_callout_reset(&wardriving_ble_interval_co,
+                              ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
+        return;
+    }
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "wardriving: re-trigger ble_gap_disc failed: %d", rc);
+        wardriving_self_stop("internal_error");
+        return;
+    }
+    ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
+}
+
+/* Stops whichever wardriving source(s) are active and, if connected+authenticated, sends
+   the docs/PROTOCOL.md-specified unsolicited error + status(state="stopped") pair (request_id
+   0, the same "ESP32-initiated, not a reply to a specific command" sentinel used for
+   backlog-drain status records) -- covers both an explicit internal self-stop trigger (a
+   persistent flash-write failure; see FEB_WARDRIVING_FLASH_FAILURE_LIMIT) and a scan/discovery
+   restart failure partway through a run. A no-op if wardriving wasn't running. Runs on the
+   NimBLE host task only (called from wifi_scan_done_cb()/ble_scan_window_close_cb() and the
+   interval callbacks above, all on that task) -- never from wifi_scan_done_handler() or
+   ble_scan_catalog_advertisement() directly, since this touches connection_handle/
+   tx_fragment_* state owned by the NimBLE host task (see wardriving_{wifi,ble}_self_stop_pending's
+   comment for the hand-off). */
+static void wardriving_self_stop(const char *error_code)
+{
+    bool was_active = wardriving_wifi_active || wardriving_ble_active;
+
+    if (wardriving_wifi_active) {
+        wardriving_wifi_active = false;
+        wifi_scan_in_progress = false;
+        ble_npl_callout_stop(&wardriving_wifi_interval_co);
+        {
+            esp_err_t serr = esp_wifi_scan_stop();
+
+            if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
+                ESP_LOGW(TAG, "esp_wifi_scan_stop failed during wardriving self-stop: %s",
+                         esp_err_to_name(serr));
+            }
+        }
+    }
+    if (wardriving_ble_active) {
+        wardriving_ble_active = false;
+        ble_scan_in_progress = false;
+        ble_npl_callout_stop(&wardriving_ble_interval_co);
+        {
+            int derr = ble_gap_disc_cancel();
+
+            if (derr != 0 && derr != BLE_HS_EALREADY) {
+                ESP_LOGW(TAG, "ble_gap_disc_cancel failed during wardriving self-stop: %d", derr);
+            }
+        }
+    }
+    if (!was_active) {
+        return;
+    }
+    ESP_LOGE(TAG, "wardriving self-stopped (%s)", error_code);
+
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        return;
+    }
+    {
+        feb_error_payload_t err = {0};
+        size_t payload_len;
+
+        err.code = error_code;
+        err.code_len = strlen(error_code);
+        err.has_request_id = 0;
+        payload_len = feb_cbor_encode_error_payload(pairing_payload_encode_buf,
+                                                    sizeof(pairing_payload_encode_buf), &err);
+        if (payload_len == 0 ||
+            !queue_and_send_protected(connection_handle, "error", strlen("error"),
+                                      pairing_payload_encode_buf, payload_len,
+                                      TX_DONE_SEND_WARDRIVING_STOPPED)) {
+            ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
+}
+
+/* Kicks off a wardriving status(state="data") send if a session is connected+authenticated,
+   there is buffered data to send, and no batch is already in flight -- called both right
+   after a live capture pass appends new records and once at session-establish time to start
+   draining any pre-existing backlog (docs/PROTOCOL.md's "Unsolicited backlog drain"). Once
+   started, wardriving_send_next_batch()'s own TX_DONE_CONTINUE_WARDRIVING chaining picks up
+   anything appended later without needing another call here. */
+static void wardriving_maybe_kick_send(uint16_t conn_handle)
+{
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        return;
+    }
+    if (wardriving_tx_in_flight) {
+        return;
+    }
+    if (wardriving_log_pending_count() == 0) {
+        return;
+    }
+    wardriving_tx_in_flight = true;
+    wardriving_send_next_batch(conn_handle);
+}
+
+/* Builds and sends one wardriving status(state="data") record from the oldest still-pending
+   flash-log records, mirroring wifi_scan_send_next_batch()/ble_scan_send_next_batch()'s
+   trial-encode-and-back-off packing exactly (see that function's comment for why
+   peeked/peek_scratch/result/status_payload/result_buf are static, not stack-local -- same
+   NimBLE host task, same reasoning). Unlike wifi_scan/ble_scan's own chaining, this always
+   chains through TX_DONE_CONTINUE_WARDRIVING -- even for the batch that drains the last
+   pending record -- rather than only while backlog_remaining > 0: the re-entry this produces
+   is what confirms full delivery of the batch before marking it drained from the flash log
+   and clearing wardriving_tx_in_flight (see wardriving_pending_drain_count's comment; fixes
+   the 2026-09-10 GATT-write-flood bug in docs/LESSONS.md). */
+static void wardriving_send_next_batch(uint16_t conn_handle)
+{
+    static feb_wardriving_record_t peeked[FEB_WARDRIVING_MAX_RECORDS_PER_BATCH];
+    static uint8_t peek_scratch[FEB_WARDRIVING_PEEK_SCRATCH_LEN];
+    static feb_wardriving_status_result_payload_t result;
+    /* Same reasoning as peeked/result/status_payload/result_buf above (and
+       ble_scan_send_next_batch()'s own `trial`) -- this holds a full
+       feb_wardriving_status_result_payload_t (a 32-entry feb_wardriving_record_t array,
+       ~2.6 KB) per trial-encode iteration. Originally declared as a loop-local, which
+       measured at -fstack-usage's 2608 bytes for this whole function -- nearly 2/3 of the
+       nimble_host task's 4096-byte budget in one frame, on top of the CBOR-encode/GATT-write
+       call chain this function itself makes. Root cause of the 2026-09-10 hardware
+       stack-overflow crash (docs/LESSONS.md); moved to static to match the sibling
+       function's already-correct pattern. */
+    static feb_wardriving_status_result_payload_t trial;
+    static feb_status_payload_t status_payload;
+    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t peeked_count;
+    size_t include_count;
+    size_t remaining_after;
+    size_t result_len;
+    size_t payload_len;
+
+    /* The previous batch's records are only safe to evict from the flash log once
+       write_complete() has confirmed every one of its fragments actually went out --
+       this function is only ever re-entered (via TX_DONE_CONTINUE_WARDRIVING) after that
+       point, never earlier. See wardriving_pending_drain_count's comment. */
+    if (wardriving_pending_drain_count > 0) {
+        wardriving_log_mark_drained(wardriving_pending_drain_count);
+        wardriving_pending_drain_count = 0;
+    }
+
+    peeked_count = wardriving_log_peek_pending(peeked, FEB_WARDRIVING_MAX_RECORDS_PER_BATCH,
+                                               peek_scratch, sizeof(peek_scratch));
+    if (peeked_count == 0) {
+        wardriving_tx_in_flight = false;
+        return;
+    }
+
+    memset(&result, 0, sizeof(result));
+    include_count = 0;
+    while (include_count < peeked_count) {
+        size_t trial_len;
+
+        trial = result;
+        trial.records[trial.record_count] = peeked[include_count];
+        trial.record_count++;
+        trial_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &trial);
+        if (trial_len == 0 || trial_len + FEB_WARDRIVING_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
+            if (result.record_count == 0) {
+                /* A single record's own encoding is already too large to ever fit -- should
+                   be unreachable given WD_RECORD_MAX_PAYLOAD's derivation, but drop it rather
+                   than spin forever re-peeking the same record every batch. Still counted in
+                   include_count so wardriving_log_mark_drained() consumes it below and moves
+                   the oldest-pending pointer past it. */
+                ESP_LOGE(TAG, "wardriving: single record too large to encode; dropping it");
+                include_count++;
+                continue;
+            }
+            break;
+        }
+        result = trial;
+        include_count++;
+    }
+
+    remaining_after = wardriving_log_pending_count() - include_count;
+    result.backlog_remaining = remaining_after;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
+
+    memset(&status_payload, 0, sizeof(status_payload));
+    status_payload.request_id = 0; /* unsolicited/live sentinel -- docs/PROTOCOL.md: no wire
+                                       distinction from a backlog-drain batch; backlog_remaining
+                                       is how a receiver tells them apart */
+    status_payload.state = "data";
+    status_payload.state_len = strlen("data");
+    status_payload.result_span = result_buf;
+    status_payload.result_span_len = result_len;
+    status_payload.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+    /* Always chain through TX_DONE_CONTINUE_WARDRIVING, even when remaining_after == 0:
+       write_complete() only runs tx_done_action once every fragment of *this* record has
+       gone out, so this is what keeps wardriving_tx_in_flight/wardriving_pending_drain_count
+       honest about the record actually being fully delivered rather than just its first
+       fragment queued (2026-09-10 GATT-write-flood bug, see wardriving_tx_in_flight's
+       comment). The re-entry this triggers finds nothing left pending and clears the flag
+       itself when this really was the last batch -- see the peeked_count == 0 branch above. */
+    if (payload_len == 0 ||
+        !queue_and_send_protected(conn_handle, "status", strlen("status"),
+                                  pairing_payload_encode_buf, payload_len,
+                                  TX_DONE_CONTINUE_WARDRIVING)) {
+        ESP_LOGE(TAG, "failed to build wardriving status(data) record");
+        wardriving_tx_in_flight = false;
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    wardriving_pending_drain_count = include_count;
+    ESP_LOGI(TAG, "sending wardriving status(data) (%u record(s), backlog_remaining=%u)",
+             (unsigned)result.record_count, (unsigned)remaining_after);
+}
+
+static bool wardriving_source_requested(const feb_wardriving_command_payload_t *payload, const char *name)
+{
+    size_t len = strlen(name);
+    size_t i;
+
+    for (i = 0; i < payload->source_count; i++) {
+        if (payload->source_lens[i] == len && memcmp(payload->sources[i], name, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* docs/PROTOCOL.md "`wardriving` command and status payloads" / docs/CAPABILITIES.md's
+   `wardriving` bullet. Field-presence/bounds validation this codec's decoder deliberately
+   leaves to the caller (see cbor_wardriving.h's top-of-file comment) is all done here:
+   action-dependent presence of `sources`/`wifi_interval_ms`/`ble_window_ms`+`ble_interval_ms`,
+   source values restricted to "wifi"/"ble" with no duplicates, board-capability gating
+   against feb_features[], and the interval bounds from docs/PLAN.md step 4.
+
+   Interpretation note on "required" vs "default when omitted" (resolved 2026-09-09,
+   supersedes an earlier pass's stricter reading -- see docs/SESSION_MEMORY.md):
+   docs/PROTOCOL.md's field table says wifi_interval_ms/ble_window_ms/ble_interval_ms are
+   each "required" on the wire whenever their source is requested, but the "Interval bounds
+   and defaults" section is more specific and explicit: "The default when a `start` omits
+   these fields is the maximum/point-4 values." Since this is exactly what a v1 Flipper
+   client sends -- its wardriving control screen has no interval-entry UI at all
+   (docs/PLAN.md), so it always requests a source via `sources` while leaving that source's
+   interval field(s) out of the CBOR map entirely -- this function treats "required" as
+   "applicable" rather than "must be present on the wire": a requested source's interval
+   field(s) may be omitted, in which case the point-4 default is substituted; an interval
+   field that IS present is still validated against the documented bounds, and an interval
+   field present for a NOT-requested source is still invalid_command (that part of the field
+   table's presence rule is unambiguous and unchanged). This resolution is implemented by
+   wardriving_resolve_start_intervals() (wardriving_validate.h/.c, host-tested in
+   tests/esp32/test_wardriving_log.c) rather than inline here, so it's exercised without
+   needing a full command-dispatch harness. `sources` itself has no default/omission concept
+   -- `action = "start"` with `sources` absent or empty is always invalid_command. */
+static void handle_wardriving_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    feb_wardriving_command_payload_t payload;
+    feb_cbor_status_t status;
+    bool is_start;
+    bool is_stop;
+    bool want_wifi = false;
+    bool want_ble = false;
+    size_t i;
+
+    status = feb_cbor_decode_wardriving_command_payload(cmd->arguments_span, cmd->arguments_span_len, &payload);
+    if (status != FEB_CBOR_OK) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    is_start = (payload.action_len == strlen("start") && memcmp(payload.action, "start", payload.action_len) == 0);
+    is_stop = (payload.action_len == strlen("stop") && memcmp(payload.action, "stop", payload.action_len) == 0);
+    if (!is_start && !is_stop) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    if (is_stop) {
+        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+        if (!wardriving_wifi_active && !wardriving_ble_active) {
+            if (!send_protected_error(conn_handle, "not_running", strlen("not_running"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+
+        if (wardriving_wifi_active) {
+            wardriving_wifi_active = false;
+            wifi_scan_in_progress = false;
+            ble_npl_callout_stop(&wardriving_wifi_interval_co);
+            {
+                esp_err_t serr = esp_wifi_scan_stop();
+
+                if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
+                    ESP_LOGW(TAG, "esp_wifi_scan_stop failed while stopping wardriving: %s",
+                             esp_err_to_name(serr));
+                }
+            }
+        }
+        if (wardriving_ble_active) {
+            wardriving_ble_active = false;
+            ble_scan_in_progress = false;
+            ble_npl_callout_stop(&wardriving_ble_interval_co);
+            {
+                int derr = ble_gap_disc_cancel();
+
+                if (derr != 0 && derr != BLE_HS_EALREADY) {
+                    ESP_LOGW(TAG, "ble_gap_disc_cancel failed while stopping wardriving: %d", derr);
+                }
+            }
+        }
+
+        {
+            feb_status_payload_t status_payload = {0};
+            size_t payload_len;
+
+            status_payload.request_id = cmd->request_id;
+            status_payload.state = "stopped";
+            status_payload.state_len = strlen("stopped");
+            payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                         sizeof(pairing_payload_encode_buf), &status_payload);
+            if (payload_len == 0 ||
+                !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                return;
+            }
+        }
+        ESP_LOGI(TAG, "wardriving stopped (request_id=%llu)", (unsigned long long)cmd->request_id);
+        return;
+    }
+
+    /* is_start */
+    if (wardriving_wifi_active || wardriving_ble_active) {
+        if (!send_protected_error(conn_handle, "busy", strlen("busy"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+    if (!payload.has_sources || payload.source_count == 0) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    want_wifi = wardriving_source_requested(&payload, "wifi");
+    want_ble = wardriving_source_requested(&payload, "ble");
+    {
+        size_t recognized_count = (want_wifi ? 1u : 0u) + (want_ble ? 1u : 0u);
+
+        /* Catches both an unrecognized source string and a duplicate entry ("wifi","wifi")
+           in one comparison: source_count can only equal recognized_count if every entry is
+           exactly one of "wifi"/"ble" and neither appears twice. Neither rule is an explicit
+           docs/PROTOCOL.md sentence for the duplicate case -- a judgment call, since a
+           repeated source is structurally nonsensical the same way an unrecognized one is. */
+        if (payload.source_count != recognized_count) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+    }
+
+    {
+        bool have_wifi_scan = false;
+        bool have_ble_scan = false;
+
+        for (i = 0; i < FEB_FEATURE_COUNT; i++) {
+            if (strcmp(feb_features[i], "wifi_scan") == 0) have_wifi_scan = true;
+            if (strcmp(feb_features[i], "ble_scan") == 0) have_ble_scan = true;
+        }
+        if ((want_wifi && !have_wifi_scan) || (want_ble && !have_ble_scan)) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+    }
+
+    {
+        wardriving_start_request_t req = {0};
+        wardriving_resolved_intervals_t resolved;
+
+        req.want_wifi = want_wifi;
+        req.want_ble = want_ble;
+        req.has_wifi_interval_ms = payload.has_wifi_interval_ms;
+        req.wifi_interval_ms = payload.wifi_interval_ms;
+        req.has_ble_params = payload.has_ble_params;
+        req.ble_window_ms = payload.ble_window_ms;
+        req.ble_interval_ms = payload.ble_interval_ms;
+
+        if (!wardriving_resolve_start_intervals(&req, &resolved)) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+
+        /* Stashed back into `payload` (not local-only) so the existing want_wifi/want_ble
+           start blocks below, which already read payload.wifi_interval_ms/ble_window_ms/
+           ble_interval_ms, pick up the resolved (explicit-and-valid, or defaulted) values
+           unchanged. */
+        payload.wifi_interval_ms = resolved.wifi_interval_ms;
+        payload.ble_window_ms = resolved.ble_window_ms;
+        payload.ble_interval_ms = resolved.ble_interval_ms;
+    }
+
+    if (want_wifi && wifi_scan_in_progress) {
+        if (!send_protected_error(conn_handle, "busy", strlen("busy"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+    if (want_ble && ble_scan_in_progress) {
+        if (!send_protected_error(conn_handle, "busy", strlen("busy"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    if (want_wifi) {
+        wifi_scan_config_t scan_cfg;
+        esp_err_t err;
+
+        memset(&scan_cfg, 0, sizeof(scan_cfg));
+        wifi_scan_in_progress = true;
+        wifi_scan_active_source = WIFI_SCAN_SOURCE_WARDRIVING;
+        wardriving_wifi_interval_ms = (uint32_t)payload.wifi_interval_ms;
+        err = esp_wifi_scan_start(&scan_cfg, false);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "wardriving: esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+            wifi_scan_in_progress = false;
+            if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+        wardriving_wifi_active = true;
+    }
+
+    if (want_ble) {
+        struct ble_gap_disc_params params = {0};
+        int rc;
+
+        ble_scan_in_progress = true;
+        ble_scan_active_source = BLE_SCAN_SOURCE_WARDRIVING;
+        ble_scan_raw_count = 0;
+        wardriving_ble_window_ms = (uint32_t)payload.ble_window_ms;
+        wardriving_ble_interval_ms = (uint32_t)payload.ble_interval_ms;
+
+        params.passive = 1;
+        params.filter_duplicates = 0;
+        params.itvl = 0;
+        params.window = 0;
+        rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
+        if (rc != 0 && rc != BLE_HS_EALREADY) {
+            ESP_LOGE(TAG, "wardriving: ble_gap_disc start failed: %d", rc);
+            ble_scan_in_progress = false;
+            if (want_wifi) {
+                /* Roll back the Wi-Fi source already started above, so `start` is atomic --
+                   either every requested source comes up, or none does. */
+                wardriving_wifi_active = false;
+                wifi_scan_in_progress = false;
+                esp_wifi_scan_stop();
+            }
+            if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+        ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
+        wardriving_ble_active = true;
+    }
+
+    {
+        feb_status_payload_t status_payload = {0};
+        size_t payload_len;
+
+        status_payload.request_id = cmd->request_id;
+        status_payload.state = "started";
+        status_payload.state_len = strlen("started");
+        payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                     sizeof(pairing_payload_encode_buf), &status_payload);
+        if (payload_len == 0 ||
+            !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "wardriving started (request_id=%llu, wifi=%d ble=%d)",
+             (unsigned long long)cmd->request_id, (int)want_wifi, (int)want_ble);
 }
 
 /* docs/PLAN.md "Wi-Fi scan capability" step: esp_netif/default event loop/esp_wifi
@@ -1812,6 +2625,10 @@ static int write_complete(uint16_t conn_handle,
         rt_tx_sequence = 1;
         rt_rx_sequence = 1;
         ESP_LOGI(TAG, "client_auth sent; runtime session authenticated");
+        /* docs/PROTOCOL.md "Unsolicited backlog drain": on every authenticated session
+           establishment, if the flash log holds buffered records, start draining them now
+           without waiting for a `command`. */
+        wardriving_maybe_kick_send(conn_handle);
         break;
     case TX_DONE_CONTINUE_WIFI_SCAN:
         wifi_scan_send_next_batch(conn_handle);
@@ -1819,6 +2636,24 @@ static int write_complete(uint16_t conn_handle,
     case TX_DONE_CONTINUE_BLE_SCAN:
         ble_scan_send_next_batch(conn_handle);
         break;
+    case TX_DONE_CONTINUE_WARDRIVING:
+        wardriving_send_next_batch(conn_handle);
+        break;
+    case TX_DONE_SEND_WARDRIVING_STOPPED: {
+        feb_status_payload_t status_payload = {0};
+        size_t payload_len;
+
+        status_payload.request_id = 0;
+        status_payload.state = "stopped";
+        status_payload.state_len = strlen("stopped");
+        payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                     sizeof(pairing_payload_encode_buf), &status_payload);
+        if (payload_len == 0 ||
+            !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -1834,12 +2669,25 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         scan_report_window_count++;
         scan_report_lifetime_total++;
 
-        /* TODO(wardriving): also gate on wardriving_ble_capture_active once that exists --
-           this task only wires the manual ble_scan busy-guard condition. */
+        /* ble_scan_in_progress is shared by the manual ble_scan capability and
+           wardriving's BLE source (see ble_scan_source_t's comment), so this single check
+           already covers both callers -- ble_scan_catalog_advertisement() itself is
+           source-agnostic (just fills ble_scan_raw_devices[]); ble_scan_window_close_cb()
+           decides what to do with the catalog based on ble_scan_active_source. */
         if (ble_scan_in_progress) {
             ble_scan_catalog_advertisement(&event->disc);
         }
 
+        /* This connect-attempt path is the "merged reconnect-scan" mechanism
+           (docs/PLAN.md step 2's "revised long-run reconnect policy" / step 4's
+           "Accepted gap"): whichever discovery is currently running -- the dedicated
+           reconnect scan (start_scan()), a manual ble_scan, or wardriving's own BLE
+           capture window -- delivers every advertisement through this same event handler,
+           so a Flipper's v2 service UUID is matched and connected to from whatever scan
+           pass happens to be active, without a second dedicated scan ever running
+           alongside wardriving's BLE source (see BLE_GAP_EVENT_DISC_COMPLETE below, which
+           suppresses start_scan() while wardriving_ble_active is true for exactly this
+           reason). */
         if (connection_handle == BLE_HS_CONN_HANDLE_NONE &&
             scan_record_matches(event->disc.data, event->disc.length_data)) {
             if (!connecting_permitted()) {
@@ -1859,7 +2707,12 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
-        if (connection_handle == BLE_HS_CONN_HANDLE_NONE && !reconnect_task_active) {
+        /* Suppressed while wardriving's BLE source is active: that source re-arms its own
+           next discovery window on its own cadence (wardriving_ble_interval_cb()), and
+           docs/PLAN.md's reconnect policy explicitly says not to run a second dedicated
+           reconnect scan alongside it -- reconnect opportunities come from the same
+           passive scan pass instead (see BLE_GAP_EVENT_DISC above). */
+        if (connection_handle == BLE_HS_CONN_HANDLE_NONE && !reconnect_task_active && !wardriving_ble_active) {
             start_scan();
         }
         return 0;
@@ -1889,6 +2742,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         tx_fragment_total = 0;
         tx_fragment_next = 0;
         feb_reassembly_reset(&rx_reassembly);
+        wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
+                                             deliberately persist across connect/disconnect */
+        wardriving_pending_drain_count = 0;
         ESP_LOGI(TAG, "connected; exchanging MTU");
         rc = ble_gattc_exchange_mtu(connection_handle, mtu_exchanged, NULL);
         if (rc != 0) {
@@ -1917,13 +2773,18 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         feb_reassembly_reset(&rx_reassembly);
         pairing_attempt_zeroize();
         runtime_auth_zeroize();
-        if (wifi_scan_in_progress) {
+        wardriving_tx_in_flight = false;
+        if (wifi_scan_in_progress && wifi_scan_active_source == WIFI_SCAN_SOURCE_MANUAL) {
             /* Don't clear wifi_scan_in_progress directly here -- the radio scan this
                connection started may still be running, and a new connection's `command`
                could otherwise race a still-in-flight wifi_scan_done_handler() write to
                wifi_scan_raw_records/wifi_scan_selected from a stale scan. esp_wifi_scan_stop()
                still fires WIFI_EVENT_SCAN_DONE for the aborted scan; wifi_scan_done_cb() then
-               finds no authenticated connection and clears the flag there, uniformly. */
+               finds no authenticated connection and clears the flag there, uniformly.
+               Gated to the manual source only -- wardriving's Wi-Fi capture (if active) must
+               keep running across this disconnect (docs/PROTOCOL.md: "continues across BLE
+               disconnects"), so wifi_scan_done_cb()'s WARDRIVING branch does not check
+               connection state at all. */
             esp_err_t serr = esp_wifi_scan_stop();
 
             if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
@@ -1934,12 +2795,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                           "(pending results will be discarded)");
         }
 
-        if (ble_scan_in_progress) {
-            /* Same disconnect-safety shape as wifi_scan_in_progress above: stop the radio
-               scan immediately, but don't clear ble_scan_in_progress here -- the
-               already-armed ble_scan_done_co window-close callout will observe "no
-               authenticated connection" when it fires and clear the flag there, uniformly
-               (avoids a race with a new connection's `command` reusing
+        if (ble_scan_in_progress && ble_scan_active_source == BLE_SCAN_SOURCE_MANUAL) {
+            /* Same disconnect-safety shape as wifi_scan_in_progress above, and gated to the
+               manual source for the same reason (wardriving's BLE capture must survive this
+               disconnect): stop the radio scan immediately, but don't clear
+               ble_scan_in_progress here -- the already-armed ble_scan_done_co window-close
+               callout will observe "no authenticated connection" when it fires and clear the
+               flag there, uniformly (avoids a race with a new connection's `command` reusing
                ble_scan_raw_devices/ble_scan_selected while this window's data is still being
                finalized). */
             int derr = ble_gap_disc_cancel();
@@ -2252,6 +3114,10 @@ static void host_synced(void)
                           ble_npl_time_ms_to_ticks32(FEB_REASSEMBLY_CHECK_INTERVAL_MS));
     ble_npl_callout_init(&wifi_scan_done_co, nimble_port_get_dflt_eventq(), wifi_scan_done_cb, NULL);
     ble_npl_callout_init(&ble_scan_done_co, nimble_port_get_dflt_eventq(), ble_scan_window_close_cb, NULL);
+    ble_npl_callout_init(&wardriving_wifi_interval_co, nimble_port_get_dflt_eventq(),
+                        wardriving_wifi_interval_cb, NULL);
+    ble_npl_callout_init(&wardriving_ble_interval_co, nimble_port_get_dflt_eventq(),
+                        wardriving_ble_interval_cb, NULL);
     ESP_LOGI(TAG, "starting v2 service-filtered scan");
     start_scan();
 }
@@ -2278,6 +3144,9 @@ void app_main(void)
     }
 
     feb_factory_reset_start();
+
+    location_init();
+    wardriving_log_init();
 
     compute_board_id();
     if (load_pairing_secret(stored_pairing_secret)) {

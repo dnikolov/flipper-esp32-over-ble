@@ -6,7 +6,12 @@
       "Read(//c/Users/Deyan/esp/esp-idf/examples/peripherals/rmt/led_strip_simple_encoder/main/**)",
       "PowerShell([System.IO.Ports.SerialPort]::GetPortNames\\(\\) | Sort-Object)",
       "Read(//c/Users/Deyan/unleashed-firmware-unlshd-092/**)",
-      "Bash(powershell.exe -NoProfile -Command \".\\\\fbt.cmd launch APPSRC=flipper_esp32_over_ble\")"
+      "Bash(powershell.exe -NoProfile -Command \".\\\\fbt.cmd launch APPSRC=flipper_esp32_over_ble\")",
+      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1)",
+      "Bash(python generate_vectors.py)",
+      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File build_pairing.ps1)",
+      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File build_session.ps1)",
+      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_esp32.ps1)"
     ]
   }
 }

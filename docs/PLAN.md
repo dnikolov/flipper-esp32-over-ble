@@ -78,26 +78,24 @@ The ESP32-C6 has a single 2.4GHz radio shared between Wi-Fi, BLE, and (later) 80
 
 **Done when:** Wi-Fi scanning, an active BLE connection, and a BLE observer scan run together without the connection dropping outside the reconnect policy's expected behavior, for both the paused and concurrent configurations, with results and chosen interval bounds recorded here. ✅ Met on 2026-09-03 — see "Step 4 results" below. Full design-decision rationale and orchestration incidents are in `docs/PROJECT_HISTORY.md`.
 
-### Step 4 results (2026-09-03)
+### Step 4 results (2026-09-03) — interval bounds other capabilities depend on
 
-A throwaway ESP32-side-only harness (`esp32/coex_test/`, not part of the shipping firmware — safe to leave in place, harmless disk space) ran a single paused-configuration baseline plus a 4-point ascending sweep of the concurrent configuration, unattended overnight. All 5 points completed cleanly on the first attempt each — no retries, no hard fails, no degradations at any duty cycle up to the theoretical maximum:
+An overnight sweep on a throwaway harness (`esp32/coex_test/`) validated 5 points; all passed
+cleanly with zero disconnects/degradations up to the theoretical maximum duty cycle. Full sweep
+table and narrative: `docs/PROJECT_HISTORY.md`'s "Step 4 (radio coexistence) validated on real
+hardware" entry. The bounds below are load-bearing (used as `wardriving`/`ble_scan` defaults),
+not just historical record:
 
-| Point | Config | BLE observer duty | Wi-Fi scan cadence | Result |
-|---|---|---|---|---|
-| 0 baseline-paused | paused | off while connected | continuous | PASS |
-| 1 conservative | concurrent | ~10% (window=100ms/interval=1000ms) | every 30s | PASS |
-| 2 moderate | concurrent | ~50% (window=100ms/interval=200ms) | every 15s | PASS |
-| 3 aggressive | concurrent | ~90% (window=135ms/interval=150ms) | continuous | PASS |
-| 4 max | concurrent | ~100% (window=30ms/interval=30ms, NimBLE's own default fast-scan params) | continuous | PASS |
+- **Minimum (most conservative) BLE observer duty:** window=100ms/interval=1000ms, Wi-Fi rescan
+  every 30s — proven stable, lowest radio-time cost.
+- **Maximum (most aggressive) BLE observer duty:** window=30ms/interval=30ms (NimBLE's own
+  default fast-scan params, already relied on by `esp32/main/main.c`'s reconnect scan),
+  continuous Wi-Fi scanning — proven stable at 100% duty.
+- **Default:** anywhere in the 50-90% duty range tested equally clean; pick based on the
+  capability's actual power/latency priorities — a product choice, not a stability constraint.
 
-**Recommended interval bounds for the `wardriving`/`ble_scan` capability:**
-
-- **Minimum (most conservative) BLE observer duty:** point 1's values — proven stable, lowest radio-time cost.
-- **Maximum (most aggressive) BLE observer duty:** point 4's values — proven stable even under continuous Wi-Fi scanning; these are also NimBLE's own default fast-scan parameters, already relied on by the proven reconnect scan in `esp32/main/main.c`.
-- **Default:** point 2 or 3's values (50-90% duty) are a reasonable balance of responsiveness vs. radio contention — pick based on the capability's actual power/latency priorities when implemented; all four concurrent points tested equally clean, so this is a product choice, not a stability constraint.
-- **Wi-Fi scan cadence:** continuous back-to-back scanning is proven safe to combine with BLE central+observer at any tested duty cycle up to 100%; a slower cadence (15-30s) is also fine and reduces Wi-Fi radio time if wardriving doesn't need continuous coverage.
-
-**Accepted gap — the merged reconnect-scan behavior was never actually exercised**, since zero disconnects occurred at any sweep point. The mechanism is implemented and code-reviewed per the step 2 policy, but a live forced-disconnect test would give full confidence. Not re-opening step 4 for this — flagged in the Backlog for step 9's full-system validation pass, which already plans reconnect/replay testing.
+**Accepted gap:** the merged reconnect-scan behavior was never exercised (zero disconnects
+occurred in the sweep) — tracked in the Backlog for step 9's full-system validation.
 
 ## 5. Implement trusted-environment pairing
 
@@ -148,7 +146,7 @@ Two findings from the hardware-verification pass were backlogged rather than fix
 Capabilities ship incrementally, gated on hardware actually present on a given board — see [CAPABILITIES.md](CAPABILITIES.md) for the registry format and the full, current capability list. See "Roadmap phases" above for how these map onto Phase 3/4/5.
 
 1. **`wifi_scan`** (Phase 3) — first capability, needs no extra hardware. ✅ Implemented and hardware-verified 2026-09-07.
-2. **`ble_scan` + `wardriving`** (Phase 3): add `ble_scan` and the composite `wardriving` capability. **Reordered 2026-09-07 to no longer wait on GPS hardware** — see "`ble_scan`, `wardriving`, and the GPS-stub reorder" below for why and how. **`ble_scan` implemented and hardware-verified 2026-09-08** (manual on-device scan trigger via Right button on the main screen, results in a scrollable view, capped at 32 devices by RSSI); `wardriving` (the composite capability and its flash-backed log) not yet started — see [CAPABILITIES.md](CAPABILITIES.md) for the full design (autonomous capture from boot, power-loss-safe on-device log, WiGLE CSV export).
+2. **`ble_scan` + `wardriving`** (Phase 3): add `ble_scan` and the composite `wardriving` capability. **Reordered 2026-09-07 to no longer wait on GPS hardware** — see "`ble_scan`, `wardriving`, and the GPS-stub reorder" below for why and how. **`ble_scan` implemented and hardware-verified 2026-09-08** (manual on-device scan trigger via Right button on the main screen, results in a scrollable view, capped at 32 devices by RSSI); **`wardriving` implemented on both firmwares and build/host-test-verified 2026-09-09, hardware verification pending** — ESP32 side: autonomous capture engine, power-loss-safe on-device flash log. Flipper side: a one-tap start/stop control/status screen (reachable via Up from the main screen), status/backlog-drain dispatch (including the `request_id = 0` unsolicited-backlog-drain case), and incremental WiGLE CSV export to SD card (one timestamped file per connected session, written record-by-record, never buffered in RAM). See [CAPABILITIES.md](CAPABILITIES.md) for the full design and this step's own "Done when" note above for implementation detail.
 3. **Heltec board support** (Phase 4, separate baseline, starts after Phase 3 completes): display and LoRa capabilities on a second, structurally different board — see `docs/BASELINES.md`.
 4. **Zigbee/Thread recon** (Phase 5a): passive `zigbee`/`thread` scanning/sniffing capabilities, matching the `wifi_scan`/`ble_scan` pattern — no network joining or commissioning.
 5. **Zigbee/Thread participation** (Phase 5b, much later, separately scoped): active stack participation — an order of magnitude larger effort; not committed to a timeline.
@@ -201,18 +199,11 @@ Because of that accepted threat model, none of the following are required for an
 
 The first real use of the generic `command`/`status` message types (defined in [PROTOCOL.md](PROTOCOL.md) but previously unimplemented) — this is the "follow-on `wifi_scan`-command step" named in Phase 3's roadmap description above, not step 8 and not part of step 7 (which explicitly deferred all `command`/`status` handling here).
 
-**Wire format and behavior** (frozen in [PROTOCOL.md](PROTOCOL.md)'s "`wifi_scan` command and status payloads" section and [CAPABILITIES.md](CAPABILITIES.md) — not re-derived here):
+**Wire format and behavior**: frozen in [PROTOCOL.md](PROTOCOL.md)'s "`wifi_scan` command and status payloads" section and [CAPABILITIES.md](CAPABILITIES.md) — read those directly rather than this plan; nothing here duplicates that spec.
 
-- Manual "Scan now" trigger only; results shown in a new scrollable Flipper view; nothing persisted or exported to SD (that stays `wardriving`'s job). Capped at the 32 strongest APs by RSSI.
-- SSID is a CBOR byte string (not text — real SSIDs aren't guaranteed valid UTF-8); RSSI is an unsigned `+128` offset (canonical-CBOR payload maps forbid negative integers); PHY generation collapses to one string naming the highest generation the AP advertises; auth mode is a full-fidelity string enum matching every `wifi_auth_mode_t` value in the pinned ESP-IDF, plus `"unknown"`.
-- `command.arguments` is always an empty map for `wifi_scan`. `status.state` is only `"partial"`/`"complete"` — the scan completes server-side in one shot, well under the idle-connection timeout, so no progress/started state was added.
-- A `wifi_scan` command received while one is already running is rejected with `error` code `busy`; no `request_id` dedup cache is kept, since scanning is idempotent.
-- The ESP32's Wi-Fi driver initializes once at boot and stays resident (matching the future `wardriving` capability's always-on-radio need); the scan itself runs asynchronously on the default event-loop task, never blocking the NimBLE host task that owns BLE connection supervision.
-- `command.arguments`/`status.result` each get their own fresh CBOR nesting-depth budget (starting at 0) rather than inheriting depth from their position inside `payload` — a decoder-internal convention, with no wire representation, that both firmwares must apply identically (added to [PROTOCOL.md](PROTOCOL.md)'s "Nesting depth" section after `status.result`'s real 3-container-level shape was found to exceed the general payload nesting limit).
+**Done when** (wire-format/build bar): ✅ Met 2026-09-07, both firmwares build- and host-test-verified against the frozen contract and shared vectors.
 
-**Done when** (the wire-format/build bar): ✅ Met 2026-09-07, both firmwares build- and host-test-verified against the frozen contract and shared vectors.
-
-**Hardware verification:** ✅ Complete 2026-09-07. See `docs/PROJECT_HISTORY.md` for the full narrative, including two real bugs found and fixed during the first hardware test — a Flipper-side send-buffer size bug (deterministic, fixed) and a new ESP32-side `nimble_host`-task stack overflow (same bug class as steps 3/5/7, fixed with the same static-storage pattern) — and a real stack-usage measurement/fix on the Flipper's CBOR-skip recursion (headroom raised from ~20% to ~50% against this project's 30% bar). One accepted gap: no non-ASCII SSID was available nearby to exercise that render path on real hardware (covered by host-native tests).
+**Hardware verification:** ✅ Complete 2026-09-07 — full narrative (two real bugs found and fixed, a stack-usage measurement) in `docs/PROJECT_HISTORY.md`'s "wifi_scan capability implemented and hardware-verified" entry.
 
 ## `ble_scan`, `wardriving`, and the GPS-stub reorder (Phase 3, decided 2026-09-07)
 
@@ -249,7 +240,17 @@ Key decisions from that design pass, made explicitly with the user:
 against the frozen wire contract with shared vectors, then hardware-verified on real devices,
 including a forced-disconnect test of the newly-productionized merged-reconnect-scan mechanism
 (closing step 4's long-open "never exercised" gap) and an extended unattended run validating the
-flash log's wraparound and power-loss behavior. Not yet started.
+flash log's wraparound and power-loss behavior.
+
+**`ble_scan`: done, hardware-verified 2026-09-08 (see above). `wardriving`: implemented on
+both firmwares, build/host-test-verified 2026-09-09, hardware-verified 2026-09-10.** Two real
+ESP32-side bugs were found and fixed during the first hardware test — see
+`docs/PROJECT_HISTORY.md`'s "wardriving hardware-verified" entry for the full narrative
+(`nimble_host` stack overflow in `wardriving_send_next_batch()`, and GATT-write-flood +
+reconnect-scan-restart collision). Both fixes are hardware re-verified. Three items still
+open per the "done when" bar — see `docs/SESSION_MEMORY.md`'s "Known open items" for exactly
+what remains: forced-disconnect test under live BLE capture, extended unattended flash-log
+wraparound/power-loss run, and CSV export SD-card confirmation.
 
 ## Backlog
 

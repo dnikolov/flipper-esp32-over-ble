@@ -1,17 +1,19 @@
 # Step 3 codec tests
 
 Host-native unit tests for the framing (`framing.c`/`.h`) and canonical-CBOR
-(`cbor_codec.c`/`.h`) modules — see [docs/PLAN.md](../docs/PLAN.md) step 3 and
-[docs/PROTOCOL.md](../docs/PROTOCOL.md). No board required; built and run with MSVC
-(`cl.exe`) on the host.
+(`cbor_codec.h` and its per-capability split, docs/OPTIMIZATION.md item 1:
+`cbor_primitives.c`/`.h`, `cbor_records.c`/`.h`, `cbor_wifi_scan.c`/`.h`,
+`cbor_ble_scan.c`/`.h`, `cbor_wardriving.c`/`.h`) modules — see
+[docs/PLAN.md](../docs/PLAN.md) step 3 and [docs/PROTOCOL.md](../docs/PROTOCOL.md). No
+board required; built and run with MSVC (`cl.exe`) on the host.
 
 - `vectors/generate_vectors.py` — generates `vectors/vectors.h` directly from the
   canonical-encoding rules in PROTOCOL.md (not from either firmware's codec). Re-run
   after editing it; do not hand-edit `vectors.h`.
-- `esp32/` — compiles `esp32/main/framing.c` and `esp32/main/cbor_codec.c` against
-  `vectors/vectors.h` into a standalone host executable.
-- `flipper/` — compiles `flipper/framing.c` and `flipper/cbor_codec.c` against the same
-  vectors into a separate standalone host executable.
+- `esp32/` — compiles `esp32/main/framing.c` and the five split `esp32/main/cbor_*.c`
+  codec files against `vectors/vectors.h` into a standalone host executable.
+- `flipper/` — compiles `flipper/framing.c` and the five split `flipper/cbor_*.c` codec
+  files against the same vectors into a separate standalone host executable.
 
 Both test executables are independent implementations exercised against the same
 fixed vectors — the point is to catch the two firmwares' codecs disagreeing with each

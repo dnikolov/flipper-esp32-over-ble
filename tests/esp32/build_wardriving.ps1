@@ -1,6 +1,13 @@
-# Builds and runs the host-native esp32 codec test with MSVC (cl.exe).
-# Locates cl.exe via vswhere; no gcc/MinGW is assumed to be on PATH (see docs/PLAN.md
-# step 3 implementation decisions).
+# Builds and runs the host-native wardriving test with MSVC (cl.exe): covers
+# wardriving_record_format.c (the pure, zero-ESP-IDF-dependency checksum/header-packing/
+# eviction-ordering helpers underneath wardriving_log.c's raw-flash circular log,
+# docs/PLAN.md step 8's wardriving-log persistence) and wardriving_validate.c (the pure
+# interval-field validation/default-substitution slice of main.c's
+# handle_wardriving_command()). Separate from build.ps1 (the framing/cbor codec test)
+# since neither of these depends on the cbor codec at all. wardriving_log.c itself depends
+# directly on esp_partition.h and is not host-buildable; see its header comment. No
+# gcc/MinGW is assumed to be on PATH (see docs/PLAN.md step 3 implementation decisions,
+# which this mirrors).
 $ErrorActionPreference = "Stop"
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -24,7 +31,6 @@ if(-not (Test-Path $vcvarsall)) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
 $esp32Dir = Join-Path $repoRoot "esp32\main"
-$vectorsDir = Join-Path $repoRoot "tests\vectors"
 $outDir = Join-Path $scriptDir "build"
 
 if(-not (Test-Path $outDir)) {
@@ -32,27 +38,23 @@ if(-not (Test-Path $outDir)) {
 }
 
 $sources = @(
-    (Join-Path $scriptDir "test_framing_cbor.c"),
-    (Join-Path $esp32Dir "framing.c"),
-    (Join-Path $esp32Dir "cbor_primitives.c"),
-    (Join-Path $esp32Dir "cbor_records.c"),
-    (Join-Path $esp32Dir "cbor_wifi_scan.c"),
-    (Join-Path $esp32Dir "cbor_ble_scan.c"),
-    (Join-Path $esp32Dir "cbor_wardriving.c")
+    (Join-Path $scriptDir "test_wardriving_log.c"),
+    (Join-Path $esp32Dir "wardriving_record_format.c"),
+    (Join-Path $esp32Dir "wardriving_validate.c")
 ) -join " "
 
-$includeDirs = "/I `"$esp32Dir`" /I `"$vectorsDir`""
-$exePath = Join-Path $outDir "test_framing_cbor.exe"
+$includeDirs = "/I `"$esp32Dir`""
+$exePath = Join-Path $outDir "test_wardriving_log.exe"
 
 $cmd = "call `"$vcvarsall`" >nul && cl.exe /nologo /W4 /std:c11 $includeDirs /Fe:`"$exePath`" /Fo:`"$outDir\\`" $sources"
 
-Write-Host "Building host test..."
+Write-Host "Building host wardriving_record_format test..."
 cmd.exe /c $cmd
 if($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE"
 }
 
 Write-Host ""
-Write-Host "Running host test..."
+Write-Host "Running host wardriving_record_format test..."
 & $exePath
 exit $LASTEXITCODE
