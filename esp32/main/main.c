@@ -32,6 +32,7 @@
 #include "wardriving_log.h"
 #include "wardriving_record_format.h"
 #include "wardriving_validate.h"
+#include "wardriving_dedup.h"
 
 static const char *TAG = "flipper_esp32_over_ble";
 
@@ -255,7 +256,11 @@ static uint8_t rt_transcript_buf[FEB_SESSION_MAX_TRANSCRIPT_LEN];
 static size_t rt_transcript_len;
 static uint8_t runtime_auth_failure_count;
 static uint32_t hello_ack_deadline_ms; /* 0 = no deadline currently active */
-static uint32_t last_record_activity_ms; /* reset on connect and on each record received */
+static uint32_t last_record_activity_ms; /* reset on connect and on each record received or
+                                             fully sent (write_complete()) -- docs/PROTOCOL.md's
+                                             "without a record" is undirected; a wardriving-style
+                                             session that only ever sends (never receives) must
+                                             still count as live. See docs/LESSONS.md 2026-09-10. */
 
 /* docs/PLAN.md step 7: first protected records exchanged post-auth. Per
    docs/PROTOCOL.md, a sequence counter begins at 1 for each authenticated session and
@@ -1135,7 +1140,7 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
                 record.payload.wifi.channel = rec->primary;
                 record.payload.wifi.auth = auth;
                 record.payload.wifi.auth_len = strlen(auth);
-                if (!wardriving_log_append(&record)) {
+                if (!wardriving_dedup_and_maybe_append(&record)) {
                     ESP_LOGW(TAG, "wardriving: failed to append wifi record to flash log");
                     if (wardriving_flash_failure_count < 0xFFu) {
                         wardriving_flash_failure_count++;
@@ -1617,7 +1622,7 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
                     record.payload.ble.has_name = 1;
                 }
                 record.payload.ble.rssi_offset = (uint64_t)((int)rec->rssi + 128);
-                if (!wardriving_log_append(&record)) {
+                if (!wardriving_dedup_and_maybe_append(&record)) {
                     ESP_LOGW(TAG, "wardriving: failed to append ble record to flash log");
                     if (wardriving_flash_failure_count < 0xFFu) {
                         wardriving_flash_failure_count++;
@@ -2042,6 +2047,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
             return;
         }
 
+        wardriving_dedup_reset();
         if (wardriving_wifi_active) {
             wardriving_wifi_active = false;
             wifi_scan_in_progress = false;
@@ -2176,6 +2182,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         return;
     }
 
+    wardriving_dedup_reset();
     if (want_wifi) {
         wifi_scan_config_t scan_cfg;
         esp_err_t err;
@@ -2603,6 +2610,13 @@ static int write_complete(uint16_t conn_handle,
         send_next_tx_fragment(conn_handle);
         return 0;
     }
+
+    /* Every outbound record (pairing or session-protected) funnels its last fragment's
+       write completion through here -- the single shared point that covers all send paths
+       without per-call-site duplication. Counts as activity the same as an inbound record,
+       so a wardriving-style session that only ever sends never trips the idle-timeout
+       below just because the peer stays quiet. */
+    last_record_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     action = tx_done_action;
     tx_done_action = TX_DONE_NONE;
