@@ -1165,6 +1165,145 @@ static void test_wardriving_csv_format_row(void) {
         "CSV_ROW: too-small out_cap returns 0, not a truncated row");
 }
 
+static feb_wardriving_record_t make_dedup_wifi_record(
+    const uint8_t bssid[6], int32_t rssi_dbm, uint64_t lat_e7_offset, uint64_t lon_e7_offset) {
+    feb_wardriving_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.lat_e7_offset = lat_e7_offset;
+    record.lon_e7_offset = lon_e7_offset;
+    record.source = "wifi";
+    record.source_len = strlen(record.source);
+    record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+    memcpy(record.payload.wifi.bssid, bssid, 6);
+    record.payload.wifi.rssi_offset = (uint64_t)(rssi_dbm + 128);
+    return record;
+}
+
+static feb_wardriving_record_t make_dedup_ble_record(
+    const uint8_t address[6], int32_t rssi_dbm, uint64_t lat_e7_offset, uint64_t lon_e7_offset) {
+    feb_wardriving_record_t record;
+    memset(&record, 0, sizeof(record));
+    record.lat_e7_offset = lat_e7_offset;
+    record.lon_e7_offset = lon_e7_offset;
+    record.source = "ble";
+    record.source_len = strlen(record.source);
+    record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+    memcpy(record.payload.ble.address, address, 6);
+    record.payload.ble.rssi_offset = (uint64_t)(rssi_dbm + 128);
+    return record;
+}
+
+/* Base coordinate used throughout: lat_e7_offset/lon_e7_offset == 900000000/1800000000 decode
+   to (0, 0) per feb_wardriving_csv_format_row()'s own arithmetic (see that test above). */
+#define DEDUP_BASE_LAT 900000000u
+#define DEDUP_BASE_LON 1800000000u
+
+static void test_wardriving_dedup(void) {
+    static const uint8_t addr_a[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    static const uint8_t addr_b[6] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    feb_wardriving_dedup_table_t table;
+    feb_wardriving_dedup_reset(&table);
+
+    feb_wardriving_record_t r1 = make_dedup_wifi_record(addr_a, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r1),
+        "DEDUP: a never-seen-before BSSID is always written");
+
+    feb_wardriving_record_t r2 = make_dedup_wifi_record(addr_a, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r2),
+        "DEDUP: same BSSID, same RSSI, same position -> skipped as a redundant repeat");
+
+    feb_wardriving_record_t r3 = make_dedup_wifi_record(addr_a, -55, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r3),
+        "DEDUP: RSSI improved by less than the threshold (5dB < 6dB) -> still skipped");
+
+    feb_wardriving_record_t r4 = make_dedup_wifi_record(addr_a, -54, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r4),
+        "DEDUP: RSSI improved by exactly the threshold (6dB) -> written again");
+
+    feb_wardriving_record_t r5 = make_dedup_wifi_record(addr_a, -54, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r5),
+        "DEDUP: repeat right after a refresh (no further RSSI/position change) -> skipped again");
+
+    /* ~0.00027 degrees of latitude is ~30m -- comfortably past the 30m move threshold. Longitude
+       held fixed so this exercises the latitude leg of the distance approximation. */
+    feb_wardriving_record_t r6 =
+        make_dedup_wifi_record(addr_a, -54, DEDUP_BASE_LAT + 2700u, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r6),
+        "DEDUP: moved >= 30m with no RSSI change -> written again");
+
+    feb_wardriving_record_t r7 =
+        make_dedup_wifi_record(addr_a, -54, DEDUP_BASE_LAT + 2700u, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r7),
+        "DEDUP: repeat at the same (already-refreshed) position -> skipped");
+
+    /* A tiny nudge (~1m) must NOT cross the 30m threshold. */
+    feb_wardriving_record_t r8 =
+        make_dedup_wifi_record(addr_a, -54, DEDUP_BASE_LAT + 2700u + 90u, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r8),
+        "DEDUP: a ~1m nudge does not cross the 30m move threshold -> skipped");
+
+    /* A second, distinct BSSID is tracked independently of the first. */
+    feb_wardriving_record_t r9 = make_dedup_ble_record(addr_b, -70, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r9),
+        "DEDUP: a second, distinct address is written regardless of the first address's state");
+
+    /* Same 6-byte value as addr_b, but as a WiFi BSSID instead of a BLE address -- payload_kind
+       is part of the key, so this must be treated as a different entry, not a repeat of r9. */
+    feb_wardriving_record_t r10 = make_dedup_wifi_record(addr_b, -70, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r10),
+        "DEDUP: same 6 bytes but a different payload_kind (wifi vs ble) is not treated as a repeat");
+}
+
+static void test_wardriving_dedup_eviction(void) {
+    feb_wardriving_dedup_table_t table;
+    feb_wardriving_dedup_reset(&table);
+
+    /* Fill the table with FEB_WARDRIVING_DEDUP_CAPACITY distinct addresses. */
+    for(uint32_t i = 0; i < FEB_WARDRIVING_DEDUP_CAPACITY; i++) {
+        uint8_t addr[6] = {
+            0,
+            0,
+            (uint8_t)(i >> 24),
+            (uint8_t)(i >> 16),
+            (uint8_t)(i >> 8),
+            (uint8_t)i,
+        };
+        feb_wardriving_record_t record =
+            make_dedup_wifi_record(addr, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+        CHECK(
+            feb_wardriving_dedup_should_write(&table, &record),
+            "DEDUP_EVICT: filling the table, every distinct address is written once");
+    }
+
+    /* One more, distinct, address: the table is full, so this evicts the oldest (first-inserted)
+       entry via the ring cursor rather than growing. */
+    uint8_t overflow_addr[6] = {0, 0, 0, 0, 0xff, 0xff};
+    feb_wardriving_record_t overflow_record =
+        make_dedup_wifi_record(overflow_addr, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &overflow_record),
+        "DEDUP_EVICT: a new address past capacity is still written (evicts the oldest slot)");
+
+    /* The very first address inserted above should have been evicted -- it's now treated as new
+       again rather than remembered. */
+    uint8_t first_addr[6] = {0, 0, 0, 0, 0, 0};
+    feb_wardriving_record_t first_record_again =
+        make_dedup_wifi_record(first_addr, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &first_record_again),
+        "DEDUP_EVICT: the oldest entry was evicted to make room, so it's no longer remembered");
+}
+
 int main(void) {
     test_fragmentation_at_mtu(
         23,
@@ -1250,6 +1389,8 @@ int main(void) {
     test_wardriving_backdate_first_seen();
     test_wardriving_csv_format_header();
     test_wardriving_csv_format_row();
+    test_wardriving_dedup();
+    test_wardriving_dedup_eviction();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

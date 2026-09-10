@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 uint32_t feb_wardriving_backdate_first_seen(
     uint64_t record_timestamp_ms, uint64_t anchor_timestamp_ms, uint32_t anchor_unix_time) {
@@ -216,4 +217,82 @@ size_t feb_wardriving_csv_format_row(
         return 0;
     }
     return (size_t)written;
+}
+
+static void wardriving_dedup_record_address(const feb_wardriving_record_t *record, uint8_t out[6]) {
+    if (record->payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI) {
+        memcpy(out, record->payload.wifi.bssid, 6);
+    } else {
+        memcpy(out, record->payload.ble.address, 6);
+    }
+}
+
+static int32_t wardriving_dedup_record_rssi_dbm(const feb_wardriving_record_t *record) {
+    uint64_t rssi_offset = (record->payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI) ?
+        record->payload.wifi.rssi_offset : record->payload.ble.rssi_offset;
+    return (int32_t)rssi_offset - 128;
+}
+
+/* Flat-earth approximation -- adequate at the ~30m scale FEB_WARDRIVING_DEDUP_MOVE_METERS
+   operates at, not worth a full haversine for a distinction this coarse. lat/lon decoding
+   mirrors feb_wardriving_csv_format_row()'s own arithmetic above (same e7-offset encoding,
+   same explicit-double-literal style to avoid this project's known
+   -Werror=double-promotion/-fsingle-precision-constant trap on the real FBT build). */
+static double wardriving_dedup_distance_meters(
+    uint64_t lat_e7_a, uint64_t lon_e7_a, uint64_t lat_e7_b, uint64_t lon_e7_b) {
+    double lat_a = ((double)(int64_t)lat_e7_a - (double)900000000) / (double)10000000;
+    double lon_a = ((double)(int64_t)lon_e7_a - (double)1800000000) / (double)10000000;
+    double lat_b = ((double)(int64_t)lat_e7_b - (double)900000000) / (double)10000000;
+    double lon_b = ((double)(int64_t)lon_e7_b - (double)1800000000) / (double)10000000;
+    double meters_per_degree = (double)111320;
+    double dlat_m = (lat_b - lat_a) * meters_per_degree;
+    double dlon_m = (lon_b - lon_a) * meters_per_degree *
+                    cos(lat_a * (double)3.14159265358979323846 / (double)180);
+    return sqrt(dlat_m * dlat_m + dlon_m * dlon_m);
+}
+
+void feb_wardriving_dedup_reset(feb_wardriving_dedup_table_t *table) {
+    memset(table, 0, sizeof(*table));
+}
+
+bool feb_wardriving_dedup_should_write(
+    feb_wardriving_dedup_table_t *table, const feb_wardriving_record_t *record) {
+    uint8_t address[6];
+    wardriving_dedup_record_address(record, address);
+    int32_t rssi_dbm = wardriving_dedup_record_rssi_dbm(record);
+
+    for (size_t i = 0; i < FEB_WARDRIVING_DEDUP_CAPACITY; i++) {
+        feb_wardriving_dedup_entry_t *entry = &table->entries[i];
+
+        if (entry->occupied && entry->payload_kind == record->payload_kind &&
+            memcmp(entry->address, address, sizeof(address)) == 0) {
+            bool stronger = (rssi_dbm - entry->last_rssi_dbm) >= FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB;
+            bool moved = wardriving_dedup_distance_meters(
+                             entry->last_lat_e7_offset,
+                             entry->last_lon_e7_offset,
+                             record->lat_e7_offset,
+                             record->lon_e7_offset) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
+
+            if (!stronger && !moved) {
+                return false;
+            }
+            entry->last_rssi_dbm = rssi_dbm;
+            entry->last_lat_e7_offset = record->lat_e7_offset;
+            entry->last_lon_e7_offset = record->lon_e7_offset;
+            return true;
+        }
+    }
+
+    {
+        feb_wardriving_dedup_entry_t *slot = &table->entries[table->next_evict_index];
+
+        memcpy(slot->address, address, sizeof(address));
+        slot->payload_kind = record->payload_kind;
+        slot->occupied = true;
+        slot->last_rssi_dbm = rssi_dbm;
+        slot->last_lat_e7_offset = record->lat_e7_offset;
+        slot->last_lon_e7_offset = record->lon_e7_offset;
+        table->next_evict_index = (table->next_evict_index + 1) % FEB_WARDRIVING_DEDUP_CAPACITY;
+    }
+    return true;
 }

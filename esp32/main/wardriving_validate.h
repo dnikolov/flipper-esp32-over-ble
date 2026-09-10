@@ -37,13 +37,24 @@
 #define FEB_WARDRIVING_BLE_WINDOW_MAX_MS 100u
 #define FEB_WARDRIVING_BLE_INTERVAL_MIN_MS 30u
 #define FEB_WARDRIVING_BLE_INTERVAL_MAX_MS 1000u
-/* Defaults substituted when a requested source's interval field(s) are absent -- equal to
-   the point-4/most-aggressive bounds above (see this header's top comment). Named
+/* Defaults substituted when a requested source's interval field(s) are absent. Named
    separately from the MIN_MS constants so a future bound change can't silently change the
-   default (or vice versa) without an explicit edit to both. */
+   default (or vice versa) without an explicit edit to both.
+
+   ble_interval_ms's default was point-4's 30ms (100% BLE observer duty) through
+   2026-09-09; raised to 500ms (~6% duty, window unchanged) on 2026-09-10 after real
+   wardriving traffic on real hardware showed 100% duty starves the active BLE connection
+   itself -- the continuous scan-restart cycle left no serviceable airtime for GATT
+   traffic, so a `stop` command could never land and the link was torn down locally every
+   ~30-40s (see docs/PROJECT_HISTORY.md's "wardriving BLE duty-cycle starvation" entry).
+   wifi_interval_ms's default is still point-4's 0 (continuous, no gap) -- WiFi scanning
+   was active in that same reproduction and is suspected to independently compete for the
+   same shared 2.4GHz radio via IDF's coexistence arbiter, but this has not yet been
+   isolated/validated the way step 4 validated the original points; flagged in
+   docs/PLAN.md, not yet fixed. */
 #define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 0u
 #define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 30u
-#define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 30u
+#define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 500u
 
 typedef struct {
     bool want_wifi;

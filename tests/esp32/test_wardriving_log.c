@@ -152,8 +152,12 @@ static void test_eviction_ordering(void)
 /* docs/PROTOCOL.md "Interval bounds and defaults" vs. its field table's terser "required
    when X in sources" wording -- resolved 2026-09-09 in favor of the more specific "Interval
    bounds and defaults" statement: a requested source's interval field(s) may be omitted, in
-   which case the point-4 (most-aggressive) default is substituted, since that's exactly
-   what the v1 Flipper client (no interval-entry UI) always sends. Covers the primary
+   which case a default is substituted, since that's exactly what the v1 Flipper client (no
+   interval-entry UI) always sends. wifi_interval_ms/ble_window_ms still default to their
+   original point-4 (most-aggressive) values; ble_interval_ms was raised from point-4's 30ms
+   to 500ms on 2026-09-10 (see wardriving_validate.h's FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS
+   comment) -- this test only checks each default against its named constant, so it does not
+   hardcode either value and needs no change from that fix. Covers the primary
    cross-firmware-compatibility case this fix targets, plus the surrounding validation rules
    that must still hold: bounds-checking on an explicit value, and rejecting an interval
    field present for a source that was never requested. */
@@ -163,17 +167,17 @@ static void test_start_interval_resolution(void)
     wardriving_resolved_intervals_t resolved;
 
     /* The exact shape a v1 Flipper client sends: both sources requested, no interval fields
-       at all -- both must default to the point-4 values. */
+       at all -- both must default to their named default constants. */
     memset(&req, 0, sizeof(req));
     req.want_wifi = true;
     req.want_ble = true;
     check(wardriving_resolve_start_intervals(&req, &resolved),
           "start intervals: both sources requested, all interval fields absent -> accepted");
     check(resolved.wifi_interval_ms == FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS,
-          "start intervals: wifi_interval_ms defaults to the point-4 value when absent");
+          "start intervals: wifi_interval_ms defaults to its default value when absent");
     check(resolved.ble_window_ms == FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS &&
           resolved.ble_interval_ms == FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS,
-          "start intervals: ble_window_ms/ble_interval_ms default to the point-4 values when absent");
+          "start intervals: ble_window_ms/ble_interval_ms default to their default values when absent");
 
     /* wifi only, interval absent -> defaulted; ble not requested and absent, untouched. */
     memset(&req, 0, sizeof(req));

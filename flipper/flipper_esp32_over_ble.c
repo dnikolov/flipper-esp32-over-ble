@@ -1605,6 +1605,11 @@ static uint32_t wardriving_csv_anchor_unix_time;
 static uint32_t wardriving_csv_records_since_sync;
 static bool wardriving_csv_write_failed;
 
+/* Same BLE-thread-only, single-owner lifetime as the fields above (see wardriving_csv_file's
+   own declaration comment) -- see wardriving_csv.h's feb_wardriving_dedup_should_write() for
+   the policy this table drives. */
+static feb_wardriving_dedup_table_t wardriving_dedup_table;
+
 /* storage_file_sync() every Nth record rather than every record (durability against a mid-
    session power loss vs. flash-write overhead) or only at close (would lose the whole
    session's writes since the last sync on a power loss) -- 8 chosen to match this app's
@@ -1616,6 +1621,7 @@ static void wardriving_csv_reset_state(void) {
     wardriving_csv_anchor_unix_time = 0;
     wardriving_csv_records_since_sync = 0;
     wardriving_csv_write_failed = false;
+    feb_wardriving_dedup_reset(&wardriving_dedup_table);
 }
 
 static void wardriving_csv_close(void) {
@@ -1737,7 +1743,10 @@ static bool
    the BLE thread itself -- not deferred through app->queue -- so the export file is genuinely
    appended-to incrementally even under an hours-long capture (docs/CAPABILITIES.md), and a
    32-record batch can never overrun the main-thread event queue's depth (see
-   AppEventWardrivingBatch's own comment). */
+   AppEventWardrivingBatch's own comment). Each record is first gated through
+   feb_wardriving_dedup_should_write() (wardriving_csv.h) -- a redundant repeat of an
+   already-written address is skipped before it ever reaches wardriving_csv_write_record(), not
+   an error path. */
 static void
     handle_wardriving_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
     Esp32App* app = profile->app;
@@ -1785,11 +1794,13 @@ static void
     last_summary[0] = '\0';
     for(size_t i = 0; i < result.record_count; i++) {
         const feb_wardriving_record_t* record = &result.records[i];
-        if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
-            wardriving_csv_write_failed = true;
-            FURI_LOG_E(
-                TAG, "wardriving CSV: write failed, no further records written this session");
-            post_wardriving_error(app, "CSV export write failed");
+        if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record)) {
+            if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
+                wardriving_csv_write_failed = true;
+                FURI_LOG_E(
+                    TAG, "wardriving CSV: write failed, no further records written this session");
+                post_wardriving_error(app, "CSV export write failed");
+            }
         }
         last_is_ble = record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE;
         if(last_is_ble) {
@@ -2030,8 +2041,11 @@ static uint64_t wardriving_next_request_id = 1;
    present via app->capability_has_wifi_scan/ble_scan. Always requests every source the board
    has (no source-picker UI in v1, docs/PLAN.md's explicit decision). Interval fields
    (wifi_interval_ms/ble_window_ms/ble_interval_ms) are omitted entirely so the ESP32 applies
-   its own documented default (the most-aggressive/point-4 values) -- v1 has no
-   interval-entry UI either. Runs on this app's own main thread (OK-press on the wardriving
+   its own documented defaults -- v1 has no interval-entry UI either. wifi_interval_ms/
+   ble_window_ms still default to the original most-aggressive/point-4 values; ble_interval_ms
+   was raised from point-4's 30ms to 500ms on 2026-09-10 after real wardriving traffic on real
+   hardware showed 100% BLE duty starves the connection itself (docs/PROJECT_HISTORY.md).
+   Runs on this app's own main thread (OK-press on the wardriving
    screen), same session_key/session_seq_out cross-thread-safety argument as
    send_wifi_scan_command()'s own comment (gated on app->capability_has_wifi_scan/ble_scan,
    which can only become true strictly after capability_bootstrap()'s send, if any, has

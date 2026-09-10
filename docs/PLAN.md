@@ -228,10 +228,13 @@ Key decisions from that design pass, made explicitly with the user:
   translation layer this project deliberately avoids (see step 8's "not a FAT-based
   wear-levelling filesystem" framing, and [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction"
   note). This corrects step 8's original "drop the oldest record" wording below.
-- **Wardriving's default cadence is the most aggressive/thorough validated point from step 4**
+- **Wardriving's default cadence was the most aggressive/thorough validated point from step 4**
   (continuous-ish Wi-Fi scanning, ~90-100% BLE observer duty — also NimBLE's own default
-  fast-scan parameters), prioritizing capture thoroughness. Fully configurable per-session via
-  the wire protocol regardless.
+  fast-scan parameters), prioritizing capture thoroughness — through 2026-09-09. **Corrected
+  2026-09-10**: real wardriving traffic on real hardware showed 100% BLE duty starves the
+  active connection itself (see "Known open items" below and `docs/PROTOCOL.md`'s "Interval
+  bounds and defaults"); `ble_interval_ms`'s default is now 500ms (~6% duty). Fully
+  configurable per-session via the wire protocol regardless.
 - **The Flipper's wardriving control screen ships with fixed defaults only for v1** — one-tap
   start/stop, no source-selection or interval-entry UI. The app has no form/settings-entry
   widget anywhere yet; building one is a separate, larger scope addition than anything else here.
@@ -268,7 +271,8 @@ Smaller items surfaced during design review or hardware testing, not yet schedul
 - Real scrollable capability-list screen on the Flipper, once `features` grows large enough to need one (step 7's initial implementation extends the existing single status screen instead).
 - Add host-test coverage for `capability_query`/`capability_response` (step 7) on the Flipper side — currently zero.
 - Mutex (or documented-safe alternative) for the Flipper's cross-thread `session_key`/`session_seq_out`/`outgoing_message_id` access — the wifi_scan command-send path (app main thread) and the existing BLE-thread senders touch the same session state with no lock today; currently argued safe only by a UI-gating invariant, not enforced by any lock.
-- Automatic pause-on-degradation fallback for concurrent BLE-source wardriving scanning while connected — only build if real wardriving traffic shows concurrent operation is unstable (step 4's sweep found it stable under synthetic load).
+- ~~Automatic pause-on-degradation fallback for concurrent BLE-source wardriving scanning while connected~~ — condition confirmed 2026-09-10 (real wardriving traffic does starve the connection at 100% BLE duty; step 4's sweep only checked synthetic load). Fixed with the simpler of the two options instead of the degradation-detection mechanism this bullet proposed: raised `ble_interval_ms`'s default to 500ms (~6% duty) rather than building automatic pause/resume logic — see `docs/PROJECT_HISTORY.md`'s "wardriving BLE duty-cycle starvation" entry.
+- **WiFi-source duty cycle is still unvalidated with an active connection** — `wifi_interval_ms`'s default remains 0 (continuous). WiFi scanning was active in the same 2026-09-10 reproduction that surfaced the BLE issue above, and is suspected to independently compete for the shared 2.4GHz radio via IDF's coexistence arbiter, but this hasn't been isolated the way step 4 isolated the BLE points. Needs its own coexistence check before picking a safe default (or confirming 0 is fine).
 - Generalize the Flipper's pairing-flow LED status stub (continuous blue blink while waiting/handshaking, solid blue on success, off on failure) into a reusable status/notification abstraction usable by other app states (capability streaming, wardriving status, etc.), instead of the hardcoded single-flow stub built for step 5.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP, instead of the single-`ViewPort`/`AppEvent`-queue pattern every screen so far (including wifi_scan's results view) has been bolted onto — a materially larger structural change than any single step's scope, flagged as increasingly strained with each new screen.
 - Check the ESP32-side `feb_cbor_skip_value()` for the same recursion-depth stack-usage issue found and fixed on the Flipper side for wifi_scan — **already checked and cleared** (66% headroom measured, well past the 30% bar; see the Wi-Fi scan capability section above) — kept here only as a closed pointer in case a future change to that recursion path needs re-measuring.

@@ -60,7 +60,19 @@ implemented, and debugged — including every bug's root cause — see
   mechanism under live wardriving BLE capture, (2) an extended unattended run validating the
   flash log's wraparound and power-loss behavior on real hardware, (3) confirming the Flipper's
   WiGLE CSV export actually lands correctly on the SD card (the on-device control/status screen
-  and start/stop dispatch were confirmed working).
+  and start/stop dispatch were confirmed working). **2026-09-10: a fourth real bug found** —
+  wardriving's default 100% BLE observer duty starves the active connection under real traffic
+  (a `stop` command couldn't land, connection dropped every ~30-40s); fixed by raising
+  `ble_interval_ms`'s default to 500ms (~6% duty) — see `docs/PROJECT_HISTORY.md`'s "wardriving
+  BLE duty-cycle starvation" entry. **Reflashed and hardware-re-verified same session** — storm
+  gone, clean reconnects. WiFi-source duty cycle (`wifi_interval_ms` default still 0/continuous)
+  remains unvalidated with an active connection — see `docs/PLAN.md`'s Backlog. **Also
+  2026-09-10: CSV export now deduplicates repeated observations of the same address**
+  (`flipper/wardriving_csv.c`'s `feb_wardriving_dedup_should_write()` — new-address/RSSI-
+  improved-6dB/moved-30m OR-gate, no time-based trigger; see `docs/PROJECT_HISTORY.md`'s
+  "wardriving CSV export writes a row per observation" entry and `docs/CAPABILITIES.md`'s
+  wardriving bullet). Build- and host-test-verified (479/479 checks, plus a clean real-FBT
+  build); **not yet hardware-verified.**
 - **Idle-connection heartbeat/keep-alive redesign**: backlogged by explicit user choice. The
   current 30-second idle-timeout disconnect-and-reconnect cycle works correctly but causes a
   cosmetic LED/screen flicker roughly every 30 seconds during an otherwise-healthy idle session.

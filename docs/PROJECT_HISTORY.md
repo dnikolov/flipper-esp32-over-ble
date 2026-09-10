@@ -828,6 +828,94 @@ Three items remain before wardriving's "done when" bar is fully met (forced-disc
 under live BLE capture, extended unattended flash-log wraparound/power-loss run, and CSV export
 SD-card confirmation) — see `docs/SESSION_MEMORY.md`'s "Known open items" for current status.
 
+## 2026-09-10: wardriving BLE duty-cycle starvation (found and fixed)
+
+While reproducing one of the three still-open items above (a forced-disconnect scenario under
+live wardriving BLE capture), a new, distinct bug surfaced: pressing OK on the Flipper's
+wardriving screen to send `stop` appeared to do nothing, the connection would drop on its own
+every ~30-40 seconds, and it would auto-reconnect but immediately repeat the same cycle.
+
+**Root cause (confirmed via a live `idf_monitor.py --port COM9` capture):** wardriving's default
+cadence (`ble_window_ms=30, ble_interval_ms=30`, i.e. 100% BLE observer duty — step 4's
+"point-4"/most-aggressive setting, `docs/PLAN.md`) leaves the active BLE connection no
+serviceable airtime once real application traffic (not step 4's synthetic load) is on it. The
+capture showed, immediately after `wardriving started`: a continuous stream of
+`GAP procedure initiated: discovery` (a fresh scan restart every ~20-30ms) for ~48 straight
+seconds with **zero further GATT writes logged** — the Flipper's `stop` command never landed —
+ending in `disconnected: reason=534` (NimBLE's `BLE_HS_ERR_HCI_BASE` encoding of HCI 0x16,
+"Connection Terminated By Local Host": the ESP32 gave up on its own connection, not the peer).
+It auto-reconnected within seconds each time (the merged-reconnect-scan mechanism itself works
+correctly), then immediately repeated the same storm-then-disconnect cycle.
+
+This is exactly the condition `docs/PLAN.md`'s backlog had flagged and deferred pending evidence
+("only build [a pause-on-degradation fallback] if real wardriving traffic shows concurrent
+operation is unstable — step 4's sweep found it stable under synthetic load"). Real traffic does
+show it, on real hardware.
+
+**Fix:** rather than building the degradation-detection/pause-resume mechanism the backlog item
+proposed, the user chose the simpler fix — raise `FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS` from
+30ms to 500ms (`esp32/main/wardriving_validate.h`), keeping `ble_window_ms` at its 30ms default.
+That's ~6% BLE observer duty instead of 100%, giving the connection real, regular gaps to be
+serviced. Bounds are unchanged (`ble_interval_ms` ∈ [30, 1000]ms), so 500ms is a same-session
+choice available to any client, not a new bound. `wifi_interval_ms`'s default (0, continuous) was
+deliberately left unchanged — WiFi scanning was active in the same reproduction (`sources=[wifi,
+ble]`) and is suspected to independently compete for the ESP32-C6's single shared 2.4GHz radio via
+IDF's coexistence arbiter, but that hasn't been isolated/validated the way step 4 isolated the BLE
+points, so it's tracked separately in `docs/PLAN.md`'s Backlog rather than guessed at here.
+
+Host tests (`tests/esp32/build_wardriving.ps1`) pass unchanged — the interval-resolution tests
+assert against the named default constants, not hardcoded values, so no test needed updating for
+the new number itself; only a few comments referencing the old "point-4 default" were corrected
+for accuracy. Reflashed and hardware re-verified same session: the BLE discovery-restart storm
+is gone (no more 20-30ms `GAP procedure initiated: discovery` spam), and the connection auto-
+reconnects cleanly. A second, distinct issue surfaced during that same re-verification pass — see
+below.
+
+## 2026-09-10: wardriving CSV export writes a row per observation, not per unique device
+
+While re-verifying the BLE duty-cycle fix above, the user separately noticed the exported WiGLE
+CSV has one row per drained observation, so a stationary device seen repeatedly accumulates many
+near-identical rows. Checked this against the actual WiGLE ecosystem convention first (official
+CSV spec at `api.wigle.net/csvFormat.html`, a real sample export, Kismet's `wiglecsv` docs): this
+is correct, standard behavior, not a bug — WiGLE CSV is one row per observation by design,
+`FirstSeen` means "this row's timestamp," not "first time this network was ever seen." Still,
+the user wanted repeats collapsed for practical file-size/readability reasons, so this became a
+feature request rather than a bug fix.
+
+**Research:** surveyed three prior projects for how they handle this. `bettercap` (MIT) —
+`modules/wifi/wifi_recon.go`'s `Session.WiFi.AddIfNew()`: a keyed map, updated in place on a
+repeat sighting rather than appended to. `wardriver_rev3` (GPL-3.0, code not reusable but the
+*pattern* isn't copyrightable) — a fixed 512-entry MAC-history ring buffer, skip if the address
+is still in the recent window, evict-oldest when full. An unlicensed Hak5-payload project,
+`pineapple_pager_wdgwars` (no LICENSE file found — treated as inspiration only, not reusable) —
+the most refined policy: write a row if the BSSID is new this session, OR moved >= 30m, OR RSSI
+improved >= 6dB, OR >= 300s elapsed, plus "no GPS fix, no row."
+
+**Design decision (with the user):** implemented independently in `flipper/wardriving_csv.c`/
+`.h` (`feb_wardriving_dedup_table_t`/`feb_wardriving_dedup_should_write()`), not the ESP32 side —
+the flash log and wire protocol stay a complete, honest observation-by-observation record; only
+the CSV export layer (the one point WiGLE is actually the consumer) collapses repeats. Adopted
+pineapple_pager_wdgwars's OR-gate shape but with two changes from the user's explicit steer:
+table capacity set to 256, not wardriver_rev3's 512 (a Flipper app has much less free RAM to
+spare than either reference project's dedicated hardware) — the "conservative window" choice;
+and the time-elapsed clause dropped entirely, not adopted at any threshold — with the current
+fixed-coordinate GPS stub, a row written only because 300s passed would be identical in every
+field except `FirstSeen`, which is exactly the kind of duplicate this exists to remove. Final
+policy: write if the address is new this session, OR RSSI improved by >= 6dB, OR moved >= 30m.
+The move clause is real, working code, just inert until real GPS lands (distance from a fixed
+coordinate to itself is always 0) — a deliberate no-op today, not a stub to fill in later.
+
+**Verification:** new host tests (`tests/flipper/test_flipper_codec.c`'s `test_wardriving_dedup()`/
+`test_wardriving_dedup_eviction()`) cover new-address-always-written, sub-threshold RSSI repeat
+skipped, at-threshold RSSI repeat written, sub-threshold movement skipped, at-threshold movement
+written, a second distinct address tracked independently, the same 6 bytes under a different
+`payload_kind` (wifi vs ble) NOT treated as a repeat, and ring-buffer eviction correctness at
+exactly capacity + 1. All 479 host-test checks pass (`tests/flipper/build.ps1`). Also verified
+against the real FBT toolchain (`fbt.cmd fap_flipper_esp32_over_ble`, build only, no flash) since
+this was the first use of `<math.h>` (`cos`/`sqrt`, for the movement distance check) anywhere in
+this codebase — linked and built cleanly with no `application.fam` changes needed. Not yet
+hardware-verified (no flash/live capture performed for this change as of this writing).
+
 ## Current project state and handoff
 
 As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime

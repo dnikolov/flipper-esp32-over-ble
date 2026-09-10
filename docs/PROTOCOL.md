@@ -284,15 +284,24 @@ envelope — `arguments` already exists as a map for exactly this kind of extens
 | `ble_window_ms` | unsigned integer | BLE observer scan window in milliseconds. Required together with `ble_interval_ms` when `"ble"` is in `sources`; absent otherwise. |
 | `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` is in `sources`; absent otherwise. |
 
-**Interval bounds and defaults.** Bounds and the default are the interval/duty-cycle values
-validated in [PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is
-step 4's "point 1" values (`ble_window_ms=100, ble_interval_ms=1000`, `wifi_interval_ms=30000`);
-maximum (most aggressive) is step 4's "point 4" values (`ble_window_ms=30, ble_interval_ms=30`
-— NimBLE's own default fast-scan parameters — with continuous, back-to-back Wi-Fi scanning).
-**The default when a `start` omits these fields is the maximum/point-4 values** — this project's
-Phase 3 wardriving use case prioritizes capture thoroughness, and step 4 already proved this
-configuration stable indefinitely. A future per-session override remains available via the
-fields above.
+**Interval bounds and defaults.** Bounds are the interval/duty-cycle values validated in
+[PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is step 4's
+"point 1" values (`ble_window_ms=100, ble_interval_ms=1000`, `wifi_interval_ms=30000`); maximum
+(most aggressive) is step 4's "point 4" values (`ble_window_ms=30, ble_interval_ms=30` — NimBLE's
+own default fast-scan parameters — with continuous, back-to-back Wi-Fi scanning).
+**The default when a `start` omits these fields was the maximum/point-4 values through
+2026-09-09** — this project's Phase 3 wardriving use case prioritizes capture thoroughness, and
+step 4 had proved this configuration stable indefinitely *under synthetic load* (no active
+connection carrying real command/status traffic). Real wardriving traffic on real hardware
+(2026-09-10) showed 100% BLE duty starves the connection itself — the continuous scan-restart
+cycle leaves no serviceable airtime for GATT traffic, so a `stop` command could never land and
+the link was torn down locally every ~30-40s. **`ble_interval_ms`'s default is now 500ms**
+(`ble_window_ms` unchanged at 30ms, ~6% duty) — see `docs/PROJECT_HISTORY.md`'s "wardriving BLE
+duty-cycle starvation" entry. `wifi_interval_ms`'s default remains 0 (continuous); WiFi scanning
+was active in that same reproduction and is suspected to independently compete for the same
+shared radio via IDF's coexistence arbiter, but this has not yet been isolated/validated — see
+this doc's own note and [PLAN.md](PLAN.md)'s Backlog. A per-session override for either source
+remains available via the fields above regardless.
 
 **Busy/not-running handling.** `action = "start"` while wardriving is already running is
 rejected `busy`. `action = "stop"` while wardriving is genuinely idle is rejected `not_running`.
