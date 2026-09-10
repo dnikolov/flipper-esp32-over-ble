@@ -71,8 +71,41 @@ implemented, and debugged — including every bug's root cause — see
   (`flipper/wardriving_csv.c`'s `feb_wardriving_dedup_should_write()` — new-address/RSSI-
   improved-6dB/moved-30m OR-gate, no time-based trigger; see `docs/PROJECT_HISTORY.md`'s
   "wardriving CSV export writes a row per observation" entry and `docs/CAPABILITIES.md`'s
-  wardriving bullet). Build- and host-test-verified (479/479 checks, plus a clean real-FBT
-  build); **not yet hardware-verified.**
+  wardriving bullet). Build- and host-test-verified (479/479 checks); its real-FBT build was
+  found to have actually been failing on a double-promotion warning, fixed same day — see
+  `docs/PROJECT_HISTORY.md`'s "idle-timeout outbound-activity bug" entry's build-fix note.
+  **Not yet hardware-verified** for the dedup behavior itself — the fix is flashed and running
+  on the physical Flipper as of 2026-09-10, pending the user's own manual SD-card CSV check.
+- **2026-09-10: ESP32 now also deduplicates before logging to flash** — new `wardriving_dedup.c`
+  module with 128-slot address hash table, logs only new addresses, RSSI improved ≥6dB, or
+  location moved ≥30m. Dramatically cuts flash usage and BLE transfer time from ESP32 to Flipper.
+  Build-verified clean; **not yet hardware-tested**.
+- **2026-09-10: idle-connection timeout only counted inbound records, breaking wardriving's
+  one-way outbound streaming** (disconnect at exactly 30s into every run). Fixed (outbound
+  sends now count too) and **hardware-verified** same day. See `docs/PROJECT_HISTORY.md`'s
+  "idle-timeout outbound-activity bug" entry.
+- **Known issue (not fixed, deferred at user's request): a `start` command landing while the
+  automatic backlog drain is already streaming clobbers the drain's continuation**, silently
+  stopping all further outbound sends until the (now-working) idle-timeout disconnects 30s
+  later. No data loss — undrained records resend on the next reconnect. See
+  `docs/PROJECT_HISTORY.md`'s "idle-timeout outbound-activity bug" entry for the root cause
+  and candidate fix.
+- **2026-09-10: after the BLE duty-cycle fix above, a short wardriving test showed zero BLE
+  records reaching the CSV** (WiFi records were present and correct). Root-caused as a
+  detection-probability artifact, not a bug: `ble_window_ms` stayed at 30ms while
+  `ble_interval_ms` rose to 500ms, dropping BLE scan duty to ~6% — each 30ms scan burst is
+  followed by 470ms of no BLE scanning at all, so a short run has a real chance of missing
+  every nearby device by bad luck. **Confirmed** by the user: a longer run did show BLE
+  records. **Fix in progress**: raised `ble_window_ms` to 100ms (duty ~20%, interval unchanged
+  at 500ms) — chosen as a conservative step up from the hardware-verified-safe 6%, not because
+  of step 4's synthetic-load sweep (that sweep also missed the original duty-starvation bug, so
+  its "10%-100% all stable" claim is not trustworthy evidence for real traffic). Build clean,
+  **flashed to the physical ESP32-C6 2026-09-10**. **NEXT STEP, not yet done**: a live,
+  multi-minute wardriving run to confirm (a) no idle-timeout or duty-starvation-style
+  disconnects at the new ~20% duty, (b) BLE records show up reliably and faster than the old
+  6%. Session ended before this run happened — do this first in the next session before
+  considering the BLE-detection issue closed. See `docs/PROTOCOL.md`'s "Interval bounds and
+  defaults" and `docs/PLAN.md` for the updated default.
 - **Idle-connection heartbeat/keep-alive redesign**: backlogged by explicit user choice. The
   current 30-second idle-timeout disconnect-and-reconnect cycle works correctly but causes a
   cosmetic LED/screen flicker roughly every 30 seconds during an otherwise-healthy idle session.

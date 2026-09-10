@@ -916,6 +916,161 @@ this was the first use of `<math.h>` (`cos`/`sqrt`, for the movement distance ch
 this codebase — linked and built cleanly with no `application.fam` changes needed. Not yet
 hardware-verified (no flash/live capture performed for this change as of this writing).
 
+## 2026-09-10: idle-timeout outbound-activity bug fixed and hardware-verified; new start/backlog-drain collision found (known issue, not fixed)
+
+### Symptom and reproduction
+
+During a live wardriving hardware test (using the freshly-rebuilt Flipper FAP with the CSV
+dedup fix from the entry above), the ESP32 disconnected a few seconds into every run, with the
+Flipper falling back to its "waiting for esp32" screen. A live serial monitor capture showed no
+panic or backtrace — a clean, deliberate self-disconnect logged by the firmware itself
+(`idle authenticated connection (30550 ms without a record); terminating`), not a crash.
+
+### Root cause
+
+`last_record_activity_ms` (`esp32/main/main.c:258`), the 30-second idle-timeout's reference
+clock, was only updated on inbound records received from the Flipper (`BLE_GAP_EVENT_CONNECT`
+and the inbound reassembly path) — never on outbound sends. Wardriving's traffic is
+one-directional after the initial `start` command: the ESP32 pushes `status(data)` batches
+continuously with nothing coming back, so the idle-timeout fired exactly 30s after the last
+inbound record even while the connection was actively transferring useful data outbound.
+`docs/PROTOCOL.md`'s own spec text ("closes an idle connection after 30 seconds without a
+record") is already undirected/correct — only the ESP32's implementation had narrowed it to
+"received." This is a new, fourth failure pattern distinct from the three bug classes already
+in this file's other 2026-09-10 entries (nimble_host stack overflow, GATT-write-flood/EBUSY
+collision, BLE duty-cycle starvation).
+
+### Fix
+
+`write_complete()` (`esp32/main/main.c`, the single callback every outbound fragment funnels
+through) now stamps `last_record_activity_ms` immediately after a record's last fragment is
+confirmed sent, before dispatching `tx_done_action` — covering every outbound record type
+(pairing, hello/client_auth, wifi_scan/ble_scan/wardriving status, errors, capability
+responses) from one shared point rather than duplicating the stamp per call site.
+
+### Verification
+
+Built clean (`idf.py build`), flashed to the physical ESP32-C6 on COM9. Live-monitored:
+confirmed 49+ seconds of continuous one-way outbound backlog-drain traffic survived with no
+false idle-disconnect, where the same traffic pattern died at exactly 30s before the fix.
+**Hardware-verified.**
+
+### New known issue found during the same verification pass (not fixed — deferred at user's request)
+
+While verifying the fix above, a fresh `start` command from the Flipper landed while the
+automatic "unsolicited backlog drain" (`docs/PROTOCOL.md`) was already actively streaming a
+large queued backlog (1278 records, left over from the earlier crash-loop). `handle_wardriving_
+command()`'s `start` path acknowledges with a plain `send_protected()` call (`main.c` ~line
+2247), which funnels through `queue_and_send_protected()` (`main.c` ~lines 957-974) — and that
+function unconditionally overwrites the shared `tx_done_action`/fragment-send state with no
+check of whether a wardriving batch send (`wardriving_tx_in_flight`) is already in progress.
+The `start` ack's own completion then dispatches `TX_DONE_NONE`, permanently clobbering the
+drain's `TX_DONE_CONTINUE_WARDRIVING` continuation — all further outbound sending silently
+stops (BLE capture keeps running in the background, filling the flash log, but nothing more
+transmits) until the now-correctly-working idle-timeout disconnects the connection 30 seconds
+later.
+
+This is the same general bug *class* as this file's GATT-write-flood/EBUSY entry above
+(unguarded shared TX/fragment state), but a different, previously-unseen manifestation — it
+only surfaces when an explicit `start` collides with an already-in-flight backlog drain, a
+timing window none of the prior verification runs happened to hit.
+
+**No data loss**: records are only marked "drained" in the flash log after a confirmed delivery
+ack, so whatever was mid-transfer when the stall began remains undrained and is automatically
+resent on the next reconnect's backlog drain.
+
+**Known issue, not fixed** — deferred at the user's explicit request. Candidate fix (not
+implemented): gate `handle_wardriving_command()`'s `start` acknowledgment behind the same
+`wardriving_tx_in_flight` check the drain path itself uses, deferring/queuing the ack instead
+of sending it unconditionally.
+
+### Also found and fixed this session: the Flipper FBT build was not actually clean
+
+Rebuilding the Flipper FAP (to get the CSV-dedup fix from the entry above onto physical
+hardware) surfaced a real build failure that host-native tests couldn't catch:
+`flipper/wardriving_csv.h`'s `FEB_WARDRIVING_DEDUP_MOVE_METERS` macro was a bare `30.0` literal,
+which the FBT ARM toolchain's `-fsingle-precision-constant` flag treats as `float` — tripping
+`-Werror=double-promotion` against the `double`-returning distance function that consumes it at
+`wardriving_csv.c:274`, despite that same file already documenting this exact trap in a comment
+at lines 236-240. Fixed with an explicit `(double)` cast, matching the file's own established
+convention elsewhere. Host tests unaffected (still 479/479 — the host toolchain doesn't set
+that flag); the real-FBT build is now clean. **This corrects the previous entry above's claim
+of "a clean real-FBT build" for the CSV dedup fix — that claim was inaccurate as committed; it
+is accurate only as of this correction.**
+
+## 2026-09-10: BLE duty-cycle fix left wardriving nearly blind to BLE devices; window widened (verification pending)
+
+### Symptom
+
+After the BLE duty-cycle-starvation fix above, a short live wardriving test produced a CSV with
+WiFi records but **zero BLE records**, even though the ESP32 had been asked to capture both
+sources.
+
+### Root cause
+
+Not a bug in the CSV writer or status dispatch (both `flipper/wardriving_csv.c` and
+`flipper_esp32_over_ble.c`'s `handle_wardriving_status()` treat WiFi and BLE symmetrically, and
+the shared GPS-fix gate in `esp32/main/main.c` is identical and satisfied for both sources). The
+actual cause: the duty-cycle fix raised `ble_interval_ms`'s default to 500ms but left
+`ble_window_ms` at 30ms (`esp32/main/wardriving_validate.h`), dropping BLE scan duty from ~100%
+to ~6% — a 30ms scan burst followed by 470ms of no BLE scanning at all, repeating. WiFi scanning
+is unaffected (`wifi_interval_ms` stays 0/continuous), which is exactly why WiFi records kept
+appearing while BLE didn't. Confirmed as a detection-probability artifact, not a deeper bug: the
+user re-ran wardriving for a longer stretch and BLE records did show up.
+
+### Fix (built and flashed; live verification still pending)
+
+Raised `FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS` from 30 to 100 (`ble_interval_ms` left at 500),
+taking duty from ~6% to ~20% — a bigger catch-window per burst without approaching the 100% duty
+that caused the original starvation bug. Chosen empirically as a conservative step up from the
+hardware-verified-safe 6% point, explicitly **not** based on step 4's synthetic-load coexistence
+sweep ("10%-100% all proven stable") — that sweep used a throwaway test harness
+(`esp32/coex_test/`) that never exercised real authenticated-session traffic, and already missed
+the actual duty-starvation bug once; it isn't trustworthy evidence for picking a new value under
+real load. `docs/PROTOCOL.md`, `docs/CAPABILITIES.md`, and `docs/PLAN.md` updated to match the
+new default.
+
+Build is clean and the fix is flashed to the physical ESP32-C6 as of this entry. **Not yet
+live-verified**: the session ended before a multi-minute wardriving run could confirm (a) no
+idle-timeout/duty-starvation-style disconnect at ~20% duty, (b) BLE records land reliably and
+faster than at the old ~6%. This is the first thing to check in the next session.
+
+## 2026-09-10: Wardriving ESP32 deduplication — reduce flash bloat and transfer time
+
+**Root cause observed**: Users reported wardriving taking a very long time to transfer records
+from ESP32 to Flipper. Investigation showed excessive duplicate observations: every WiFi/BLE scan
+window logs the same devices again, creating massive flash logs (mostly redundant) and slow BLE
+transfers.
+
+**Solution**: Implement deduplication on the ESP32 side before logging to flash. This is
+complementary to the Flipper's CSV-export dedup (which only helps the final output, not transfer
+speed) and applies the same criteria to flash logging: **only log if new address, RSSI improved
+≥6dB, or location moved ≥30m**.
+
+### Implementation (wardriving_dedup.c/h)
+
+- **128-slot hash table** indexed by 6-byte MAC address (XOR-fold modulo).
+- Tracks per-address state: address, last RSSI offset, last lat/lon.
+- Before logging any WiFi or BLE record, queries the table and applies dedup gate.
+- Hash collisions (different address in same slot) silently evict the old entry — acceptable
+  tradeoff given ~128 table slots and ~64-128 unique devices per capture type in typical
+  wardriving range.
+- Resets table on wardriving start/stop (no stale state between runs).
+
+**Integration**:
+- `wardriving_dedup_and_maybe_append()` called instead of `wardriving_log_append()` in both
+  `wifi_scan_done_handler()` (line 1143) and `ble_scan_window_close_cb()` (line 1625).
+- `wardriving_dedup_reset()` called at start of both `handle_wardriving_command()` stop path
+  (line 2050) and start path (line 2184).
+- Module designed as pure C (no ESP-IDF dependencies) for future host-side testing.
+
+**Result**: Flash log now contains only "meaningful" observations per the dedup criteria. Measured
+improvement will be validated by live wardriving run in next session, but expected: massive
+reduction in transferred record count, hence BLE transfer time.
+
+Build verified clean (commit 47f57ff). **Not yet hardware-tested**: dedup filtering behavior
+will be confirmed by running wardriving on real hardware and comparing record counts before/after.
+
 ## Current project state and handoff
 
 As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime
