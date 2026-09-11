@@ -98,9 +98,12 @@ uint32_t feb_wardriving_backdate_first_seen(
    kind of duplicate this exists to remove. The move clause is real code, not a stub, but is
    inert until real GPS lands: distance from a fixed coordinate to itself is always 0.
 
-   Table lifetime matches the CSV export session (reset alongside wardriving_csv_reset_state()'s
-   existing call sites in flipper_esp32_over_ble.c: session close, and a "started" ack), same
-   scope as the FirstSeen-anchor state above. 256 entries chosen deliberately more conservative
+   Table lifetime matches the CSV export file's own lifetime, not any narrower per-restart
+   session segment (docs/CAPABILITIES.md; former docs/BACKLOG.md G29) -- reset only from
+   wardriving_csv_close() in flipper_esp32_over_ble.c (disconnect/profile-teardown/app-exit),
+   deliberately never from a same-file "started" ack, so a manual stop/restart mid-capture
+   does not make every address still in range look brand-new again. Same scope as the
+   FirstSeen-anchor state above. 256 entries chosen deliberately more conservative
    than wardriver_rev3's 512 -- a Flipper app shares far less free RAM with the rest of the
    firmware than that project's dedicated board. A table full of distinct addresses evicts its
    oldest entry (simple ring cursor, not LRU, matching wardriver_rev3's own simplification) --
@@ -125,7 +128,8 @@ typedef struct {
 } feb_wardriving_dedup_table_t;
 
 /* Zeroes the table (all entries unoccupied, cursor at 0). Call once per new CSV export
-   session, alongside wardriving_csv_reset_state(). */
+   file (its lifetime, not any narrower restart segment within it), alongside
+   wardriving_csv_reset_state() -- see that function's own comment. */
 void feb_wardriving_dedup_reset(feb_wardriving_dedup_table_t *table);
 
 /* Looks up `record`'s address in `table`, applies the policy above, and updates the matching

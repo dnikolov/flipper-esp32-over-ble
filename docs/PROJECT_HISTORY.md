@@ -1071,6 +1071,123 @@ reduction in transferred record count, hence BLE transfer time.
 Build verified clean (commit 47f57ff). **Not yet hardware-tested**: dedup filtering behavior
 will be confirmed by running wardriving on real hardware and comparing record counts before/after.
 
+
+## 2026-09-11: Wardriving CSV dedup reset on restart fixed (former BACKLOG G29)
+
+A 2026-09-11 field capture (`docs/grok-4.6-findings-2026-09-11.md`) surfaced 29 policy
+violations in a 778-row WiGLE CSV export, clustered in bursts of several unrelated addresses
+within seconds of each other. Replaying the capture against the current dedup logic confirmed
+the whole 256-slot table was being wiped at once, not a per-address RSSI-comparison bug (the
+table never exceeded 27/256 slots used, ruling out eviction churn) — and that line
+(`wardriving_csv.c`'s `feb_wardriving_dedup_should_write()`) had correctly updated the entry
+since the commit that introduced it (`59e5c0f`), so the earlier suspicion of a
+`last_rssi_dbm`-not-updated defect (formerly tracked as BL02) was wrong.
+
+Root cause: `send_wardriving_start_command()` fires on every OK-press on the wardriving
+screen, and each resulting `"started"` ack in `handle_wardriving_status()`
+(`flipper/flipper_esp32_over_ble.c`) called `wardriving_csv_reset_state()` →
+`feb_wardriving_dedup_reset()`, wiping the per-address dedup table (and the FirstSeen anchor)
+on every manual stop/restart mid-capture — while the CSV export file itself, by design, stays
+open across restarts within one connection. Every address still in radio range then looked
+brand-new again on the next batch, defeating the RSSI-improvement/movement dedup policy and
+producing duplicate rows for addresses whose signal hadn't actually improved.
+
+**Fix**: dedup scope (and the FirstSeen anchor) is now explicitly the CSV export file's own
+lifetime, not a narrower per-restart segment — of the three options weighed in the backlog
+entry (session segment / file lifetime / rotate a new file per start), file lifetime was
+chosen because it matches the design this module's own top comment already stated ("kept open
+and appended to for the rest of the session regardless of any stop/restart within it") and
+needs no wire/UX change. The `"started"` handler no longer calls
+`wardriving_csv_reset_state()`; both the dedup table and the FirstSeen anchor now reset only
+in `wardriving_csv_close()` (disconnect, profile teardown, or app exit), alongside the file
+handle itself. Verified safe for the FirstSeen anchor specifically because the ESP32's
+`record->timestamp_ms` is `esp_timer_get_time()`-based — monotonic since the ESP32's own boot,
+never reset by a wardriving start/stop — so letting the anchor persist across a restart cannot
+regress or go stale. Documented explicitly in `docs/CAPABILITIES.md`'s `wardriving` bullet.
+Host-native `wardriving_csv` tests (479/479 checks, `tests/flipper/build.ps1`) pass unchanged —
+the fix is entirely in the caller (`flipper_esp32_over_ble.c`), not the tested pure-codec
+module. Build-verified via the pinned FBT checkout; not yet hardware-re-verified with a real
+stop/restart mid-capture.
+
+## 2026-09-11: ESP32-side wardriving dedup reset on restart fixed (former BACKLOG G35)
+
+Found while fixing G29 (above): `main.c`'s `handle_wardriving_command()` called
+`wardriving_dedup_reset()` at the start of both its stop path (then line 2070) and start
+path (then line 2205), unconditionally wiping `wardriving_dedup.c`'s 128-slot per-address
+table on every manual stop/restart of the `wardriving` command. Same defect class as G29, but
+worse on this side: that table doesn't just gate a CSV export row, it gates what actually gets
+appended into the ESP32's own flash-backed circular log (`wardriving_log.c`, the persistent
+"wardrive" partition) — every reset made every still-in-range address look brand-new again,
+causing `wardriving_dedup_and_maybe_append()` to write real duplicate records into physical
+flash and evict genuinely older records out of the circular log sooner than necessary.
+
+**Fix**: dedup scope now matches the flash log's own persistent lifetime (which spans
+reboots, not just one connection or one start/stop cycle) rather than a single start/stop
+cycle — both calls to `wardriving_dedup_reset()` were removed from the stop and start command
+handlers in `main.c`. This intentionally does not add a call anywhere else either:
+`wardriving_log_init()` (`esp32/main/wardriving_log.c`) itself resumes the existing on-flash
+log at boot rather than wiping it, so resetting the in-RAM dedup table at boot would give it a
+narrower scope than the store it gates, the same mismatch this fix removes elsewhere. The
+table still starts empty at every ESP32 boot — via ordinary C static zero-initialization, not
+an explicit reset call — and is not rebuilt from the existing on-flash records, so a reboot
+mid-capture (not a same-session stop/restart) can still cause one extra duplicate append per
+address still in range at that moment; this is accepted as a boot-time edge case rather than
+the systemic every-restart bug that was fixed. `wardriving_dedup_reset()` itself is kept
+(currently uncalled by any firmware path) as the natural hook for a possible future explicit
+"clear wardriving log" command. `wardriving_dedup.h`'s header comment, which had claimed
+"Resets on stop/start" as the design, is corrected to describe this scope. Documented in
+`docs/CAPABILITIES.md`'s `wardriving` bullet, mirroring G29's writeup there.
+
+Verified: `idf.py build` succeeds (ESP-IDF v5.5.2, target `esp32c6`). The host-native
+`wardriving_record_format`/`wardriving_validate` test (`tests/esp32/build_wardriving.ps1`)
+passes unchanged — `wardriving_dedup.c` itself has no host-native test harness (it depends on
+`wardriving_log.h`, whose implementation needs `esp_partition.h`). Not hardware-re-verified
+with a real stop/restart mid-capture or a real reboot mid-capture.
+
+## 2026-09-11: ESP32 wardriving dedup table split into Wi-Fi/BLE, resized, and made collision-safe (former BACKLOG G22)
+
+Flagged during the same session as G29/G35 above but originally left as a disputed-severity,
+do-not-fix item: `wardriving_dedup.c`'s table was a single 128-slot array shared by both
+Wi-Fi and BLE addresses, hashed with a 7-bit XOR-fold of the 6 raw address bytes and no type
+discriminator, so a Wi-Fi and a BLE address could hash to the same slot. On that collision,
+`should_log_record()` treated the incoming address as unconditionally "new" (logging it) and
+the caller silently overwrote the evicted entry with no flush — destroying its RSSI/location
+tracking, so the next time *that* address reappeared it was also wrongly treated as new. The
+table's own comment rationalized this as "~64 active devices per type, collisions should be
+rare," an assumption that depended on the table being wiped often; G35 (above) removed those
+resets, so the real working set became however many distinct addresses one full session sees,
+not one bounded by frequent wipes.
+
+A real field capture analyzed this session (`docs/grok-4.6-findings-2026-09-11.md`) found 517
+distinct addresses in one session — 172 Wi-Fi, 345 BLE — far more than the 128 total slots
+(or the assumed 64 per type), making collisions the norm rather than the exception once G35
+landed. The user approved fixing it after this discussion, overriding the earlier disputed
+status.
+
+**Fix**: split into two separate tables — 256 slots for Wi-Fi, 512 for BLE — eliminating
+cross-type aliasing entirely, sized with headroom above the 172/345 field-capture floor
+rather than the old "~64" guess. Replaced the XOR-fold hash with FNV-1a (better distribution,
+still cheap) and added linear probing within each table, so a same-type hash collision no
+longer silently evicts a different address either — eviction now only happens when a table is
+genuinely full (every slot holds a distinct in-use address), which the chosen sizes make a
+rare capacity-exhaustion case rather than the routine collision case it was before. The two
+tables together add ~24.5 KB of static `.bss` (up from ~4 KB for the old single table);
+`idf.py size` after the change reports DIRAM `.bss` at 21.25% (96056 / 452112 bytes total
+DIRAM, 203900 bytes still free), so this is not a tight budget. `wardriving_dedup.h`'s header
+comment (sizing rationale) and its `wardriving_dedup_and_maybe_append()` declaration comment
+(which had incorrectly claimed evicted entries are "flushed to flash" — they never were; the
+table only ever held compact RSSI/location tracking state, not a full record) are both
+corrected. Documented in `docs/CAPABILITIES.md`'s `wardriving` bullet, mirroring G29/G35's
+writeups there. `docs/BACKLOG.md`'s G22 row and its "disputed severity" deferred-item bullet
+are both removed, replaced with a pointer to this entry.
+
+Verified: `idf.py build` succeeds (ESP-IDF v5.5.2, target `esp32c6`). The host-native
+`wardriving_record_format`/`wardriving_validate` test (`tests/esp32/build_wardriving.ps1`)
+passes unchanged (54 checks) — `wardriving_dedup.c` itself still has no host-native test
+harness (same reason as noted in the G35 writeup: it depends on `wardriving_log.h`, which
+needs `esp_partition.h`). Not hardware-verified — no real multi-hundred-address capture
+session was replayed against the physical board.
+
 ## Current project state and handoff
 
 As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime

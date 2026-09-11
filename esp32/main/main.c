@@ -2067,7 +2067,6 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
             return;
         }
 
-        wardriving_dedup_reset();
         if (wardriving_wifi_active) {
             wardriving_wifi_active = false;
             wifi_scan_in_progress = false;
@@ -2202,7 +2201,6 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         return;
     }
 
-    wardriving_dedup_reset();
     if (want_wifi) {
         wifi_scan_config_t scan_cfg;
         esp_err_t err;

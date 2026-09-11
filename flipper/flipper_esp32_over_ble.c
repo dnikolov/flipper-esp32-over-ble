@@ -1607,7 +1607,11 @@ static void post_wardriving_error(Esp32App* app, const char* message) {
    and closed on disconnect/profile-teardown/app-exit (reset_scan_ui_state(), further below).
    Judgment call: this is simpler than slicing a file per start/stop, and a single connection's
    backlog-drain-then-maybe-live-capture reads naturally as one contiguous export rather than
-   several fragments. */
+   several fragments. The per-address dedup table and FirstSeen anchor (docs/CAPABILITIES.md)
+   share this exact file-lifetime scope -- reset together with the file in
+   wardriving_csv_close() only, never on a same-session "started" ack (former docs/BACKLOG.md
+   G29: resetting dedup on every restart made every address still in range look brand-new
+   again, defeating the whole policy). */
 static File* wardriving_csv_file;
 static char wardriving_csv_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
 static uint64_t wardriving_csv_anchor_timestamp_ms;
@@ -1768,7 +1772,15 @@ static void
     }
 
     if(text_matches(status_payload.state, status_payload.state_len, "started")) {
-        wardriving_csv_reset_state();
+        /* Deliberately NOT wardriving_csv_reset_state() here (docs/BACKLOG.md's former G29):
+           a manual stop/restart mid-session must not wipe the FirstSeen anchor or the
+           per-address dedup table, or every address still in range looks brand-new again
+           and the RSSI-improvement/movement policy is defeated. Dedup scope is the CSV
+           export file's lifetime (docs/CAPABILITIES.md), same as wardriving_csv_file itself
+           -- both are reset together only in wardriving_csv_close(), on disconnect/teardown,
+           never on a same-session restart. record->timestamp_ms is esp_timer_get_time()-based
+           on the ESP32 (monotonic since its boot, not reset by a start/stop), so the anchor
+           staying live across a restart cannot regress or go stale. */
         post_wardriving_run_state(app, true, true);
         return;
     }
