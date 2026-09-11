@@ -1419,7 +1419,10 @@ static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payl
     ble_scan_request_id = cmd->request_id;
     ble_scan_raw_count = 0;
 
-    params.passive = 1;
+    params.passive = 0;
+    /* Active scanning: send scan requests and collect scan response data, which often
+       includes device names that passive advertisements omit. Trade latency for name
+       discovery (docs/PLAN.md backlog: "BLE active scanning on/off toggle"). */
     /* No controller dup-filtering here (unlike start_scan()'s reconnect-scan concern) --
        ble_scan wants every advertisement so it can track each address's strongest RSSI
        itself; see ble_scan_catalog_advertisement()'s own dedup-by-address handling. */
@@ -1754,7 +1757,13 @@ static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
         return;
     }
     ble_scan_raw_count = 0;
-    params.passive = 1;
+    /* Active, not passive (was passive through 2026-09-10): this window is also the merged
+       reconnect-scan pass (docs/PLAN.md "Revised long-run reconnect policy") while wardriving's
+       BLE source owns discovery. A live forced-disconnect test found reconnect silently never
+       matching under a passive-only re-arm here -- root-caused and fixed 2026-09-11
+       (docs/LESSONS.md); the dedicated reconnect scan in start_scan() has always used active
+       scanning and does find peers reliably. */
+    params.passive = 0;
     params.filter_duplicates = 0;
     params.itvl = 0;
     params.window = 0;
@@ -2224,7 +2233,10 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         wardriving_ble_window_ms = (uint32_t)payload.ble_window_ms;
         wardriving_ble_interval_ms = (uint32_t)payload.ble_interval_ms;
 
-        params.passive = 1;
+        /* Active, not passive -- see wardriving_ble_interval_cb()'s comment: this window is
+           also the merged reconnect-scan pass while wardriving's BLE source owns discovery,
+           and a passive-only pass here was found to never catch the reconnect match. */
+        params.passive = 0;
         params.filter_duplicates = 0;
         params.itvl = 0;
         params.window = 0;
