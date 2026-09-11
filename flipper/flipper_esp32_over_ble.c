@@ -952,6 +952,12 @@ static uint8_t session_key[FEB_SESSION_KEY_LEN];
 static uint64_t session_seq_out;
 static uint64_t session_seq_in;
 
+/* docs/PROTOCOL.md: "must never wrap. A new BLE session is required before 2^24 - 1
+   protected records are sent." feb_session_build_nonce() truncates sequence to its low
+   24 bits and does not itself enforce this cap (session.h) -- both directions of a single
+   session must stay strictly below this value or the AES-GCM nonce repeats. */
+#define FEB_SESSION_SEQUENCE_MAX 0xFFFFFFu
+
 /* feb_session_decrypt_record()'s plaintext output; its contract requires capacity >=
    FEB_CBOR_MAX_PAYLOAD (session.h) -- not shrunk to "today's actual capability_response
    size" on purpose, matching the project's own 256-vs-512 lesson (docs/PLAN.md step 3
@@ -1343,6 +1349,10 @@ static void capability_bootstrap(Esp32BleProfile* profile) {
         capability_query_payload_buf, sizeof(capability_query_payload_buf), &query_payload);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "capability_query: payload encode failed");
+        return;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "capability_query: session sequence at cap; reconnect required");
         return;
     }
     size_t record_len = feb_session_encrypt_record(
@@ -1924,6 +1934,10 @@ static bool send_wifi_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wifi_scan command: payload encode failed");
         return false;
     }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "wifi_scan command: session sequence at cap; reconnect required");
+        return false;
+    }
 
     size_t record_len = feb_session_encrypt_record(
         session_key,
@@ -1991,6 +2005,10 @@ static bool send_ble_scan_command(Esp32App* app) {
         ble_scan_cmd_payload_buf, sizeof(ble_scan_cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "ble_scan command: payload encode failed");
+        return false;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "ble_scan command: session sequence at cap; reconnect required");
         return false;
     }
 
@@ -2099,6 +2117,10 @@ static bool send_wardriving_start_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wardriving start: payload encode failed");
         return false;
     }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "wardriving start: session sequence at cap; reconnect required");
+        return false;
+    }
 
     size_t record_len = feb_session_encrypt_record(
         session_key,
@@ -2165,6 +2187,10 @@ static bool send_wardriving_stop_command(Esp32App* app) {
         wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "wardriving stop: payload encode failed");
+        return false;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "wardriving stop: session sequence at cap; reconnect required");
         return false;
     }
 
@@ -2410,7 +2436,8 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                        memcmp(decrypted.session_id, session_id_bytes, FEB_SESSION_ID_LEN) != 0 ||
                        decrypted.board_id_len != session_board_id_len ||
                        memcmp(decrypted.board_id, session_board_id, session_board_id_len) != 0 ||
-                       decrypted.sequence != session_seq_in) {
+                       decrypted.sequence != session_seq_in ||
+                       decrypted.sequence >= FEB_SESSION_SEQUENCE_MAX) {
                         FURI_LOG_W(TAG, "Protected record session/sequence mismatch; dropping (no reply)");
                         return BleEventAckFlowEnable;
                     }

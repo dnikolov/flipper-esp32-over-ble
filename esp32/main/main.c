@@ -272,6 +272,12 @@ static uint64_t rt_rx_sequence;
 static uint8_t rt_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
 static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
 
+/* docs/PROTOCOL.md: "must never wrap. A new BLE session is required before 2^24 - 1
+   protected records are sent." feb_session_build_nonce() truncates sequence to its low
+   24 bits and does not itself enforce this cap (session.h) -- both directions of a single
+   session must stay strictly below this value or the AES-GCM nonce repeats. */
+#define FEB_SESSION_SEQUENCE_MAX 0xFFFFFFu
+
 static const char *const feb_features[] = {"wifi_scan", "ble_scan", "wardriving"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
 
@@ -959,6 +965,11 @@ static bool queue_and_send_protected(uint16_t conn_handle, const char *type, siz
                                      const uint8_t *payload, size_t payload_len,
                                      tx_done_action_t next_action)
 {
+    if (rt_tx_sequence >= FEB_SESSION_SEQUENCE_MAX) {
+        ESP_LOGW(TAG, "protected tx sequence at cap; closing to force a new session");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return false;
+    }
     if (!encode_and_queue_protected_record(type, type_len, payload, payload_len, rt_tx_sequence)) {
         return false;
     }
@@ -2952,7 +2963,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                     memcmp(decrypted.session_id, rt_session_id, FEB_SESSION_ID_LEN) != 0 ||
                     decrypted.board_id_len != board_id_len ||
                     memcmp(decrypted.board_id, board_id_buf, board_id_len) != 0 ||
-                    decrypted.sequence != rt_rx_sequence) {
+                    decrypted.sequence != rt_rx_sequence ||
+                    decrypted.sequence >= FEB_SESSION_SEQUENCE_MAX) {
                     ESP_LOGW(TAG, "protected record session/sequence mismatch; closing without reply");
                     ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
                     break;

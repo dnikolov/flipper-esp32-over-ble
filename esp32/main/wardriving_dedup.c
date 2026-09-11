@@ -55,8 +55,8 @@ static bool should_log_record(const uint8_t address[6], uint64_t rssi_offset,
     }
 
     /* Location moved: check if either lat or lon changed by ≥30m.
-       At the equator, 1 degree ≈ 111 km, so 1e7 units ≈ 1.11 cm.
-       30 m ≈ 2.7e6 units. Use 3e6 as a conservative round number. */
+       At the equator, 1 degree ≈ 111 km, so 1e7 units ≈ 1.11 cm, i.e. 1 unit ≈ 1.11 cm.
+       30 m = 3000 cm; 3000 cm / 1.11 cm per unit ≈ 2700 units. */
     uint64_t lat_delta = (lat_e7 > entry->last_lat_e7_offset) ?
                          (lat_e7 - entry->last_lat_e7_offset) :
                          (entry->last_lat_e7_offset - lat_e7);
@@ -64,7 +64,7 @@ static bool should_log_record(const uint8_t address[6], uint64_t rssi_offset,
                          (lon_e7 - entry->last_lon_e7_offset) :
                          (entry->last_lon_e7_offset - lon_e7);
 
-    if (lat_delta >= 3000000ULL || lon_delta >= 3000000ULL) {
+    if (lat_delta >= 2700ULL || lon_delta >= 2700ULL) {
         return true;
     }
 
