@@ -6,13 +6,20 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-11, commit TBD)
+## Current state (as of 2026-09-12, commit 8fe4dc7)
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete.** Steps 1-7 —
 build baselines, BLE transport, record framing, radio-coexistence validation, trusted-environment
 X25519 pairing, authenticated AES-256-GCM runtime sessions, and the board-identity/capability
 registry — are implemented **and hardware-verified** on real devices (ESP32-C6-DevKitC-1-N4 +
 Flipper Zero).
+
+**Current Phase 3a status:** the Home-first menu flow and the reconnect-retention follow-up are in
+place. The app no longer snaps back to the Home screen on session loss, and stale scan/wardriving
+state is cleared without abandoning the user’s active submenu. The next step is the runtime polish
+pass for the remaining capability screens: keep submenu state stable across reconnects, confirm the
+connection-lost banner is visible and consistent, and then finish the remaining menu-flow polish
+before moving deeper into product settings work.
 
 **Immediate next step: Phase 3a (UI architecture + menu redesign), scheduled 2026-09-12.** The
 Flipper app is still flat and button-shortcut driven today, so the approved design in
