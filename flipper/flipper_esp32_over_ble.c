@@ -3170,6 +3170,7 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
     canvas_draw_str(canvas, 2, 11, "Home");
     canvas_set_font(canvas, FontSecondary);
 
+    uint8_t header_rows = home_header_height(app);
     uint8_t y = HOME_FIRST_ROW_Y;
     canvas_draw_str(canvas, 2, y, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
     y += HOME_ROW_HEIGHT;
@@ -3189,6 +3190,10 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
         canvas_draw_str(canvas, 2, y, line);
         y += HOME_ROW_HEIGHT;
     }
+
+    /* Keep the menu below the header block. Without this offset, the menu starts at the same
+       Y coordinates as the final status line and visually overlaps it. */
+    uint8_t menu_y = HOME_FIRST_ROW_Y + header_rows * HOME_ROW_HEIGHT;
 
     static const char* labels[HomeMenuCount] = {
         "Wardriving",
@@ -3212,8 +3217,8 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
                 "%s%s",
                 app->home_menu_index == (HomeMenuItem)i ? "> " : "  ",
                 labels[i]);
-            canvas_draw_str(canvas, 2, y, line);
-            y += HOME_ROW_HEIGHT;
+            canvas_draw_str(canvas, 2, menu_y, line);
+            menu_y += HOME_ROW_HEIGHT;
         }
         rank++;
     }
