@@ -3226,6 +3226,12 @@ static void draw_callback(Canvas* canvas, void* context) {
        leave stale pixels behind when the new draw code only paints a subset of the canvas. */
     canvas_clear(canvas);
 
+    if(app->screen != AppScreenHome && app->pairing_phase == PairingPhaseFailed &&
+       strcmp(app->pairing_reason, "connection lost") == 0) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 12, "Connection lost");
+    }
+
     if(app->screen == AppScreenHome) {
         home_menu_fix_selection(app);
         draw_home_screen(canvas, app);
@@ -3286,8 +3292,10 @@ static void input_callback(InputEvent* input, void* context) {
    and resetting wardriving_running_known to false, since this Flipper's knowledge of the
    ESP32's run state does not survive a lost session (docs/LESSONS.md "UI must derive from
    real state") -- the next authenticated session starts genuinely not knowing either way. */
-static void reset_scan_ui_state(Esp32App* app) {
-    app->screen = AppScreenHome;
+static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
+    if(return_home) {
+        app->screen = AppScreenHome;
+    }
     pending_command_kind = PendingCommandNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
@@ -3308,6 +3316,14 @@ static void reset_scan_ui_state(Esp32App* app) {
     wardriving_csv_close();
 }
 
+static void reset_scan_ui_state(Esp32App* app) {
+    reset_scan_ui_state_impl(app, true);
+}
+
+static void reset_scan_ui_state_keep_screen(Esp32App* app) {
+    reset_scan_ui_state_impl(app, false);
+}
+
 static void stop_service(Esp32App* app) {
     furi_timer_stop(reassembly_timeout_timer);
     furi_hal_bt_stop_advertising();
@@ -3318,7 +3334,7 @@ static void stop_service(Esp32App* app) {
     }
     pairing_reset_state();
     session_reset_state();
-    reset_scan_ui_state(app);
+    reset_scan_ui_state_keep_screen(app);
     if(app->notifications) {
         notification_message(app->notifications, &sequence_blink_stop);
         notification_message(app->notifications, &sequence_reset_blue);
@@ -3414,22 +3430,25 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         if(event.type == AppEventBtStatus) {
             if(app.profile) {
                 if(event.bt_status == BtStatusConnected) {
-                    app.screen = AppScreenHome;
                     pairing_reset_state();
                     session_reset_state();
-                    reset_scan_ui_state(&app);
+                    reset_scan_ui_state_keep_screen(&app);
                     app.pairing_phase = PairingPhaseExchanging;
+                    app.pairing_reason[0] = '\0';
                 } else if(event.bt_status == BtStatusAdvertising) {
                     if(app.pairing_phase != PairingPhaseDone) {
-                        app.screen = AppScreenHome;
                         pairing_reset_state();
                         session_reset_state();
-                        reset_scan_ui_state(&app);
+                        reset_scan_ui_state_keep_screen(&app);
                         notification_message(app.notifications, &sequence_blink_start_blue);
                         app.pairing_phase = PairingPhaseWaiting;
+                        app.pairing_reason[0] = '\0';
                     }
                 } else if(event.bt_status == BtStatusUnavailable) {
                     stop_service(&app);
+                    app.pairing_phase = PairingPhaseFailed;
+                    strncpy(app.pairing_reason, "connection lost", sizeof(app.pairing_reason) - 1);
+                    app.pairing_reason[sizeof(app.pairing_reason) - 1] = '\0';
                 }
             }
         } else if(event.type == AppEventPairingPhase) {
@@ -3437,11 +3456,17 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             if(event.pairing_phase == PairingPhaseFailed) {
                 strncpy(app.pairing_reason, event.pairing_reason, sizeof(app.pairing_reason) - 1);
                 app.pairing_reason[sizeof(app.pairing_reason) - 1] = '\0';
-            } else if(event.pairing_phase == PairingPhaseDone) {
+            } else {
+                app.pairing_reason[0] = '\0';
+            }
+            if(event.pairing_phase == PairingPhaseDone) {
                 app.has_saved_pairing = true;
             }
         } else if(event.type == AppEventSessionFatal) {
             bt_disconnect(app.bt);
+            app.pairing_phase = PairingPhaseFailed;
+            strncpy(app.pairing_reason, "connection lost", sizeof(app.pairing_reason) - 1);
+            app.pairing_reason[sizeof(app.pairing_reason) - 1] = '\0';
         } else if(event.type == AppEventCapabilityInfo) {
             app.has_capability_info = true;
             strncpy(app.capability_board, event.capability_board, sizeof(app.capability_board) - 1);
