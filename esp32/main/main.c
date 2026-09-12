@@ -197,7 +197,7 @@ static struct ble_npl_callout reassembly_timeout_co;
 static char board_id_buf[FEB_PAIRING_BOARD_ID_MAX_LEN + 1];
 static size_t board_id_len;
 static uint8_t pairing_epoch[FEB_PAIRING_EPOCH_LEN];
-static uint32_t pairing_window_deadline_ms;
+static uint32_t pairing_window_start_ms;
 static bool pairing_window_closed;
 
 typedef enum {
@@ -262,7 +262,8 @@ static uint8_t rt_session_key[FEB_SESSION_KEY_LEN];
 static uint8_t rt_transcript_buf[FEB_SESSION_MAX_TRANSCRIPT_LEN];
 static size_t rt_transcript_len;
 static uint8_t runtime_auth_failure_count;
-static uint32_t hello_ack_deadline_ms; /* 0 = no deadline currently active */
+static uint32_t hello_ack_start_ms; /* 0 = no hello_ack wait currently active; else the
+                                        wrap-safe elapsed-time base for FEB_HELLO_ACK_TIMEOUT_MS */
 static uint32_t last_record_activity_ms; /* reset on connect and on each record received or
                                              fully sent (write_complete()) -- docs/PROTOCOL.md's
                                              "without a record" is undirected; a wardriving-style
@@ -540,7 +541,7 @@ static bool pairing_window_is_open(void)
         return false;
     }
     now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (now_ms >= pairing_window_deadline_ms) {
+    if ((uint32_t)(now_ms - pairing_window_start_ms) >= FEB_PAIRING_WINDOW_MS) {
         pairing_window_closed = true;
         ESP_LOGW(TAG, "pairing window expired");
         return false;
@@ -1966,7 +1967,10 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
         include_count++;
     }
 
-    remaining_after = wardriving_log_pending_count() - include_count;
+    {
+        size_t pending_now = wardriving_log_pending_count();
+        remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
+    }
     result.backlog_remaining = remaining_after;
     result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
 
@@ -2512,7 +2516,7 @@ static void fail_runtime_auth(uint16_t conn_handle)
     if (runtime_auth_failure_count < 0xFFu) {
         runtime_auth_failure_count++;
     }
-    hello_ack_deadline_ms = 0;
+    hello_ack_start_ms = 0;
     pending_disconnect_reason = DISCONNECT_REASON_AUTH_FAILED;
     runtime_auth_zeroize();
     ESP_LOGW(TAG, "runtime auth failed (%u consecutive failure(s)); closing without reply",
@@ -2522,7 +2526,7 @@ static void fail_runtime_auth(uint16_t conn_handle)
 
 static void handle_runtime_auth_unknown_board(uint16_t conn_handle)
 {
-    hello_ack_deadline_ms = 0;
+    hello_ack_start_ms = 0;
     pending_disconnect_reason = DISCONNECT_REASON_UNKNOWN_BOARD;
     runtime_auth_zeroize();
     ESP_LOGW(TAG, "flipper has no pairing record for board_id=%s; will open a pairing window "
@@ -2552,7 +2556,7 @@ static void begin_runtime_auth(uint16_t conn_handle)
 
     runtime_auth_state = RUNTIME_AUTH_STATE_HELLO_SENT;
     tx_done_action = TX_DONE_AWAIT_HELLO_ACK;
-    hello_ack_deadline_ms = (uint32_t)(esp_timer_get_time() / 1000) + FEB_HELLO_ACK_TIMEOUT_MS;
+    hello_ack_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     ESP_LOGI(TAG, "sending hello");
     send_next_tx_fragment(conn_handle);
 }
@@ -2566,7 +2570,7 @@ static void handle_hello_ack(uint16_t conn_handle, const feb_unencrypted_record_
     feb_client_auth_payload_t auth_payload;
     size_t payload_len;
 
-    hello_ack_deadline_ms = 0;
+    hello_ack_start_ms = 0;
 
     status = feb_cbor_decode_hello_ack_payload(envelope->payload_span, envelope->payload_span_len, &ack);
     if (status != FEB_CBOR_OK) {
@@ -2791,7 +2795,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         pairing_state = PAIRING_STATE_IDLE;
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
-        hello_ack_deadline_ms = 0;
+        hello_ack_start_ms = 0;
         last_record_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
         rt_tx_sequence = 0;
         rt_rx_sequence = 0;
@@ -2822,7 +2826,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         notify_cccd_handle = 0;
         pairing_state = PAIRING_STATE_IDLE;
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
-        hello_ack_deadline_ms = 0;
+        hello_ack_start_ms = 0;
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
         tx_done_action = TX_DONE_NONE;
         tx_fragment_total = 0;
@@ -2883,7 +2887,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         case DISCONNECT_REASON_UNKNOWN_BOARD:
             boot_mode = FEB_BOOT_MODE_PAIRING;
             esp_fill_random(pairing_epoch, sizeof(pairing_epoch));
-            pairing_window_deadline_ms = (uint32_t)(esp_timer_get_time() / 1000) + FEB_PAIRING_WINDOW_MS;
+            pairing_window_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
             pairing_window_closed = false;
             reconnect_retries = 0;
             ESP_LOGI(TAG, "falling back to pairing window on next connection attempt "
@@ -3139,7 +3143,8 @@ static void reassembly_timeout_cb(struct ble_npl_event *ev)
     }
     if (boot_mode == FEB_BOOT_MODE_RUNTIME_AUTH &&
         runtime_auth_state == RUNTIME_AUTH_STATE_HELLO_SENT &&
-        hello_ack_deadline_ms != 0 && now_ms >= hello_ack_deadline_ms &&
+        hello_ack_start_ms != 0 &&
+        (uint32_t)(now_ms - hello_ack_start_ms) >= FEB_HELLO_ACK_TIMEOUT_MS &&
         connection_handle != BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGW(TAG, "timed out waiting for hello_ack");
         fail_runtime_auth(connection_handle);
@@ -3225,7 +3230,7 @@ void app_main(void)
     } else {
         boot_mode = FEB_BOOT_MODE_PAIRING;
         esp_fill_random(pairing_epoch, sizeof(pairing_epoch));
-        pairing_window_deadline_ms = (uint32_t)(esp_timer_get_time() / 1000) + FEB_PAIRING_WINDOW_MS;
+        pairing_window_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
         ESP_LOGI(TAG, "board_id=%s: no stored pairing_secret; pairing window open for %u ms",
                  board_id_buf, (unsigned)FEB_PAIRING_WINDOW_MS);
     }

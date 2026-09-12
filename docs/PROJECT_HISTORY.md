@@ -1395,6 +1395,92 @@ harness (same reason as noted in the G35 writeup: it depends on `wardriving_log.
 needs `esp_partition.h`). Not hardware-verified — no real multi-hundred-address capture
 session was replayed against the physical board.
 
+## 2026-09-12: Six Flipper-side bugfixes from the approved review backlog (G01, G28, BL03, G14, G27, G17)
+
+Implemented together, build-verified only (no hardware flash), per an approved fix plan:
+
+- **G01** — `feb_reassembly_feed()` (`flipper/framing.c`) accepted a fragment header with
+  nonzero (reserved) `flags`, asymmetric with the ESP32 side which already rejected it. Now
+  rejects with `FEB_FRAME_INVALID_HEADER` alongside the existing `fragment_count`/
+  `fragment_index` checks. Test case `NONZERO_FLAGS_FRAG0` added to
+  `tests/flipper/test_flipper_codec.c`. G02 (ESP32's matching mid-fragment-capacity gap) is
+  tracked separately, owned by the ESP32 agent.
+- **G28** — `wardriving_csv_ensure_open()` wrote the WiGLE CSV header unconditionally on every
+  successful `FSOM_OPEN_APPEND`, corrupting the file with a repeated header whenever the same
+  path was reopened. Now gated on `storage_file_size(file) == 0`, matching the pattern already
+  used by `capability_storage_load()`.
+- **BL03** — the CSV filename was timestamped to the second
+  (`wardriving_%04u%02u%02u_%02u%02u%02u.csv`), so idle-timeout reconnect churn alone could
+  mint many near-empty files per outing. Widened to per-calendar-day
+  (`wardriving_%04u%02u%02u.csv`); safe only because G28 landed first (a same-day reopen now
+  appends to a nonzero-size file without re-emitting the header). Landed together per the
+  plan's explicit dependency.
+  - Follow-up discovered while implementing this (not fixed here, tracked as
+    `docs/BACKLOG.md` BL04): the CSV dedup table (`wardriving_dedup_table`) is still reset on
+    every disconnect (`wardriving_csv_close()`, via `reset_scan_ui_state()`), which no longer
+    matches the file's new per-day lifetime — a same-day reconnect can re-log an address
+    already written earlier that day as a duplicate row (not a duplicate header; G28 still
+    prevents that).
+- **G14** — `any_saved_pairing_exists()` called `storage_dir_read()` once and treated any
+  nonzero return as "a saved pairing exists," so a leftover `<board_id>.dat.tmp` from a
+  crashed save satisfied it like a real `.dat` file. Now loops until `storage_dir_read()`
+  returns false and only accepts a name ending in `.dat`.
+- **G27** — `pending_command_kind` was set at every command send but never cleared, so a
+  stale value from an already-completed wifi_scan/ble_scan/wardriving command could be
+  misattributed to a later, unrelated `error` reply. Now cleared to `PendingCommandNone` at
+  every response-completion path (wifi_scan/ble_scan "complete", wardriving
+  "started"/"stopped", every branch of `handle_runtime_error()`, and
+  `reset_scan_ui_state()`). `handle_runtime_error()`'s `internal_error` branch — previously an
+  unconditional wardriving-stopped UI update — is now gated: it only posts the
+  wardriving-specific message when a wardriving start/stop is still the pending command
+  (the accompanying `"stopped"` status always drives the actual run-state transition
+  regardless, per PROTOCOL.md's self-stop note); otherwise it routes to whichever other
+  capability's error surface was actually pending (`post_wifi_scan_error`/
+  `post_ble_scan_error`), or logs and does nothing if none was.
+- **G17** — `handle_client_auth()`'s proof-verification-failure path reset session state but
+  never updated the UI, leaving the Flipper stuck on "Authenticating…" indefinitely after a
+  wrong proof. Now calls `post_pairing_phase(profile->app, PairingPhaseFailed, "proof
+  verification failed")` before `session_reset_state()` — UI-only, still sends no wire reply
+  (silent drop, per PROTOCOL.md). **Changes on-screen text**: the main screen now shows
+  "Failed: proof verification failed" instead of hanging on "Authenticating…".
+  `docs/USER_GUIDE.md` sync for this (and for BL03's file-per-session → file-per-day wording)
+  is still pending.
+
+Verified: `fbt.cmd fap_flipper_esp32_over_ble` builds clean against the pinned Unleashed
+checkout; `tests/flipper/build.ps1` passes, including the new G01 test case. Not
+hardware-verified — no physical board was flashed or exercised for this pass.
+
+## 2026-09-12: Tier 1 backlog fixes — ESP32 side (G02, G05, G31)
+
+Same batch as G01/G28/BL03/G14/G27/G17 above, split by firmware side and implemented in
+parallel; this covers the ESP32-only items.
+
+- **G02** — `esp32/main/framing.c`'s `feb_reassembly_feed()` stored `fragment_payload_capacity`
+  from fragment 0 but never re-checked it against later fragments' payload length, so a
+  mid-message fragment larger than fragment 0's declared capacity was silently accepted (up to
+  the 768-byte total-size cap). Now checks `payload_len > r->fragment_payload_capacity` before
+  the existing total-size check, returning `FEB_FRAME_OVERSIZED` — matching the Flipper side,
+  which already had this check. Regression test added to `tests/esp32/test_framing_cbor.c`
+  (fragment 0 with a short payload, then an oversized fragment 1).
+- **G05** — Two absolute `uint32_t` millisecond deadline comparisons in `esp32/main/main.c`
+  wrapped unsafely at ~49.7 days of uptime: `pairing_window_is_open()`'s
+  `now_ms >= pairing_window_deadline_ms` and `reassembly_timeout_cb()`'s
+  `now_ms >= hello_ack_deadline_ms`. Both variables renamed to `pairing_window_start_ms` /
+  `hello_ack_start_ms` and converted to the wrap-safe elapsed-time form already used for idle
+  timeout (`(uint32_t)(now_ms - start_ms) >= DURATION_MS`); every set/clear site updated to
+  match.
+- **G31** — `wardriving_send_next_batch()`'s `remaining_after = wardriving_log_pending_count() -
+  include_count` was an unlocked `size_t` subtract that could underflow to a huge number if the
+  live pending count ever dropped below `include_count` between the batch's start and this line.
+  Now a saturating subtract (`pending_now >= include_count ? pending_now - include_count : 0`).
+  G30 (the underlying cross-thread race between the Wi-Fi `sys_evt` writer and the NimBLE-host
+  drain reader that could cause this) is still open — this only stops the underflow symptom.
+
+Verified: `idf.py build` (ESP-IDF v5.5.2, target `esp32c6`) builds clean; `tests/esp32/`'s host
+suites (framing/cbor, pairing, session, wardriving, location) all pass, including the two new
+framing regression cases. Not hardware-verified — no physical board was flashed or exercised for
+this pass.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

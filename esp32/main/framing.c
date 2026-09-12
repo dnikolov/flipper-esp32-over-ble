@@ -148,6 +148,10 @@ feb_frame_status_t feb_reassembly_feed(
         feb_reassembly_reset(r);
         return FEB_FRAME_OUT_OF_ORDER;
     }
+    if (payload_len > r->fragment_payload_capacity) {
+        feb_reassembly_reset(r);
+        return FEB_FRAME_OVERSIZED;
+    }
     if (r->record_len + payload_len > FEB_MAX_RECORD_SIZE) {
         feb_reassembly_reset(r);
         return FEB_FRAME_OVERSIZED;

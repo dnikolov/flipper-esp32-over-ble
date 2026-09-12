@@ -117,7 +117,8 @@ feb_frame_status_t feb_reassembly_feed(
     header.message_id = fragment[1];
     header.fragment_index = fragment[2];
     header.fragment_count = fragment[3];
-    if(header.fragment_count == 0 || header.fragment_index >= header.fragment_count) {
+    if(header.flags != 0 || header.fragment_count == 0 ||
+       header.fragment_index >= header.fragment_count) {
         feb_reassembly_reset(r);
         return FEB_FRAME_INVALID_HEADER;
     }

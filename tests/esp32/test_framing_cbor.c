@@ -754,6 +754,42 @@ int main(void)
         check(st == FEB_FRAME_OVERSIZED && r.in_progress == 0,
               "oversized fragment 0 rejected and reassembly reset");
     }
+    {
+        /* G02: fragment 0 declares a 4-byte payload capacity; fragment 1 tries to smuggle
+           a 5-byte payload through. Must be rejected even though the running total
+           (4 + 5 = 9 bytes) is nowhere near FEB_MAX_RECORD_SIZE. */
+        feb_reassembly_t r;
+        const uint8_t *out_record = NULL;
+        size_t out_len = 0;
+        feb_frame_status_t st;
+        static const uint8_t frag0[] = {0x00, 0x2a, 0x00, 0x02, 0xaa, 0xbb, 0xcc, 0xdd};
+        static const uint8_t frag1_oversized[] = {0x00, 0x2a, 0x01, 0x02,
+                                                   0x11, 0x22, 0x33, 0x44, 0x55};
+
+        feb_reassembly_reset(&r);
+        st = feb_reassembly_feed(&r, frag0, sizeof(frag0), 0, &out_record, &out_len);
+        check(st == FEB_FRAME_OK, "mid-message oversized fragment: fragment 0 accepted");
+
+        st = feb_reassembly_feed(&r, frag1_oversized, sizeof(frag1_oversized), 0,
+                                  &out_record, &out_len);
+        check(st == FEB_FRAME_OVERSIZED && r.in_progress == 0,
+              "mid-message fragment exceeding fragment-0 capacity rejected and reassembly reset");
+    }
+    {
+        /* G01: nonzero flags must be rejected regardless of an otherwise well-formed
+           single-fragment header. */
+        feb_reassembly_t r;
+        const uint8_t *out_record = NULL;
+        size_t out_len = 0;
+        feb_frame_status_t st;
+        static const uint8_t frag_bad_flags[] = {0x01, 0x2a, 0x00, 0x01, 0x99};
+
+        feb_reassembly_reset(&r);
+        st = feb_reassembly_feed(&r, frag_bad_flags, sizeof(frag_bad_flags), 0,
+                                  &out_record, &out_len);
+        check(st == FEB_FRAME_INVALID_HEADER && r.in_progress == 0,
+              "nonzero flags rejected as invalid header");
+    }
 
     test_decode_error_record();
     test_encode_roundtrip();

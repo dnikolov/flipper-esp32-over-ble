@@ -1342,6 +1342,13 @@ int main(void) {
         FEB_VEC_OUT_OF_ORDER_FRAGS_COUNT,
         FEB_FRAME_OUT_OF_ORDER,
         "OUT_OF_ORDER_FRAGS");
+    {
+        static const uint8_t nonzero_flags_frag0[4] = {0x01, 0x00, 0x00, 0x01};
+        const uint8_t* single[1] = {nonzero_flags_frag0};
+        size_t single_len[1] = {sizeof(nonzero_flags_frag0)};
+        test_malformed_fragment_sequence(
+            single, single_len, 1, FEB_FRAME_INVALID_HEADER, "NONZERO_FLAGS_FRAG0");
+    }
 
     test_near_max_record_at_uneven_capacity();
 

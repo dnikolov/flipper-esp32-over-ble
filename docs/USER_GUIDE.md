@@ -44,6 +44,9 @@ unless you mean to** — read-only queries (`flash_id`, log monitoring) are alwa
 2a. **If you have a saved pairing**, the app auto-starts advertising immediately — no OK-press
    needed. Instead of the pair/confirm/save phases, you'll see:
    - `Authenticating...` — the ESP32 found the Flipper; the runtime auth handshake is running.
+   - `Failed: proof verification failed` — the authentication handshake failed because the
+     ESP32's stored secret doesn't match the Flipper's (they are out of sync). Reset the ESP32
+     for a fresh pairing window and try again.
    - `ESP32 session active` — done. The authentication succeeded, the session is live, and the
      Flipper's LED goes solid blue.
 3. **If you have no saved pairing**, press **OK**. This starts the app's custom BLE profile and
@@ -187,15 +190,14 @@ records are captured and exported the same as live results (see below).
 GPS hardware is not yet wired to the board (see [CAPABILITIES.md](CAPABILITIES.md)).
 
 **SD card export:** every wardriving record (both backlog-drained and live) is appended,
-incrementally and in WiGLE CSV format, to a timestamped file under
-`/ext/apps_data/flipper_esp32_over_ble/wardriving/` on the Flipper's SD card. One file covers
-one connected session (from the first record received after connecting to disconnect/exit) —
-starting and stopping wardriving within the same session does not create separate files.
-Records are written to the file as they arrive rather than held in memory, so a capture
-session can run for hours without growing the app's RAM usage. Because the ESP32 has no
-real-time clock, each record's exported timestamp is an approximation: the most recently
-received record is anchored to the Flipper's current clock, and older records are backdated
-from it using their reported time-since-boot — not a true wall-clock record.
+incrementally and in WiGLE CSV format, to a daily file under
+`/ext/apps_data/flipper_esp32_over_ble/wardriving/` on the Flipper's SD card. The filename is
+`wardriving_YYYYMMDD.csv` (calendar date only), so multiple sessions across the same calendar
+day all append to the same file. Records are written to the file as they arrive rather than
+held in memory, so a capture session can run for hours without growing the app's RAM usage.
+Because the ESP32 has no real-time clock, each record's exported timestamp is an approximation:
+the most recently received record is anchored to the Flipper's current clock, and older records
+are backdated from it using their reported time-since-boot — not a true wall-clock record.
 
 ## Factory-resetting the ESP32 without a PC
 

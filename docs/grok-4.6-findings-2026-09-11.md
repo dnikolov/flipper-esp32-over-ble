@@ -70,7 +70,7 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 | #2 | `feb_cbor_skip_value` type-set drift | FIXED |
 | #3 | Nesting depth drift | FIXED |
 | #4 | Over-length `board_id` clamp vs zero | FIXED |
-| #5 | Framing flags / mid-fragment capacity | **STILL OPEN** → G01, G02 |
+| #5 | Framing flags / mid-fragment capacity | G01 (Flipper flags check) **FIXED 2026-09-12**; G02 (ESP32 mid-fragment capacity) status tracked separately by the ESP32 agent |
 | #6 | `client_auth` AUTHENTICATED on local write-complete | **STILL OPEN** → G03 |
 | #7 | No pairing-ceremony timeout | **STILL OPEN** → G04 |
 | #8 | `uint32_t` ms wrap on absolute deadlines | **STILL OPEN** → G05 |
@@ -103,7 +103,9 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G01 — Flipper does not reject nonzero fragment `flags`
 
 - **Severity:** P0 (contract) / practical P2 until flags gain meaning
-- **Status:** Known #5, still open
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `feb_reassembly_feed()` now
+  rejects `header.flags != 0` with `FEB_FRAME_INVALID_HEADER`, matching the ESP32 side; test
+  case added to `tests/flipper/test_flipper_codec.c` (`NONZERO_FLAGS_FRAG0`).
 - **Files:** [flipper/framing.c](../flipper/framing.c) (~L116–L123). ESP32 already rejects at [esp32/main/framing.c](../esp32/main/framing.c#L104).
 - **Evidence:** Flipper parses `header.flags = fragment[0]` then only checks `fragment_count == 0` / `fragment_index >= fragment_count`. PROTOCOL.md: `flags` reserved, all bits 0.
 - **Impact:** Asymmetric acceptance. A future flag bit, or a hostile peer, is ignored on Flipper and rejected on ESP32.
@@ -116,7 +118,10 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G02 — ESP32 never enforces mid-message fragment payload ≤ fragment-0 capacity
 
 - **Severity:** P0 (contract) / practical P2
-- **Status:** Known #5, still open (ESP32 half)
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `feb_reassembly_feed()` now
+  checks `payload_len > r->fragment_payload_capacity` before the total-size check, returning
+  `FEB_FRAME_OVERSIZED`, matching the Flipper side; regression test added to
+  `tests/esp32/test_framing_cbor.c`.
 - **Files:** [esp32/main/framing.c](../esp32/main/framing.c) — `fragment_payload_capacity` is stored on fragment 0 and **never read again**. Flipper checks `payload_len > r->fragment_payload_capacity` at [flipper/framing.c](../flipper/framing.c#L152).
 - **Impact:** ESP32 can accept a mid-fragment larger than the capacity established by fragment 0 until the 768-byte total cap hits. Status-code ordering also still differs (inconsistent-count vs duplicate).
 - **Fix:**
@@ -161,7 +166,10 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G05 — Absolute `uint32_t` ms deadlines wrap at ~49.7 days
 
 - **Severity:** P1 for unattended wardriving uptime (project's own long-run scenario)
-- **Status:** Known #8, still open
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `pairing_window_deadline_ms`
+  and `hello_ack_deadline_ms` renamed to `pairing_window_start_ms`/`hello_ack_start_ms` and both
+  comparisons converted to the wrap-safe elapsed-time form, matching the existing idle-timeout
+  pattern. G04's new pairing-ceremony timeout can build on this once implemented.
 - **Files:** [esp32/main/main.c](../esp32/main/main.c)
   - `pairing_window_is_open` (~L522): `now_ms >= pairing_window_deadline_ms` **unsafe**
   - `reassembly_timeout_cb` (~L3087): `now_ms >= hello_ack_deadline_ms` **unsafe**
@@ -353,6 +361,10 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G31 — `backlog_remaining` uses unlocked `size_t` subtract
 
 - **Severity:** P2 alone; P1 with G30
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `wardriving_send_next_batch()`
+  now saturates the subtract (`pending_now >= include_count ? pending_now - include_count : 0`).
+  G30 (the underlying cross-thread race that can make `include_count` exceed the live count) is
+  still open.
 - **Files:** [esp32/main/main.c](../esp32/main/main.c) (~L1935)
   ```c
   remaining_after = wardriving_log_pending_count() - include_count;

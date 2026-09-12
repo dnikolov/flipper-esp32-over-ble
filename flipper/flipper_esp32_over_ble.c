@@ -561,7 +561,13 @@ static bool any_saved_pairing_exists(Storage* storage) {
     if(storage_dir_open(dir, pairings_dir_path)) {
         FileInfo info;
         char name[64];
-        found = storage_dir_read(dir, &info, name, sizeof(name));
+        while(storage_dir_read(dir, &info, name, sizeof(name))) {
+            size_t len = strlen(name);
+            if(len > 4 && strcmp(name + len - 4, ".dat") == 0) {
+                found = true;
+                break;
+            }
+        }
     }
     storage_dir_close(dir);
     storage_file_free(dir);
@@ -1477,6 +1483,7 @@ static void
         }
     }
     if(is_complete) {
+        pending_command_kind = PendingCommandNone;
         post_wifi_scan_complete(app);
     }
 }
@@ -1564,6 +1571,7 @@ static void
         }
     }
     if(is_complete) {
+        pending_command_kind = PendingCommandNone;
         post_ble_scan_complete(app);
     }
 }
@@ -1674,14 +1682,11 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
     int written = snprintf(
         wardriving_csv_path,
         sizeof(wardriving_csv_path),
-        "%s/wardriving_%04u%02u%02u_%02u%02u%02u.csv",
+        "%s/wardriving_%04u%02u%02u.csv",
         wardriving_export_dir_path,
         (unsigned)now.year,
         (unsigned)now.month,
-        (unsigned)now.day,
-        (unsigned)now.hour,
-        (unsigned)now.minute,
-        (unsigned)now.second);
+        (unsigned)now.day);
     if(written <= 0 || (size_t)written >= sizeof(wardriving_csv_path)) {
         FURI_LOG_E(TAG, "wardriving CSV: path build failed");
         return false;
@@ -1690,9 +1695,11 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
     File* file = storage_file_alloc(storage);
     bool ok = storage_file_open(file, wardriving_csv_path, FSAM_WRITE, FSOM_OPEN_APPEND);
     if(ok) {
-        static char header_buf[FEB_WARDRIVING_CSV_HEADER_MAX_LEN];
-        size_t header_len = feb_wardriving_csv_format_header(header_buf, sizeof(header_buf));
-        ok = header_len > 0 && storage_file_write(file, header_buf, header_len) == header_len;
+        if(storage_file_size(file) == 0) {
+            static char header_buf[FEB_WARDRIVING_CSV_HEADER_MAX_LEN];
+            size_t header_len = feb_wardriving_csv_format_header(header_buf, sizeof(header_buf));
+            ok = header_len > 0 && storage_file_write(file, header_buf, header_len) == header_len;
+        }
     }
     if(!ok) {
         FURI_LOG_E(TAG, "wardriving CSV: failed to create '%s'", wardriving_csv_path);
@@ -1790,10 +1797,12 @@ static void
            never on a same-session restart. record->timestamp_ms is esp_timer_get_time()-based
            on the ESP32 (monotonic since its boot, not reset by a start/stop), so the anchor
            staying live across a restart cannot regress or go stale. */
+        pending_command_kind = PendingCommandNone;
         post_wardriving_run_state(app, true, true);
         return;
     }
     if(text_matches(status_payload.state, status_payload.state_len, "stopped")) {
+        pending_command_kind = PendingCommandNone;
         if(wardriving_csv_file) {
             storage_file_sync(wardriving_csv_file);
         }
@@ -1872,13 +1881,19 @@ static void
    `invalid_command` responses (docs/PROTOCOL.md's "Busy/not-running handling"); any other code
    is logged and otherwise ignored. `error` carries no capability field, so
    pending_command_kind (see its own declaration comment above) picks which capability's
-   in-flight command this reply belongs to. A `busy` on a wardriving start means it was
-   already running -- corrected here rather than left "unknown" (docs/LESSONS.md "UI must
-   derive from real state"); symmetrically, `not_running` on a stop confirms it was already
-   stopped. `internal_error` is treated as a wardriving self-stop notice (docs/PROTOCOL.md:
-   "an error record accompanies" a proactive `stopped` sent when "the engine self-stops for an
-   internal reason") -- the only capability with a self-stop concept today; revisit this
-   special case if a future capability also needs `internal_error` routed elsewhere. */
+   in-flight command this reply belongs to, and is reset back to PendingCommandNone at the
+   end of every branch below (also on the wifi_scan/ble_scan "complete" status, the
+   wardriving "started"/"stopped" status, and reset_scan_ui_state()) so a stale value from an
+   already-finished command can never be misattributed to a later, unrelated reply. A `busy`
+   on a wardriving start means it was already running -- corrected here rather than left
+   "unknown" (docs/LESSONS.md "UI must derive from real state"); symmetrically, `not_running`
+   on a stop confirms it was already stopped. `internal_error` is a wardriving self-stop
+   notice (docs/PROTOCOL.md: "an error record accompanies" a proactive `stopped` sent when
+   "the engine self-stops for an internal reason") only when a wardriving start/stop is still
+   the pending command -- the accompanying "stopped" status (handle_wardriving_status() above)
+   always drives the actual run-state update regardless, so this branch only adds the reason
+   message. If some other capability's command was pending instead, this reply is routed to
+   that capability's own error surface rather than assumed to be about wardriving. */
 static void
     handle_runtime_error(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
     Esp32App* app = profile->app;
@@ -1899,19 +1914,39 @@ static void
             post_wardriving_run_state(app, true, false);
             post_wardriving_error(app, "Already running");
         }
+        pending_command_kind = PendingCommandNone;
     } else if(text_matches(error_payload.code, error_payload.code_len, "not_running")) {
         if(pending_command_kind == PendingCommandWardrivingStop) {
             post_wardriving_run_state(app, false, false);
             post_wardriving_error(app, "Already stopped");
         }
+        pending_command_kind = PendingCommandNone;
     } else if(text_matches(error_payload.code, error_payload.code_len, "invalid_command")) {
         if(pending_command_kind == PendingCommandWardrivingStart ||
            pending_command_kind == PendingCommandWardrivingStop) {
             post_wardriving_error(app, "Invalid command");
         }
+        pending_command_kind = PendingCommandNone;
     } else if(text_matches(error_payload.code, error_payload.code_len, "internal_error")) {
-        post_wardriving_run_state(app, false, false);
-        post_wardriving_error(app, "Engine stopped (internal error)");
+        /* Only a wardriving start/stop still in flight makes this "internal_error" a
+           self-stop notice for *this* pending command (docs/PROTOCOL.md's "stopped" state:
+           self-stop always also sends its own "stopped" status, which already drives
+           post_wardriving_run_state() regardless of pending_command_kind -- see
+           handle_wardriving_status() above). Otherwise this reply belongs to whichever
+           other capability was actually in flight (or none), so route it through that
+           capability's own error surface instead of misattributing it to wardriving. */
+        if(pending_command_kind == PendingCommandWardrivingStart ||
+           pending_command_kind == PendingCommandWardrivingStop) {
+            post_wardriving_run_state(app, false, false);
+            post_wardriving_error(app, "Engine stopped (internal error)");
+        } else if(pending_command_kind == PendingCommandWifiScan) {
+            post_wifi_scan_error(app, "ESP32 internal error");
+        } else if(pending_command_kind == PendingCommandBleScan) {
+            post_ble_scan_error(app, "ESP32 internal error");
+        } else {
+            FURI_LOG_W(TAG, "internal_error with no matching pending command; ignoring");
+        }
+        pending_command_kind = PendingCommandNone;
     }
 }
 
@@ -2287,6 +2322,7 @@ static void handle_client_auth(Esp32BleProfile* profile, const feb_unencrypted_r
     feb_secure_zero(expected_proof, sizeof(expected_proof));
     if(!match) {
         FURI_LOG_W(TAG, "client_auth: proof verification failed (no reply, per PROTOCOL.md)");
+        post_pairing_phase(profile->app, PairingPhaseFailed, "proof verification failed");
         session_reset_state();
         return;
     }
@@ -2904,6 +2940,7 @@ static void input_callback(InputEvent* input, void* context) {
    real state") -- the next authenticated session starts genuinely not knowing either way. */
 static void reset_scan_ui_state(Esp32App* app) {
     app->screen = AppScreenMain;
+    pending_command_kind = PendingCommandNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
     app->wifi_scan_scroll_offset = 0;

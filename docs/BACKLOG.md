@@ -32,7 +32,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | --- | --- | --- |
 | G03 | ESP32 marks the session `AUTHENTICATED` on its own GATT write-complete, not on peer confirmation | Open — needs a product decision on the `capability_query`-caveat (see appendix) |
 | G04 | Pairing ceremony (`pair_init`→`pair_complete`) has no application-level timeout | Open |
-| G05 | Absolute `uint32_t` millisecond deadlines wrap at ~49.7 days uptime | Open |
+| G05 | Absolute `uint32_t` millisecond deadlines wrap at ~49.7 days uptime | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G06 | Neither firmware sends the spec-mandated `unsupported_version` error + close | Open |
 | G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below) |
 | G09 | Flipper advances `session_seq_out` even when notify delivery is unknown | Open |
@@ -48,14 +48,17 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | --- | --- | --- |
 | G08 | SD-card I/O (pairing, capability cache, CSV) runs on `BleEventWorker`, the BLE-pump thread | Open |
 | G10 | Flipper `session_key`/`session_seq_out`/`outgoing_message_id` accessed from two threads with no lock | Open |
-| G14 | `any_saved_pairing_exists()` matches any directory entry, including a crashed-save `.dat.tmp` leftover | Open |
-| G17 | `client_auth` proof failure leaves the Flipper UI stuck on "Authenticating…" | Open — pairs with G03/G11 |
-| G27 | `pending_command_kind` is never cleared; a stray `internal_error` always looks like a wardriving self-stop | Open |
-| G28 | Wardriving CSV writes a WiGLE header on every `FSOM_OPEN_APPEND`, not only on a genuinely new file | Open |
+| G14 | `any_saved_pairing_exists()` matches any directory entry, including a crashed-save `.dat.tmp` leftover | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G17 | `client_auth` proof failure leaves the Flipper UI stuck on "Authenticating…" | **DONE 2026-09-12** — see PROJECT_HISTORY.md; USER_GUIDE.md sync still pending (on-screen text now changes to "Failed: proof verification failed") |
+| G27 | `pending_command_kind` is never cleared; a stray `internal_error` always looks like a wardriving self-stop | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G28 | Wardriving CSV writes a WiGLE header on every `FSOM_OPEN_APPEND`, not only on a genuinely new file | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G30 | Wardriving log/dedup state has no lock between the Wi-Fi `sys_evt` writer and the NimBLE-host drain reader | Open |
-| G31 | `backlog_remaining` uses an unlocked `size_t` subtract — can underflow under G30's race | Open |
+| G31 | `backlog_remaining` uses an unlocked `size_t` subtract — can underflow under G30's race | **DONE 2026-09-12** — see PROJECT_HISTORY.md (G30's underlying race is still open) |
 | G13 | ESP32 NVS pairing blob has no version, validity marker, or atomic replacement | **Roadmap-gated → PLAN.md step 8.** Do not fix as a drive-by. |
 | G36 | Wardriving BLE reconnect can stall permanently (discovery restarts every ~500ms, never matches) when wardriving's Wi-Fi source runs concurrently at its gapless default | Open — coexistence-starvation theory now well-supported (BLE-only isolation test: 7/7 disconnects recovered; earlier `wifi=1 ble=1` capture: stalled permanently), fix not yet designed. See `docs/PROJECT_HISTORY.md`'s "Wardriving reconnect stall" investigation (5 dated entries) and `docs/LESSONS.md`. |
+| BL02 | Flipper doesn't query wardriving status on (re)connect — closing/reopening the FAP while the ESP32 is still capturing shows "status unknown" on the wardriving screen instead of the real running state | Open — needs a status-query on session auth / entering the wardriving screen, not just a passive "last known state" |
+| BL03 | Wardriving CSV filename is timestamped to the second (`wardriving_csv_ensure_open()`, `flipper_esp32_over_ble.c:1677`) and a new file opens on every reconnect (`wardriving_csv_close()` runs on every disconnect/teardown) — idle-timeout reconnect churn alone can mint many near-empty files per outing | **DONE 2026-09-12** — see PROJECT_HISTORY.md; landed together with G28 as required. USER_GUIDE.md's "one file per connected session" wording is now stale (a file now covers one calendar day, not one session) and needs a sync pass. Also see new BL04 below (dedup table no longer matches the file's new lifetime). |
+| BL04 | Wardriving CSV dedup table (`wardriving_dedup_table`) is reset on every disconnect (`wardriving_csv_close()`, via `reset_scan_ui_state()`), but BL03 widened the on-disk CSV file's lifetime to per-calendar-day — a same-day reconnect now reopens the same file with a freshly-empty dedup table, so an address already written earlier that day can be re-logged as a duplicate row (not a duplicate header; G28 still prevents that) | Open — discovered while implementing BL03/G28 (2026-09-12), not fixed as part of that change. Candidate fix: persist/rebuild the dedup table's scope to match the file's calendar-day scope (e.g. seed it from the existing file's addresses on reopen), or accept the quality regression and document it. |
 
 ## P2 — robustness / cost / defense-in-depth
 
@@ -121,11 +124,48 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   question: can the Flipper's peripheral role advertise while already connected?
 - GPS backfill-to-first-fix as a Flipper-settable option, instead of discarding every
   pre-fix wardriving result outright (step 7/GPS capability).
+- **Replace the CSV `FirstSeen` backdating approximation with a real timestamp once GPS lands.**
+  `record->timestamp_ms` is ESP32 boot-uptime (`esp_timer_get_time()`, no RTC on that board —
+  `esp32/main/main.c`), not wall-clock time; the Flipper reconstructs an approximate wall-clock
+  `FirstSeen` for the WiGLE CSV export by anchoring the newest drained record to its own RTC and
+  backdating the rest (`feb_wardriving_backdate_first_seen()`, `flipper/wardriving_csv.h` /
+  `wardriving_csv.c`, `flipper_esp32_over_ble.c`'s `wardriving_csv_write_record()`). This is only
+  as accurate as the Flipper's RTC and drifts further from real capture time under reorder or a
+  stalled drain. Once a real GPS module supplies its own fix time (or the ESP32 gets an RTC), the
+  wire protocol/CSV export should carry that instead of reconstructing it after the fact — revisit
+  the whole backdating mechanism at that point rather than layering GPS time on top of it.
 - Non-ASCII SSID rendering is untested on real hardware (host-native codec tests cover the
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
   single-`ViewPort`/`AppEvent`-queue pattern every screen has been bolted onto. Structural,
   no deadline.
+- **Consolidating/grouping wardriving records on the Flipper side** (e.g. de-duplicating or
+  rolling up repeated/nearby sightings for display, as distinct from the ESP32-side capture-time
+  dedup that already exists). Not scoped yet — needs its own planning/grill-me session before
+  implementation, not a drive-by design call.
+- **Reconsider the RSSI-improve dedup gate's comparison basis: last-written vs. best-ever.**
+  Both `esp32/main/wardriving_dedup.c`'s `should_log_record()` and
+  `flipper/wardriving_csv.c`'s `feb_wardriving_dedup_should_write()` re-trigger a write when RSSI
+  improves ≥6dB versus the *last-written* observation for that address — which lets a signal that
+  is merely fluctuating (not trending stronger), especially BLE's noisier RSSI, repeatedly clear
+  the gate (e.g. -92→-82→-74 dBm, three writes, none of which beat an earlier peak). Investigated
+  against WiGLE's own reference Android app (`wigle-wifi-wardriving`,
+  `DatabaseHelper.java`'s `addObservation()`, `db/DatabaseHelper.java` on GitHub): its gate is a
+  hybrid — a 64-entry in-memory LRU cache (`previousWrittenLocationsCache`) makes it compare
+  against last-written for addresses still warm in cache (same behavior as this project), falling
+  back to the DB's true best-ever `network.bestlevel` column only on a cache miss (likely the
+  common case once a session exceeds ~64 concurrently-active addresses). Worth deciding whether to
+  switch to (or approximate) a best-ever comparison here, which would stop repeat-fluctuation
+  writes at the cost of never re-logging a device that's still below its historical peak. Related
+  to the "Consolidating/grouping wardriving records" item above but narrower — this is about the
+  comparison basis inside the existing per-address gate, not a new consolidation feature. Not
+  scoped/decided yet.
+- **Explore throttling the Wi-Fi source specifically during wardriving results-flush to the
+  Flipper** — the flush was observed getting stuck before the recent dedup/sequence-cap fixes
+  (`e616d81`, `3111fa2`). Possibly the same BLE/Wi-Fi coexistence starvation as G36, just
+  triggered by the drain instead of by a reconnect; not yet isolated whether it still reproduces
+  post-fix. Related to the "WiFi-source duty cycle" item under "Deferred by explicit product
+  decision" below, but narrower — only during the flush window, not a general default change.
 
 ## Deferred by explicit product decision — confirm with the user before touching
 
