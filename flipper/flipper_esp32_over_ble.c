@@ -84,11 +84,12 @@ typedef enum {
 /* docs/PLAN.md's Wi-Fi scan capability follow-on step: manual-trigger-only, results shown
    in a dedicated scrollable view, distinct from the fixed-layout main status screen. */
 typedef enum {
-    AppScreenMain,
     AppScreenHome,
+    AppScreenScan,
     AppScreenGps,
     AppScreenSettings,
     AppScreenAbout,
+    AppScreenLegacy,
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
     AppScreenWardriving,
@@ -100,8 +101,15 @@ typedef enum {
     HomeMenuGps,
     HomeMenuSettings,
     HomeMenuAbout,
+    HomeMenuLegacy,
     HomeMenuCount,
 } HomeMenuItem;
+
+typedef enum {
+    ScanMenuWifi = 0,
+    ScanMenuBle,
+    ScanMenuCount,
+} ScanMenuItem;
 
 typedef enum {
     AppEventInput,
@@ -195,6 +203,8 @@ typedef struct {
     bool capability_has_wifi_scan;
     AppScreen screen;
     HomeMenuItem home_menu_index;
+    size_t home_menu_scroll_offset;
+    ScanMenuItem scan_menu_index;
     bool wifi_scan_in_progress;
     bool wifi_scan_complete;
     size_t wifi_scan_scroll_offset;
@@ -2714,7 +2724,6 @@ static const char* pairing_phase_text(PairingPhase phase) {
 #define WIFI_SCAN_RESULTS_FOOTER_Y 62
 
 static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
-    canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     char header[32];
     if(app->wifi_scan_in_progress) {
@@ -2774,7 +2783,6 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
 #define BLE_SCAN_RESULTS_FOOTER_Y 62
 
 static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
-    canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     char header[32];
     if(app->ble_scan_in_progress) {
@@ -2850,7 +2858,6 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
    this Flipper genuinely has no evidence either way until a "started"/"stopped" ack or a
    busy/not_running error arrives this session (see Esp32App's own field comment). */
 static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
-    canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     const char* state_text;
     if(!app->wardriving_running_known) {
@@ -2924,6 +2931,28 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, 56, footer);
 }
 
+/* Home screen layout: same proven 10px-pitch / y=62-footer convention as the
+   WIFI_SCAN_RESULTS_ and BLE_SCAN_RESULTS_ constants above (see their declaration comments) --
+   content rows run 22,32,42,52 (4 rows total budget) with the footer one more 10px stride
+   below the last possible row, at 62. The header (has_saved_pairing + pairing-phase line,
+   plus an optional capability line) consumes the first 2 or 3 of those 4 rows; whatever is
+   left is the menu's visible window (1 row when the capability line is shown, since up to
+   6 menu items -- Wardriving/Scan/GPS/Settings/About/Legacy -- can be visible at once and
+   none of the 2/1 leftover rows fit them all, the menu must scroll rather than draw every
+   visible item unconditionally. */
+#define HOME_ROW_HEIGHT 10
+#define HOME_FIRST_ROW_Y 22
+#define HOME_FOOTER_Y 62
+#define HOME_MAX_ROWS 4
+
+static uint8_t home_header_height(Esp32App* app) {
+    return app->has_capability_info ? 3 : 2;
+}
+
+static uint8_t home_menu_visible_rows(Esp32App* app) {
+    return (uint8_t)(HOME_MAX_ROWS - home_header_height(app));
+}
+
 static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
     switch(item) {
     case HomeMenuWardriving:
@@ -2935,9 +2964,37 @@ static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
         return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wardriving;
     case HomeMenuSettings:
     case HomeMenuAbout:
+    case HomeMenuLegacy:
         return true;
     default:
         return false;
+    }
+}
+
+/* Keeps app->home_menu_index's rank within the currently-visible (filtered) item list inside
+   the [scroll_offset, scroll_offset + visible_rows) window, the same "scroll follows
+   selection" behavior draw_wifi_scan_results()/draw_ble_scan_results() get from their own
+   scroll_offset + up/down clamping. Safe to call whenever the selection or the visible set
+   (capability info, session state) may have changed -- it's a no-op if already in range. */
+static void home_menu_scroll_into_view(Esp32App* app) {
+    int total = 0;
+    int rank = -1;
+    for(int i = 0; i < HomeMenuCount; i++) {
+        if(!home_menu_visible(app, (HomeMenuItem)i)) continue;
+        if((HomeMenuItem)i == app->home_menu_index) rank = total;
+        total++;
+    }
+    if(rank < 0) return;
+
+    uint8_t visible_rows = home_menu_visible_rows(app);
+    size_t max_offset = (size_t)total > visible_rows ? (size_t)total - visible_rows : 0;
+    if(app->home_menu_scroll_offset > max_offset) {
+        app->home_menu_scroll_offset = max_offset;
+    }
+    if((size_t)rank < app->home_menu_scroll_offset) {
+        app->home_menu_scroll_offset = (size_t)rank;
+    } else if((size_t)rank >= app->home_menu_scroll_offset + visible_rows) {
+        app->home_menu_scroll_offset = (size_t)rank - visible_rows + 1;
     }
 }
 
@@ -2950,9 +3007,10 @@ static void home_menu_step(Esp32App* app, int delta) {
         if(idx >= count) idx = 0;
         if(home_menu_visible(app, (HomeMenuItem)idx)) {
             app->home_menu_index = (HomeMenuItem)idx;
-            return;
+            break;
         }
     }
+    home_menu_scroll_into_view(app);
 }
 
 static void home_menu_fix_selection(Esp32App* app) {
@@ -2964,34 +3022,171 @@ static void home_menu_fix_selection(Esp32App* app) {
             }
         }
     }
+    home_menu_scroll_into_view(app);
 }
 
-static void draw_placeholder_screen(Canvas* canvas, const char* title, const char* body) {
-    canvas_clear(canvas);
+static bool scan_menu_visible(Esp32App* app, ScanMenuItem item) {
+    switch(item) {
+    case ScanMenuWifi:
+        return app->capability_has_wifi_scan;
+    case ScanMenuBle:
+        return app->capability_has_ble_scan;
+    default:
+        return false;
+    }
+}
+
+static void scan_menu_step(Esp32App* app, int delta) {
+    int idx = (int)app->scan_menu_index;
+    int count = ScanMenuCount;
+    while(true) {
+        idx += delta;
+        if(idx < 0) idx = count - 1;
+        if(idx >= count) idx = 0;
+        if(scan_menu_visible(app, (ScanMenuItem)idx)) {
+            app->scan_menu_index = (ScanMenuItem)idx;
+            return;
+        }
+    }
+}
+
+static void scan_menu_fix_selection(Esp32App* app) {
+    if(!scan_menu_visible(app, app->scan_menu_index)) {
+        for(int i = 0; i < ScanMenuCount; i++) {
+            if(scan_menu_visible(app, (ScanMenuItem)i)) {
+                app->scan_menu_index = (ScanMenuItem)i;
+                return;
+            }
+        }
+    }
+}
+
+static void draw_settings_screen(Canvas* canvas, Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 11, title);
+    canvas_draw_str(canvas, 2, 11, "Settings");
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 24, body);
+
+    char line[64];
+    snprintf(line, sizeof(line), "Scan prefs: TBD");
+    canvas_draw_str(canvas, 2, 22, line);
+    snprintf(line, sizeof(line), "BLE active/passive: TBD");
+    canvas_draw_str(canvas, 2, 33, line);
+    snprintf(line, sizeof(line), "Pairing: %s", app->has_saved_pairing ? "saved" : "none");
+    canvas_draw_str(canvas, 2, 44, line);
     canvas_draw_str(canvas, 2, 56, "Back: return");
 }
 
+static void draw_about_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "About");
+    canvas_set_font(canvas, FontSecondary);
+
+    char line[80];
+    snprintf(line, sizeof(line), "ESP32 over BLE");
+    canvas_draw_str(canvas, 2, 22, line);
+    snprintf(
+        line,
+        sizeof(line),
+        "Board: %s",
+        app->has_capability_info && app->capability_board[0] != '\0' ? app->capability_board : "n/a");
+    canvas_draw_str(canvas, 2, 33, line);
+    snprintf(line, sizeof(line), "Protocol: v2");
+    canvas_draw_str(canvas, 2, 44, line);
+    snprintf(line, sizeof(line), "Session: %s", app->pairing_phase == PairingPhaseSessionActive ? "active" : "not active");
+    canvas_draw_str(canvas, 2, 48, line);
+    canvas_draw_str(canvas, 2, 56, "Back: return");
+}
+
+static void draw_legacy_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Legacy");
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, 2, 22, "Compatibility controls");
+    if(app->profile) {
+        canvas_draw_str(canvas, 2, 33, "OK: start session");
+    } else {
+        canvas_draw_str(canvas, 2, 33, "OK: start pair/connect");
+    }
+    canvas_draw_str(canvas, 2, 44, "Up: open Home");
+    canvas_draw_str(canvas, 2, 56, "Back: return");
+    UNUSED(app);
+}
+
+static void draw_gps_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "GPS");
+    canvas_set_font(canvas, FontSecondary);
+
+    DateTime now;
+    furi_hal_rtc_get_datetime(&now);
+
+    char line[64];
+    snprintf(line, sizeof(line), "Mode: simulated");
+    canvas_draw_str(canvas, 2, 22, line);
+    snprintf(line, sizeof(line), "Fix: no fix (simulated)");
+    canvas_draw_str(canvas, 2, 33, line);
+    snprintf(
+        line,
+        sizeof(line),
+        "Time: %04u-%02u-%02u %02u:%02u:%02u",
+        now.year,
+        now.month,
+        now.day,
+        now.hour,
+        now.minute,
+        now.second);
+    canvas_draw_str(canvas, 2, 44, line);
+    canvas_draw_str(canvas, 2, 48, "Lat/Lon: --   Speed: --");
+    canvas_draw_str(canvas, 2, 56, "Back: return");
+    UNUSED(app);
+}
+
+static void draw_scan_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Scan");
+    canvas_set_font(canvas, FontSecondary);
+
+    int menu_index = 0;
+    if(app->capability_has_wifi_scan) {
+        char line[24];
+        snprintf(line, sizeof(line), "%sWi-Fi scan", app->scan_menu_index == ScanMenuWifi ? "> " : "  ");
+        canvas_draw_str(canvas, 2, 22 + 10 * menu_index, line);
+        menu_index++;
+    }
+    if(app->capability_has_ble_scan) {
+        char line[24];
+        snprintf(line, sizeof(line), "%sBLE scan", app->scan_menu_index == ScanMenuBle ? "> " : "  ");
+        canvas_draw_str(canvas, 2, 22 + 10 * menu_index, line);
+        menu_index++;
+    }
+
+    canvas_draw_str(canvas, 2, 56, "Up/Down: move  OK: start  Back: return");
+}
+
 static void draw_home_screen(Canvas* canvas, Esp32App* app) {
-    canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "Home");
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 22, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
+
+    uint8_t y = HOME_FIRST_ROW_Y;
+    canvas_draw_str(canvas, 2, y, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
+    y += HOME_ROW_HEIGHT;
+
     if(app->pairing_phase == PairingPhaseFailed) {
         char line[48];
         snprintf(line, sizeof(line), "Failed: %s", app->pairing_reason);
-        canvas_draw_str(canvas, 2, 33, line);
+        canvas_draw_str(canvas, 2, y, line);
     } else {
-        canvas_draw_str(canvas, 2, 33, pairing_phase_text(app->pairing_phase));
+        canvas_draw_str(canvas, 2, y, pairing_phase_text(app->pairing_phase));
     }
+    y += HOME_ROW_HEIGHT;
+
     if(app->has_capability_info) {
         char line[CAPABILITY_BOARD_MAX_LEN + CAPABILITY_FEATURES_MAX_LEN + 4];
         snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
-        canvas_draw_str(canvas, 2, 44, line);
+        canvas_draw_str(canvas, 2, y, line);
+        y += HOME_ROW_HEIGHT;
     }
 
     static const char* labels[HomeMenuCount] = {
@@ -3000,37 +3195,61 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
         "GPS",
         "Settings",
         "About",
+        "Legacy",
     };
 
-    int menu_index = 0;
+    uint8_t visible_rows = home_menu_visible_rows(app);
+    int rank = 0;
     for(int i = 0; i < HomeMenuCount; i++) {
         if(!home_menu_visible(app, (HomeMenuItem)i)) continue;
-        char line[32];
-        snprintf(line, sizeof(line), "%s%s", app->home_menu_index == (HomeMenuItem)i ? "> " : "  ", labels[i]);
-        canvas_draw_str(canvas, 2, 18 + 10 * menu_index + 10, line);
-        menu_index++;
+        if((size_t)rank >= app->home_menu_scroll_offset &&
+           (size_t)rank < app->home_menu_scroll_offset + visible_rows) {
+            char line[32];
+            snprintf(
+                line,
+                sizeof(line),
+                "%s%s",
+                app->home_menu_index == (HomeMenuItem)i ? "> " : "  ",
+                labels[i]);
+            canvas_draw_str(canvas, 2, y, line);
+            y += HOME_ROW_HEIGHT;
+        }
+        rank++;
     }
 
-    canvas_draw_str(canvas, 2, 56, "Up/Down: move  OK: select");
+    canvas_draw_str(canvas, 2, HOME_FOOTER_Y, "Up/Down: move  OK: select");
 }
 
 static void draw_callback(Canvas* canvas, void* context) {
     Esp32App* app = context;
+    /* Clear the entire viewport before every redraw; this ensures a screen transition cannot
+       leave stale pixels behind when the new draw code only paints a subset of the canvas. */
+    canvas_clear(canvas);
+
     if(app->screen == AppScreenHome) {
         home_menu_fix_selection(app);
         draw_home_screen(canvas, app);
         return;
     }
+    if(app->screen == AppScreenScan) {
+        scan_menu_fix_selection(app);
+        draw_scan_screen(canvas, app);
+        return;
+    }
     if(app->screen == AppScreenGps) {
-        draw_placeholder_screen(canvas, "GPS", "Simulated/no fix");
+        draw_gps_screen(canvas, app);
         return;
     }
     if(app->screen == AppScreenSettings) {
-        draw_placeholder_screen(canvas, "Settings", "Not yet configured");
+        draw_settings_screen(canvas, app);
         return;
     }
     if(app->screen == AppScreenAbout) {
-        draw_placeholder_screen(canvas, "About", "ESP32 over BLE");
+        draw_about_screen(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenLegacy) {
+        draw_legacy_screen(canvas, app);
         return;
     }
     if(app->screen == AppScreenWifiScanResults) {
@@ -3045,47 +3264,9 @@ static void draw_callback(Canvas* canvas, void* context) {
         draw_wardriving_screen(canvas, app);
         return;
     }
-    canvas_clear(canvas);
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 11, "ESP32 over BLE");
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 2, 22, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
-    if(app->pairing_phase == PairingPhaseFailed) {
-        char line[48];
-        snprintf(line, sizeof(line), "Failed: %s", app->pairing_reason);
-        canvas_draw_str(canvas, 2, 33, line);
-    } else {
-        canvas_draw_str(canvas, 2, 33, pairing_phase_text(app->pairing_phase));
-    }
-    /* docs/PLAN.md step 7: compact capability line, extending this same fixed-layout
-       screen rather than a new scrollable view -- see this file's capability_bootstrap(). */
-    if(app->has_capability_info) {
-        char line[CAPABILITY_BOARD_MAX_LEN + CAPABILITY_FEATURES_MAX_LEN + 4];
-        snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
-        canvas_draw_str(canvas, 2, 44, line);
-    }
-    /* Footer hints are built incrementally (rather than one snprintf per combination, as
-       step 7's original two-capability version did) now that a third capability-gated
-       action (wardriving) can also appear -- three independent booleans would otherwise be
-       2^3 combinations to enumerate by hand. */
-    char footer[40];
-    size_t pos = 0;
-    if(app->pairing_phase == PairingPhaseSessionActive) {
-        if(app->capability_has_wifi_scan) {
-            int n = snprintf(footer + pos, sizeof(footer) - pos, "L:WiFi ");
-            if(n > 0) pos += (size_t)n;
-        }
-        if(app->capability_has_ble_scan) {
-            int n = snprintf(footer + pos, sizeof(footer) - pos, "R:BLE ");
-            if(n > 0) pos += (size_t)n;
-        }
-        if(app->capability_has_wardriving) {
-            int n = snprintf(footer + pos, sizeof(footer) - pos, "U:War ");
-            if(n > 0) pos += (size_t)n;
-        }
-    }
-    snprintf(footer + pos, sizeof(footer) - pos, "Back: exit");
-    canvas_draw_str(canvas, 2, 56, footer);
+
+    home_menu_fix_selection(app);
+    draw_home_screen(canvas, app);
 }
 
 static void input_callback(InputEvent* input, void* context) {
@@ -3106,7 +3287,7 @@ static void input_callback(InputEvent* input, void* context) {
    ESP32's run state does not survive a lost session (docs/LESSONS.md "UI must derive from
    real state") -- the next authenticated session starts genuinely not knowing either way. */
 static void reset_scan_ui_state(Esp32App* app) {
-    app->screen = AppScreenMain;
+    app->screen = AppScreenHome;
     pending_command_kind = PendingCommandNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
@@ -3175,6 +3356,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     UNUSED(context);
     Esp32App app = {
         .queue = furi_message_queue_alloc(8, sizeof(AppEvent)),
+        .screen = AppScreenHome,
         .pairing_phase = PairingPhaseNone,
         .has_saved_pairing = false,
         .wardriving_use_wifi = true,
@@ -3232,12 +3414,14 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         if(event.type == AppEventBtStatus) {
             if(app.profile) {
                 if(event.bt_status == BtStatusConnected) {
+                    app.screen = AppScreenHome;
                     pairing_reset_state();
                     session_reset_state();
                     reset_scan_ui_state(&app);
                     app.pairing_phase = PairingPhaseExchanging;
                 } else if(event.bt_status == BtStatusAdvertising) {
                     if(app.pairing_phase != PairingPhaseDone) {
+                        app.screen = AppScreenHome;
                         pairing_reset_state();
                         session_reset_state();
                         reset_scan_ui_state(&app);
@@ -3343,8 +3527,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
             if(app.screen == AppScreenHome) {
+                app.screen = AppScreenHome;
                 if(event.input.key == InputKeyBack) {
-                    app.screen = AppScreenMain;
+                    running = false;
                 } else if(event.input.key == InputKeyUp) {
                     home_menu_step(&app, -1);
                 } else if(event.input.key == InputKeyDown) {
@@ -3355,7 +3540,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         app.screen = AppScreenWardriving;
                         break;
                     case HomeMenuScan:
-                        if(app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
+                        if(app.capability_has_wifi_scan && app.capability_has_ble_scan) {
+                            app.scan_menu_index = ScanMenuWifi;
+                            app.screen = AppScreenScan;
+                        } else if(app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
                             wifi_scan_ap_count = 0;
                             app.wifi_scan_scroll_offset = 0;
                             app.wifi_scan_complete = false;
@@ -3363,7 +3551,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                             app.screen = AppScreenWifiScanResults;
                             app.wifi_scan_in_progress = send_wifi_scan_command(&app);
                             if(!app.wifi_scan_in_progress) {
-                                app.screen = AppScreenMain;
+                                app.screen = AppScreenHome;
                             }
                         } else if(app.capability_has_ble_scan && !app.ble_scan_in_progress) {
                             ble_scan_device_count = 0;
@@ -3373,7 +3561,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                             app.screen = AppScreenBleScanResults;
                             app.ble_scan_in_progress = send_ble_scan_command(&app);
                             if(!app.ble_scan_in_progress) {
-                                app.screen = AppScreenMain;
+                                app.screen = AppScreenHome;
                             }
                         }
                         break;
@@ -3386,12 +3574,45 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     case HomeMenuAbout:
                         app.screen = AppScreenAbout;
                         break;
+                    case HomeMenuLegacy:
+                        app.screen = AppScreenLegacy;
+                        break;
                     default:
                         break;
                     }
                 }
+            } else if(app.screen == AppScreenScan) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenHome;
+                } else if(event.input.key == InputKeyUp) {
+                    scan_menu_step(&app, -1);
+                } else if(event.input.key == InputKeyDown) {
+                    scan_menu_step(&app, 1);
+                } else if(event.input.key == InputKeyOk) {
+                    if(app.scan_menu_index == ScanMenuWifi && app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
+                        wifi_scan_ap_count = 0;
+                        app.wifi_scan_scroll_offset = 0;
+                        app.wifi_scan_complete = false;
+                        app.wifi_scan_error_message[0] = '\0';
+                        app.screen = AppScreenWifiScanResults;
+                        app.wifi_scan_in_progress = send_wifi_scan_command(&app);
+                        if(!app.wifi_scan_in_progress) {
+                            app.screen = AppScreenHome;
+                        }
+                    } else if(app.scan_menu_index == ScanMenuBle && app.capability_has_ble_scan && !app.ble_scan_in_progress) {
+                        ble_scan_device_count = 0;
+                        app.ble_scan_scroll_offset = 0;
+                        app.ble_scan_complete = false;
+                        app.ble_scan_error_message[0] = '\0';
+                        app.screen = AppScreenBleScanResults;
+                        app.ble_scan_in_progress = send_ble_scan_command(&app);
+                        if(!app.ble_scan_in_progress) {
+                            app.screen = AppScreenHome;
+                        }
+                    }
+                }
             } else if(app.screen == AppScreenGps || app.screen == AppScreenSettings ||
-                      app.screen == AppScreenAbout) {
+                      app.screen == AppScreenAbout || app.screen == AppScreenLegacy) {
                 if(event.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
                 }
@@ -3447,7 +3668,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                        navigation, not a discard of unconfirmed state (there is none: start/
                        stop are already-sent, already-acked actions by the time this screen
                        reflects them). */
-                    app.screen = AppScreenMain;
+                    app.screen = AppScreenHome;
                 } else if(event.input.key == InputKeyOk) {
                     if(app.wardriving_running_known && app.wardriving_running) {
                         send_wardriving_stop_command(&app);
@@ -3477,9 +3698,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         app.wardriving_use_ble = true;
                     }
                 }
-            } else {
+            } else if(app.screen == AppScreenLegacy) {
                 if(event.input.key == InputKeyBack) {
-                    running = false;
+                    app.screen = AppScreenHome;
                 } else if(event.input.key == InputKeyOk && !app.profile) {
                     start_profile(&app);
                 } else if(
@@ -3493,9 +3714,6 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     event.input.key == InputKeyLeft && app.profile &&
                     app.pairing_phase == PairingPhaseSessionActive && app.capability_has_wifi_scan &&
                     !app.wifi_scan_in_progress) {
-                    /* User decision: Left triggers wifi_scan, Right triggers ble_scan --
-                       replaces the old single-Ok-press behavior, which picked wifi_scan first
-                       and left ble_scan unreachable whenever both capabilities were present. */
                     wifi_scan_ap_count = 0;
                     app.wifi_scan_scroll_offset = 0;
                     app.wifi_scan_complete = false;
@@ -3503,7 +3721,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.screen = AppScreenWifiScanResults;
                     app.wifi_scan_in_progress = send_wifi_scan_command(&app);
                     if(!app.wifi_scan_in_progress) {
-                        app.screen = AppScreenMain;
+                        app.screen = AppScreenHome;
                     }
                 } else if(
                     event.input.key == InputKeyRight && app.profile &&
@@ -3516,7 +3734,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.screen = AppScreenBleScanResults;
                     app.ble_scan_in_progress = send_ble_scan_command(&app);
                     if(!app.ble_scan_in_progress) {
-                        app.screen = AppScreenMain;
+                        app.screen = AppScreenHome;
                     }
                 }
             }
