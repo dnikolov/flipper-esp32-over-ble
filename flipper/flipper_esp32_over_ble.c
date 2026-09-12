@@ -94,6 +94,7 @@ typedef enum {
     AppEventInput,
     AppEventBtStatus,
     AppEventPairingPhase,
+    AppEventSessionFatal,
     AppEventCapabilityInfo,
     AppEventWifiScanAp,
     AppEventWifiScanDone,
@@ -237,7 +238,7 @@ typedef struct {
 static bool notify_data_callback(const void* context, const uint8_t** data, uint16_t* data_len) {
     if(context == NULL) {
         if(data) *data = NULL;
-        if(data_len) *data_len = PAYLOAD_MAX;
+        if(data_len) *data_len = 0;
         return false;
     }
     const NotifyFragment* fragment = context;
@@ -675,6 +676,13 @@ static void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* re
     } else {
         event.pairing_reason[0] = '\0';
     }
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+static void post_session_fatal(Esp32App* app) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventSessionFatal;
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -2324,6 +2332,7 @@ static void handle_client_auth(Esp32BleProfile* profile, const feb_unencrypted_r
         FURI_LOG_W(TAG, "client_auth: proof verification failed (no reply, per PROTOCOL.md)");
         post_pairing_phase(profile->app, PairingPhaseFailed, "proof verification failed");
         session_reset_state();
+        post_session_fatal(profile->app);
         return;
     }
 
@@ -2464,14 +2473,14 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                     }
                 } else if(field_count == 7) {
                     /* docs/PLAN.md step 7: protected (AES-256-GCM) record, e.g.
-                       capability_response. Per docs/PROTOCOL.md, decode/decrypt failure,
-                       a session/board_id/sequence mismatch, or an unrecognized type are
-                       all dropped silently -- this Flipper (the BLE peripheral) has no
-                       safe way to proactively terminate an established connection from
-                       inside profile_event_handler (see this file's existing
-                       no-proactive-bt_disconnect() rationale above); the ESP32's own
-                       30-second idle-connection timeout is what eventually reaps a
-                       connection stuck this way. */
+                       capability_response. Per docs/PROTOCOL.md, decode/decrypt failure or
+                       a session/board_id/sequence mismatch is fatal: dropped silently (no
+                       reply) and the connection is closed. This function still can't call
+                       bt_disconnect() directly (BLE-thread reentrancy hazard, see this
+                       file's existing no-proactive-bt_disconnect() rationale above), so it
+                       posts AppEventSessionFatal instead; the main thread's event loop
+                       calls bt_disconnect() on receipt. An unrecognized type is not fatal
+                       and is still just dropped below. */
                     if(session_stage != SessionStageActive) {
                         FURI_LOG_W(TAG, "Ignoring protected record: no active session");
                         return BleEventAckFlowEnable;
@@ -2490,6 +2499,8 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                             TAG,
                             "Protected record decode/decrypt failed: %d; dropping (no reply)",
                             decode_status);
+                        session_reset_state();
+                        post_session_fatal(profile->app);
                         return BleEventAckFlowEnable;
                     }
                     if(decrypted.version != 2 ||
@@ -2499,6 +2510,8 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                        decrypted.sequence != session_seq_in ||
                        decrypted.sequence >= FEB_SESSION_SEQUENCE_MAX) {
                         FURI_LOG_W(TAG, "Protected record session/sequence mismatch; dropping (no reply)");
+                        session_reset_state();
+                        post_session_fatal(profile->app);
                         return BleEventAckFlowEnable;
                     }
                     session_seq_in++;
@@ -3089,6 +3102,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             } else if(event.pairing_phase == PairingPhaseDone) {
                 app.has_saved_pairing = true;
             }
+        } else if(event.type == AppEventSessionFatal) {
+            bt_disconnect(app.bt);
         } else if(event.type == AppEventCapabilityInfo) {
             app.has_capability_info = true;
             strncpy(app.capability_board, event.capability_board, sizeof(app.capability_board) - 1);

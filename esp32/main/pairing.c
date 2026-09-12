@@ -842,6 +842,7 @@ void feb_pairing_flipper_confirm(const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LE
 
     feb_pairing_hmac_label(k_confirm, label, KLEN(label), t, t_len, full);
     memcpy(out, full, FEB_PAIRING_REPLY_CONFIRM_LEN);
+    feb_secure_zero(full, sizeof(full));
 }
 
 void feb_pairing_esp32_confirm(const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LEN], const uint8_t *t, size_t t_len, uint8_t out[FEB_PAIRING_REPLY_CONFIRM_LEN])
@@ -851,6 +852,7 @@ void feb_pairing_esp32_confirm(const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LEN]
 
     feb_pairing_hmac_label(k_confirm, label, KLEN(label), t, t_len, full);
     memcpy(out, full, FEB_PAIRING_REPLY_CONFIRM_LEN);
+    feb_secure_zero(full, sizeof(full));
 }
 
 void feb_pairing_complete_tag(const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LEN], const uint8_t *t, size_t t_len, uint8_t out[FEB_PAIRING_COMPLETE_TAG_LEN])
@@ -860,4 +862,5 @@ void feb_pairing_complete_tag(const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LEN],
 
     feb_pairing_hmac_label(k_confirm, label, KLEN(label), t, t_len, full);
     memcpy(out, full, FEB_PAIRING_COMPLETE_TAG_LEN);
+    feb_secure_zero(full, sizeof(full));
 }

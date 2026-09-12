@@ -9,4 +9,10 @@
    app_main() after gpio/rmt-owning peripherals are otherwise idle. */
 void feb_factory_reset_start(void);
 
+/* Defined in main.c: zeroizes the in-RAM stored pairing secret plus any live
+   pairing/session-auth scratch (reusing pairing_attempt_zeroize()/runtime_auth_zeroize()).
+   Must be called before esp_restart() in the factory-reset path so a warm-boot crash
+   between NVS erase and restart cannot leave the old secret sitting in SRAM. */
+void feb_wipe_pairing_secrets(void);
+
 #endif

@@ -5,6 +5,7 @@
 #include "mbedtls/cipher.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/platform_util.h"
+#include "pairing_crypto.h"
 
 void feb_gcm_encrypt(
     const uint8_t key[FEB_SESSION_KEY_LEN],
@@ -28,9 +29,9 @@ void feb_gcm_encrypt(
     }
     if (rc != 0) {
         if (plaintext_len > 0) {
-            memset(ciphertext_out, 0, plaintext_len);
+            feb_secure_zero(ciphertext_out, plaintext_len);
         }
-        memset(tag_out, 0, FEB_SESSION_GCM_TAG_LEN);
+        feb_secure_zero(tag_out, FEB_SESSION_GCM_TAG_LEN);
     }
     mbedtls_gcm_free(&ctx);
 }

@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
@@ -57,6 +58,9 @@ static const char *TAG = "flipper_esp32_over_ble";
    a couple of small BLE round trips over an already-established connection are realistically
    sub-second, so 5s is generous margin, not a tight bound). */
 #define FEB_HELLO_ACK_TIMEOUT_MS 5000u
+/* Same RTT budget as FEB_HELLO_ACK_TIMEOUT_MS: one round trip over the same BLE link,
+   bounding how long the ESP32 waits for the Flipper's pair_reply after pair_init. */
+#define FEB_PAIR_REPLY_TIMEOUT_MS 5000u
 /* Judgment call (docs/PLAN.md step 6 leaves the exact shape open): repeated runtime-auth
    proof failures back off exponentially (1,2,4,...32s) for the first
    FEB_RUNTIME_AUTH_BACKOFF_MAX_EXP attempts, then fall back to a fixed slow cadence
@@ -264,6 +268,9 @@ static size_t rt_transcript_len;
 static uint8_t runtime_auth_failure_count;
 static uint32_t hello_ack_start_ms; /* 0 = no hello_ack wait currently active; else the
                                         wrap-safe elapsed-time base for FEB_HELLO_ACK_TIMEOUT_MS */
+static uint32_t pair_reply_wait_start_ms; /* 0 = no wait active; else wrap-safe elapsed-time
+                                              base for FEB_PAIR_REPLY_TIMEOUT_MS, mirrors
+                                              hello_ack_start_ms */
 static uint32_t last_record_activity_ms; /* reset on connect and on each record received or
                                              fully sent (write_complete()) -- docs/PROTOCOL.md's
                                              "without a record" is undirected; a wardriving-style
@@ -491,7 +498,12 @@ static void compute_board_id(void)
     }
     written = snprintf(board_id_buf, sizeof(board_id_buf), "esp32c6-%02x%02x%02x%02x%02x%02x",
                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    board_id_len = (written > 0) ? (size_t)written : 0;
+    if (written < 0) {
+        ESP_LOGE(TAG, "board_id snprintf failed");
+        return;
+    }
+    board_id_len = (size_t)written < sizeof(board_id_buf) - 1 ? (size_t)written
+                                                               : sizeof(board_id_buf) - 1;
 }
 
 static bool persist_pairing_secret(const uint8_t secret[FEB_PAIRING_SECRET_LEN])
@@ -561,6 +573,17 @@ static void pairing_attempt_zeroize(void)
 static void runtime_auth_zeroize(void)
 {
     feb_secure_zero(rt_session_key, sizeof(rt_session_key));
+}
+
+/* Called from factory_reset.c's perform_factory_reset() before esp_restart(), so the
+   persisted pairing_secret's in-RAM copy (and any pairing/session scratch still live from
+   an interrupted ceremony) doesn't survive in SRAM past the erase that's supposed to
+   invalidate it. */
+void feb_wipe_pairing_secrets(void)
+{
+    feb_secure_zero(stored_pairing_secret, sizeof(stored_pairing_secret));
+    pairing_attempt_zeroize();
+    runtime_auth_zeroize();
 }
 
 static bool connecting_permitted(void)
@@ -2399,6 +2422,7 @@ static void begin_pairing(uint16_t conn_handle)
     }
 
     pairing_state = PAIRING_STATE_INIT_SENT;
+    pair_reply_wait_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     tx_done_action = TX_DONE_AWAIT_PAIR_REPLY;
     ESP_LOGI(TAG, "sending pair_init");
     send_next_tx_fragment(conn_handle);
@@ -2413,6 +2437,7 @@ static void handle_pair_reply(uint16_t conn_handle, const feb_pairing_envelope_t
     feb_pair_confirm_payload_t confirm_payload;
     size_t payload_len;
 
+    pair_reply_wait_start_ms = 0;
     status = feb_cbor_decode_pair_reply_payload(envelope->payload_span, envelope->payload_span_len, &reply);
     if (status != FEB_CBOR_OK) {
         ESP_LOGW(TAG, "pair_reply payload decode failed: %d", (int)status);
@@ -2796,6 +2821,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
         hello_ack_start_ms = 0;
+        pair_reply_wait_start_ms = 0;
         last_record_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
         rt_tx_sequence = 0;
         rt_rx_sequence = 0;
@@ -2827,6 +2853,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         pairing_state = PAIRING_STATE_IDLE;
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
         hello_ack_start_ms = 0;
+        pair_reply_wait_start_ms = 0;
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
         tx_done_action = TX_DONE_NONE;
         tx_fragment_total = 0;
@@ -3148,6 +3175,14 @@ static void reassembly_timeout_cb(struct ble_npl_event *ev)
         connection_handle != BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGW(TAG, "timed out waiting for hello_ack");
         fail_runtime_auth(connection_handle);
+    }
+    if (pairing_state == PAIRING_STATE_INIT_SENT &&
+        pair_reply_wait_start_ms != 0 &&
+        (uint32_t)(now_ms - pair_reply_wait_start_ms) >= FEB_PAIR_REPLY_TIMEOUT_MS &&
+        connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGW(TAG, "timed out waiting for pair_reply");
+        pair_reply_wait_start_ms = 0;
+        fail_pairing_ceremony(connection_handle, FEB_PAIRING_ERR_EXPIRED);
     }
     if (connection_handle != BLE_HS_CONN_HANDLE_NONE &&
         runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED &&

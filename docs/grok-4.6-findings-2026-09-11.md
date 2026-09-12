@@ -157,7 +157,12 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G04 — Pairing ceremony has no application timeout
 
 - **Severity:** P1 (listed P0-adjacent in prior review; not a crypto break)
-- **Status:** Known #7, still open
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. Added `pair_reply_wait_start_ms` /
+  `FEB_PAIR_REPLY_TIMEOUT_MS` (5000ms), mirroring the `hello_ack_start_ms` wrap-safe elapsed-time
+  pattern; armed in `begin_pairing()`, cleared in `handle_pair_reply()` and on connect/disconnect,
+  checked in `reassembly_timeout_cb()`. Expiry calls `fail_pairing_ceremony(..., FEB_PAIRING_ERR_EXPIRED)`.
+  Only the pair_init→pair_reply wait needed a deadline — `finish_pairing_after_confirm()` runs
+  synchronously off the pair_confirm TX-done callback, no second wait exists.
 - **Files:** [esp32/main/main.c](../esp32/main/main.c) — `hello_ack_deadline_ms` exists; `TX_DONE_AWAIT_PAIR_REPLY` only logs. No `pair_reply` / `pair_confirm` deadline.
 - **Impact:** Flipper connects during the 120s window and never answers `pair_init` → ESP32 holds the link until BLE supervision timeout.
 - **Fix:** Mirror hello_ack: set `pair_reply_deadline_ms` when `pair_init` write completes; in `reassembly_timeout_cb`, if `PAIRING_STATE_INIT_SENT` and expired, `fail_pairing_ceremony` + terminate. Same for confirm if there is a wait after `pair_reply`. Use wrap-safe elapsed compare (G05).
@@ -237,7 +242,12 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 ### G11 — Flipper does not close the connection on auth / GCM / sequence failure
 
 - **Severity:** P0 vs PROTOCOL.md letter; Flipper comments already admit they rely on ESP32 idle timeout because `bt_disconnect` from `profile_event_handler` is considered unsafe
-- **Status:** NEW emphasis (no-reply half was intentional; **close** half is missing)
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. Added a new `AppEventSessionFatal`
+  posted from `profile_event_handler` (client_auth proof-fail, protected-record decode/decrypt fail,
+  protected-record session/sequence mismatch) and handled on the main thread by `bt_disconnect(app.bt)`
+  — keeps the existing "no wire reply" behavior, adds the missing "close the connection" half.
+  `session_reset_state()` now also runs on the two protected-record failure paths, which previously
+  only dropped the record. G03 (ESP32-side AUTHENTICATED-too-early) is still open separately.
 - **Files:** [flipper/flipper_esp32_over_ble.c](../flipper/flipper_esp32_over_ble.c)
   - `handle_client_auth` proof fail (~L2238): `session_reset_state(); return;` — no UI phase, no disconnect
   - Protected decrypt fail (~L2394): drop, keep link, **seq not incremented** (good) but connection stays
@@ -384,13 +394,22 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 
 ### G15 — ESP32 HMAC `full[32]` not zeroized after truncation to 16
 
-- **Status:** Known #24
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `feb_secure_zero()` added after the
+  `memcpy` to `out` in `feb_session_flipper_proof`/`feb_session_esp32_proof` (session.c) and in all
+  **three** pairing.c confirmation functions (`feb_pairing_flipper_confirm`, `feb_pairing_esp32_confirm`,
+  `feb_pairing_complete_tag` — one more call site than this finding originally listed; confirmed against
+  Flipper's shared `pairing_confirm_tag()` helper, which already zeroizes for all three). Label scratch
+  in `feb_session_hmac_label` holds only public label+transcript bytes, not key-derived material — left
+  unchanged.
 - **Files:** [esp32/main/session.c](../esp32/main/session.c) `feb_session_flipper_proof` / `feb_session_esp32_proof` (~L420–L436); pairing confirmations in [esp32/main/pairing.c](../esp32/main/pairing.c) (~L838–L863). Flipper already zeroizes.
 - **Fix:** `feb_secure_zero(full, sizeof(full));` on every path after `memcpy` to `out`. Same for label scratch in `feb_session_hmac_label` if it holds key-derived bytes.
 
 ### G16 — Factory reset does not zeroize in-RAM `stored_pairing_secret`
 
-- **Status:** Known #24
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `feb_wipe_pairing_secrets()` added
+  to main.c (declared in `factory_reset.h`), zeroizes `stored_pairing_secret` and reuses the existing
+  `pairing_attempt_zeroize()`/`runtime_auth_zeroize()`; called from `perform_factory_reset()` immediately
+  before `esp_restart()`.
 - **Files:** [esp32/main/factory_reset.c](../esp32/main/factory_reset.c) `perform_factory_reset` (~L131) erase NVS + `esp_restart()`. Secret lives in [main.c](../esp32/main/main.c). Soft reset keeps SRAM.
 - **Fix:** Export `feb_wipe_pairing_secrets()` from main (or a boot-registered callback) that `feb_secure_zero`s stored secret + session/pairing scratch, call it **before** `esp_restart()`.
 
@@ -409,7 +428,7 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 
 ### G20 — `notify_data_callback` NULL context sets `*data_len = PAYLOAD_MAX`
 
-- **Status:** Known #20
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. One-line change, as suggested.
 - **Files:** [flipper/flipper_esp32_over_ble.c](../flipper/flipper_esp32_over_ble.c) (~L228)
 - **Fix:** `if (data_len) *data_len = 0;`. One-line.
 
@@ -446,19 +465,24 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 
 ### G32 — Factory-reset LED RMT leak on partial init failure
 
-- **Status:** Known style
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `led_init()` now deletes the
+  already-created RMT channel on encoder-creation failure, and deletes both encoder and channel on
+  `rmt_enable` failure.
 - **Files:** [esp32/main/factory_reset.c](../esp32/main/factory_reset.c) (~L96)
 - **Fix:** `rmt_del_channel` / delete encoder on encoder or enable failure.
 
 ### G33 — `board_id_len` from `snprintf` return; missing `<stdio.h>`
 
-- **Status:** Known style
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. `<stdio.h>` now included explicitly;
+  a negative `snprintf` return bails out without touching `board_id_len`, a non-negative return is
+  clamped to `sizeof(board_id_buf) - 1`.
 - **Files:** [esp32/main/main.c](../esp32/main/main.c) `compute_board_id`
 - **Fix:** `#include <stdio.h>`; clamp length to actual written (`written < 0` → fail; else `min((size_t)written, sizeof(buf)-1)`).
 
 ### G34 — ESP32 `feb_gcm_encrypt` failure uses `memset` not `feb_secure_zero`
 
-- **Status:** NEW, minor
+- **Status:** **FIXED 2026-09-12** — see `docs/PROJECT_HISTORY.md`. Both `memset` calls in the encrypt
+  failure path replaced with `feb_secure_zero`.
 - **Files:** [esp32/main/session_crypto.c](../esp32/main/session_crypto.c) vs decrypt's `mbedtls_platform_zeroize`
 - **Fix:** `feb_secure_zero` on ciphertext and tag failure paths.
 

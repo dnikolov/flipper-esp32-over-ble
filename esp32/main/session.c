@@ -424,6 +424,7 @@ void feb_session_flipper_proof(const uint8_t pairing_secret[FEB_PAIRING_SECRET_L
 
     feb_session_hmac_label(pairing_secret, label, KLEN(label), s, s_len, full);
     memcpy(out, full, FEB_SESSION_PROOF_LEN);
+    feb_secure_zero(full, sizeof(full));
 }
 
 void feb_session_esp32_proof(const uint8_t pairing_secret[FEB_PAIRING_SECRET_LEN], const uint8_t *s, size_t s_len, uint8_t out[FEB_SESSION_PROOF_LEN])
@@ -433,6 +434,7 @@ void feb_session_esp32_proof(const uint8_t pairing_secret[FEB_PAIRING_SECRET_LEN
 
     feb_session_hmac_label(pairing_secret, label, KLEN(label), s, s_len, full);
     memcpy(out, full, FEB_SESSION_PROOF_LEN);
+    feb_secure_zero(full, sizeof(full));
 }
 
 void feb_session_derive_key(

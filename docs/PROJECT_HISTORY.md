@@ -1481,6 +1481,68 @@ suites (framing/cbor, pairing, session, wardriving, location) all pass, includin
 framing regression cases. Not hardware-verified — no physical board was flashed or exercised for
 this pass.
 
+## 2026-09-12: Tier 2 backlog fixes (G04, G11, G15, G16, G20, G32, G33, G34)
+
+Next-cheapest batch after Tier 1 (severity × effort), split by firmware side and implemented in
+parallel. No wire-format changes, no cross-firmware coordination.
+
+ESP32 side:
+
+- **G04** — Pairing ceremony (`pair_init`→`pair_complete`) had no application-level timeout: if the
+  Flipper never wrote back `pair_reply` after `begin_pairing()` sent `pair_init`, `pairing_state`
+  just sat at `PAIRING_STATE_INIT_SENT` until the BLE link itself died. Added
+  `pair_reply_wait_start_ms` / `FEB_PAIR_REPLY_TIMEOUT_MS` (5000ms), mirroring the existing
+  wrap-safe `hello_ack_start_ms` pattern: armed in `begin_pairing()`, cleared in
+  `handle_pair_reply()` and on connect/disconnect, checked in `reassembly_timeout_cb()`. Expiry
+  calls `fail_pairing_ceremony(..., FEB_PAIRING_ERR_EXPIRED)` — the existing "pairing_expired" wire
+  code, not "pairing_failed" (that means a bad pubkey/shared-secret/confirmation, a different
+  case). Only this one wait needed a deadline: `finish_pairing_after_confirm()` runs synchronously
+  off the pair_confirm TX-done callback, so there's no second wait after `pair_confirm`.
+- **G15** — ESP32 HMAC scratch buffers holding the full 32-byte HMAC output before truncation to
+  the 16-byte wire value were never zeroized (Flipper's equivalents already were). Fixed in
+  `feb_session_flipper_proof`/`feb_session_esp32_proof` (`session.c`) and in all three of
+  `pairing.c`'s confirmation functions (`feb_pairing_flipper_confirm`, `feb_pairing_esp32_confirm`,
+  `feb_pairing_complete_tag` — one more call site than the original finding listed; confirmed
+  against Flipper's shared `pairing_confirm_tag()` helper, which already zeroizes for all three).
+- **G16** — Factory reset erased NVS and called `esp_restart()` without zeroizing the in-RAM
+  `stored_pairing_secret` first. Added `feb_wipe_pairing_secrets()` (declared in
+  `factory_reset.h`, defined in `main.c`), reusing the existing `pairing_attempt_zeroize()`/
+  `runtime_auth_zeroize()`; called from `perform_factory_reset()` immediately before
+  `esp_restart()`.
+- **G32** — The factory-reset LED's RMT channel leaked if encoder creation or `rmt_enable` failed
+  after the channel itself was already created. `led_init()` now tears down the channel (and
+  encoder, if created) on either failure path.
+- **G33** — `compute_board_id()` took `snprintf()`'s return value verbatim, which can exceed the
+  buffer on truncation; `<stdio.h>` wasn't directly included either. Added the include; a negative
+  return now bails out without touching `board_id_len`, a non-negative return is clamped to
+  `sizeof(board_id_buf) - 1`.
+- **G34** — `feb_gcm_encrypt`'s failure path zeroized ciphertext/tag scratch with `memset` instead
+  of `feb_secure_zero` (the decrypt side already used `mbedtls_platform_zeroize`). Both `memset`
+  calls replaced.
+
+Flipper side:
+
+- **G11** — Per PROTOCOL.md, an auth/GCM/sequence failure must discard the record and close the
+  connection without replying; the Flipper already did the "no reply" half at all three relevant
+  sites but never actually closed the link, relying on the ESP32's 30s idle timeout instead (the
+  existing rule that `bt_disconnect()` must never be called from inside `profile_event_handler`
+  meant this was never wired up). Added a new `AppEventSessionFatal`, posted from
+  `handle_client_auth()`'s proof-mismatch branch and from the protected-record decode/decrypt-fail
+  and session/sequence-mismatch branches, handled on the main thread by `bt_disconnect(app.bt)` —
+  the existing `BtStatusAdvertising` handling already resets pairing/session/UI state once the
+  disconnect completes and the profile resumes advertising. `session_reset_state()` now also runs
+  on the two protected-record failure paths, which previously only dropped the record and left
+  session state untouched. G03 (ESP32 marking the session authenticated too early, on its own
+  GATT write-complete) is a separate, still-open finding.
+- **G20** — `notify_data_callback`'s NULL-context path set `*data_len = PAYLOAD_MAX` instead of
+  `0`. One-line fix.
+
+Verified: `idf.py build` clean; `fbt.cmd fap_flipper_esp32_over_ble` clean (106876-byte FAP);
+`tests/esp32/`'s and `tests/flipper/`'s host suites all pass (481/481 checks on the Flipper side);
+`tools/check_shared_headers.py` reports all 11 shared headers still matching (expected — no
+shared-header prototypes changed). Not hardware-verified — no physical board was flashed or
+exercised for this pass. No on-screen text changed, so no USER_GUIDE.md sync was needed.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

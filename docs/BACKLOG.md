@@ -31,12 +31,12 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | ID | Title | Status |
 | --- | --- | --- |
 | G03 | ESP32 marks the session `AUTHENTICATED` on its own GATT write-complete, not on peer confirmation | Open — needs a product decision on the `capability_query`-caveat (see appendix) |
-| G04 | Pairing ceremony (`pair_init`→`pair_complete`) has no application-level timeout | Open |
+| G04 | Pairing ceremony (`pair_init`→`pair_complete`) has no application-level timeout | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G05 | Absolute `uint32_t` millisecond deadlines wrap at ~49.7 days uptime | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G06 | Neither firmware sends the spec-mandated `unsupported_version` error + close | Open |
 | G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below) |
 | G09 | Flipper advances `session_seq_out` even when notify delivery is unknown | Open |
-| G11 | Flipper never closes the connection on auth/GCM/sequence failure (relies on ESP32's 30s idle timeout) | Open |
+| G11 | Flipper never closes the connection on auth/GCM/sequence failure (relies on ESP32's 30s idle timeout) | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | BL01 | Flipper's `handle_pair_init()` runs unconditionally on any incoming `pair_init` — no local user-gesture/authorization-state check, contradicting [PAIRING.md](PAIRING.md) step 3's "user selects Add ESP32 board" | Open — needs a decision: implement the gate, or correct PAIRING.md if none was intended |
 
 `G26` (AES-GCM 24-bit sequence cap not enforced) — **DONE 2026-09-11** (`3111fa2`); see
@@ -65,18 +65,18 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | ID | Title | Status |
 | --- | --- | --- |
 | G12 | Flipper fragments every record at ATT MTU 23 (16-byte payload) even after MTU negotiation | Open — ~3-4x fewer BLE notifications per record if fixed |
-| G15 | ESP32 HMAC `full[32]` scratch not zeroized after truncating to the 16-byte wire value | Open |
-| G16 | Factory reset doesn't zeroize in-RAM `stored_pairing_secret` before `esp_restart()` | Open |
+| G15 | ESP32 HMAC `full[32]` scratch not zeroized after truncating to the 16-byte wire value | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G16 | Factory reset doesn't zeroize in-RAM `stored_pairing_secret` before `esp_restart()` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G18 | Flipper X25519 donna static ladder scratch (~3-4 KB) never zeroized, resident for the app's lifetime | Open |
 | G19 | Reconnect still `xTaskCreate(..., 3072)` just to sleep once, every ~30s during a prolonged outage | Open |
-| G20 | `notify_data_callback`'s NULL-context path sets `*data_len = PAYLOAD_MAX` instead of `0` | Open — one-line fix |
+| G20 | `notify_data_callback`'s NULL-context path sets `*data_len = PAYLOAD_MAX` instead of `0` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G21 | Pairing/capability/CSV path buffers sized at 96 bytes, one constant short of the real max (~137) | Open |
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
 | G24 | ESP32 built with `-Og`, not `-Os` | **Product choice, not a bug** — record in BASELINES.md if changed |
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
-| G32 | Factory-reset LED RMT channel leaks on partial init failure | Open |
-| G33 | `board_id_len` takes `snprintf()`'s return value verbatim; `<stdio.h>` not directly included | Open |
-| G34 | ESP32 `feb_gcm_encrypt` failure path uses `memset`, not `feb_secure_zero` | Open |
+| G32 | Factory-reset LED RMT channel leaks on partial init failure | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G33 | `board_id_len` takes `snprintf()`'s return value verbatim; `<stdio.h>` not directly included | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G34 | ESP32 `feb_gcm_encrypt` failure path uses `memset`, not `feb_secure_zero` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 
 `G35` (ESP32 `wardriving_dedup_reset()` wiped the flash-log-gating dedup table on every
 `start`/`stop`) — ✅ done, see [PROJECT_HISTORY.md](PROJECT_HISTORY.md).

@@ -103,12 +103,18 @@ static void led_init(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "rmt_new_simple_encoder failed: %s; factory-reset LED feedback disabled",
                  esp_err_to_name(err));
+        rmt_del_channel(led_channel);
+        led_channel = NULL;
         return;
     }
     err = rmt_enable(led_channel);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "rmt_enable failed: %s; factory-reset LED feedback disabled",
                  esp_err_to_name(err));
+        rmt_del_encoder(led_encoder);
+        led_encoder = NULL;
+        rmt_del_channel(led_channel);
+        led_channel = NULL;
         return;
     }
     led_ready = true;
@@ -143,6 +149,7 @@ static void perform_factory_reset(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nvs_flash_init after erase failed: %s", esp_err_to_name(err));
     }
+    feb_wipe_pairing_secrets();
     /* No new post-erase path (docs/PLAN.md): esp_restart() falls straight into the existing
        app_main() boot logic, which finds no stored pairing_secret and opens a pairing
        window, reused verbatim. */
