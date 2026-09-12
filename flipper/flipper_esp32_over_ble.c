@@ -3558,7 +3558,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 sizeof(app.wardriving_error_message) - 1);
             app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
-            if(app.screen == AppScreenHome) {
+            if(app.connection_lost && event.input.key == InputKeyBack) {
+                app.connection_lost = false;
+                app.screen = AppScreenHome;
+            } else if(app.screen == AppScreenHome) {
                 app.screen = AppScreenHome;
                 if(event.input.key == InputKeyBack) {
                     running = false;
