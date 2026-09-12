@@ -382,6 +382,42 @@ assumes. Before optimizing a transfer path, check whether a declared limit is th
   site, either measure real stack usage (`-fstack-usage` or equivalent) or say explicitly that
   you didn't and it remains a risk.
 
+### the-1280-byte-rule-applies-to-every-tight-system-thread-not-just-bleeventworker
+
+The 2026-09-12 GPS-driver commit (`1f0cb8e`) made the FAP crash on launch. Root cause,
+confirmed with `-fstack-usage` (not assumed): `bt_status_callback()` (runs on the "Bt"
+service's own thread, `stack_size=1024` in `applications/services/bt/application.fam`) and
+the new `gps_poll_timer_callback()` (runs on the FreeRTOS Timer Service task,
+`configTIMER_TASK_STACK_DEPTH=256` words = 1024 bytes, `targets/f7/inc/FreeRTOSConfig.h` —
+shared by every `furi_timer_alloc(..., FuriTimerTypePeriodic, ...)` callback in the whole
+firmware, not owned by this app) each stack-allocated a full local `AppEvent` instead of a
+`static` one. `AppEvent` had grown large enough by this point (wifi_scan/ble_scan/wardriving
+buffers already in it, plus this commit's ~60 new GPS bytes) that one measured frame was 480
+bytes before this commit and 536 after — for `bt_status_callback`, already over budget
+*before* this commit even landed, just not by enough to crash yet. `gps_poll_timer_callback`
+was a clean net-new 528-byte violation on an equally tight thread.
+
+- **The established "any buffer ≥100 bytes reachable from `BleEventWorker` must be `static`"
+  rule is really "...reachable from any small system thread."** `BleEventWorker` (1280 bytes)
+  just happens to be the one this project has hit first and most often. The Bt service
+  thread and the Timer Service task are both *smaller* (1024 bytes) and just as reachable
+  from this app's own callbacks (`bt_set_status_changed_callback`, any periodic
+  `furi_timer_alloc`) — before writing a callback for either, check its thread's
+  `application.fam`/`FreeRTOSConfig.h` stack size the same way you would already reflexively
+  check `BleEventWorker`'s.
+- **A pre-existing frame can be "not crashing" purely by chance of margin, not because it's
+  actually safe.** `bt_status_callback`'s 480-byte frame on a 1024-byte thread (47% of the
+  entire budget for one frame, before counting the Bt service's own dispatch call chain on
+  top) had already been shipping and hardware-verified for weeks before this commit — until
+  an unrelated ~60-byte struct growth elsewhere in the same file pushed it over. Measure
+  margin, don't infer safety from "it hasn't crashed yet."
+- **Every function that stack-allocates a shared, ever-growing app-wide event/message struct
+  (this project's `AppEvent`) needs re-auditing whenever that struct grows**, not just at the
+  point it was first written — grepping for the moment a struct crosses "big" is what
+  `-fstack-usage` is for; eyeballing field counts is not reliable at this size.
+- Fix: match this file's own already-established convention (`static AppEvent event; memset(&event, 0, sizeof(event));` then set fields, as `post_wifi_scan_ap()` and ~10 other
+  `post_*()` functions already do) rather than inventing a new pattern.
+
 ### ported-code-inherits-upstream-memory-profile
 
 `pairing_crypto.c`'s X25519 is a port of `curve25519-donna`, deliberately kept diffable

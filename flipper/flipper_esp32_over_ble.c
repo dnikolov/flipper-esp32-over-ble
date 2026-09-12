@@ -2718,7 +2718,19 @@ static void reassembly_timeout_timer_callback(void* context) {
    handler for that event is what actually calls send_gps_command(). */
 static void gps_poll_timer_callback(void* context) {
     Esp32App* app = context;
-    AppEvent event = {.type = AppEventGpsPollTick};
+    /* static, not stack-local: AppEvent is now large enough (~500+ bytes, grown further by
+       this capability's own gps_* fields) that a stack copy here would consume roughly half
+       of the FreeRTOS Timer Service task's entire 256-word/1024-byte stack
+       (targets/f7/inc/FreeRTOSConfig.h's configTIMER_TASK_STACK_DEPTH) -- the thread every
+       furi_timer_alloc(..., FuriTimerTypePeriodic, ...) callback in the whole firmware
+       shares, not one this app owns. Matches reassembly_timeout_timer_callback's own
+       static-buffer convention above and every post_*() function's in this file (see
+       docs/LESSONS.md's BleEventWorker entry for the general rule this generalizes to any
+       tight system thread, not just BleEventWorker). Explicit reset below because a static
+       initializer only runs once at load time, not per call. */
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventGpsPollTick;
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -2980,7 +2992,19 @@ static const FuriHalBleProfileTemplate profile_callbacks = {
 static void bt_status_callback(BtStatus status, void* context) {
     Esp32App* app = context;
     FURI_LOG_I(TAG, "Bluetooth status: %d", status);
-    AppEvent event = {.type = AppEventBtStatus, .bt_status = status};
+    /* static, not stack-local (found during the 2026-09-12 GPS-driver stack audit, measured
+       via -fstack-usage): this callback runs on the "Bt" service's own thread
+       (applications/services/bt/application.fam: stack_size=1024), a budget of the same
+       order as BleEventWorker's, not this app's own. A stack-local AppEvent here already
+       measured 480 bytes before this session's gps_* field additions and 536 after --
+       essentially half that thread's entire stack for one frame, before counting the Bt
+       service's own dispatch call chain on top. Matches every post_*() function's static
+       convention elsewhere in this file. Explicit reset below because a static initializer
+       only runs once at load time, not per call. */
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventBtStatus;
+    event.bt_status = status;
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -3656,7 +3680,16 @@ static void draw_callback(Canvas* canvas, void* context) {
 
 static void input_callback(InputEvent* input, void* context) {
     Esp32App* app = context;
-    AppEvent event = {.type = AppEventInput, .input = *input};
+    /* static, not stack-local -- same 2026-09-12 stack-audit finding as bt_status_callback/
+       gps_poll_timer_callback above: this runs on the GuiSrv thread (stack_size=2048,
+       applications/services/gui/application.fam), a larger budget than Bt's/the Timer
+       Service's but the same risk class as AppEvent keeps growing with new capabilities.
+       Explicit reset below because a static initializer only runs once at load time, not
+       per call. */
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventInput;
+    event.input = *input;
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -3675,6 +3708,7 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     if(return_home) {
         app->screen = AppScreenHome;
     }
+    furi_timer_stop(gps_poll_timer);
     pending_command_kind = PendingCommandNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
@@ -3692,6 +3726,11 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     app->wardriving_backlog_remaining = 0;
     app->wardriving_last_summary[0] = '\0';
     app->wardriving_error_message[0] = '\0';
+    wardriving_flush_led_active = false;
+    if(app->notifications) {
+        notification_message(app->notifications, &sequence_blink_stop);
+        notification_message(app->notifications, &sequence_set_only_blue_255);
+    }
     wardriving_csv_close();
     /* This Flipper's knowledge of the ESP32's gps status does not survive a lost session
        either (same "UI must derive from real state" argument as wardriving_running_known
@@ -3856,6 +3895,26 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             }
         } else if(event.type == AppEventSessionFatal) {
             bt_disconnect(app.bt);
+            /* Unlike BtStatusUnavailable (stop_service(), which already calls this) and the
+               reconnect paths above, this path previously left wardriving_running_known/
+               wardriving_running/gps_status_known/etc. untouched -- a real hardware bug: a
+               fatal decrypt/sequence-mismatch disconnect (e.g. the ESP32-side TX-fragment
+               race fixed alongside this) left the Wardriving screen showing the last known
+               "running" state as if it were still current after the session actually died.
+               keep_screen matches this file's existing connection_lost-banner convention
+               (stay on the current screen, don't snap back to Home). */
+            reset_scan_ui_state_keep_screen(&app);
+            /* session_reset_state() (BLE thread, before this event was posted) already
+               cleared the wardriving_flush_led_active flag, but never touched the physical
+               LED itself -- without this, a session-fatal disconnect that happens while the
+               solid-green flush indicator is lit leaves the LED stuck green for the whole
+               disconnected interval. Matches stop_service()'s own LED cleanup (the
+               BtStatusUnavailable path just above), which this path otherwise skips since it
+               doesn't call stop_service(). */
+            if(app.notifications) {
+                notification_message(app.notifications, &sequence_blink_stop);
+                notification_message(app.notifications, &sequence_reset_blue);
+            }
             app.connection_lost = true;
             app.pairing_phase = PairingPhaseFailed;
             strncpy(app.pairing_reason, "connection lost", sizeof(app.pairing_reason) - 1);
@@ -3957,13 +4016,11 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.gps_altitude_dm_offset = event.gps_altitude_dm_offset;
             }
         } else if(event.type == AppEventGpsPollTick) {
-            /* Only actually sends while the Wardriving or GPS screen is genuinely open (the
-               only two gps_poll_timer users, never open simultaneously) and a session is
-               active (docs/PLAN.md decision 5) -- a stray tick that arrives just after Back
-               has already left one of those screens, or while disconnected, is a harmless
-               no-op (send_gps_command() itself also guards on pairing_phase). */
-            if((app.screen == AppScreenWardriving || app.screen == AppScreenGps) &&
-               app.capability_has_gps) {
+            /* GPS polling must not run while the Wardriving screen is open: the Wardriving
+               capture is already a live BLE stream and the extra polling traffic can stall or
+               disconnect the session. Only the dedicated GPS screen should keep the timer
+               active. */
+            if(app.screen == AppScreenGps && app.capability_has_gps) {
                 send_gps_command(&app);
             }
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
@@ -3988,12 +4045,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                            app.capability_has_wardriving && !app.wardriving_running_known) {
                             send_wardriving_status_query(&app);
                         }
-                        /* Poll `gps` status only while this screen is open (docs/PLAN.md
-                           decision 5) -- restarted (not just started) every entry in case a
-                           prior Back already stopped it, matching the stop-then-start pattern
-                           used elsewhere in this file for idempotent timer (re)starts. */
+                        /* Do not keep the GPS timer running while the Wardriving screen is
+                           open. That poll stream is the source of the disconnects seen while a
+                           capture is already live. */
                         furi_timer_stop(gps_poll_timer);
-                        furi_timer_start(gps_poll_timer, furi_ms_to_ticks(GPS_POLL_PERIOD_MS));
                         break;
                     case HomeMenuScan:
                         if(app.capability_has_wifi_scan && app.capability_has_ble_scan) {

@@ -1509,6 +1509,26 @@ static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t
         return;
     }
 
+    if (tx_fragment_next < tx_fragment_total) {
+        /* queue_and_send_protected()/queue_encoded_record_for_tx() share one
+           single-in-flight tx_fragment_* state across every capability (see
+           wardriving_tx_in_flight's own comment above) and have no re-entrancy guard
+           of their own: sending here while a wardriving status("data") batch (or any
+           other protected record) is still mid-fragmentation would reset that shared
+           state out from under the send already in progress, corrupting or losing it
+           -- the likely root cause of a real hardware report where leaving the
+           Wardriving/GPS screen open (the only source of this periodic, otherwise
+           unthrottled `gps` poll, docs/PROTOCOL.md) while wardriving is actively
+           streaming reliably broke the connection. `gps` is documented as having "no
+           exclusivity/busy concept" on the wire, so silently drop this poll's reply
+           rather than teaching every queue_and_send_protected() caller a new failure
+           mode -- the Flipper's gps_poll_timer simply retries every
+           GPS_POLL_PERIOD_MS regardless. */
+        ESP_LOGW(TAG, "gps status query dropped: protected tx busy (request_id=%llu)",
+                 (unsigned long long)cmd->request_id);
+        return;
+    }
+
     loc_state = location_get_fix(&fix);
     status_payload.request_id = cmd->request_id;
     switch (loc_state) {

@@ -80,21 +80,40 @@ just doing it, and update [docs/BASELINES.md](../../docs/BASELINES.md) if it hap
 peripheral state — say so plainly in your reports. Full incident writeups:
 [docs/LESSONS.md](../../docs/LESSONS.md).
 
-### The `BleEventWorker` stack is 1280 bytes — three separate crashes so far
+### The `BleEventWorker` stack is 1280 bytes — and it is not the only tight system thread
 
 `profile_event_handler` runs synchronously on the `"BleEventWorker"` FuriThread
 (`furi_thread_alloc_ex("BleEventWorker", 1280, ...)`,
 `targets/f7/ble_glue/ble_event_thread.c`). Everything reachable from it — fragment
 reassembly, CBOR decode, the pairing handlers, all of `pairing.c`/`pairing_crypto.c` — shares
-that one budget.
+that one budget. **Four separate crashes so far, the fourth (2026-09-12, the GPS-driver
+commit) on a *different* thread of the same size class** — `bt_status_callback()`
+(the `"Bt"` service thread, `stack_size=1024`) and a new `gps_poll_timer_callback()` (the
+FreeRTOS Timer Service task, `configTIMER_TASK_STACK_DEPTH=256` words = 1024 bytes, shared by
+every periodic `furi_timer_alloc()` callback in the whole firmware) each stack-allocated a
+full local `AppEvent` — by then large enough (~500+ bytes) that one alone was roughly half
+either thread's entire budget, before any of that thread's own dispatch overhead. Read this
+rule as "any small system thread your callback is invoked on," not "`BleEventWorker`
+specifically" — check the actual thread's stack size (`application.fam`'s `stack_size`, or
+`FreeRTOSConfig.h` for FreeRTOS-internal tasks) for every new `bt_set_status_changed_callback`/
+`furi_timer_alloc`/similar callback the same way you'd already reflexively check
+`BleEventWorker`'s.
 
-- Any sizeable buffer in that call chain must be file-scope `static`, never a local. Rule of
+- Any sizeable buffer in such a call chain must be file-scope `static`, never a local. Rule of
   thumb **≥100 bytes**, and *unconditionally* anything sized off `FEB_MAX_RECORD_SIZE`,
-  `FEB_PAIRING_MAX_TRANSCRIPT_LEN`, or a crypto field-element array. Justification: BLE
-  events dispatch single-threaded and sequentially, one in flight at a time.
+  `FEB_PAIRING_MAX_TRANSCRIPT_LEN`, a crypto field-element array, or this app's own
+  ever-growing shared event/message struct (`AppEvent`) — the last of these needs
+  re-auditing on *every* growth, not just when first written, since a frame that was safe
+  yesterday can be pushed over budget purely by an unrelated field added elsewhere in the
+  same struct. Justification: BLE events (and most of these other system callbacks) dispatch
+  single-threaded and sequentially, one in flight at a time.
 - **Nesting is what kills, not any single frame** — add up the whole call chain, don't
   spot-check individual functions (`cmult()`+`fmonty()` alone were each survivable, nested
   ~2440 bytes, nearly 2x the stack).
+- **A frame that "isn't crashing yet" can be shipping on pure margin, not actual safety** —
+  `bt_status_callback`'s stack-local `AppEvent` measured 480 bytes (of a 1024-byte thread)
+  *before* the GPS commit that finally tipped it over 536. Measure margin with
+  `-fstack-usage`; don't infer safety from "it hasn't crashed yet."
 - **Host tests are structurally blind to this** — MSVC's megabyte-plus stack means
   `build_pairing.ps1` passes regardless of whether the code fits on the Flipper. Never cite
   a passing host test as evidence of stack safety.
@@ -105,7 +124,8 @@ that one budget.
   — the "grep for large local arrays" heuristic is blind to this. Before hardware-testing a
   change that adds or deepens a recursive `feb_cbor_skip_value()` call site, either measure
   real stack usage (`-fstack-usage` or equivalent) or say explicitly that you didn't and it
-  remains a risk. Full detail: `docs/LESSONS.md#ble-event-worker-stack-budget`.
+  remains a risk. Full detail: `docs/LESSONS.md#ble-event-worker-stack-budget` and
+  `docs/LESSONS.md#the-1280-byte-rule-applies-to-every-tight-system-thread-not-just-bleeventworker`.
 
 ### `APP_DATA_PATH`/`"/data"` resolves against the *calling thread's* app ID, not this app
 
