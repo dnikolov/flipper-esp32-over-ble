@@ -3067,14 +3067,11 @@ static void draw_settings_screen(Canvas* canvas, Esp32App* app) {
     canvas_draw_str(canvas, 2, 11, "Settings");
     canvas_set_font(canvas, FontSecondary);
 
-    char line[64];
-    snprintf(line, sizeof(line), "Scan prefs: TBD");
-    canvas_draw_str(canvas, 2, 22, line);
-    snprintf(line, sizeof(line), "BLE active/passive: TBD");
-    canvas_draw_str(canvas, 2, 33, line);
-    snprintf(line, sizeof(line), "Pairing: %s", app->has_saved_pairing ? "saved" : "none");
-    canvas_draw_str(canvas, 2, 44, line);
+    canvas_draw_str(canvas, 2, 22, "Placeholder");
+    canvas_draw_str(canvas, 2, 33, "Scan preferences TBD");
+    canvas_draw_str(canvas, 2, 44, "BLE toggle TBD");
     canvas_draw_str(canvas, 2, 56, "Back: return");
+    UNUSED(app);
 }
 
 static void draw_about_screen(Canvas* canvas, Esp32App* app) {
@@ -3082,20 +3079,11 @@ static void draw_about_screen(Canvas* canvas, Esp32App* app) {
     canvas_draw_str(canvas, 2, 11, "About");
     canvas_set_font(canvas, FontSecondary);
 
-    char line[80];
-    snprintf(line, sizeof(line), "ESP32 over BLE");
-    canvas_draw_str(canvas, 2, 22, line);
-    snprintf(
-        line,
-        sizeof(line),
-        "Board: %s",
-        app->has_capability_info && app->capability_board[0] != '\0' ? app->capability_board : "n/a");
-    canvas_draw_str(canvas, 2, 33, line);
-    snprintf(line, sizeof(line), "Protocol: v2");
-    canvas_draw_str(canvas, 2, 44, line);
-    snprintf(line, sizeof(line), "Session: %s", app->pairing_phase == PairingPhaseSessionActive ? "active" : "not active");
-    canvas_draw_str(canvas, 2, 48, line);
+    canvas_draw_str(canvas, 2, 22, "ESP32 over BLE");
+    canvas_draw_str(canvas, 2, 33, "Version info TBD");
+    canvas_draw_str(canvas, 2, 44, "Board details TBD");
     canvas_draw_str(canvas, 2, 56, "Back: return");
+    UNUSED(app);
 }
 
 static void draw_legacy_screen(Canvas* canvas, Esp32App* app) {
@@ -3238,7 +3226,9 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
 
     if(app->screen == AppScreenHome) {
-        home_menu_fix_selection(app);
+        if(!app->connection_lost) {
+            home_menu_fix_selection(app);
+        }
         draw_home_screen(canvas, app);
         return;
     }
