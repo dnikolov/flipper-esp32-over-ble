@@ -156,6 +156,13 @@ static const char *TAG = "flipper_esp32_over_ble";
    logged and tolerated; three in a row past the wear-out/hardware-fault range this project
    is willing to silently absorb. */
 #define FEB_WARDRIVING_FLASH_FAILURE_LIMIT 3u
+/* BLE reconnect-stall coexistence fix: the gap wardriving's Wi-Fi source backs off to while
+   a reconnect attempt is in flight after a normal disconnect (see
+   wardriving_wifi_interval_throttled's comment above). Matches BLE's own idle gap per cycle
+   (FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS=100 on FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS=500,
+   i.e. ~400ms idle) rather than an unrelated number -- ESP32-internal recovery behavior, not
+   part of the wire protocol, so it lives here and not in wardriving_validate.h. */
+#define FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS 400u
 
 static const ble_uuid128_t service_uuid = BLE_UUID128_INIT(
     0x9c, 0x3f, 0x7e, 0x6a, 0xf4, 0x03, 0x4c, 0x31,
@@ -314,6 +321,14 @@ static ble_scan_source_t ble_scan_active_source;
 static bool wardriving_wifi_active;
 static bool wardriving_ble_active;
 static uint32_t wardriving_wifi_interval_ms;
+/* BLE reconnect-stall coexistence fix (see docs/PROJECT_HISTORY.md's "Wardriving reconnect
+   stall" investigation, sixth entry): while a reconnect attempt is in flight after a normal
+   disconnect, wardriving's Wi-Fi source is temporarily throttled to
+   FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS so it stops starving the shared 2.4GHz radio. These
+   two hold the pre-throttle interval and whether throttling is currently applied, so
+   BLE_GAP_EVENT_CONNECT's success path can restore the user's configured cadence exactly. */
+static uint32_t wardriving_wifi_interval_saved_ms;
+static bool wardriving_wifi_interval_throttled;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
 static struct ble_npl_callout wardriving_wifi_interval_co;
@@ -2209,6 +2224,9 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         wifi_scan_in_progress = true;
         wifi_scan_active_source = WIFI_SCAN_SOURCE_WARDRIVING;
         wardriving_wifi_interval_ms = (uint32_t)payload.wifi_interval_ms;
+        /* Defensive reset, not relied on in practice -- should already be false by a fresh
+           start (see wardriving_wifi_interval_throttled's comment above). */
+        wardriving_wifi_interval_throttled = false;
         err = esp_wifi_scan_start(&scan_cfg, false);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "wardriving: esp_wifi_scan_start failed: %s", esp_err_to_name(err));
@@ -2759,6 +2777,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             return 0;
         }
         connection_handle = event->connect.conn_handle;
+        if (wardriving_wifi_interval_throttled) {
+            wardriving_wifi_interval_ms = wardriving_wifi_interval_saved_ms;
+            wardriving_wifi_interval_throttled = false;
+        }
         reconnect_retries = 0;
         service_start_handle = 0;
         service_end_handle = 0;
@@ -2875,6 +2897,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         default:
             /* Plain link loss / idle timeout / graceful close -- reconnect promptly,
                no rate-limit penalty (docs/PLAN.md step 6). */
+            if (wardriving_wifi_active && !wardriving_wifi_interval_throttled) {
+                /* Coexistence-starvation fix (docs/PROJECT_HISTORY.md's "Wardriving
+                   reconnect stall" investigation): give the shared radio a real Wi-Fi gap
+                   while a reconnect is pending, restored on BLE_GAP_EVENT_CONNECT success.
+                   wifi_scan_done_cb()'s WIFI_SCAN_SOURCE_WARDRIVING branch re-reads
+                   wardriving_wifi_interval_ms fresh on its next re-arm, so nothing in
+                   flight needs to be stopped or aborted here. */
+                wardriving_wifi_interval_saved_ms = wardriving_wifi_interval_ms;
+                wardriving_wifi_interval_ms = FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS;
+                wardriving_wifi_interval_throttled = true;
+            }
             start_scan();
             break;
         }

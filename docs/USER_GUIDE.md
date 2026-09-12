@@ -142,14 +142,26 @@ Once an authenticated session is active and the Flipper's status line shows the 
 advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving`), press **Up**
 from the main screen to open the wardriving control/status screen.
 
-**Starting and stopping:** Press **OK** to start wardriving. Unlike `wifi_scan`/`ble_scan`,
-there's no source-picker or interval-entry screen — the app automatically requests every
-source the connected board actually advertises (`wifi_scan`, `ble_scan`, or both) and lets
-the ESP32 apply its own default capture cadence (the most thorough setting validated during
-this project's radio-coexistence testing). Once running, pressing **OK** again sends a stop
-command. **Back** always returns to the main screen without stopping the capture — wardriving
-runs autonomously on the ESP32 regardless of whether this screen is open or the Flipper is
-even connected, so leaving the screen is pure navigation, not an implicit stop.
+**Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, the
+records/source line reads `Source: WiFi+BLE`, `Source: WiFi only`, or `Source: BLE only`
+while wardriving is stopped, and **Left**/**Right** toggle Wi-Fi/BLE membership for the next
+start (at least one source always stays selected — toggling off the last remaining one is a
+no-op). This line and the toggle are only shown when the board has both sources; a board with
+only one has nothing to pick and always uses it, matching the original behavior. The
+selection defaults to both, so pressing **OK** without touching Left/Right behaves exactly as
+before. There's still no interval-entry screen — the ESP32 always applies its own default
+capture cadence (the most thorough setting validated during this project's radio-coexistence
+testing) for whichever source(s) are requested.
+
+**Starting and stopping:** Press **OK** to start wardriving with the currently selected
+source(s). Once running, pressing **OK** again sends a stop command, and the records/source
+line switches back to showing the records/backlog count (see below) — the source toggle only
+applies, and is only shown, while stopped. **Back** always returns to the main screen without
+stopping the capture — wardriving runs autonomously on the ESP32 regardless of whether this
+screen is open or the Flipper is even connected, so leaving the screen is pure navigation, not
+an implicit stop.
+
+**Known issue:** if you press **OK** to start wardriving at the exact moment the ESP32 is still sending you a backlog of previously-buffered records from an earlier session (see "Backlog drain" below), the new start command can silently stop all further data from being sent — capture keeps running on the ESP32, but nothing more arrives on the Flipper until the connection times out and reconnects about 30 seconds later. No data is lost (the stalled records resend automatically on the next reconnect), but you may see the connection drop shortly after starting in this specific timing window. Not yet fixed; see `docs/BACKLOG.md` (item G07) for the tracked issue.
 
 **Screen contents:**
 - **Header** — `Wardriving: unknown`, `Wardriving: RUNNING`, or `Wardriving: stopped`. The
@@ -159,7 +171,8 @@ even connected, so leaving the screen is pure navigation, not an implicit stop.
   state — this is deliberate, not a bug, and OK will always try to start it from `unknown`.
 - **Records/backlog line** — a running count of records received this connected session, plus
   either `Backlog: N` (still draining previously-buffered results from the ESP32's flash log)
-  or `Live` (caught up).
+  or `Live` (caught up). While wardriving is stopped and the board advertises both sources,
+  this line instead shows the source selection (see "Choosing sources" above).
 - **Last result line** — the most recently received record's kind (WiFi/BLE) and a short
   summary (SSID or BLE address).
 - **Error line** — appears only when something needs attention (e.g. the board reports it's

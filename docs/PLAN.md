@@ -10,7 +10,7 @@ This plan implements the trusted-environment BLE pairing decision in [DECISIONS.
 - **Phase 4 (later, decided 2026-09-07):** Heltec WiFi LoRa 32 V2 board support — a second, structurally different target (classic ESP32/Xtensa, not C6) adding display and LoRa capabilities. Does not start until Phase 3 is complete.
 - **Phase 5 (later, much larger, decided 2026-09-07):** Zigbee/Thread and `gpio_control`. Zigbee/Thread recon (passive scanning, Phase 5a) first, then participation (active stack join / possible border-router role, Phase 5b) as a separately-scoped, order-of-magnitude-larger effort with no committed timeline. `gpio_control` rides along in this phase rather than blocking Phase 3's wardriving focus.
 
-For the full dated narrative of how each phase/step was designed, implemented, and debugged, see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For current state and open backlog, see [docs/SESSION_MEMORY.md](SESSION_MEMORY.md).
+For the full dated narrative of how each phase/step was designed, implemented, and debugged, see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For current state, see [docs/SESSION_MEMORY.md](SESSION_MEMORY.md); for the open backlog, see [docs/BACKLOG.md](BACKLOG.md).
 
 ## Confirmed setup choices
 
@@ -50,9 +50,9 @@ The original five-retry ceiling was designed for recovering from a transient dis
 
 - Bounded exponential backoff for the first several attempts, same as above, for fast recovery from a transient disconnect.
 - After reaching a backoff ceiling, do not give up — continue retrying indefinitely at a slow, fixed cadence (on the order of tens of seconds) so a board left running for a long unattended stretch is still connectable whenever a Flipper eventually comes into range, without requiring a reboot.
-- When BLE-source wardriving scanning is active, do not run a separate dedicated reconnect scan — reuse the same passive scan pass, filtering for the Flipper's fixed v2 service UUID, and trigger a connection attempt on a match. Fall back to a dedicated reconnect scan using the policy above only when BLE-source wardriving is not running.
+- When BLE-source wardriving scanning is active, do not run a separate dedicated reconnect scan — reuse the same scan pass (**active**, not passive — see 2026-09-11 correction below), filtering for the Flipper's fixed v2 service UUID, and trigger a connection attempt on a match. Fall back to a dedicated reconnect scan using the policy above only when BLE-source wardriving is not running.
 
-This policy is implemented on the ESP32 as two independent two-phase (exponential-then-flatten) backoff paths — one for GAP-level connect failures (`MAX_RECONNECT_RETRIES`, flattening to a 30-second cadence), one for runtime-auth proof failures (a separate, longer 5-minute flattened cadence, since that path also throttles repeated bad credentials) — and is **hardware-verified** on both paths (see `docs/PROJECT_HISTORY.md`'s step-6 stability-fixes entry for the connect-failure path; runtime-auth failures were exercised as part of step 6's own hardware verification). The merged-reconnect-scan behavior (bullet 3 above) is implemented and code-reviewed but has not yet been exercised under a live forced disconnect during concurrent BLE-observer scanning — see the Backlog.
+This policy is implemented on the ESP32 as two independent two-phase (exponential-then-flatten) backoff paths — one for GAP-level connect failures (`MAX_RECONNECT_RETRIES`, flattening to a 30-second cadence), one for runtime-auth proof failures (a separate, longer 5-minute flattened cadence, since that path also throttles repeated bad credentials) — and is **hardware-verified** on both paths (see `docs/PROJECT_HISTORY.md`'s step-6 stability-fixes entry for the connect-failure path; runtime-auth failures were exercised as part of step 6's own hardware verification). The merged-reconnect-scan behavior (bullet 3 above) was implemented as a **passive** scan pass and code-reviewed but not yet exercised under a live forced disconnect at the time step 4 closed. **2026-09-11**: a live forced disconnect during wardriving's BLE capture found it never reconnects under a passive-only pass; wardriving's BLE re-arm (`wardriving_ble_interval_cb()` and its `start` counterpart in `main.c`) now scans active, matching `start_scan()`'s already-working reconnect scan — see `docs/LESSONS.md`'s "wardriving-passive-scan-reconnect-stall" entry and `docs/PROJECT_HISTORY.md`. Build-verified; hardware re-verification of the fix itself is still pending (see `docs/SESSION_MEMORY.md`).
 
 ## 3. Define and implement record framing
 
@@ -95,7 +95,13 @@ not just historical record:
   capability's actual power/latency priorities — a product choice, not a stability constraint.
 
 **Accepted gap:** the merged reconnect-scan behavior was never exercised (zero disconnects
-occurred in the sweep) — tracked in the Backlog for step 9's full-system validation.
+occurred in the sweep) — tracked in the Backlog for step 9's full-system validation. **Still
+open as of 2026-09-11**: a live forced disconnect during wardriving's BLE capture exercised it
+for the first time and found it never reconnects. The first candidate fix (switching
+wardriving's BLE re-arm from passive to active scanning) was flashed and retested live and did
+**not** resolve it — zero reconnects over 130+ discovery restarts. See `docs/LESSONS.md`'s
+"wardriving-passive-scan-reconnect-stall" entry for the current investigation state and leading
+(unconfirmed) suspect.
 
 ## 5. Implement trusted-environment pairing
 
@@ -168,7 +174,7 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 - The wardriving buffer uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — when full, evicts the oldest **erase-sector's worth** of records at once (raw NOR flash only erases a whole sector at a time; true single-record eviction would need a wear-levelling translation layer, which this bullet's own "not a FAT-based wear-levelling filesystem" already rules out) — not literally the single oldest record. See [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction" note.
 - **Scope note (added 2026-09-07):** the wardriving-log half of this step is being built now, ahead of the rest of Phase 3, as part of "`ble_scan`, `wardriving`, and the GPS-stub reorder" above — not deferred to a later pass through step 8. The pairing-record/capability-file persistence hardening (the first two bullets above) remains deferred; this step isn't "done" until those land too.
 
-**Done when:** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state, for both the pairing record and the wardriving log. Wardriving-log persistence: not yet started (see the reorder section above). Pairing-record/capability-file hardening: not yet started.
+**Done when:** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state, for both the pairing record and the wardriving log. Wardriving-log persistence: implemented as part of the reorder above (checksummed circular flash log, `esp32/main/wardriving_log.c`/`wardriving_record_format.c`), build- and host-test-verified; hardware acceptance for it specifically (extended unattended wraparound/power-loss run) is still open — see [BACKLOG.md](BACKLOG.md). Pairing-record/capability-file hardening: not yet started.
 
 **See also:** "Deferred: hardware hardening" below — Secure Boot, flash encryption, and related eFuse-dependent work are explicitly out of scope for this phase and are not part of this step's "done when" bar.
 
@@ -233,11 +239,18 @@ Key decisions from that design pass, made explicitly with the user:
   fast-scan parameters), prioritizing capture thoroughness — through 2026-09-09. **Corrected
   2026-09-10**: real wardriving traffic on real hardware showed 100% BLE duty starves the
   active connection itself (see "Known open items" below and `docs/PROTOCOL.md`'s "Interval
-  bounds and defaults"); `ble_interval_ms`'s default is now 500ms (~6% duty). Fully
+  bounds and defaults"); `ble_interval_ms`'s default is now 500ms. **Corrected again same day**:
+  `ble_window_ms`'s default (left at 30ms by the first fix, ~6% duty) was raised to 100ms
+  (~20% duty) after a short test run showed a real chance of missing every nearby BLE device's
+  advertisement at 6% duty — still far below the 100% duty that caused the starvation. Fully
   configurable per-session via the wire protocol regardless.
 - **The Flipper's wardriving control screen ships with fixed defaults only for v1** — one-tap
   start/stop, no source-selection or interval-entry UI. The app has no form/settings-entry
   widget anywhere yet; building one is a separate, larger scope addition than anything else here.
+  **Corrected 2026-09-11**: a Left/Right source-selection toggle (Wi-Fi/BLE/both, offered only
+  when the board advertises both) was added to unblock the reconnect-stall investigation's
+  BLE-only isolation test — see `docs/PROJECT_HISTORY.md`. This is a toggle on the existing
+  screen, not the form/settings-entry widget described above; interval-entry is still absent.
 
 **Done when:** matches `wifi_scan`'s bar — both capabilities build- and host-test-verified
 against the frozen wire contract with shared vectors, then hardware-verified on real devices,
@@ -252,52 +265,13 @@ ESP32-side bugs were found and fixed during the first hardware test — see
 (`nimble_host` stack overflow in `wardriving_send_next_batch()`, and GATT-write-flood +
 reconnect-scan-restart collision). Both fixes are hardware re-verified. Three items still
 open per the "done when" bar — see `docs/SESSION_MEMORY.md`'s "Known open items" for exactly
-what remains: forced-disconnect test under live BLE capture, extended unattended flash-log
-wraparound/power-loss run, and CSV export SD-card confirmation.
+what remains: forced-disconnect test under live BLE capture (ran 2026-09-11, found and fixed a
+real bug — see the "Accepted gap" note above and `docs/SESSION_MEMORY.md`), extended unattended
+flash-log wraparound/power-loss run, and CSV export SD-card confirmation.
 
 ## Backlog
 
-Smaller items surfaced during design review or hardware testing, not yet scheduled to a specific step, or (marked ~~struck through~~) already resolved with full narrative moved to `docs/PROJECT_HISTORY.md`.
-
-### Open
-
-- Manual "disconnect current board" Flipper UI action (step 7).
-- Automatic BLE connection arbitration between multiple paired boards — gated on an unresolved BLE-HAL feasibility question: can the Flipper's peripheral role advertise while already connected? (step 7).
-- GPS backfill-to-first-fix as a Flipper-settable wardriving option, instead of discarding pre-fix results (step 7/GPS capability).
-- Idle-connection keepalive/heartbeat during a live wardriving view session (step 9's own scope item, see step 9 above).
-- **Replace the 30-second idle-connection timeout with a heartbeat/keep-alive**, instead of a disconnect-and-reconnect cycle. The current mechanism is functionally correct (hardware-verified) but can't distinguish "the link is actually dead" from "the user just hasn't sent anything in 30s," so a genuinely healthy idle session still visibly flickers its LED/screen every 30 seconds. This is a wire-protocol change (a new message type, both firmwares, a `docs/PROTOCOL.md` update), not a quick patch — needs its own design session before implementation. Deliberately backlogged at the user's explicit request rather than fixed as a quick patch.
-- **Neither firmware sends the spec-mandated `unsupported_version` error + connection close** for a bad `version` field, on either the pairing-envelope or session-envelope path.
-- `pairing_crypto.c`'s X25519 ladder (`mbedtls_mpi_mod_mpi()`) is not documented as constant-time. Accepted for the current threat model (one-shot pairing, physical possession already accepted as fully compromising) — a genuine timing-side-channel gap versus a production constant-time field implementation, not fixed.
-- Real scrollable capability-list screen on the Flipper, once `features` grows large enough to need one (step 7's initial implementation extends the existing single status screen instead).
-- Add host-test coverage for `capability_query`/`capability_response` (step 7) on the Flipper side — currently zero.
-- Mutex (or documented-safe alternative) for the Flipper's cross-thread `session_key`/`session_seq_out`/`outgoing_message_id` access — the wifi_scan command-send path (app main thread) and the existing BLE-thread senders touch the same session state with no lock today; currently argued safe only by a UI-gating invariant, not enforced by any lock.
-- ~~Automatic pause-on-degradation fallback for concurrent BLE-source wardriving scanning while connected~~ — condition confirmed 2026-09-10 (real wardriving traffic does starve the connection at 100% BLE duty; step 4's sweep only checked synthetic load). Fixed with the simpler of the two options instead of the degradation-detection mechanism this bullet proposed: raised `ble_interval_ms`'s default to 500ms (~6% duty) rather than building automatic pause/resume logic — see `docs/PROJECT_HISTORY.md`'s "wardriving BLE duty-cycle starvation" entry.
-- **WiFi-source duty cycle is still unvalidated with an active connection** — `wifi_interval_ms`'s default remains 0 (continuous). WiFi scanning was active in the same 2026-09-10 reproduction that surfaced the BLE issue above, and is suspected to independently compete for the shared 2.4GHz radio via IDF's coexistence arbiter, but this hasn't been isolated the way step 4 isolated the BLE points. Needs its own coexistence check before picking a safe default (or confirming 0 is fine).
-- Generalize the Flipper's pairing-flow LED status stub (continuous blue blink while waiting/handshaking, solid blue on success, off on failure) into a reusable status/notification abstraction usable by other app states (capability streaming, wardriving status, etc.), instead of the hardcoded single-flow stub built for step 5.
-- Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP, instead of the single-`ViewPort`/`AppEvent`-queue pattern every screen so far (including wifi_scan's results view) has been bolted onto — a materially larger structural change than any single step's scope, flagged as increasingly strained with each new screen.
-- Check the ESP32-side `feb_cbor_skip_value()` for the same recursion-depth stack-usage issue found and fixed on the Flipper side for wifi_scan — **already checked and cleared** (66% headroom measured, well past the 30% bar; see the Wi-Fi scan capability section above) — kept here only as a closed pointer in case a future change to that recursion path needs re-measuring.
-- Step 9 must exercise the real negotiated ATT MTU, not just forced-small fragments — step 3's on-device smoke test pinned a tiny fixed fragment capacity to exercise multi-fragment reassembly, which also meant the oversized-write path was never tested (exactly how a later real ATT-length bug in step 5 stayed latent through step 3). Treat "this test pins a parameter" as requiring a note about which failure modes the pinning excludes.
-- Catch stack-budget violations at build time (`-fstack-usage`/`-Wstack-usage=N` wired into the FAP build, checked against a budget for every function reachable from `profile_event_handler`), rather than only ever finding this recurring bug class (four times now: steps 3, 5, 7, wifi_scan) by crashing real hardware. Highest-value item in this backlog: it would convert a recurring hardware-debug cycle into a compile-time check.
-- Promote implicit cross-firmware constants into the shared contract — e.g. the Flipper's `PAYLOAD_MAX` (64, the Write characteristic's declared max attribute value length) is silently also a hard constraint on every ESP32 write, duplicated as `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` on that side rather than living in `framing.h`/`docs/PROTOCOL.md` where both sides' tests would catch drift.
-- Converting the ESP32's ad hoc `xTaskCreate(reconnect_task, ..., 3072, ...)`-per-retry pattern to a second `ble_npl_callout` (as the reassembly-timeout mechanism already uses) to remove a ~3 KB heap allocation/free every 30 seconds during a prolonged outage under the now-indefinite slow-cadence retry policy.
-- `uint32_t` millisecond-clock wraparound (`esp_timer_get_time() / 1000` wraps at ~49.7 days) is handled inconsistently across the ESP32's deadline checks — within the "board left running unattended for days" wardriving scenario this project is designed for. See `docs/CODE_REVIEW_FINDINGS.md` finding #8.
-- ~3 KB of X25519 intermediate ladder state sits unzeroized in the Flipper's `.bss` for the app's entire lifetime (a side effect of the step-3/step-5 stack-overflow fix converting locals to `static`). See `docs/CODE_REVIEW_FINDINGS.md` finding #11.
-- Several smaller findings from `docs/CODE_REVIEW_FINDINGS.md` remain open (findings #5-8, #12-19 excluding #17 which step 8 owns) — consult that document directly rather than duplicating its detail here.
-
-### Resolved (full narrative in `docs/PROJECT_HISTORY.md`)
-
-- ~~Flipper pairing files saved under the wrong app's data directory~~ — fixed during step 6 (real thread-identity resolution via `storage_common_resolve_path_and_ensure_app_directory()`).
-- ~~Custom BLE profile could stay connectable after "paired," allowing silent re-pairing without a fresh OK-press~~ — resolved by design via step 6's reset-vs-runtime-auth decision, not a targeted fix.
-- ~~In-firmware, no-PC/no-session physical factory-reset gesture~~ — designed, implemented, and hardware-verified 2026-09-06 (BOOT held 5s erases NVS and restarts).
-- ~~`MAX_RECONNECT_RETRIES` hard-stops forever after 5 GAP-level connect failures~~ — fixed and hardware-verified 2026-09-06/07 (two-phase exponential-then-flatten shape, see "Revised long-run reconnect policy" above).
-- ~~BLE scan pipeline appears to silently stall for minutes, then self-recovers~~ — root-caused (not a stall: the BLE controller's duplicate-address filter was suppressing the Flipper's readvertisement) and fixed, hardware-verified 2026-09-06.
-- ~~ESP32 `scan_log_count` never reset, scan logging died permanently after 40 events~~ — fixed alongside the scan-stall item above.
-- ~~Neither firmware enforces the 30-second idle-connection timeout on an authenticated-but-idle session~~ — ESP32 side implemented and hardware-verified 2026-09-06 (this also resolved a real user-reported bug: closing/reopening the Flipper FAP left the ESP32 stuck until a physical reset).
-- ~~`feb_cbor_decode_protected()`'s `ciphertext` bound (256 bytes) is smaller than the real max (512 bytes)~~ — fixed ahead of step 6 as a pure constant-widening change.
-- ~~`FEB_TX_MAX_FRAGMENTS` documented/derived incorrectly~~, ~~`feb_fragment_record()`'s stale doc comment~~, ~~`feb_reassembly_check_timeout()` never called on either firmware~~ — all fixed 2026-09-05 (see "Live code-health defects" history).
-- ~~Six shared-contract convergence findings from the full-repository code review (`docs/CODE_REVIEW_FINDINGS.md` #1-4, #9, #10)~~ — fixed ahead of step 7 per `docs/CODE_REVIEW_FIX_PLAN.md`; see `docs/PROJECT_HISTORY.md`'s "Full-repository code review" entry.
-- ~~wifi_scan `BleEventWorker`/`nimble_host` stack-usage risks~~ — measured and fixed on both firmwares; see the Wi-Fi scan capability section above.
-
-### Remediations proposed after the 2026-09-05 hardware pairing test
-
-All three bugs found during that test (`docs/PROJECT_HISTORY.md`) built cleanly and passed every host-native test. These items attack the *classes* rather than the individual bugs; `.claude/agents/` were updated the same day with the behavioral half of the lessons (a "Known failure modes" section on both agent definitions). The build-time stack-budget check and the shared-constant-promotion items are carried in "Open" above; not yet implemented.
+Every open, not-yet-scheduled item (defects, deferred product decisions, cost/efficiency work)
+now lives in the single centralized [docs/BACKLOG.md](BACKLOG.md) — that file explains how to
+use it and links to full detail per item. Resolved items' full narrative is in
+[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md); this file does not keep a shadow "resolved" log.

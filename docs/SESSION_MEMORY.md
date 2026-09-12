@@ -6,7 +6,7 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-09, commit TBD)
+## Current state (as of 2026-09-11, commit TBD)
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete.** Steps 1-7 —
 build baselines, BLE transport, record framing, radio-coexistence validation, trusted-environment
@@ -47,99 +47,47 @@ implemented, and debugged — including every bug's root cause — see
 
 ## Known open items (check before starting related work)
 
-- **`ble_scan` capability**: implemented and hardware-verified 2026-09-08 (manual on-device scan
-  trigger via Right button on the main screen, results in a scrollable view, capped at 32 devices
-  by RSSI). See [docs/USER_GUIDE.md](USER_GUIDE.md) "Scanning for BLE devices" section.
-- **`wardriving` capability**: both firmwares implemented 2026-09-09, build- and host-test-verified.
-  **Hardware-verified 2026-09-10** with two real bugs found and fixed during the first real-device
-  test — see `docs/PROJECT_HISTORY.md`'s "wardriving hardware-verified" entry for the full
-  narrative (a `nimble_host` stack overflow in `wardriving_send_next_batch()`, and a
-  GATT-write-flood + reconnect-scan-restart collision). Both fixes build- and host-test-verified
-  and hardware re-verified on the physical ESP32-C6 + Flipper. **Three items still open** before
-  final acceptance: (1) a forced-disconnect test specifically exercising the merged-reconnect-scan
-  mechanism under live wardriving BLE capture, (2) an extended unattended run validating the
-  flash log's wraparound and power-loss behavior on real hardware, (3) confirming the Flipper's
-  WiGLE CSV export actually lands correctly on the SD card (the on-device control/status screen
-  and start/stop dispatch were confirmed working). **2026-09-10: a fourth real bug found** —
-  wardriving's default 100% BLE observer duty starves the active connection under real traffic
-  (a `stop` command couldn't land, connection dropped every ~30-40s); fixed by raising
-  `ble_interval_ms`'s default to 500ms (~6% duty) — see `docs/PROJECT_HISTORY.md`'s "wardriving
-  BLE duty-cycle starvation" entry. **Reflashed and hardware-re-verified same session** — storm
-  gone, clean reconnects. WiFi-source duty cycle (`wifi_interval_ms` default still 0/continuous)
-  remains unvalidated with an active connection — see `docs/PLAN.md`'s Backlog. **Also
-  2026-09-10: CSV export now deduplicates repeated observations of the same address**
-  (`flipper/wardriving_csv.c`'s `feb_wardriving_dedup_should_write()` — new-address/RSSI-
-  improved-6dB/moved-30m OR-gate, no time-based trigger; see `docs/PROJECT_HISTORY.md`'s
-  "wardriving CSV export writes a row per observation" entry and `docs/CAPABILITIES.md`'s
-  wardriving bullet). Build- and host-test-verified (479/479 checks); its real-FBT build was
-  found to have actually been failing on a double-promotion warning, fixed same day — see
-  `docs/PROJECT_HISTORY.md`'s "idle-timeout outbound-activity bug" entry's build-fix note.
-  **Not yet hardware-verified** for the dedup behavior itself — the fix is flashed and running
-  on the physical Flipper as of 2026-09-10, pending the user's own manual SD-card CSV check.
-- **2026-09-10: ESP32 now also deduplicates before logging to flash** — new `wardriving_dedup.c`
-  module with 128-slot address hash table, logs only new addresses, RSSI improved ≥6dB, or
-  location moved ≥30m. Dramatically cuts flash usage and BLE transfer time from ESP32 to Flipper.
-  Build-verified clean; **not yet hardware-tested**.
-- **2026-09-10: idle-connection timeout only counted inbound records, breaking wardriving's
-  one-way outbound streaming** (disconnect at exactly 30s into every run). Fixed (outbound
-  sends now count too) and **hardware-verified** same day. See `docs/PROJECT_HISTORY.md`'s
-  "idle-timeout outbound-activity bug" entry.
-- **Known issue (not fixed, deferred at user's request): a `start` command landing while the
-  automatic backlog drain is already streaming clobbers the drain's continuation**, silently
-  stopping all further outbound sends until the (now-working) idle-timeout disconnects 30s
-  later. No data loss — undrained records resend on the next reconnect. See
-  `docs/PROJECT_HISTORY.md`'s "idle-timeout outbound-activity bug" entry for the root cause
-  and candidate fix.
-- **2026-09-10: after the BLE duty-cycle fix above, a short wardriving test showed zero BLE
-  records reaching the CSV** (WiFi records were present and correct). Root-caused as a
-  detection-probability artifact, not a bug: `ble_window_ms` stayed at 30ms while
-  `ble_interval_ms` rose to 500ms, dropping BLE scan duty to ~6% — each 30ms scan burst is
-  followed by 470ms of no BLE scanning at all, so a short run has a real chance of missing
-  every nearby device by bad luck. **Confirmed** by the user: a longer run did show BLE
-  records. **Fix in progress**: raised `ble_window_ms` to 100ms (duty ~20%, interval unchanged
-  at 500ms) — chosen as a conservative step up from the hardware-verified-safe 6%, not because
-  of step 4's synthetic-load sweep (that sweep also missed the original duty-starvation bug, so
-  its "10%-100% all stable" claim is not trustworthy evidence for real traffic). Build clean,
-  **flashed to the physical ESP32-C6 2026-09-10**. **NEXT STEP, not yet done**: a live,
-  multi-minute wardriving run to confirm (a) no idle-timeout or duty-starvation-style
-  disconnects at the new ~20% duty, (b) BLE records show up reliably and faster than the old
-  6%. Session ended before this run happened — do this first in the next session before
-  considering the BLE-detection issue closed. See `docs/PROTOCOL.md`'s "Interval bounds and
-  defaults" and `docs/PLAN.md` for the updated default.
-- **Idle-connection heartbeat/keep-alive redesign**: backlogged by explicit user choice. The
-  current 30-second idle-timeout disconnect-and-reconnect cycle works correctly but causes a
-  cosmetic LED/screen flicker roughly every 30 seconds during an otherwise-healthy idle session.
-  Needs its own design session (it's a wire-protocol change, both firmwares) before
-  implementation — see `docs/PLAN.md`'s Backlog.
-- **`unsupported_version` handling is missing** on both the pairing-envelope and session-envelope
-  paths — a bad `version` field is not currently rejected with the spec-mandated error + disconnect
-  on either firmware.
-- **`pairing_crypto.c`'s X25519 ladder is not constant-time** (`mbedtls_mpi_mod_mpi()`'s reduction
-  loop is data-dependent). Accepted for the current threat model (one-shot pairing operation,
-  physical possession of either device already accepted as fully compromising) — not fixed.
-- **Multi-board UX gaps**: no manual "disconnect current board" action to free the BLE connection
-  slot without powering one off, and no automatic arbitration between multiple paired boards
-  (gated on an unresolved question: can the Flipper's peripheral role advertise while already
-  connected?).
-- **No host-test coverage** for `capability_query`/`capability_response` on the Flipper side.
-- **Unsynchronized cross-thread access** to the Flipper's `session_key`/`session_seq_out`/
-  `outgoing_message_id` state (the wifi_scan command send path, on the app's main thread, vs.
-  BLE-thread senders) — currently safe only by a UI-gating invariant, not a lock.
-- **No scrollable capability-list screen yet** on the Flipper — the single status screen just
-  grows a line per capability; fine while `features` is short, will need a real list view once it
-  grows.
-- **Flipper FAP still uses a single-`ViewPort`/`AppEvent`-queue architecture**, not a real
-  `ViewDispatcher`/scene manager — every screen so far (including wifi_scan's results view) has
-  been bolted onto this; flagged as increasingly strained, not yet worth the rework.
-- **GPS backfill-to-first-fix** is not implemented — once wardriving exists, results captured
-  before GPS achieves a fix will be discarded outright, with no Flipper-settable override yet.
-- **Non-ASCII SSID rendering** is untested on real hardware (host-native codec tests cover the
-  encoding; no such network was available nearby during wifi_scan's hardware verification). Not a
-  blocker.
-- **Step 4's merged-reconnect-scan mechanism** (recovering a disconnect via the same BLE-observer
-  scan pass rather than a dedicated reconnect scan) was implemented and reviewed but never actually
-  exercised under test, since the step 4 sweep had zero disconnects at any duty cycle. Flagged for
-  step 9's full-system validation, which already plans reconnect/replay testing.
+**Active investigation — blocks wardriving's step-9 "done when" bar:**
+
+- **Wardriving BLE reconnect stall is still open.** A live forced disconnect during wardriving's
+  BLE capture never reconnects. The first candidate fix (switching wardriving's BLE re-arm from
+  passive to active scanning) was flashed and retested live and **did not resolve it** — zero
+  reconnects over 130+ discovery restarts across 70+ seconds. Several hypotheses were ruled out
+  by reading source directly this session (stale `connection_handle`, a `scan_record_matches()`
+  logic bug, a scan that never truly re-arms). Leading unconfirmed suspect: Wi-Fi/BLE radio
+  coexistence starvation from wardriving's concurrent, gapless Wi-Fi source
+  (`wifi_interval_ms` defaults to 0/continuous). **Next step**: reproduce with wardriving's
+  BLE source only (no Wi-Fi) to isolate. A third capture (`esp32_monitor3.log`) was initially
+  reported as a wardriving-free reproduction of the same stall on the plain reconnect path;
+  the log itself refutes that — `wardriving started (... wifi=1 ble=1)` precedes the stalling
+  disconnect by 66s and is never stopped, so `start_scan()`'s dedicated reconnect scan was
+  never in play (it no-ops while `wardriving_ble_active`). Third data point consistent with,
+  not against, the coexistence suspect; the plain `start_scan()` path remains unimplicated.
+  Full investigation: `docs/LESSONS.md`'s "wardriving-passive-scan-reconnect-stall" entry and
+  `docs/PROJECT_HISTORY.md`'s matching dated entries.
+
+**Immediately next once the above is resolved:**
+
+- **Live multi-minute wardriving run at the current BLE duty cycle** (`ble_window_ms=100`,
+  `ble_interval_ms=500`, ~20% duty, raised 2026-09-10) to confirm no idle-timeout or
+  duty-starvation-style disconnects, and that BLE records show up reliably. Flashed but not yet
+  run. See `docs/PROJECT_HISTORY.md`'s "BLE duty-cycle fix left wardriving nearly blind" entry.
+- **Remaining two of three wardriving hardware-acceptance items**: an extended unattended run
+  validating the flash log's wraparound/power-loss behavior, and confirming the Flipper's WiGLE
+  CSV export actually lands correctly on the SD card.
+- **ESP32 wardriving dedup** (128-slot address hash table) and its 2026-09-11
+  distance-threshold fix (`3111fa2`, see `docs/PROJECT_HISTORY.md`): build-verified, **not yet
+  hardware-tested**.
+- **CSV export dedup** (`feb_wardriving_dedup_should_write()`): build- and host-test-verified,
+  flashed 2026-09-10, **pending the user's own manual SD-card check**.
+- **BLE active scanning** in `ble_scan` (2026-09-11, `e92aad9`): build-verified, not yet
+  hardware-tested.
+
+For everything else — deferred fixes, known bugs not yet scheduled, disputed-severity items, and
+cost/efficiency work — see the single consolidated list in [BACKLOG.md](BACKLOG.md). Add
+genuinely new current-state facts here as they happen; file everything else there instead of
+letting this section re-accumulate narrative (this section drifted into exactly that twice
+before — see `CLAUDE.md`'s conventions).
 - **Build-time stack-budget checking** (`-fstack-usage`/`-Wstack-usage=N` wired into the FAP build)
   is still just a proposal, not an actual standing check — every stack-overflow bug so far (four of
   them across steps 3, 5, 7, and wifi_scan) was found by crashing real hardware first. See

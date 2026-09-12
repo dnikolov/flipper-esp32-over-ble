@@ -203,6 +203,15 @@ typedef struct {
     bool wardriving_last_is_ble;
     char wardriving_last_summary[40];
     char wardriving_error_message[48];
+    /* User's source selection for the next `start`, independent of capability_has_wifi_scan/
+       ble_scan (the board's own advertised set). Defaults to both (preserves pre-existing
+       behavior for anyone who never touches Left/Right on this screen); only meaningful --
+       and only togglable -- when the board advertises both sources, since a single-source
+       board has no choice to offer (send_wardriving_start_command() already ANDs these
+       against capability_has_wifi_scan/ble_scan). Deliberately not reset by
+       reset_scan_ui_state() -- a user preference for this app run, not scan-result state. */
+    bool wardriving_use_wifi;
+    bool wardriving_use_ble;
 } Esp32App;
 
 typedef struct {
@@ -2066,10 +2075,13 @@ static uint64_t wardriving_next_request_id = 1;
 
 /* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
    payloads"). `sources` is built from whichever of wifi_scan/ble_scan the connected board
-   actually advertises -- a source the board doesn't have is rejected `invalid_command` per
-   PROTOCOL.md, so this only ever requests what capability_bootstrap() already confirmed
-   present via app->capability_has_wifi_scan/ble_scan. Always requests every source the board
-   has (no source-picker UI in v1, docs/PLAN.md's explicit decision). Interval fields
+   actually advertises AND the user has selected via app->wardriving_use_wifi/wardriving_use_ble
+   (the AppScreenWardriving Left/Right toggle, only offered when the board advertises both --
+   see draw_wardriving_screen()) -- a source the board doesn't have is rejected
+   `invalid_command` per PROTOCOL.md, so this only ever requests a subset of what
+   capability_bootstrap() already confirmed present via app->capability_has_wifi_scan/
+   ble_scan. Both selection flags default true, so a board with only one source, or a user who
+   never touches the toggle, gets the original "every available source" behavior. Interval fields
    (wifi_interval_ms/ble_window_ms/ble_interval_ms) are omitted entirely so the ESP32 applies
    its own documented defaults -- v1 has no interval-entry UI either. wifi_interval_ms/
    ble_window_ms still default to the original most-aggressive/point-4 values; ble_interval_ms
@@ -2092,19 +2104,19 @@ static bool send_wardriving_start_command(Esp32App* app) {
     command_args.action_len = sizeof("start") - 1;
     command_args.has_sources = 1;
     size_t source_count = 0;
-    if(app->capability_has_wifi_scan) {
+    if(app->capability_has_wifi_scan && app->wardriving_use_wifi) {
         command_args.sources[source_count] = "wifi";
         command_args.source_lens[source_count] = sizeof("wifi") - 1;
         source_count++;
     }
-    if(app->capability_has_ble_scan) {
+    if(app->capability_has_ble_scan && app->wardriving_use_ble) {
         command_args.sources[source_count] = "ble";
         command_args.source_lens[source_count] = sizeof("ble") - 1;
         source_count++;
     }
     command_args.source_count = source_count;
     if(source_count == 0) {
-        FURI_LOG_W(TAG, "wardriving start: no wifi_scan/ble_scan source available");
+        FURI_LOG_W(TAG, "wardriving start: no source selected/available");
         return false;
     }
 
@@ -2732,10 +2744,11 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, BLE_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
-/* wardriving control/status screen (docs/CAPABILITIES.md's wardriving bullet; docs/PLAN.md's
-   "no source-selection or interval-entry UI in v1" decision) -- a third fixed-layout screen
-   alongside the main screen and the two scan-results views, not a scrollable list (there is
-   nothing to scroll: one running/stopped state plus a handful of session counters).
+/* wardriving control/status screen (docs/CAPABILITIES.md's wardriving bullet) -- a third
+   fixed-layout screen alongside the main screen and the two scan-results views, not a
+   scrollable list. Left/Right toggle which source(s) the next `start` requests when the
+   board advertises both wifi_scan and ble_scan (see app->wardriving_use_wifi/
+   wardriving_use_ble); there is still no interval-entry UI (docs/PLAN.md).
    wardriving_running_known is deliberately displayed as its own distinct "unknown" state
    (docs/LESSONS.md "UI must derive from real state") rather than defaulting to "stopped" --
    this Flipper genuinely has no evidence either way until a "started"/"stopped" ack or a
@@ -2760,7 +2773,23 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
        project's docs/LESSONS.md for why a value that "can't really" overflow at runtime
        still needs a buffer GCC can prove is large enough. */
     char line[80];
-    if(app->wardriving_backlog_remaining > 0) {
+    bool wardriving_is_running = app->wardriving_running_known && app->wardriving_running;
+    bool both_sources_advertised = app->capability_has_wifi_scan && app->capability_has_ble_scan;
+    /* While stopped and both sources are advertised, this line shows what the next `start`
+       will request (toggled via Left/Right below) instead of the Recs/Backlog line -- picking
+       a source is only actionable before OK is pressed, so it takes the slot back once
+       running. Single-source boards have nothing to pick, so they always see Recs/Backlog. */
+    if(!wardriving_is_running && both_sources_advertised) {
+        const char* source_label;
+        if(app->wardriving_use_wifi && app->wardriving_use_ble) {
+            source_label = "WiFi+BLE";
+        } else if(app->wardriving_use_wifi) {
+            source_label = "WiFi only";
+        } else {
+            source_label = "BLE only";
+        }
+        snprintf(line, sizeof(line), "Source: %s", source_label);
+    } else if(app->wardriving_backlog_remaining > 0) {
         snprintf(
             line,
             sizeof(line),
@@ -2788,9 +2817,14 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
         canvas_draw_str(canvas, 2, 44, line);
     }
 
-    const char* footer =
-        (app->wardriving_running_known && app->wardriving_running) ? "OK: stop  Back: exit" :
-                                                                       "OK: start  Back: exit";
+    const char* footer;
+    if(wardriving_is_running) {
+        footer = "OK: stop  Back: exit";
+    } else if(both_sources_advertised) {
+        footer = "OK:start L/R:src Back:exit";
+    } else {
+        footer = "OK: start  Back: exit";
+    }
     canvas_draw_str(canvas, 2, 56, footer);
 }
 
@@ -2939,6 +2973,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         .queue = furi_message_queue_alloc(8, sizeof(AppEvent)),
         .pairing_phase = PairingPhaseNone,
         .has_saved_pairing = false,
+        .wardriving_use_wifi = true,
+        .wardriving_use_ble = true,
     };
     app.bt = furi_record_open(RECORD_BT);
     app.storage = furi_record_open(RECORD_STORAGE);
@@ -3158,6 +3194,28 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         send_wardriving_stop_command(&app);
                     } else {
                         send_wardriving_start_command(&app);
+                    }
+                } else if(
+                    event.input.key == InputKeyLeft && app.capability_has_wifi_scan &&
+                    app.capability_has_ble_scan &&
+                    !(app.wardriving_running_known && app.wardriving_running)) {
+                    /* Toggle Wi-Fi's membership in the next `start`'s sources, refusing to
+                       drop the last remaining source (send_wardriving_start_command() already
+                       guards this too, but the UI should never let the user reach a
+                       zero-source selection in the first place). */
+                    if(app.wardriving_use_wifi) {
+                        if(app.wardriving_use_ble) app.wardriving_use_wifi = false;
+                    } else {
+                        app.wardriving_use_wifi = true;
+                    }
+                } else if(
+                    event.input.key == InputKeyRight && app.capability_has_wifi_scan &&
+                    app.capability_has_ble_scan &&
+                    !(app.wardriving_running_known && app.wardriving_running)) {
+                    if(app.wardriving_use_ble) {
+                        if(app.wardriving_use_wifi) app.wardriving_use_ble = false;
+                    } else {
+                        app.wardriving_use_ble = true;
                     }
                 }
             } else {

@@ -296,12 +296,22 @@ connection carrying real command/status traffic). Real wardriving traffic on rea
 (2026-09-10) showed 100% BLE duty starves the connection itself — the continuous scan-restart
 cycle leaves no serviceable airtime for GATT traffic, so a `stop` command could never land and
 the link was torn down locally every ~30-40s. **`ble_interval_ms`'s default is now 500ms**
-(`ble_window_ms` unchanged at 30ms, ~6% duty) — see `docs/PROJECT_HISTORY.md`'s "wardriving BLE
-duty-cycle starvation" entry. `wifi_interval_ms`'s default remains 0 (continuous); WiFi scanning
-was active in that same reproduction and is suspected to independently compete for the same
-shared radio via IDF's coexistence arbiter, but this has not yet been isolated/validated — see
-this doc's own note and [PLAN.md](PLAN.md)'s Backlog. A per-session override for either source
-remains available via the fields above regardless.
+(`ble_window_ms` initially left unchanged at 30ms, ~6% duty) — see `docs/PROJECT_HISTORY.md`'s
+"wardriving BLE duty-cycle starvation" entry. A same-day follow-up test found that ~6% duty's
+30ms window, followed by 470ms of zero BLE scanning per cycle, gave short test runs a real
+chance of missing every nearby device's advertisement purely by bad luck (not a capture bug —
+longer runs did eventually see BLE records). **`ble_window_ms`'s default is now 100ms**
+(interval unchanged at 500ms, ~20% duty) — more than 3x the listen time per burst, while still
+far below the 100% duty that caused the starvation above. Note: step 4's coexistence sweep
+(referenced for the bounds above) claimed 10%-100% duty "proven stable," but that sweep used a
+synthetic throwaway test harness that also completely missed the starvation bug found later
+under real authenticated-session traffic — it is not trustworthy evidence for picking a duty
+value on its own; 20% was chosen as a conservative step up from the already-hardware-verified
+6%, not because the step 4 sweep endorsed it. `wifi_interval_ms`'s default remains 0
+(continuous); WiFi scanning was active in that same reproduction and is suspected to
+independently compete for the same shared radio via IDF's coexistence arbiter, but this has not
+yet been isolated/validated — see [BACKLOG.md](BACKLOG.md). A
+per-session override for either source remains available via the fields above regardless.
 
 **Busy/not-running handling.** `action = "start"` while wardriving is already running is
 rejected `busy`. `action = "stop"` while wardriving is genuinely idle is rejected `not_running`.

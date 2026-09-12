@@ -1,7 +1,8 @@
 # Step 3 codec tests
 
 Host-native unit tests for the framing (`framing.c`/`.h`) and canonical-CBOR
-(`cbor_codec.h` and its per-capability split, docs/OPTIMIZATION.md item 1:
+(`cbor_codec.h` and its per-capability split — see docs/PROJECT_HISTORY.md's 2026-09-08
+"Codebase and agent cost-efficiency pass" entry:
 `cbor_primitives.c`/`.h`, `cbor_records.c`/`.h`, `cbor_wifi_scan.c`/`.h`,
 `cbor_ble_scan.c`/`.h`, `cbor_wardriving.c`/`.h`) modules — see
 [docs/PLAN.md](../docs/PLAN.md) step 3 and [docs/PROTOCOL.md](../docs/PROTOCOL.md). No

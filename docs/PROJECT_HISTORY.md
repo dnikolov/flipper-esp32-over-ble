@@ -651,6 +651,71 @@ it as a known limitation.
 Per existing design decision: **Left triggers `wifi_scan`, Right triggers `ble_scan`** on the main
 screen when the connected board's capability line advertises it.
 
+## 2026-09-08: Codebase and agent cost-efficiency pass
+
+A review of file sizes/read-cost across the codebase and the two developer subagents (folded
+here 2026-09-11 from the now-retired `docs/OPTIMIZATION.md`; still-open items from that review
+moved to [BACKLOG.md](BACKLOG.md)).
+
+- **Wardriving codec shape reconciled** between `esp32/main/cbor_codec.h`/`.c` and
+  `flipper/cbor_codec.h`/`.c` — a real structural divergence (tagged union vs. two
+  always-present named fields; two presence flags vs. one), not just cosmetic. See
+  [LESSONS.md#wardriving-struct-shape-divergence](LESSONS.md#wardriving-struct-shape-divergence).
+- **`tools/check_shared_headers.py` added** — diffs macro values and function prototypes between
+  each esp32/flipper header pair. Does not catch struct-body shape divergence (see above); still
+  read the actual struct on both sides for any new composite/optional-field/union shape.
+- **Both agent files restructured**: narrative/incident writeups moved to `docs/LESSONS.md`,
+  agent files cut to imperative rules + links (`esp32-developer.md` ~4.7k→2.7k tokens,
+  `flipper-developer.md` ~6.3k→4.0k tokens). Near-duplicate sections shared between the two
+  agent files were merged into one `LESSONS.md` entry instead of two copies. A read-discipline
+  rule was added to both: grep for the symbol first, then `Read` with `offset`/`limit`, for any
+  file over ~800 lines.
+- **Split `cbor_codec.c`/`.h` per capability** on both firmwares: gone, replaced by
+  `cbor_primitives.c`/`.h`, `cbor_records.c`/`.h`, `cbor_wifi_scan.c`/`.h`, `cbor_ble_scan.c`/`.h`,
+  `cbor_wardriving.c`/`.h`, plus a small `cbor_internal.h` per side for implementation-only
+  shared macros. Each `cbor_codec.h` is now a thin umbrella `#include`-ing the five split
+  headers, so nothing that already included it needed to change.
+  `esp32/main/CMakeLists.txt` and three `tests/esp32/build*.ps1` scripts (all three link the
+  codec, not just one) were updated to list the five new files. All host-native suites and a
+  full clean `idf.py build` pass with zero new warnings; `tools/check_shared_headers.py` reports
+  `OK` for the split umbrella on both sides.
+  **Orchestrator follow-up:** adding the five new split-header pairs to
+  `check_shared_headers.py`'s `HEADER_PAIRS` surfaced a pre-existing bug in the script's own
+  macro-value regex (`\s*` between a macro name and its value matched newlines, so a bare
+  include-guard `#define X` followed by a blank line swallowed the *next* line's content as the
+  guard's fake "value"). Fixed (`\s*` → `[ \t]*`); re-run reports `OK` on all 11 header pairs.
+  Also found and fixed: `tests/flipper/build_pairing.ps1` and `build_session.ps1` still
+  hardcoded the deleted `cbor_codec.c` (missed by the flipper-developer agent's task, which only
+  named `build.ps1`) — both updated and re-verified passing (67/67, 57/57).
+- **Normalized the ESP32 build invocation**: added `tools/build_esp32.ps1` (clears `MSYSTEM`,
+  sources `export.ps1`, runs `idf.py build`, tails output). `.claude/settings.json`'s three
+  near-duplicate `idf.py build` allow entries collapsed into one entry for this script.
+
+## 2026-09-11: Wardriving dedup distance-threshold fix, AES-GCM sequence cap enforced, BLE active scanning enabled
+
+Three small, independent fixes landed the same session (folded here 2026-09-11 from the
+now-retired `docs/FINDINGS_BACKLOG.md`, which tracked them ad hoc as they landed):
+
+- **Wardriving location-dedup threshold was 1000x too large** (`3111fa2`). The 2026-09-10
+  dedup module's own comment math was correct (30m ≈ 2700 units at 1e7-scaled lat/lon), but
+  `wardriving_dedup.c`'s `should_log_record()` compared against `3000000ULL` instead of `2700ULL`
+  — requiring ~33km of movement before logging a new position instead of the intended 30m.
+  Found independently by this session and by Gemini's review (BUG-02); fixed by correcting the
+  constant.
+- **AES-GCM 24-bit sequence cap now enforced on both firmwares** (`3111fa2`). PROTOCOL.md's
+  nonce construction only encodes the low 24 bits of the sequence counter, so a direction's
+  sequence reaching `2^24 - 1` would repeat a nonce under the same session key — a GCM
+  catastrophic failure — but nothing checked for it. Added `FEB_SESSION_SEQUENCE_MAX =
+  0xFFFFFFu` on both sides; `queue_and_send_protected()` (ESP32) and each Flipper command sender
+  now refuse to encrypt/send at the cap and terminate the connection, and both receive paths
+  reject/close on an incoming sequence at or past it. Three of four independent reviews
+  (Copilot, Gemini, Grok) converged on this as their top-priority finding.
+- **BLE active scanning enabled for `ble_scan`** (`e92aad9`). Changed from passive
+  (`params.passive = 1`) to active scanning: active scanning sends scan requests, and devices
+  often include their full name only in the scan-response data passive scanning never sees.
+  Expected cost: ~10-20% latency per device. Not yet extended to `wardriving`'s own capture
+  engine, and no runtime on/off toggle yet — see [BACKLOG.md](BACKLOG.md).
+
 ## 2026-09-09: `wardriving` implemented on both firmwares (build/host-test-verified, hardware pending)
 
 The composite capability tying `wifi_scan`/`ble_scan` into an autonomous capture loop with
@@ -1071,6 +1136,148 @@ reduction in transferred record count, hence BLE transfer time.
 Build verified clean (commit 47f57ff). **Not yet hardware-tested**: dedup filtering behavior
 will be confirmed by running wardriving on real hardware and comparing record counts before/after.
 
+## 2026-09-11: Wardriving reconnect stall — passive BLE re-arm never catches the merged reconnect scan (investigation ongoing; first candidate fix did not hold)
+
+**Symptom (live hardware session)**: start wardriving from the Flipper, then close the Flipper
+FAP or otherwise let the BLE link drop while wardriving is running. Normal disconnects (no
+wardriving running) reconnect within ~10ms in the monitor log (`disconnected` -> `found v2
+peer, connecting`). With wardriving's BLE source active, the ESP32 instead restarted discovery
+every ~500ms for 2+ minutes (250+ restarts) with `found v2 peer, connecting` never appearing —
+the Flipper FAP stuck on "waiting for esp," recoverable only by stopping wardriving or
+rebooting the board.
+
+**Initial hypothesis, and why it was wrong**: the theory going in was that the Flipper's
+128-bit service UUID lives in the scan-response PDU (plausible byte-budget argument: a 128-bit
+UUID AD entry is 18 bytes, tight against ADV_IND's 31-byte legacy limit alongside flags/name),
+making it invisible to wardriving's passive-only re-arm scan. Reading the actual Flipper GAP
+source refuted this: `gap_advertise_start()`
+(`docs/references/flipper-firmware/upstream/targets/f7/ble_glue/gap.c`) only programs scan
+response data when `mfg_data_len > 0`, and `flipper/flipper_esp32_over_ble.c` never sets
+`mfg_data`/`mfg_data_len` at all — no scan response is ever configured. The UUID
+(`set_advertisment_service_uid()`) is written directly into the primary `ADV_IND` payload
+handed to `aci_gap_set_discoverable()`, along with an empty name (`adv_name` is always two
+null bytes). Total AD content is ~21 bytes, comfortably inside the legacy budget. The UUID is
+visible to any scanner, passive or active.
+
+**What actually distinguishes the working and broken paths**: `esp32/main/main.c`'s
+`start_scan()` (the dedicated reconnect scan, proven reliable) has always scanned **active**.
+`wardriving_ble_interval_cb()`'s periodic re-arm, and the `start`-time BLE-source scan config in
+`handle_wardriving_command()`, scanned **passive**. Per `docs/PLAN.md`'s "Revised long-run
+reconnect policy," `start_scan()` is a deliberate no-op whenever wardriving's BLE source owns
+discovery — reconnect matching is supposed to piggyback on whichever scan pass is currently
+running instead. That means wardriving's passive re-arm was the *only* scan pass available for
+reconnect matching in that state, and it never once caught a match. This merged-reconnect
+mechanism had been flagged as an untested gap since step 4 ("Accepted gap: the merged
+reconnect-scan behavior was never exercised... zero disconnects occurred in the sweep" —
+`docs/PLAN.md`) and carried into wardriving's step-9 "done when" bar as an explicit open item
+("forced-disconnect test under live BLE capture," `docs/SESSION_MEMORY.md`). This session was
+the first real exercise of it, and it failed outright.
+
+The exact mechanism by which passive scanning fails to deliver a match here (duty-cycle
+misalignment with the Flipper's advertising cadence vs. the BT/Wi-Fi coexistence arbiter
+plausibly deprioritizing passive-only RX windows, something else in the closed-source
+ESP32-C6 BLE controller) was not isolated — the closed-source controller blob and NimBLE's
+scan-parameter defaulting (`ble_gap_disc_fill_dflts()`, identical for passive/active) gave no
+static evidence of a mechanism, so the fix is validated by directly observed before/after
+behavior, not a confirmed root mechanism. Worth an RF capture if this ever regresses.
+
+**Fix**: switched both wardriving BLE scan configs (`wardriving_ble_interval_cb()` and the
+`start`-path config in `handle_wardriving_command()`) from `params.passive = 1` to
+`params.passive = 0`, matching `start_scan()`. `params.filter_duplicates = 0` was already set
+on both (a controller-dup-filter concern unrelated to scan type, per the 2026-09-10 scan-stall
+fix), so this does not reintroduce that earlier bug. See `docs/LESSONS.md`'s
+"wardriving-passive-scan-reconnect-stall" entry for the generalizable lesson.
+
+Build-verified clean (`idf.py build`). Hardware re-verification of the fix (forcing a disconnect
+during live wardriving BLE capture and confirming a fast reconnect) is still pending — the
+physical board was under a live monitor session at the time of this fix and was deliberately
+not flashed or disturbed.
+
+**2026-09-11 follow-up: retested live, and the fix above did not hold.** Same session, same
+board: wardriving started (both sources — the v1 Flipper UI always requests every source the
+board advertises), FAP closed, then over 70+ seconds and 130+ confirmed-active discovery
+restarts, neither of `BLE_GAP_EVENT_DISC`'s two possible match outcomes (`found v2 peer,
+connecting` / `pairing window closed; not connecting`) ever logged — refuting the
+active-vs-passive theory outright, not just leaving its mechanism unconfirmed. Static
+re-investigation this session ruled out `connection_handle` staleness, a `scan_record_matches()`
+logic difference, and an EBUSY/never-actually-arming failure (all read directly against source,
+not assumed). Leading unconfirmed suspect: Wi-Fi/BLE coexistence starvation from wardriving's
+concurrent, gapless Wi-Fi source. Full investigation detail, and the next isolation step
+(reproduce BLE-source-only, no Wi-Fi), is in `docs/LESSONS.md`'s
+"wardriving-passive-scan-reconnect-stall" entry — **do not treat this bug as closed** based on
+the "Fix" text above; see `docs/SESSION_MEMORY.md` for current status.
+
+**2026-09-11, third capture: a claimed "wardriving-independent" reproduction did not hold up
+against its own log.** A later session captured a fresh monitor log
+(`esp32_monitor3.log`) and reported it as a bare, wardriving-free reconnect stall — three
+idle-timeout disconnects, the first two reconnecting instantly, the third stalling forever
+in the same 500 ms-restart pattern — and argued this ruled out the Wi-Fi coexistence
+suspect above, since no wardriving was supposedly running. Reading the actual log
+line-by-line refutes that framing: `wardriving started (request_id=3, wifi=1 ble=1)` is
+logged at the 80965 ms mark (22:32:33), a full 66 seconds *before* the third idle-timeout
+disconnect at 146615 ms (22:33:39), and no stop/self-stop for either source appears anywhere
+in the rest of the ~185 s capture. The first two disconnects (34595 ms/22:31:47 and
+66605 ms/22:32:19) genuinely predate that `wardriving started` line and did reconnect
+instantly, as claimed — but the third, stalling one occurred entirely inside an active
+`wifi=1 ble=1` wardriving run, not on the bare path.
+
+Confirmed directly against `esp32/main/main.c`: `start_scan()` (the dedicated reconnect
+scan used by the first two disconnects) is a no-op whenever `wardriving_ble_active` is
+true (by design, since 2026-09-10 — see the entry above), so on the third disconnect
+`BLE_GAP_EVENT_DISCONNECT`'s `DISCONNECT_REASON_NORMAL` branch called `start_scan()`,
+which returned immediately, and the only discovery activity for the rest of the capture
+was `wardriving_ble_interval_cb()`'s own 100 ms-window/500 ms-period re-arm (matching
+`FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS`/`FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS` in
+`esp32/main/wardriving_validate.h`) — the exact mechanism already under investigation
+above, not a distinct bug in the plain reconnect path. `wifi_interval_ms` was still at its
+gapless default (`FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS = 0`), so this capture is a third
+data point *consistent with* the still-unconfirmed Wi-Fi/BLE coexistence-starvation
+suspect, not evidence against it. The plain `start_scan()` path itself was not exercised at
+all during the failing disconnect and remains unimplicated — both its exercises in this
+capture (disconnects one and two) worked, as they always have.
+
+**2026-09-11, fourth entry: per-source selection added to the Flipper UI specifically to run
+the isolation test above.** Every prior capture in this investigation started wardriving with
+both sources (`wifi=1 ble=1` — the v1 Flipper UI had no way to request a subset), so the
+leading Wi-Fi/BLE coexistence-starvation suspect was never actually isolated from a bare
+BLE-only run. `send_wardriving_start_command()` in `flipper/flipper_esp32_over_ble.c` now
+builds `sources` from a user selection (`app->wardriving_use_wifi`/`wardriving_use_ble`,
+toggled via Left/Right on the wardriving screen when the board advertises both `wifi_scan`
+and `ble_scan`) instead of unconditionally including every source the board advertises; no
+ESP32-side change was needed (`handle_wardriving_command()` already validated and honored
+whichever subset of `sources` it was given). Build-verified only, not yet flashed — the next
+step is to actually run the isolation test this unblocks (start wardriving BLE-only, force a
+disconnect, see whether the stall still reproduces without Wi-Fi in the mix).
+
+Net effect: this capture adds no new evidence toward closing the open investigation and
+does not rule out wardriving/coexistence as the cause. The still-outstanding next step is
+unchanged from the entry above — reproduce with wardriving's BLE source active and its
+Wi-Fi source *not* running (or given a real interval gap), to test the coexistence
+hypothesis in isolation; a "no wardriving was running" claim should be verified against the
+log's own `wardriving started`/self-stop lines before being treated as evidence.
+
+**2026-09-11, fifth entry: the isolation test the fourth entry unblocked was run on live
+hardware, and the coexistence-starvation suspect held up.** The new per-source UI (fourth
+entry) was flashed and used to start wardriving BLE-only (`wardriving started (request_id=1,
+wifi=0 ble=1)`), with no Wi-Fi source running at all. Across the following ~7 minutes of live
+capture, 7 disconnects occurred against this BLE-only run — 5 routine 30 s idle-timeouts
+(`reason=534`) and 2 real link drops (`reason=531`, from a deliberate forced-disconnect test)
+— and every single one reconnected successfully, almost all within 1-3 seconds (one took two
+attempts, reconnecting ~3 s after an initial immediate re-drop, still far from the "stuck
+forever" pattern). This is a sharp contrast to the third entry above, where the identical
+idle-timeout disconnect pattern stalled permanently (250+ discovery restarts, no match) under
+a concurrent `wifi=1 ble=1` run with Wi-Fi at its gapless default.
+
+**Status: coexistence-starvation is now the well-supported working theory, not just the
+leading unconfirmed suspect** — a BLE-only run reconnects reliably where a Wi-Fi+BLE run
+previously stalled, under otherwise-identical conditions (same board, same firmware, same
+idle-timeout mechanism, same reconnect-scan code path). Not yet done: a matching multi-cycle
+capture of a `wifi=1 ble=1` run on this *exact* current firmware (the stall's only direct
+observation so far predates the per-source UI change, i.e. commit-wise slightly stale) to
+confirm the stall still reproduces under identical instrumentation before calling this fully
+closed; and an actual fix (e.g. giving the Wi-Fi source a real scan gap during wardriving, or
+deprioritizing it during a pending BLE reconnect) has not been designed or attempted. See
+[BACKLOG.md](BACKLOG.md) for the open item.
 
 ## 2026-09-11: Wardriving CSV dedup reset on restart fixed (former BACKLOG G29)
 
@@ -1190,13 +1397,12 @@ session was replayed against the physical board.
 
 ## Current project state and handoff
 
-As of 2026-09-08 (commit TBD): Phase 2 (core BLE transport through authenticated runtime
-sessions) is complete, and Phase 3 (production-ready wardriving) is underway. Steps 1 through 7 are
-implemented and hardware-verified, along with the follow-on `wifi_scan` and `ble_scan` capabilities.
-See `docs/SESSION_MEMORY.md` for exactly what's next and any open backlog items, and `docs/PLAN.md`
-for the full roadmap and per-step "done when" criteria.
+This section intentionally does not restate a dated status snapshot — that drifts stale by
+definition (this file logs history; it doesn't track current state) and duplicated one anyway.
+See [SESSION_MEMORY.md](SESSION_MEMORY.md) for current state, [PLAN.md](PLAN.md) for the full
+roadmap and per-step "done when" criteria, and [BACKLOG.md](BACKLOG.md) for the open backlog.
 
-Preserve these constraints going forward:
+Preserve these constraints going forward — these are durable, not date-scoped:
 
 - Keep the pinned Unleashed release/API and ESP-IDF version (`docs/BASELINES.md`).
 - Keep ESP-IDF target `esp32c6` and the verified 4 MB flash configuration unless hardware changes.

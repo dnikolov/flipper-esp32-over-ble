@@ -225,6 +225,118 @@ firmware's own code* is a coordination bug to fix, not a peer condition to give 
 Fixed 2026-09-10, build-, host-test, and hardware-verified (see `docs/PROJECT_HISTORY.md`'s
 "wardriving hardware-verified" entry).
 
+### wardriving-passive-scan-reconnect-stall
+
+2026-09-11 live hardware session: start wardriving, then drop the BLE link (close the Flipper
+FAP or let it disconnect) — the ESP32 never reconnects. Normal disconnects (wardriving not
+running) reconnect within ~10ms; with wardriving's BLE source active, discovery restarted
+every ~500ms for 2+ minutes with zero matches, leaving the link dead until wardriving was
+stopped or the board rebooted.
+
+The initial hypothesis (raised before investigation) was that the Flipper's 128-bit service
+UUID lives in the scan-response PDU, invisible to a passive-only scan. Reading the actual
+Flipper GAP source (`docs/references/flipper-firmware/upstream/targets/f7/ble_glue/gap.c`)
+refuted this directly: `gap_advertise_start()` only calls `hci_le_set_scan_response_data()`
+when `mfg_data_len > 0`, and `flipper/flipper_esp32_over_ble.c` never sets `mfg_data`/
+`mfg_data_len` — so no scan response is ever programmed at all, and the UUID (via
+`set_advertisment_service_uid()`) is baked directly into the primary `ADV_IND` payload passed
+to `aci_gap_set_discoverable()`. A specific, plausible-sounding hypothesis about a peer's wire
+behavior is still a hypothesis until the peer's actual source is read — this is another
+instance of `flipper-facts-must-be-read-not-assumed` above, this time catching a *wrong* guess
+rather than confirming a right one.
+
+The real distinguishing fact: `wardriving_ble_interval_cb()`'s periodic re-arm (and its `start`
+counterpart in `handle_wardriving_command()`) requested **passive** scanning, while the
+dedicated reconnect scan in `start_scan()` — proven to work — has always been active. This
+passive re-arm is also, by design (`docs/PLAN.md`'s "Revised long-run reconnect policy"), the
+*only* scan pass available for reconnect matching whenever wardriving's BLE source owns
+discovery, since `start_scan()` is a deliberate no-op in that state. That merged-reconnect path
+had been flagged as an **untested gap since step 4** ("Accepted gap: the merged reconnect-scan
+behavior was never exercised" — zero disconnects occurred during step 4's synthetic coexistence
+sweep) and carried forward through wardriving's step-9 "done when" bar as an open item; this
+session is the first time it was ever exercised against a real disconnect, and it failed
+outright. Exactly why passive scanning fails here specifically (duty-cycle misalignment with
+the Flipper's advertising cadence, ESP32 BT/Wi-Fi coexistence arbiter deprioritizing passive-only
+RX windows, or something else) was not isolated on this pass — the fix was validated by direct
+observed behavior (active works, passive doesn't), not by a confirmed mechanism, and that gap is
+worth closing with an RF capture if this ever regresses. Fixed by switching both wardriving BLE
+scan configs (`wardriving_ble_interval_cb()` and the `start`-time config) to active scanning,
+matching `start_scan()`; `params.filter_duplicates = 0` was already set on both (independent of
+scan type), so this does not reintroduce the controller-dup-filter scan-stall bug from
+`docs/PROJECT_HISTORY.md`. A documented "accepted gap: never exercised" is a live liability, not
+paperwork — the first real test against it found a real, total-failure bug.
+
+Build-verified 2026-09-11; hardware re-verification of the fix itself is still pending (see
+`docs/SESSION_MEMORY.md`).
+
+**2026-09-11 follow-up: the active-scan fix was flashed and retested live, and it did not
+work.** Same session, same board: wardriving started (both wifi and ble sources — the Flipper
+v1 UI always requests every source the board advertises, no picker), FAP closed
+(`disconnected: reason=531`), then over 70+ seconds and 130+ discovery restarts — every one
+confirmed active (`passive=0` in the "GAP procedure initiated: discovery" log line) — neither
+`found v2 peer, connecting` nor `pairing window closed; not connecting to discovered peer` ever
+logged. Both of those lines are the only two possible outcomes of `BLE_GAP_EVENT_DISC`'s
+top-level `connection_handle == BLE_HS_CONN_HANDLE_NONE && scan_record_matches(...)` branch, so
+neither half of that condition was ever true during the whole run. This refutes the
+active-vs-passive theory outright (the prior entry above already flagged that its mechanism was
+never confirmed, only its outcome — and the outcome itself doesn't hold up under a second,
+harder test).
+
+Static re-investigation this session, by process of elimination:
+
+- `connection_handle` staleness: refuted by reading every write site. It is set only in
+  `BLE_GAP_EVENT_CONNECT` and reset to `BLE_HS_CONN_HANDLE_NONE` unconditionally at the top of
+  `BLE_GAP_EVENT_DISCONNECT`, before any reconnect-policy branching. No stray write found.
+- `scan_record_matches()` logic: identical code path and identical `ble_gap_disc()` params
+  (`passive=0, filter_duplicates=0, itvl=0, window=0`) are used by both the dedicated
+  reconnect scan (`start_scan()`, proven reliable) and wardriving's re-armed scan — the only
+  structural difference is that wardriving repeatedly cancels/restarts a ~100 ms window every
+  ~500 ms instead of running one continuous `BLE_HS_FOREVER` scan. `ble_hs_adv_parse_fields()`
+  itself is stateless per-call and can't behave differently based on scan cadence.
+- EBUSY/never-actually-arming: refuted by reading NimBLE's `ble_gap_disc()`
+  (`components/bt/host/nimble/nimble/nimble/host/src/ble_gap.c`, legacy — not ext-adv — path
+  confirmed live via `sdkconfig`'s `CONFIG_BT_NIMBLE_EXT_ADV` being unset): the "GAP procedure
+  initiated: discovery" log line is emitted *before* the HCI scan-enable command is sent, but
+  `ble_gap_disc()` only returns 0 after `ble_gap_disc_enable_tx()` (which blocks on the HCI
+  command-complete event) succeeds. A logged, successful call is real evidence the controller
+  actually enabled scanning for that window, not just that a host-side call queued cleanly.
+- Advertising/scan phase-alignment: weakened, not ruled out cleanly, by the Flipper's own GAP
+  timing (`docs/references/flipper-firmware/upstream/targets/f7/ble_glue/gap.c`:
+  `FAST_ADV_TIMEOUT` = 30000 ms, 80–100 ms fast-advertising interval for the first 30 s after
+  `profile_start()`/advertising begins, then 1–2.5 s low-power interval after). A 30-second,
+  80–100 ms-interval fast-advertising phase against even a 20%-duty 500 ms scan cadence should
+  produce a near-certain match within the first several windows (P(miss all ~60) is
+  vanishingly small); a persistent zero-match result spanning that phase argues against pure
+  phase-beat bad luck as the sole explanation, though it hasn't been captured on a scope/sniffer
+  to fully close this out.
+
+**Leading, still-unconfirmed suspect: Wi-Fi/BLE radio coexistence starvation.** The Flipper v1
+UI always requests every source the board has — this reproduction almost certainly ran
+wardriving's Wi-Fi source concurrently with its BLE source. `wifi_interval_ms` still defaults
+to 0 (`FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS` in `esp32/main/wardriving_validate.h`) —
+continuous, back-to-back `esp_wifi_scan_start()` with no gap between passes
+(`wifi_scan_done_cb()` re-arms immediately on `WIFI_EVENT_SCAN_DONE`). That header's own comment
+already flagged this exact configuration in 2026-09-10 as "suspected to independently compete
+for the same shared 2.4GHz radio via IDF's coexistence arbiter, but this has not yet been
+isolated/validated" — this session's evidence is consistent with, but does not prove, that
+suspicion: a near-continuous full-channel Wi-Fi active scan monopolizing the coexistence
+arbiter would explain HCI-level scan-enable succeeding on schedule while the BLE radio never
+gets meaningful real receive time, hence zero advertisements from anyone (not just the
+Flipper) ever reaching `gap_event()`'s `BLE_GAP_EVENT_DISC` case. This cannot be confirmed
+from static reading alone — it depends on ESP32-C6 coexistence arbitration behavior, which
+isn't observable from host-side code or logs.
+
+**Not yet done, and the concrete next step before attempting another fix:** rerun the same
+forced-disconnect scenario with wardriving started BLE-source-only (no Wi-Fi source active) and
+see whether the merged reconnect match succeeds. If it does, Wi-Fi coexistence starvation is
+confirmed and the fix is a Wi-Fi-source duty cycle for wardriving (a non-zero
+`wifi_interval_ms` default, not just the BLE side); if reconnect still fails BLE-only, the
+mechanism is inside the windowed-restart discovery cycle itself and needs live temporary
+instrumentation (e.g. a counter of *all* `BLE_GAP_EVENT_DISC` events, from any device, per
+wardriving window) to see whether the BLE radio is receiving anything at all during these
+windows. Do not re-attempt a fix without running this isolation test first — the
+active-vs-passive change already shipped once on an unconfirmed mechanism and didn't work.
+
 ### efficiency-fix-the-constraint-not-the-symptom
 
 The 64-byte Write characteristic means each record costs ~4x the ATT round trips it needs at

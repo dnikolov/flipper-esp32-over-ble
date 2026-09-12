@@ -19,13 +19,13 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/SESSION_MEMORY.md](docs/SESSION_MEMORY.md) | Current state, what's implemented, what's next. **Start here every session.** |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Building, flashing, and pairing the two devices as they work today — scoped to what's actually implemented and hardware-verified. |
 | [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria. |
+| [docs/BACKLOG.md](docs/BACKLOG.md) | The single centralized list of open, actionable items — defects, deferred product decisions, cost/efficiency work. Check before starting anything not already in the current roadmap step. |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why pairing/transport/delivery choices were made, and their accepted tradeoffs. |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The v2 wire contract — CBOR shapes, crypto derivations, UUIDs. Source of truth for both firmwares. |
 | [docs/PAIRING.md](docs/PAIRING.md) | The reset-gated X25519 pairing ceremony, step by step. |
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
 | [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |
-| [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) | Backlog of codebase/agent cost-efficiency splits not yet done (file sizes, read cost). |
 | [docs/STANDALONE_FAP.md](docs/STANDALONE_FAP.md) | What the Flipper external-app ABI can and can't do; feasibility evidence with file citations. |
 | [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) | Dated narrative log of setup/debugging (toolchain repairs, root causes). Reference, don't duplicate. |
 | [docs/hardware/esp32-c6-devkitc-1/README.md](docs/hardware/esp32-c6-devkitc-1/README.md) | Board pinout, strapping pins, USB paths, vendor datasheets. |

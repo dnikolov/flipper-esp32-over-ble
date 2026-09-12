@@ -111,7 +111,7 @@ uint32_t feb_wardriving_backdate_first_seen(
    gets deduplicated. */
 #define FEB_WARDRIVING_DEDUP_CAPACITY 256u
 #define FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB 6
-#define FEB_WARDRIVING_DEDUP_MOVE_METERS 30.0
+#define FEB_WARDRIVING_DEDUP_MOVE_METERS ((double)30.0)
 
 typedef struct {
     uint8_t address[6];

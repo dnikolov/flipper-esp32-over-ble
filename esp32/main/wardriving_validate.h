@@ -42,18 +42,30 @@
    default (or vice versa) without an explicit edit to both.
 
    ble_interval_ms's default was point-4's 30ms (100% BLE observer duty) through
-   2026-09-09; raised to 500ms (~6% duty, window unchanged) on 2026-09-10 after real
+   2026-09-09; raised to 500ms (~6% duty, window unchanged at 30ms) on 2026-09-10 after real
    wardriving traffic on real hardware showed 100% duty starves the active BLE connection
    itself -- the continuous scan-restart cycle left no serviceable airtime for GATT
    traffic, so a `stop` command could never land and the link was torn down locally every
    ~30-40s (see docs/PROJECT_HISTORY.md's "wardriving BLE duty-cycle starvation" entry).
+
+   ble_window_ms's default raised from 30ms to 100ms on 2026-09-10 (same day, second fix):
+   at 500ms interval / 30ms window (~6% duty), a short test run has a real chance of missing
+   every nearby device's advertisement by bad luck -- each burst is followed by 470ms of zero
+   BLE scanning. 100ms window / 500ms interval is ~20% duty, still far below the 100% that
+   caused the starvation above, while giving each burst more than 3x the listen time. Note:
+   step 4's coexistence sweep (docs/PLAN.md) claimed 10%-100% duty "proven stable," but that
+   sweep used a synthetic throwaway harness (esp32/coex_test/) that also completely missed
+   the real starvation bug above under actual authenticated-session traffic -- that old
+   validation is not trustworthy evidence for picking a duty value and was not relied on
+   here; 20% was chosen as a conservative step up from the already-hardware-verified 6%,
+   not because the old sweep endorsed it.
    wifi_interval_ms's default is still point-4's 0 (continuous, no gap) -- WiFi scanning
    was active in that same reproduction and is suspected to independently compete for the
    same shared 2.4GHz radio via IDF's coexistence arbiter, but this has not yet been
    isolated/validated the way step 4 validated the original points; flagged in
    docs/PLAN.md, not yet fixed. */
 #define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 0u
-#define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 30u
+#define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 100u
 #define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 500u
 
 typedef struct {

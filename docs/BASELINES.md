@@ -60,4 +60,8 @@ The fixed-payload BLE transport was verified on the physical ESP32-C6 and Flippe
 - ESP32 received and verified the `FLIPPER-ACK` prefix in the fixed-size notification.
 - After disconnect reason 08, the ESP32 reconnected and the Flipper received the payload again.
 
-ESP32 build and flash passed with hash verification. Known remaining work: ESP32 logs still report that NVS was not initialized before Bluetooth startup, although RF calibration falls back successfully. Pairing, persistence, encryption, CBOR framing, and capabilities remain future roadmap work.
+ESP32 build and flash passed with hash verification. Known remaining work at the time (step 1/2):
+ESP32 logs still reported that NVS was not initialized before Bluetooth startup, although RF
+calibration fell back successfully; pairing, persistence, encryption, CBOR framing, and
+capabilities were still future roadmap work. All of that has since shipped — see
+[docs/SESSION_MEMORY.md](SESSION_MEMORY.md) for current status.
