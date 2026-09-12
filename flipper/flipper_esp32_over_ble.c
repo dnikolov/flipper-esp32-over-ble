@@ -86,6 +86,9 @@ typedef enum {
 typedef enum {
     AppScreenMain,
     AppScreenHome,
+    AppScreenGps,
+    AppScreenSettings,
+    AppScreenAbout,
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
     AppScreenWardriving,
@@ -2952,6 +2955,26 @@ static void home_menu_step(Esp32App* app, int delta) {
     }
 }
 
+static void home_menu_fix_selection(Esp32App* app) {
+    if(!home_menu_visible(app, app->home_menu_index)) {
+        for(int i = 0; i < HomeMenuCount; i++) {
+            if(home_menu_visible(app, (HomeMenuItem)i)) {
+                app->home_menu_index = (HomeMenuItem)i;
+                break;
+            }
+        }
+    }
+}
+
+static void draw_placeholder_screen(Canvas* canvas, const char* title, const char* body) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, title);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 24, body);
+    canvas_draw_str(canvas, 2, 56, "Back: return");
+}
+
 static void draw_home_screen(Canvas* canvas, Esp32App* app) {
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
@@ -2994,7 +3017,20 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
 static void draw_callback(Canvas* canvas, void* context) {
     Esp32App* app = context;
     if(app->screen == AppScreenHome) {
+        home_menu_fix_selection(app);
         draw_home_screen(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenGps) {
+        draw_placeholder_screen(canvas, "GPS", "Simulated/no fix");
+        return;
+    }
+    if(app->screen == AppScreenSettings) {
+        draw_placeholder_screen(canvas, "Settings", "Not yet configured");
+        return;
+    }
+    if(app->screen == AppScreenAbout) {
+        draw_placeholder_screen(canvas, "About", "ESP32 over BLE");
         return;
     }
     if(app->screen == AppScreenWifiScanResults) {
@@ -3342,15 +3378,22 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         }
                         break;
                     case HomeMenuGps:
-                        app.screen = AppScreenMain;
+                        app.screen = AppScreenGps;
                         break;
                     case HomeMenuSettings:
+                        app.screen = AppScreenSettings;
+                        break;
                     case HomeMenuAbout:
-                        app.screen = AppScreenMain;
+                        app.screen = AppScreenAbout;
                         break;
                     default:
                         break;
                     }
+                }
+            } else if(app.screen == AppScreenGps || app.screen == AppScreenSettings ||
+                      app.screen == AppScreenAbout) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenHome;
                 }
             } else if(app.screen == AppScreenWifiScanResults) {
                 if(event.input.key == InputKeyBack) {
