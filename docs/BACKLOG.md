@@ -69,7 +69,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G16 | Factory reset doesn't zeroize in-RAM `stored_pairing_secret` before `esp_restart()` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G18 | Flipper X25519 donna static ladder scratch (~3-4 KB) never zeroized, resident for the app's lifetime | Open |
 | G19 | Reconnect still `xTaskCreate(..., 3072)` just to sleep once, every ~30s during a prolonged outage | Open |
-| G20 | `notify_data_callback`'s NULL-context path sets `*data_len = PAYLOAD_MAX` instead of `0` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
+| G20 | `notify_data_callback`'s NULL-context path sets `*data_len = PAYLOAD_MAX` instead of `0` | **Not a bug — the suggested fix was wrong and broke runtime auth.** Reverted 2026-09-12; see PROJECT_HISTORY.md. |
 | G21 | Pairing/capability/CSV path buffers sized at 96 bytes, one constant short of the real max (~137) | Open |
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
 | G24 | ESP32 built with `-Og`, not `-Os` | **Product choice, not a bug** — record in BASELINES.md if changed |
@@ -93,11 +93,25 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   off on every future capability. Hold until a natural roadmap boundary; decide the
   static-buffer-arena question first (see
   [LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety](LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety)).
-- **BLE active scanning**: enabled for `ble_scan` 2026-09-11 (`e92aad9`). Still open: a runtime
-  on/off toggle, extending it to `wardriving`'s own capture engine, and measuring the real-world
-  name-discovery improvement once hardware-tested.
+- **BLE active scanning**: enabled for `ble_scan` 2026-09-11 (`e92aad9`), and confirmed
+  2026-09-12 to already be hardcoded on for `wardriving`'s own capture engine too — all four
+  `ble_gap_disc()` call sites in `esp32/main/main.c` set `passive=0` (the "extending it to
+  wardriving's own capture engine" item once tracked here is done, not open). Still open: a
+  **runtime active/passive toggle** (nothing today can request passive scanning — a
+  prerequisite for [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s "Scan" menu's two passive modes),
+  and measuring the real-world name-discovery improvement once hardware-tested.
 - Do **not** split `flipper/pairing_crypto.c` (kept diffable against upstream curve25519-donna
   for auditability) or `tests/vectors/vectors.h` (98KB, generated — never `Read` it whole).
+- `tests/flipper/build.ps1` fails out-of-the-box on a machine where Visual Studio's
+  `vcvars64.bat` shells out to `vswhere.exe` by bare name and the VS Installer directory isn't
+  already on `PATH` (surfaced 2026-09-12 while verifying the LED-indicator feature). Needs a
+  one-line `PATH` prepend in that script; not yet fixed.
+- **No canonical, agent-usable build/flash scripts for either platform** — ✅ done 2026-09-12, see
+  PROJECT_HISTORY.md. `tools/build_esp32.ps1` (extended: build, plus optional `-Port`,
+  `-SkipBuild`, `-CaptureBootLog`/`-CaptureSeconds`), `tools/build_flipper.ps1` (new: syncs into
+  the pinned Unleashed checkout's `applications_user/` and builds, optional `-Port` to also
+  transfer), and `tools/flash_flipper.ps1` (new: transfers a built FAP to the Flipper's SD card
+  via `runfap.py`, never auto-launches) are the canonical entry points now.
 
 ## Other open items (not covered by the cross-model review)
 
@@ -122,6 +136,17 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   powering a board off (step 7 scope).
 - Automatic BLE arbitration between multiple paired boards — gated on an unresolved BLE-HAL
   question: can the Flipper's peripheral role advertise while already connected?
+- **Implement real GPS support** — swap `esp32/main/location.c`'s fixed-coordinate stub for a
+  real UART-based NMEA-0183 driver reading the GY-NEO6MV2/NEO-6M module, behind the existing
+  `location_init()`/`location_get_fix()` interface in `location.h` (see PLAN.md's "GPS-stub
+  reorder" for why that interface exists — callers in `wardriving_log.c` etc. should need no
+  changes). Confirmed-working settings from the `esp32/gps_antenna_test/` smoke test
+  (2026-09-12, hardware-verified via `tools/test_gps_antenna.ps1`): UART1, 9600 baud 8N1, no
+  flow control, RX=GPIO18, TX=GPIO19 (ESP32 side), and **RX-only** — send nothing to the
+  module; an earlier wake/cold-start command burst was proven unnecessary and actively
+  harmful (it forced the receiver to re-acquire on every reconnect). Parse `$..GGA` sentences
+  for fix quality/satellite count/HDOP/lat-lon the same way the smoke test's log parsing does.
+  Prerequisite for the two items directly below.
 - GPS backfill-to-first-fix as a Flipper-settable option, instead of discarding every
   pre-fix wardriving result outright (step 7/GPS capability).
 - **Replace the CSV `FirstSeen` backdating approximation with a real timestamp once GPS lands.**
@@ -138,7 +163,9 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
   single-`ViewPort`/`AppEvent`-queue pattern every screen has been bolted onto. Structural,
-  no deadline.
+  no deadline. **Promoted to a hard prerequisite by [docs/UI_REDESIGN.md](UI_REDESIGN.md)**
+  (2026-09-12 design pass) — that design's menu-driven navigation cannot be built on today's
+  flat event-queue pattern.
 - **Consolidating/grouping wardriving records on the Flipper side** (e.g. de-duplicating or
   rolling up repeated/nearby sightings for display, as distinct from the ESP32-side capture-time
   dedup that already exists). Not scoped yet — needs its own planning/grill-me session before

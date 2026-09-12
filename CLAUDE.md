@@ -25,6 +25,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/PAIRING.md](docs/PAIRING.md) | The reset-gated X25519 pairing ceremony, step by step. |
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
+| [docs/UI_REDESIGN.md](docs/UI_REDESIGN.md) | Design-only Flipper FAP menu/navigation overhaul (Home/Menu/Scan/GPS/Settings/About) — no phase assigned yet, no code written against it. |
 | [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |
 | [docs/STANDALONE_FAP.md](docs/STANDALONE_FAP.md) | What the Flipper external-app ABI can and can't do; feasibility evidence with file citations. |
 | [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) | Dated narrative log of setup/debugging (toolchain repairs, root causes). Reference, don't duplicate. |

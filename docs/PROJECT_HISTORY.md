@@ -1543,6 +1543,138 @@ Verified: `idf.py build` clean; `fbt.cmd fap_flipper_esp32_over_ble` clean (1068
 shared-header prototypes changed). Not hardware-verified — no physical board was flashed or
 exercised for this pass. No on-screen text changed, so no USER_GUIDE.md sync was needed.
 
+## 2026-09-12: Connection/flush LED indicators added to both firmwares
+
+New feature (user request), not a backlog item: both boards now give a visual signal for BLE
+connection state, instead of no indicator at all.
+
+ESP32 side (new module `esp32/main/status_led.c`/`.h`, driving the onboard WS2812 on GPIO8):
+
+- **Blinking blue** while connecting — scanning for the Flipper, or physically BLE-connected
+  but not yet authenticated. This is also what shows throughout a fresh pairing ceremony, since
+  that never reaches the authenticated state (the ESP32 intentionally disconnects right after
+  `pair_complete` and only re-authenticates on its next boot).
+- **Solid blue** once `RUNTIME_AUTH_STATE_AUTHENTICATED` (`TX_DONE_RUNTIME_AUTHENTICATED`).
+- **Solid green** while a wardriving backlog batch is actively draining
+  (`wardriving_tx_in_flight`), restoring to solid blue once a batch finishes with nothing left
+  pending.
+- The previously-existing factory-reset BOOT-hold gesture (dim red blink,
+  `esp32/main/factory_reset.c`) needed to keep working on the same physical LED/RMT channel, so
+  its low-level WS2812 driver (RMT channel/encoder setup, timing tables, GRB byte order) was
+  moved out of `factory_reset.c` into the new shared `status_led.c` module, exposed as
+  `feb_ws2812_set()`. The factory-reset gesture now calls `feb_status_led_factory_reset_begin()`
+  when BOOT is first held (suppressing the status LED's own redraws so the two don't fight over
+  the shared hardware) and `feb_status_led_factory_reset_end()` on an early-release cancel
+  (restoring whatever the real connection-status state actually is, instead of the previous
+  behavior of just turning the LED off). A confirmed reset still turns the LED off directly
+  before `esp_restart()`, with no restore needed since the device reboots.
+- The `factory_reset_active` suppression flag is a plain bool shared between the NimBLE host
+  task and the factory-reset task — an accepted cosmetic-only cross-thread flag, same tier as
+  this project's other known (tracked, not blocking) cross-thread races; not worth a mutex for a
+  single LED refresh.
+
+Flipper side (`flipper/flipper_esp32_over_ble.c`): blinking-blue/solid-blue already existed
+(`sequence_blink_start_blue` while waiting, `sequence_set_only_blue_255` once
+`PairingPhaseSessionActive`) and were untouched. Added solid green while `handle_wardriving_status()`
+is processing a `"data"` batch, restoring to solid blue once `result.backlog_remaining == 0`.
+The `wardriving_flush_led_active` guard flag ended up declared once, next to
+`session_reset_state()` rather than next to the other wardriving statics as originally sketched
+— `session_reset_state()` (which clears the flag) is defined earlier in the file than the
+wardriving-statics block, and this build's `-Werror=redundant-decls` rejects a forward-declare-
+then-redeclare split, so a single declaration at the earlier site was used instead, with a
+pointer comment left at the wardriving-statics block.
+
+Verified: `idf.py build` clean; all 5 `tests/esp32/build*.ps1` host suites pass; `fbt.cmd
+fap_flipper_esp32_over_ble` clean (107096-byte FAP); Flipper host codec tests (481/481 checks)
+pass, though — like the ESP32 host suites — they don't exercise this feature directly (RMT/GPIO
+and live BLE/notification state aren't covered by the existing host harness; build + code review
+is the verification tier for host-side checks).
+
+**Hardware-found-and-fixed bug (same day, before this feature was committed):** an initial
+hardware flash (by a peer session sharing this working directory) broke ESP32 runtime auth.
+Root cause: `feb_status_led_tick()` — called from `reassembly_timeout_cb()`, which runs on
+NimBLE's own host event queue — drove the LED via what was then a *blocking* `feb_ws2812_set()`
+(it called `rmt_tx_wait_all_done(led_channel, pdMS_TO_TICKS(50))` after every transmit, a leftover
+from when the only caller was `factory_reset.c`'s own dedicated task, where blocking was
+harmless). That block stalled the shared NimBLE host queue long enough to delay handshake
+processing and fail runtime auth. Fix: `feb_ws2812_set()` in `esp32/main/status_led.c` is now
+fire-and-forget (no wait call) — safe because the RMT channel's `trans_queue_depth = 4` lets a
+new transmit queue behind one still in flight. Reflashed and confirmed: no more RMT
+flush-timeout errors, handshake proceeds past `hello`. Full LED visual behavior (blink timing,
+factory-reset cancel handoff, flush-state colors) is still not exhaustively confirmed on
+hardware — only that this fix stopped it from breaking auth.
+
+Tooling note (not fixed, flagged for later): `tests/flipper/build.ps1` fails out-of-the-box in
+an environment where Visual Studio's `vcvars64.bat` shells out to `vswhere.exe` by bare name and
+the VS Installer directory isn't already on `PATH` — a pre-existing script fragility unrelated to
+this change, surfaced while verifying it.
+
+## 2026-09-12: G20 regression found and reverted; hello_ack was never reaching the ESP32
+
+Follow-on to the LED-indicator entry above: after that RMT-blocking fix, ESP32 runtime auth
+still failed — the Flipper alternated between "Authenticating" and "Waiting for ESP32", LEDs
+blinking on both sides. Live serial captures on both COM8 (Flipper CLI `log`) and COM9 (ESP32
+`idf.py monitor`) during a real connect attempt showed the Flipper's own `[GattChar]` log
+repeating `Failed updating Notify characteristic: 146` immediately after every `hello` arrived,
+then the ESP32 timing out 5s later waiting for `hello_ack` and disconnecting/retrying with
+backoff.
+
+**Root cause:** `146` (`0x92`) is `BLE_STATUS_INVALID_PARAMS`
+(`lib/stm32wb_copro/wpan/ble/core/ble_defs.h` in the pinned Unleashed checkout). Furi's
+`ble_gatt_characteristic_init()` (`targets/f7/ble_glue/furi_ble/gatt.c`) registers a
+`FlipperGattCharacteristicDataCallback` characteristic's *maximum* attribute length by calling
+its data callback once at registration time with `context = NULL` (no real fragment exists yet)
+and reading back `*data_len`. This project's `notify_data_callback()` in
+`flipper/flipper_esp32_over_ble.c` treats `context == NULL` as its only signal to distinguish
+that registration-time probe from a real send — but this morning's G20 "fix" (commit `171640d`,
+applied without hardware verification) changed that branch to report `*data_len = 0` instead of
+`PAYLOAD_MAX`, on the assumption the NULL-context path only ever meant "sending with no data."
+It doesn't: in this codebase, real sends always pass a non-NULL `&notify_fragment` context, so
+the NULL-context branch is *exclusively* the init-time size probe. Reporting 0 there registered
+the Notify characteristic's max value length as 0 bytes, so every real notify since (including
+`hello_ack`, wardriving/wifi_scan/ble_scan results, everything) was silently rejected by the BLE
+stack — `emit_fragment()` never checks `ble_gatt_characteristic_update()`'s return value, so the
+failure was invisible to the app.
+
+**Fix:** reverted `notify_data_callback`'s NULL-context branch back to `*data_len = PAYLOAD_MAX`
+(its original, working value), with a comment explaining the dual-purpose call so it doesn't get
+"fixed" the same way again. G20's original finding is not a bug — BACKLOG.md corrected.
+
+Verified: `fbt.cmd fap_flipper_esp32_over_ble` clean; confirmed via live Flipper CLI log that the
+specific "Failed updating Notify characteristic: 146" pattern was the mechanism, tracing the ACI
+status code and the init-time-probe call path directly in the pinned Unleashed firmware source
+(`targets/f7/ble_glue/furi_ble/gatt.c`, `lib/stm32wb_copro/wpan/ble/core/ble_defs.h`).
+**Hardware-confirmed** — the user transferred the corrected FAP to the physical Flipper,
+restarted, and relaunched; runtime auth now completes successfully end to end.
+
+## 2026-09-12: Canonical build/flash scripts added for both platforms (BACKLOG cost-efficiency item)
+
+Both boards' build/flash tooling had been ad hoc: agents repeatedly re-derived ESP-IDF's
+Git-Bash/MSYS incompatibility from scratch (one agent burned six near-duplicate throwaway Python
+scripts reaching a working `idf.py` invocation), and the Flipper FAP's actual SD-card transfer
+method (`scripts/runfap.py` in the pinned Unleashed checkout) wasn't documented anywhere an agent
+would find it, causing a second agent to assume the SD card mounts as a USB drive and stall.
+
+Added/extended three scripts under `tools/`, each tested this session (real build runs; the
+flash script's argument validation and control flow were verified, though a live hardware
+transfer wasn't re-run at delivery time to avoid interrupting the user's own in-progress manual
+transfer):
+
+- **`tools/build_esp32.ps1`** (extended, backward-compatible — no-args behavior unchanged): added
+  `-Port` (flash after build), `-SkipBuild` (flash-only), `-CaptureBootLog`/`-CaptureSeconds`
+  (non-interactive boot-log capture via the existing `ESP_IDF_MONITOR_TEST=1` workaround).
+- **`tools/build_flipper.ps1`** (new): mirrors `flipper/` into the pinned checkout's
+  `applications_user/<AppName>` via `robocopy /MIR`, runs `fbt.cmd fap_<AppName>`, reports the
+  artifact path/size; optional `-Port` chains into the flash script below.
+- **`tools/flash_flipper.ps1`** (new): transfers a built FAP to the Flipper's SD card via
+  `scripts/runfap.py` in the pinned checkout (the real transfer mechanism — the SD card is not a
+  mounted mass-storage drive); deliberately never auto-launches (see this session's transient
+  "not enough memory" preload error on auto-launch).
+
+All three still prompt for approval like any other script in `tools/`/`tests/` (no changes to
+`.claude/settings.json`); a user or agent can pre-approve them the same way `tools/build_esp32.ps1`
+was already pre-approved.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

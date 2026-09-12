@@ -234,11 +234,20 @@ typedef struct {
 
 /* ble_gatt_characteristic_update()'s Fixed-data path always sends data.fixed.length bytes
    regardless of the source buffer's real size; a Callback characteristic is required here
-   so each notification carries exactly the fragment's own length over the air. */
+   so each notification carries exactly the fragment's own length over the air.
+
+   context == NULL is not a "sending with no data" case: it's ble_gatt_characteristic_init()
+   itself (targets/f7/ble_glue/furi_ble/gatt.c) probing this characteristic's maximum size at
+   registration time, via this same callback with data=NULL. Reporting anything less than
+   PAYLOAD_MAX here registers the Notify characteristic's max attribute length too small,
+   and aci_gatt_update_char_value() then rejects every real notify (BLE_STATUS_INVALID_PARAMS,
+   0x92) whose fragment exceeds that registered max -- silently breaking hello_ack and every
+   other outbound notification. (Regressed 2026-09-12 by an unverified "fix" for G20 that
+   assumed this NULL-context path only mattered for real sends.) */
 static bool notify_data_callback(const void* context, const uint8_t** data, uint16_t* data_len) {
     if(context == NULL) {
         if(data) *data = NULL;
-        if(data_len) *data_len = 0;
+        if(data_len) *data_len = PAYLOAD_MAX;
         return false;
     }
     const NotifyFragment* fragment = context;
@@ -1099,6 +1108,14 @@ typedef struct {
 static BleScanDeviceDisplay ble_scan_devices[BLE_SCAN_MAX_DISPLAY_DEVICES];
 static size_t ble_scan_device_count;
 
+/* Solid-green-while-flushing / solid-blue-when-idle LED indicator for an active wardriving
+   backlog flush (docs/PROTOCOL.md's backlog_remaining semantics) -- see
+   handle_wardriving_status()'s "data" branch, further below, for both transition points.
+   Declared here (rather than grouped with the other wardriving-status statics further down,
+   next to wardriving_csv_write_failed) because session_reset_state(), which must clear it,
+   is defined earlier in this file than that group. */
+static bool wardriving_flush_led_active;
+
 static void session_reset_state(void) {
     session_stage = SessionStageNone;
     feb_secure_zero(session_board_id, sizeof(session_board_id));
@@ -1112,6 +1129,7 @@ static void session_reset_state(void) {
     feb_secure_zero(session_key, sizeof(session_key));
     session_seq_out = 0;
     session_seq_in = 0;
+    wardriving_flush_led_active = false;
 }
 
 /* docs/PROTOCOL.md's "Runtime auth failure handling": unknown_board replies use the
@@ -1643,6 +1661,11 @@ static uint64_t wardriving_csv_anchor_timestamp_ms;
 static uint32_t wardriving_csv_anchor_unix_time;
 static uint32_t wardriving_csv_records_since_sync;
 static bool wardriving_csv_write_failed;
+/* wardriving_flush_led_active (the solid-green-while-flushing / solid-blue-when-idle LED
+   indicator for an active wardriving backlog flush, docs/PROTOCOL.md's backlog_remaining
+   semantics) is declared earlier in this file, next to session_reset_state() which must
+   clear it -- see handle_wardriving_status()'s "data" branch, further below, for both
+   transition points. */
 
 /* Same BLE-thread-only, single-owner lifetime as the fields above (see wardriving_csv_file's
    own declaration comment) -- see wardriving_csv.h's feb_wardriving_dedup_should_write() for
@@ -1837,6 +1860,11 @@ static void
         return;
     }
 
+    if(!wardriving_flush_led_active && app->notifications) {
+        notification_message(app->notifications, &sequence_set_only_green_255);
+        wardriving_flush_led_active = true;
+    }
+
     bool last_is_ble = false;
     static char last_summary[40];
     last_summary[0] = '\0';
@@ -1881,6 +1909,11 @@ static void
 
     post_wardriving_batch(
         app, (uint32_t)result.record_count, result.backlog_remaining, last_is_ble, last_summary);
+
+    if(wardriving_flush_led_active && result.backlog_remaining == 0 && app->notifications) {
+        notification_message(app->notifications, &sequence_set_only_blue_255);
+        wardriving_flush_led_active = false;
+    }
 }
 
 /* Protected-record `error` (post-session-establishment shape, docs/PROTOCOL.md "Runtime

@@ -7,3 +7,4 @@
 "2026-09-09 09:32:33","antenna-name","60","0","0",,"False",,,"[antenna-name] 60s listen: NO FIX (best: 0 satellites)"
 "2026-09-09 09:35:19","antenna-name","60","0","0",,"False",,,"[antenna-name] 60s listen: NO FIX (best: 0 satellites)"
 "2026-09-09 09:37:41","antenna-name","60","0","0",,"False",,,"[antenna-name] 60s listen: NO FIX (best: 0 satellites)"
+"2026-09-12 12:07:42","your-label","60","9","1","2.1","True","42,70498","27,713326","[your-label] 60s listen: FIX ACQUIRED -- lat=42.70498 lon=27.713326 (9 sats, HDOP 2.1)"

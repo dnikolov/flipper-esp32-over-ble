@@ -445,6 +445,25 @@ change: update the ESP32's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` in the same breath, 
 it at all. Any Flipper-side value the peer must know is a shared contract even when it doesn't
 live in `framing.h`.
 
+### notify-callback-null-context-has-two-meanings
+
+`ble_gatt_characteristic_init()` (`targets/f7/ble_glue/furi_ble/gatt.c`) calls a
+`FlipperGattCharacteristicDataCallback` characteristic's data-callback function for two
+unrelated reasons: once at registration time, with `context = NULL` and `data = NULL`, purely
+to read back `*data_len` as the characteristic's max attribute length to register with the BLE
+stack; and again at every real send (`ble_gatt_characteristic_update()`), with whatever
+`context` the caller passed via `source` (never NULL in this app's own usage, since
+`emit_fragment()` always passes `&notify_fragment`). A one-line "fix" (this project's G20,
+commit `171640d`) assumed `context == NULL` only ever meant "no real data for this send" and
+made that branch report `*data_len = 0` — silently registering the Notify characteristic's max
+length as 0 bytes and breaking `aci_gatt_update_char_value()` for every future notify
+(`BLE_STATUS_INVALID_PARAMS`, `0x92` = 146), including `hello_ack`, invisibly (the app never
+checks `ble_gatt_characteristic_update()`'s return value). Reverted 2026-09-12 — see
+`docs/PROJECT_HISTORY.md`. When a `DataCallback` characteristic's callback is touched, the
+NULL-context branch's return value must stay the characteristic's true max size, not a "no
+data" sentinel — a callback invoked from two different call sites for two different reasons
+needs a real signal to distinguish them, not an overloaded NULL check.
+
 ### ui-must-derive-from-real-state
 
 The second status line was hardcoded `"No saved pairing"` — a claim that could never become

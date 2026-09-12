@@ -86,6 +86,28 @@ factory MAC address), so pairing a second ESP32 later won't disturb a pairing yo
 have for a different one — this was specifically verified on real hardware, not just
 assumed from the design.
 
+## LED status indicators
+
+**Hardware-verification status:** the LED state transitions described below are implemented
+and pass host-native tests, but have not yet been exercised on real hardware — they document
+the behavior you will see in the current code, not a confirmed-on-hardware guarantee.
+
+The onboard LED on each device provides visual feedback about the connection and session state:
+
+**Flipper (built-in notification LED):**
+- **Blinking blue** — waiting for the ESP32 to connect, or advertising for pairing.
+- **Solid blue** — a runtime session is authenticated and active.
+- **Solid green** — a wardriving backlog batch is being received from the ESP32; returns to solid blue once complete.
+
+**ESP32 (onboard WS2812 RGB LED on GPIO8):**
+- **Blinking blue** (or **blinking purple** if a wardriving session is active) — connecting: scanning for the Flipper, physically BLE-connected but not yet
+  authenticated, or running the pairing ceremony (the ESP32 disconnects after pairing completes
+  and only re-authenticates on its next boot).
+- **Solid blue** (or **solid purple** if a wardriving session is active) — a runtime session is authenticated and active.
+- **Solid green** — a wardriving backlog batch is actively being sent to the Flipper; returns to solid blue (or solid purple if a wardriving session is active) once complete.
+- **Dim red blink** (BOOT-button factory-reset only) — released early to cancel the reset; the LED then
+  returns to the actual connection state (blinking/solid blue, blinking/solid purple, or solid green) instead of turning off.
+
 ## Idle-connection behavior during an active session
 
 Once `ESP32 session active` (solid blue LED) is established, if 30 seconds pass with no traffic, the ESP32 automatically disconnects and rescans. Upon reconnection, it runs the runtime-auth handshake again — fully automatic, no user action. The Flipper may briefly leave `ESP32 session active` and return, though the board identity and capability line cached in step 7 will persist through these reconnections. Since capability commands now exist (wifi_scan is implemented; see below), this 30-second idle-reconnect cycle repeats indefinitely while both devices are powered and in range unless you actively trigger a scan. This is expected behavior, not a malfunction — just something to know if watching the LED or logs.

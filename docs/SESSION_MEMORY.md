@@ -82,6 +82,10 @@ implemented, and debugged — including every bug's root cause — see
   flashed 2026-09-10, **pending the user's own manual SD-card check**.
 - **BLE active scanning** in `ble_scan` (2026-09-11, `e92aad9`): build-verified, not yet
   hardware-tested.
+- **Connection/flush LED indicators (both firmwares)**: ✅ done and hardware-confirmed
+  2026-09-12, including two real regressions found+fixed along the way (a BLE-host-queue-
+  blocking LED tick, and an unrelated G20 "fix" that had broken every outbound notify). See
+  PROJECT_HISTORY.md's two matching 2026-09-12 entries.
 
 For everything else — deferred fixes, known bugs not yet scheduled, disputed-severity items, and
 cost/efficiency work — see the single consolidated list in [BACKLOG.md](BACKLOG.md). Add
@@ -99,10 +103,11 @@ before — see `CLAUDE.md`'s conventions).
   sessions, not guaranteed stable across reboots.
 - Check for concurrent peer Claude Code sessions on this repo before touching hardware (this
   project frequently has several running at once).
-- Any `scripts/*.py`/`esptool` call with a Flipper path argument starting with `/` must run from
-  PowerShell, not Git-Bash (MSYS path translation mangles the leading slash).
-- `idf.py`/ESP-IDF's `export.ps1` refuses to run if `MSYSTEM` is set in the environment (Git-Bash
-  sets it; clear it first if shelling out from a POSIX context).
+- Use the canonical scripts for build/flash instead of re-deriving environment setup:
+  `tools/build_esp32.ps1` (build, optional `-Port`/`-SkipBuild`/`-CaptureBootLog`),
+  `tools/build_flipper.ps1` (build, optional `-Port` to also transfer), `tools/flash_flipper.ps1`
+  (transfer a built FAP to the Flipper's SD card via `runfap.py`). They already handle the
+  Git-Bash/MSYS `export.ps1` pitfall and the Flipper's real (non-mass-storage) transfer method.
 - Delegate mechanical doc sync (e.g. `docs/USER_GUIDE.md` updates) and known-procedure hardware
   flash/verify passes to the cheapest capable model (Haiku), per this project's own convention.
 - This project has hit the same `BleEventWorker`/task-stack-overflow bug class repeatedly (steps

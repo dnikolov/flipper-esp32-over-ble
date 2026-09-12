@@ -30,6 +30,7 @@
 #include "pairing_crypto.h"
 #include "session.h"
 #include "session_crypto.h"
+#include "status_led.h"
 #include "wardriving_log.h"
 #include "wardriving_record_format.h"
 #include "wardriving_validate.h"
@@ -1827,6 +1828,11 @@ static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
     ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
 }
 
+static void wardriving_sync_status_led(void)
+{
+    feb_status_led_set_wardriving_active(wardriving_wifi_active || wardriving_ble_active);
+}
+
 /* Stops whichever wardriving source(s) are active and, if connected+authenticated, sends
    the docs/PROTOCOL.md-specified unsolicited error + status(state="stopped") pair (request_id
    0, the same "ESP32-initiated, not a reply to a specific command" sentinel used for
@@ -1867,6 +1873,7 @@ static void wardriving_self_stop(const char *error_code)
             }
         }
     }
+    wardriving_sync_status_led();
     if (!was_active) {
         return;
     }
@@ -1912,6 +1919,7 @@ static void wardriving_maybe_kick_send(uint16_t conn_handle)
         return;
     }
     wardriving_tx_in_flight = true;
+    feb_status_led_set(FEB_STATUS_LED_FLUSHING);
     wardriving_send_next_batch(conn_handle);
 }
 
@@ -1961,6 +1969,7 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
                                                peek_scratch, sizeof(peek_scratch));
     if (peeked_count == 0) {
         wardriving_tx_in_flight = false;
+        feb_status_led_set(FEB_STATUS_LED_CONNECTED);
         return;
     }
 
@@ -2134,6 +2143,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
                 }
             }
         }
+        wardriving_sync_status_led();
 
         {
             feb_status_payload_t status_payload = {0};
@@ -2264,6 +2274,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
             return;
         }
         wardriving_wifi_active = true;
+        wardriving_sync_status_led();
     }
 
     if (want_ble) {
@@ -2293,6 +2304,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
                 wardriving_wifi_active = false;
                 wifi_scan_in_progress = false;
                 esp_wifi_scan_stop();
+                wardriving_sync_status_led();
             }
             if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"), 1, cmd->request_id)) {
                 ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -2301,6 +2313,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         }
         ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
         wardriving_ble_active = true;
+        wardriving_sync_status_led();
     }
 
     {
@@ -2707,6 +2720,7 @@ static int write_complete(uint16_t conn_handle,
         rt_tx_sequence = 1;
         rt_rx_sequence = 1;
         ESP_LOGI(TAG, "client_auth sent; runtime session authenticated");
+        feb_status_led_set(FEB_STATUS_LED_CONNECTED);
         /* docs/PROTOCOL.md "Unsolicited backlog drain": on every authenticated session
            establishment, if the flash log holds buffered records, start draining them now
            without waiting for a `command`. */
@@ -2819,6 +2833,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         negotiated_att_mtu = 23;
         pairing_state = PAIRING_STATE_IDLE;
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
+        feb_status_led_set(FEB_STATUS_LED_CONNECTING);
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
         hello_ack_start_ms = 0;
         pair_reply_wait_start_ms = 0;
@@ -2852,6 +2867,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         notify_cccd_handle = 0;
         pairing_state = PAIRING_STATE_IDLE;
         runtime_auth_state = RUNTIME_AUTH_STATE_IDLE;
+        feb_status_led_set(FEB_STATUS_LED_CONNECTING);
         hello_ack_start_ms = 0;
         pair_reply_wait_start_ms = 0;
         pending_disconnect_reason = DISCONNECT_REASON_NORMAL;
@@ -3165,6 +3181,7 @@ static void reassembly_timeout_cb(struct ble_npl_event *ev)
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     (void)ev;
+    feb_status_led_tick();
     if (feb_reassembly_check_timeout(&rx_reassembly, now_ms) == FEB_FRAME_TIMEOUT) {
         ESP_LOGW(TAG, "rx reassembly timed out; discarding partial message");
     }
@@ -3252,6 +3269,7 @@ void app_main(void)
         return;
     }
 
+    feb_status_led_init();
     feb_factory_reset_start();
 
     location_init();
