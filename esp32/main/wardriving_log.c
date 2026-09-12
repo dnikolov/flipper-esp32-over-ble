@@ -123,6 +123,33 @@ static bool wd_try_read_valid_record(size_t sector, size_t offset, wd_record_hea
     return true;
 }
 
+static void wd_clear_undrained_record(size_t sector, size_t offset, size_t payload_len)
+{
+    uint8_t flag_byte = (uint8_t)(0xFFu & ~WD_RECORD_FLAG_UNDRAINED);
+
+    if (!wd_write(sector, offset + 6u, &flag_byte, 1u)) {
+        ESP_LOGW(TAG, "failed to clear stale record flag at sector %u offset %u; leaving it pending",
+                 (unsigned)sector, (unsigned)offset);
+        return;
+    }
+    if (wd_undrained_in_sector[sector] > 0u) {
+        wd_undrained_in_sector[sector]--;
+    }
+    if (wd_pending_count > 0u) {
+        wd_pending_count--;
+    }
+    if (wd_oldest_sector == sector && wd_oldest_offset == offset) {
+        size_t next_offset = offset + wd_record_on_flash_size(payload_len);
+
+        if (next_offset >= WD_SECTOR_SIZE) {
+            wd_oldest_sector = (sector + 1u) % wd_sector_count;
+            wd_oldest_offset = WD_SECTOR_HEADER_SIZE;
+        } else {
+            wd_oldest_offset = next_offset;
+        }
+    }
+}
+
 static bool wd_roll_to_next_sector(void)
 {
     size_t next_sector = (wd_active_sector + 1u) % wd_sector_count;
@@ -290,9 +317,22 @@ void wardriving_log_init(void)
         for (i = 0; i < occupied_total; i++) {
             size_t offset = WD_SECTOR_HEADER_SIZE;
             wd_record_header_t parsed;
+            uint8_t payload_buf[WD_RECORD_MAX_PAYLOAD];
 
-            while (wd_try_read_valid_record(sector, offset, &parsed, NULL)) {
+            while (wd_try_read_valid_record(sector, offset, &parsed, payload_buf)) {
                 if (parsed.undrained) {
+                    feb_wardriving_record_t record = {0};
+                    feb_cbor_status_t decode_status = FEB_CBOR_OK;
+
+                    if (feb_cbor_decode_wardriving_record(payload_buf, parsed.payload_len,
+                                                         &record, &decode_status) == 0) {
+                        ESP_LOGW(TAG,
+                                 "wardriving log: stored record at sector %u offset %u failed to decode during resume (status %d); discarding stale record",
+                                 (unsigned)sector, (unsigned)offset, (int)decode_status);
+                        wd_clear_undrained_record(sector, offset, parsed.payload_len);
+                        offset += wd_record_on_flash_size(parsed.payload_len);
+                        continue;
+                    }
                     wd_undrained_in_sector[sector]++;
                     wd_pending_count++;
                     if (!found_oldest_undrained) {
@@ -424,8 +464,10 @@ size_t wardriving_log_peek_pending(feb_wardriving_record_t *out, size_t max_reco
             break; /* shouldn't happen (just validated above); stop rather than trust dest */
         }
         if (feb_cbor_decode_wardriving_record(dest, parsed.payload_len, &out[produced], &decode_status) == 0) {
-            ESP_LOGW(TAG, "wardriving log: stored record failed to decode (status %d); skipping",
-                     (int)decode_status);
+            ESP_LOGW(TAG,
+                     "wardriving log: stored record at sector %u offset %u failed to decode (status %d); discarding stale record",
+                     (unsigned)sector, (unsigned)offset, (int)decode_status);
+            wd_clear_undrained_record(sector, offset, parsed.payload_len);
             offset += wd_record_on_flash_size(parsed.payload_len);
             continue;
         }
