@@ -85,10 +85,20 @@ typedef enum {
    in a dedicated scrollable view, distinct from the fixed-layout main status screen. */
 typedef enum {
     AppScreenMain,
+    AppScreenHome,
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
     AppScreenWardriving,
 } AppScreen;
+
+typedef enum {
+    HomeMenuWardriving = 0,
+    HomeMenuScan,
+    HomeMenuGps,
+    HomeMenuSettings,
+    HomeMenuAbout,
+    HomeMenuCount,
+} HomeMenuItem;
 
 typedef enum {
     AppEventInput,
@@ -181,6 +191,7 @@ typedef struct {
     char capability_features[CAPABILITY_FEATURES_MAX_LEN];
     bool capability_has_wifi_scan;
     AppScreen screen;
+    HomeMenuItem home_menu_index;
     bool wifi_scan_in_progress;
     bool wifi_scan_complete;
     size_t wifi_scan_scroll_offset;
@@ -2910,8 +2921,82 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, 56, footer);
 }
 
+static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
+    switch(item) {
+    case HomeMenuWardriving:
+        return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wardriving;
+    case HomeMenuScan:
+        return app->pairing_phase == PairingPhaseSessionActive &&
+               (app->capability_has_wifi_scan || app->capability_has_ble_scan);
+    case HomeMenuGps:
+        return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wardriving;
+    case HomeMenuSettings:
+    case HomeMenuAbout:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void home_menu_step(Esp32App* app, int delta) {
+    int idx = (int)app->home_menu_index;
+    int count = HomeMenuCount;
+    while(true) {
+        idx += delta;
+        if(idx < 0) idx = count - 1;
+        if(idx >= count) idx = 0;
+        if(home_menu_visible(app, (HomeMenuItem)idx)) {
+            app->home_menu_index = (HomeMenuItem)idx;
+            return;
+        }
+    }
+}
+
+static void draw_home_screen(Canvas* canvas, Esp32App* app) {
+    canvas_clear(canvas);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Home");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 22, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
+    if(app->pairing_phase == PairingPhaseFailed) {
+        char line[48];
+        snprintf(line, sizeof(line), "Failed: %s", app->pairing_reason);
+        canvas_draw_str(canvas, 2, 33, line);
+    } else {
+        canvas_draw_str(canvas, 2, 33, pairing_phase_text(app->pairing_phase));
+    }
+    if(app->has_capability_info) {
+        char line[CAPABILITY_BOARD_MAX_LEN + CAPABILITY_FEATURES_MAX_LEN + 4];
+        snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
+        canvas_draw_str(canvas, 2, 44, line);
+    }
+
+    static const char* labels[HomeMenuCount] = {
+        "Wardriving",
+        "Scan",
+        "GPS",
+        "Settings",
+        "About",
+    };
+
+    int menu_index = 0;
+    for(int i = 0; i < HomeMenuCount; i++) {
+        if(!home_menu_visible(app, (HomeMenuItem)i)) continue;
+        char line[32];
+        snprintf(line, sizeof(line), "%s%s", app->home_menu_index == (HomeMenuItem)i ? "> " : "  ", labels[i]);
+        canvas_draw_str(canvas, 2, 18 + 10 * menu_index + 10, line);
+        menu_index++;
+    }
+
+    canvas_draw_str(canvas, 2, 56, "Up/Down: move  OK: select");
+}
+
 static void draw_callback(Canvas* canvas, void* context) {
     Esp32App* app = context;
+    if(app->screen == AppScreenHome) {
+        draw_home_screen(canvas, app);
+        return;
+    }
     if(app->screen == AppScreenWifiScanResults) {
         draw_wifi_scan_results(canvas, app);
         return;
@@ -3221,7 +3306,53 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 sizeof(app.wardriving_error_message) - 1);
             app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
-            if(app.screen == AppScreenWifiScanResults) {
+            if(app.screen == AppScreenHome) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenMain;
+                } else if(event.input.key == InputKeyUp) {
+                    home_menu_step(&app, -1);
+                } else if(event.input.key == InputKeyDown) {
+                    home_menu_step(&app, 1);
+                } else if(event.input.key == InputKeyOk) {
+                    switch(app.home_menu_index) {
+                    case HomeMenuWardriving:
+                        app.screen = AppScreenWardriving;
+                        break;
+                    case HomeMenuScan:
+                        if(app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
+                            wifi_scan_ap_count = 0;
+                            app.wifi_scan_scroll_offset = 0;
+                            app.wifi_scan_complete = false;
+                            app.wifi_scan_error_message[0] = '\0';
+                            app.screen = AppScreenWifiScanResults;
+                            app.wifi_scan_in_progress = send_wifi_scan_command(&app);
+                            if(!app.wifi_scan_in_progress) {
+                                app.screen = AppScreenMain;
+                            }
+                        } else if(app.capability_has_ble_scan && !app.ble_scan_in_progress) {
+                            ble_scan_device_count = 0;
+                            app.ble_scan_scroll_offset = 0;
+                            app.ble_scan_complete = false;
+                            app.ble_scan_error_message[0] = '\0';
+                            app.screen = AppScreenBleScanResults;
+                            app.ble_scan_in_progress = send_ble_scan_command(&app);
+                            if(!app.ble_scan_in_progress) {
+                                app.screen = AppScreenMain;
+                            }
+                        }
+                        break;
+                    case HomeMenuGps:
+                        app.screen = AppScreenMain;
+                        break;
+                    case HomeMenuSettings:
+                    case HomeMenuAbout:
+                        app.screen = AppScreenMain;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            } else if(app.screen == AppScreenWifiScanResults) {
                 if(event.input.key == InputKeyBack) {
                     reset_scan_ui_state(&app);
                 } else if(event.input.key == InputKeyUp) {
@@ -3311,8 +3442,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 } else if(
                     event.input.key == InputKeyUp && app.profile &&
                     app.pairing_phase == PairingPhaseSessionActive &&
-                    app.capability_has_wardriving) {
-                    app.screen = AppScreenWardriving;
+                    (app.capability_has_wardriving || app.capability_has_wifi_scan ||
+                     app.capability_has_ble_scan)) {
+                    app.home_menu_index = HomeMenuWardriving;
+                    app.screen = AppScreenHome;
                 } else if(
                     event.input.key == InputKeyLeft && app.profile &&
                     app.pairing_phase == PairingPhaseSessionActive && app.capability_has_wifi_scan &&

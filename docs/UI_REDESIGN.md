@@ -1,14 +1,36 @@
 # Flipper FAP UI redesign
 
-**Status: design-only, 2026-09-12. No code has been written against this design, and it has
-no assigned phase/step in [PLAN.md](PLAN.md) yet** — placement was explicitly deferred rather
-than decided (see "Open items" below). Do not start implementation from this doc without
-first resolving that placement, per [CLAUDE.md](../CLAUDE.md)'s "don't implement roadmap
-steps out of order" convention.
+**Status: design-approved for immediate next implementation, 2026-09-12.** This is now the
+next roadmap item in [PLAN.md](PLAN.md) as **Phase 3a** — not a loose idea, but a scheduled
+prerequisite slice before further product polish. The design remains intentionally narrow in
+scope for this pass: no code is written yet, but the implementation boundary is now fixed and
+tracked in the roadmap rather than left as a deferred question.
 
 This replaces today's flat, button-shortcut Main screen with a menu-driven Home screen.
 Reached via a grill-me design session with the user; decisions and rationale are recorded
 below rather than left in chat, per this project's documentation conventions.
+
+## Implementation sequencing
+
+This pass is intentionally staged as a prerequisite-first refactor, not a one-shot UI rewrite:
+
+1. **Architecture prerequisite:** move the Flipper app off its single `ViewPort`/`AppEvent`
+   pattern and onto a real `ViewDispatcher`/scene-manager or equivalent screen router.
+2. **Home shell:** implement a single Home screen with a session indicator strip and a
+   menu list, keeping Settings/About always visible and hiding Wardriving/Scan/GPS unless the
+   board is connected and supports them.
+3. **Runtime behavior:** preserve reconnect semantics, connection-loss messaging, and the
+   existing command-layer radio conflict behavior without forcing navigation away from the
+   active submenu.
+4. **Capability screens:** add the Scan and Wardriving flows, plus the GPS screen with honest
+   stub labeling, but leave Settings/About as placeholders until a later decision.
+5. **Follow-on product work:** add the runtime BLE active/passive toggle, any persistent scan
+   settings, and any deeper settings management once the menu architecture exists and the
+   scan engine has the needed runtime controls.
+
+This is the implementation boundary for the approved v1 menu redesign; it intentionally does
+not expand the existing product scope beyond the menu shell and the capability-aware screens
+that the design requires.
 
 ## Current-state baseline (as of 2026-09-12, for contrast)
 

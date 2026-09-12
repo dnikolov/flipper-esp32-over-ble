@@ -14,6 +14,13 @@ X25519 pairing, authenticated AES-256-GCM runtime sessions, and the board-identi
 registry — are implemented **and hardware-verified** on real devices (ESP32-C6-DevKitC-1-N4 +
 Flipper Zero).
 
+**Immediate next step: Phase 3a (UI architecture + menu redesign), scheduled 2026-09-12.** The
+Flipper app is still flat and button-shortcut driven today, so the approved design in
+[docs/UI_REDESIGN.md](UI_REDESIGN.md) must begin with the architecture prerequisite:
+`ViewDispatcher`/scene-manager navigation, a single Home screen with capability-gated menu items,
+and the reconnect-stays-put behavior. This is intentionally scheduled before the remaining Phase 3
+wardriving polish because the menu architecture itself is the gating requirement for the redesign.
+
 **Phase 3 (production-ready wardriving) is underway.** `wifi_scan` and `ble_scan` are implemented
 and hardware-verified: both manual on-device scan triggers with results rendered in scrollable
 views, each capped at the 32 strongest results by RSSI. **Reordered 2026-09-07**:
