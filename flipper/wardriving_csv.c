@@ -5,26 +5,13 @@
 #include <string.h>
 #include <math.h>
 
-uint32_t feb_wardriving_backdate_first_seen(
-    uint64_t record_timestamp_ms, uint64_t anchor_timestamp_ms, uint32_t anchor_unix_time) {
-    if(record_timestamp_ms >= anchor_timestamp_ms) {
-        return anchor_unix_time;
-    }
-    uint64_t delta_ms = anchor_timestamp_ms - record_timestamp_ms;
-    uint64_t delta_s = delta_ms / 1000u;
-    if(delta_s > (uint64_t)anchor_unix_time) {
-        return 0;
-    }
-    return anchor_unix_time - (uint32_t)delta_s;
-}
-
 size_t feb_wardriving_csv_format_header(char *out, size_t out_cap) {
     int written = snprintf(
         out,
         out_cap,
         "WigleWifi-1.4,appRelease=1.0.0,model=ESP32-C6,release=1.0.0,"
         "device=flipper-esp32-over-ble,display=none,board=f7,brand=flipper\n"
-        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,"
         "AltitudeMeters,AccuracyMeters,Type\n");
     if(written < 0 || (size_t)written >= out_cap) {
         return 0;
@@ -112,11 +99,29 @@ static char mac[18];
 static char ssid_field[FEB_CBOR_MAX_TEXT_LEN * 2 + 2 + 1]; /* worst case: every byte doubled + 2 quotes */
 static char auth_field[32];
 static char channel_field[16];
+static char freq_field[16];
+
+/* 2.4GHz-only channel->frequency map (this board has a single 2.4GHz radio, no 5GHz --
+   docs/hardware/esp32-c6-devkitc-1/README.md). Standard IEEE 802.11 mapping: channels 1-13 are
+   evenly spaced 5MHz apart starting at 2412MHz; channel 14 (Japan-only, 802.11b) breaks that
+   spacing at 2484MHz rather than the 2487MHz the linear formula would give. Returns -1 (blank
+   field, matching Channel's own blank convention) for anything outside 1-14 -- defensive only,
+   this board's Wi-Fi scan never reports a channel out of range. */
+static long channel_to_freq_mhz(long channel) {
+    if(channel == 14) {
+        return 2484;
+    }
+    if(channel >= 1 && channel <= 13) {
+        return 2407 + 5 * channel;
+    }
+    return -1;
+}
 
 /* Worst-case row length (see FEB_WARDRIVING_CSV_ROW_MAX_LEN's own comment in
    wardriving_csv.h): mac(17) + ssid_field(130, a 64-byte all-quote-character SSID escaped)
-   + auth_field(31) + first_seen(19) + channel(3) + rssi(4, "-128") + lat(11) + lon(12) +
-   the literal "0,0"(3) + type(4) + 10 field-separating commas + 1 newline == 245 bytes. */
+   + auth_field(31) + first_seen(19) + channel(3) + freq(4, "2484") + rssi(4, "-128") + lat(11)
+   + lon(12) + the literal "0,0"(3) + type(4) + 11 field-separating commas + 1 newline ==
+   250 bytes. */
 size_t feb_wardriving_csv_format_row(
     char *out,
     size_t out_cap,
@@ -189,26 +194,34 @@ size_t feb_wardriving_csv_format_row(
         return 0;
     }
 
-    /* channel_field is sized against `long`'s worst-case textual width (up to 11 digits +
-       sign + NUL) rather than this project's real 2.4GHz-only channel range (1-14), to
-       satisfy -Werror=format-truncation's static (type-range-based, not value-based)
-       analysis; declared file-scope static above alongside mac/ssid_field/auth_field. */
+    /* channel_field/freq_field are sized against `long`'s worst-case textual width (up to 11
+       digits + sign + NUL) rather than this project's real 2.4GHz-only channel/frequency
+       range, to satisfy -Werror=format-truncation's static (type-range-based, not
+       value-based) analysis; declared file-scope static above alongside
+       mac/ssid_field/auth_field. */
     if(channel >= 0) {
         snprintf(channel_field, sizeof(channel_field), "%ld", channel);
     } else {
         channel_field[0] = '\0';
     }
+    long freq_mhz = channel >= 0 ? channel_to_freq_mhz(channel) : -1;
+    if(freq_mhz >= 0) {
+        snprintf(freq_field, sizeof(freq_field), "%ld", freq_mhz);
+    } else {
+        freq_field[0] = '\0';
+    }
 
     int written = snprintf(
         out,
         out_cap,
-        "%s,%s,%s,%.*s,%s,%ld,%.7f,%.7f,0,0,%s\n",
+        "%s,%s,%s,%.*s,%s,%s,%ld,%.7f,%.7f,0,0,%s\n",
         mac,
         ssid_field,
         auth_field,
         (int)first_seen_len,
         first_seen,
         channel_field,
+        freq_field,
         (long)rssi_dbm,
         lat,
         lon,

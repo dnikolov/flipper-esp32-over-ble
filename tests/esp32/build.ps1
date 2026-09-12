@@ -38,7 +38,8 @@ $sources = @(
     (Join-Path $esp32Dir "cbor_records.c"),
     (Join-Path $esp32Dir "cbor_wifi_scan.c"),
     (Join-Path $esp32Dir "cbor_ble_scan.c"),
-    (Join-Path $esp32Dir "cbor_wardriving.c")
+    (Join-Path $esp32Dir "cbor_wardriving.c"),
+    (Join-Path $esp32Dir "cbor_gps.c")
 ) -join " "
 
 $includeDirs = "/I `"$esp32Dir`" /I `"$vectorsDir`""

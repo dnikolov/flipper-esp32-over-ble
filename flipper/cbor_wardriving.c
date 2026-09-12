@@ -427,13 +427,20 @@ size_t feb_cbor_encode_wardriving_record(uint8_t* out, size_t out_cap, const feb
     }
     size_t pos = 0;
     size_t n;
-    n = feb_cbor_encode_map_header(out, out_cap, 5);
+    n = feb_cbor_encode_map_header(out, out_cap, 6);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_encode_text(out + pos, out_cap - pos, "timestamp_ms", sizeof("timestamp_ms") - 1);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_encode_uint(out + pos, out_cap - pos, record->timestamp_ms);
+    if(n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_text(
+        out + pos, out_cap - pos, "utc_timestamp_s", sizeof("utc_timestamp_s") - 1);
+    if(n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, record->utc_timestamp_s);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_encode_text(out + pos, out_cap - pos, "lat_e7_offset", sizeof("lat_e7_offset") - 1);
@@ -482,17 +489,17 @@ size_t feb_cbor_decode_wardriving_record(
     if(pos == 0) {
         return 0;
     }
-    if(count < 5) {
+    if(count < 6) {
         *status = FEB_CBOR_ERR_MISSING_FIELD;
         return 0;
     }
-    if(count > 5) {
+    if(count > 6) {
         *status = FEB_CBOR_ERR_TOO_MANY_ENTRIES;
         return 0;
     }
 
-    const uint8_t* seen_ptrs[5];
-    size_t seen_lens[5];
+    const uint8_t* seen_ptrs[6];
+    size_t seen_lens[6];
     size_t n;
 
     n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "timestamp_ms", seen_ptrs, seen_lens, 0, status);
@@ -502,21 +509,28 @@ size_t feb_cbor_decode_wardriving_record(
     if(n == 0) return 0;
     pos += n;
 
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lat_e7_offset", seen_ptrs, seen_lens, 1, status);
+    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "utc_timestamp_s", seen_ptrs, seen_lens, 1, status);
+    if(n == 0) return 0;
+    pos += n;
+    n = feb_cbor_decode_uint(in + pos, in_len - pos, &record->utc_timestamp_s, status);
+    if(n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lat_e7_offset", seen_ptrs, seen_lens, 2, status);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_decode_uint(in + pos, in_len - pos, &record->lat_e7_offset, status);
     if(n == 0) return 0;
     pos += n;
 
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lon_e7_offset", seen_ptrs, seen_lens, 2, status);
+    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lon_e7_offset", seen_ptrs, seen_lens, 3, status);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_decode_uint(in + pos, in_len - pos, &record->lon_e7_offset, status);
     if(n == 0) return 0;
     pos += n;
 
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "source", seen_ptrs, seen_lens, 3, status);
+    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "source", seen_ptrs, seen_lens, 4, status);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_decode_text(
@@ -524,7 +538,7 @@ size_t feb_cbor_decode_wardriving_record(
     if(n == 0) return 0;
     pos += n;
 
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "payload", seen_ptrs, seen_lens, 4, status);
+    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "payload", seen_ptrs, seen_lens, 5, status);
     if(n == 0) return 0;
     pos += n;
 

@@ -1,10 +1,12 @@
 # Flipper FAP UI redesign
 
-**Status: design-approved for immediate next implementation, 2026-09-12.** This is now the
-next roadmap item in [PLAN.md](PLAN.md) as **Phase 3a** — not a loose idea, but a scheduled
-prerequisite slice before further product polish. The design remains intentionally narrow in
-scope for this pass: no code is written yet, but the implementation boundary is now fixed and
-tracked in the roadmap rather than left as a deferred question.
+**Status: Home/menu shell substantially implemented, 2026-09-12 — build-verified, not yet
+hardware-verified.** Tracked as **Phase 3a** in [PLAN.md](PLAN.md). The Home screen, capability-
+gated menu, and reconnect-stays-put behavior are in place; the "Current-state baseline" section
+below describes exactly what's built vs. still open against the target design further down this
+file (notably: the `ViewDispatcher`/scene-manager architecture step was skipped, and the Scan
+screen is a placeholder picker, not yet the five-mode design). See
+[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits.
 
 This replaces today's flat, button-shortcut Main screen with a menu-driven Home screen.
 Reached via a grill-me design session with the user; decisions and rationale are recorded
@@ -12,41 +14,81 @@ below rather than left in chat, per this project's documentation conventions.
 
 ## Implementation sequencing
 
-This pass is intentionally staged as a prerequisite-first refactor, not a one-shot UI rewrite:
+This pass was intentionally staged as a prerequisite-first refactor, not a one-shot UI rewrite.
+Actual outcome as of 2026-09-12 (see "Current-state baseline" below for detail):
 
-1. **Architecture prerequisite:** move the Flipper app off its single `ViewPort`/`AppEvent`
-   pattern and onto a real `ViewDispatcher`/scene-manager or equivalent screen router.
-2. **Home shell:** implement a single Home screen with a session indicator strip and a
-   menu list, keeping Settings/About always visible and hiding Wardriving/Scan/GPS unless the
-   board is connected and supports them.
-3. **Runtime behavior:** preserve reconnect semantics, connection-loss messaging, and the
-   existing command-layer radio conflict behavior without forcing navigation away from the
-   active submenu.
-4. **Capability screens:** add the Scan and Wardriving flows, plus the GPS screen with honest
-   stub labeling, but leave Settings/About as placeholders until a later decision.
-5. **Follow-on product work:** add the runtime BLE active/passive toggle, any persistent scan
-   settings, and any deeper settings management once the menu architecture exists and the
-   scan engine has the needed runtime controls.
+1. **Architecture prerequisite: NOT done, and skipped rather than deferred.** The Home shell
+   (step 2) was built directly on the existing single `ViewPort`/`AppEvent` pattern; there is no
+   `ViewDispatcher`/scene-manager anywhere in `flipper/flipper_esp32_over_ble.c` today. This
+   contradicts this file's own original sequencing and [BACKLOG.md](BACKLOG.md)'s framing of the
+   architecture change as a hard prerequisite — flagged as a documentation-vs-reality mismatch,
+   not silently resolved.
+2. **Home shell: done.** Single Home screen with a session/status header and a capability- and
+   session-gated `HomeMenuItem` list (Wardriving/Scan/GPS/Settings/About, plus an extra `Legacy`
+   item not in the original design — see below).
+3. **Runtime behavior: done.** Reconnect-stays-put (a `connection_lost` flag keeps the active
+   screen and shows a banner instead of forcing navigation to Home), stale scan/wardriving UI
+   state cleared without leaving the active submenu, existing command-layer radio-conflict
+   behavior unchanged.
+4. **Capability screens: partially done.** `AppScreenGps` exists with honest stub labeling;
+   Settings/About exist as placeholders (as intended). The "Scan" screen exists but is **not**
+   the five-mode BLE-active/passive design below — see "Current-state baseline."
+5. **Follow-on product work: not started.** No runtime BLE active/passive toggle, no persistent
+   scan settings, no deeper settings management.
 
 This is the implementation boundary for the approved v1 menu redesign; it intentionally does
 not expand the existing product scope beyond the menu shell and the capability-aware screens
 that the design requires.
 
-## Current-state baseline (as of 2026-09-12, for contrast)
+## Current-state baseline (as of 2026-09-12, post-implementation — read this, not the design
+above, for what actually ships today)
 
-- `AppScreen` enum has exactly 4 screens: `AppScreenMain`, `AppScreenWifiScanResults`,
-  `AppScreenBleScanResults`, `AppScreenWardriving` (`flipper/flipper_esp32_over_ble.c`).
-- Single `ViewPort`/`AppEvent`-queue architecture — no `ViewDispatcher`/scene manager.
-- On the Main screen, Left/Right/Up are hardcoded to `wifi_scan`/`ble_scan`/Wardriving
-  respectively; nothing is capability-list-driven at the menu level.
-- `wifi_scan`/`ble_scan` are one-shot, manually-triggered scans. `wardriving` is continuous,
-  interval-based, dual-source (Wi-Fi+BLE) capture with flash-log + WiGLE CSV persistence.
-- BLE active scanning is hardcoded on (`passive=0`) at all four `ble_gap_disc()` call sites in
-  `esp32/main/main.c` (confirmed by code search 2026-09-12) — there is no active/passive
-  runtime toggle anywhere today.
-- GPS is a fixed-coordinate stub behind a swappable `location_get_fix()` interface. No real
-  GPS hardware is wired to the board. The ESP32 has no RTC; the Flipper's own clock is the
-  only real wall-clock source in the whole system.
+- `AppScreen` enum (`flipper/flipper_esp32_over_ble.c`) now has 9 values: `AppScreenHome`,
+  `AppScreenScan`, `AppScreenGps`, `AppScreenSettings`, `AppScreenAbout`, `AppScreenLegacy`, plus
+  the existing `AppScreenWifiScanResults`/`AppScreenBleScanResults`/`AppScreenWardriving`.
+  `AppScreenLegacy` is a compatibility screen preserving the old direct-button-shortcut flow
+  (OK to start pairing/session, Up/Left/Right to jump straight to Wardriving/wifi_scan/ble_scan);
+  it is not part of this design's original menu-item list and is reachable as its own always-
+  visible `HomeMenuLegacy` item.
+- **Still no `ViewDispatcher`/scene manager** — the Home menu shell was built directly on the
+  original single `ViewPort`/`AppEvent`-queue pattern. See "Implementation sequencing" above.
+- **Home is menu-driven**, matching the target design's navigation model: a `HomeMenuItem` list
+  (`HomeMenuWardriving`, `HomeMenuScan`, `HomeMenuGps`, `HomeMenuSettings`, `HomeMenuAbout`,
+  `HomeMenuLegacy`) with Up/Down to move, OK to select, and a scrolling window when more items
+  are visible than fit four rows. `home_menu_visible()` hides Wardriving/Scan/GPS unless a
+  session is active and the board's capability registry supports them; Settings/About/Legacy are
+  always visible, matching this design's decisions #7 and #9.
+- **Reconnect/disconnect while inside any screen: stay put, matching decision #10.** A
+  `connection_lost` flag (set on a BLE-unavailable event, a fatal session error, or a "connection
+  lost" pairing failure) keeps whichever screen is active and overlays a "Connection lost"
+  message rather than forcing navigation to Home. Only Back is accepted while lost; it returns to
+  Home and clears the flag.
+- **Settings and About are still deliberate, unscoped placeholders** (decision #6), not stale
+  documentation catching up to real content: both screens render static "TBD" text today.
+  Notably, an intermediate version of both screens briefly showed real data (saved-pairing state
+  in Settings; board/protocol/session info in About) before commit `a744bb4` ("Complete Phase 3a
+  UI polish") explicitly reverted them back to plain placeholders to match this file's own
+  decision #6 — a deliberate choice, not a regression.
+- **The Scan screen exists but is not yet this design's five-mode BLE-active/passive screen.**
+  Today's `AppScreenScan` (`draw_scan_screen`, a 2-item `ScanMenuItem` list) is only a picker
+  between the existing one-shot `wifi_scan` and `ble_scan` commands/results screens — it does not
+  reuse Wardriving's capture engine, has no BLE-active/passive mode cycling, and has no live,
+  non-persisting view. It is a placeholder-level stand-in, not a partial implementation of the
+  target design below.
+- `wifi_scan`/`ble_scan` are still one-shot, manually-triggered scans. `wardriving` is still
+  continuous, interval-based, dual-source (Wi-Fi+BLE) capture with flash-log + WiGLE CSV
+  persistence. Unchanged from before this pass.
+- BLE active scanning is still hardcoded on (`passive=0`) at every `ble_gap_disc()` call site in
+  `esp32/main/main.c` — there is still no active/passive runtime toggle anywhere, so the Scan
+  screen's two passive modes (below) remain unbuildable. Unchanged from before this pass; also
+  tracked in [BACKLOG.md](BACKLOG.md).
+- **The GPS screen is now wired to the real `gps` capability** (2026-09-12, build-verified only —
+  see [PLAN.md](PLAN.md)'s "Real GPS driver..." section). It shows the real three-state
+  fix status, real coordinates and GPS-derived UTC time when a fix exists (falling back to the
+  Flipper's own RTC clock, clearly labeled as such, otherwise), and still `--` for speed (a
+  separate, still-backlogged follow-on). Along the way, a capability-gating bug was found and
+  fixed: `HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
+  `capability_has_gps`.
 
 ## Target design
 
@@ -78,8 +120,10 @@ that the design requires.
 Unchanged from today's screen: source toggle (Wi-Fi/BLE/both, shown only while stopped and
 only when the board supports both), Start/Stop, live record count, backlog-drain count, Back.
 
-New: a GPS fix/no-fix icon. Since GPS is a stub, this always honestly shows "no fix
-(simulated)" — never claims a real fix — until real GPS hardware lands.
+New: a GPS fix/no-fix icon, plus a Start action label that toggles "Start"/"Start (delayed)" —
+both implemented 2026-09-12, build-verified only (see [PLAN.md](PLAN.md)'s "Real GPS driver,
+wardriving fix-dependency, and real wardriving-record timestamps"), reading the real `gps`
+capability's live status rather than a hardcoded stub value.
 
 #### Scan (new)
 
@@ -109,16 +153,15 @@ design: the real distinction is BLE active vs. passive scan type (whether a scan
 carrying the device name is solicited), not a window/interval duty-cycle preset. No
 "long/short poll" concept or terminology exists anywhere in the codebase or docs today.)
 
-#### GPS (new)
+#### GPS (implemented 2026-09-12, build-verified only — see "Current-state baseline" above)
 
-Built now despite no real GPS hardware, with the stub made explicit rather than hidden or
-omitted:
-
-- **Coordinates** — the fixed stub value, clearly labeled as simulated/no real fix.
-- **Current time** — explicitly the Flipper's own clock (the ESP32 has no RTC), labeled as
-  such, not presented as GPS-derived.
-- **Speed** — shown as `--`, not a misleading `0.0`. Structurally meaningless without two
-  distinct real fixes over time, which a fixed-coordinate stub can never produce.
+- **Coordinates** — real degrees, decoded from the `gps` capability's `lat_e7_offset`/
+  `lon_e7_offset` when the current status is `fix`; `--` otherwise.
+- **Current time** — real GPS-derived UTC time (from `utc_timestamp_s`) when `fix`; falls back to
+  the Flipper's own RTC clock, clearly labeled as such (never presented as GPS-derived), whenever
+  status is `no_signal`/`acquiring`.
+- **Speed** — still shown as `--`. Parsing real speed from `RMC` remains a separate, backlogged
+  follow-on (see [BACKLOG.md](BACKLOG.md)), not part of this pass.
 
 #### Settings (placeholder)
 
@@ -168,17 +211,26 @@ version — all already available to the app via the existing capability/pairing
 12. **No menu-level pre-emption of the Scan/Wardriving radio conflict** — simplest option,
     accepted for v1.
 
-## Open items this design creates (not yet actioned)
+## Open items (updated 2026-09-12 against what's actually implemented)
 
-- **Add to [BACKLOG.md](BACKLOG.md):** a runtime BLE active/passive toggle (prerequisite for
-  Scan's two passive modes) — new item, not previously tracked.
-- **Correct [BACKLOG.md](BACKLOG.md):** its "extending [active scanning] to `wardriving`'s own
-  capture engine" note is stale — confirmed already done in code as of the 2026-09-11
-  reconnect-stall fix (all four `ble_gap_disc()` call sites already set `passive=0`). Only the
-  runtime on/off *toggle* itself remains open, not the extension to wardriving.
-- **Decide this design's placement in [PLAN.md](PLAN.md)** (which phase/step) before any
-  implementation begins.
-- **[BACKLOG.md](BACKLOG.md)'s existing "Adopt a real `ViewDispatcher`/scene-manager
-  architecture" item becomes a hard prerequisite** for implementing this design, not just a
-  nice-to-have — today's single `ViewPort`/`AppEvent`-queue pattern cannot support a real
-  navigable menu list.
+- **Runtime BLE active/passive toggle: still open, still tracked in [BACKLOG.md](BACKLOG.md).**
+  Prerequisite for the Scan screen's real five-mode design; nothing on the wire protocol or
+  either firmware can request passive scanning yet.
+- **[BACKLOG.md](BACKLOG.md)'s "extending [active scanning] to `wardriving`'s own capture
+  engine" note:** already corrected there — confirmed done in code, not open.
+- **This design's placement in [PLAN.md](PLAN.md):** done — it is Phase 3a.
+- **[BACKLOG.md](BACKLOG.md)'s "Adopt a real `ViewDispatcher`/scene-manager architecture" item
+  is stale and needs correcting, not closing.** It still frames the architecture change as a
+  hard prerequisite for this design, but the Home menu shell shipped 2026-09-12 built directly on
+  the existing single `ViewPort`/`AppEvent`-queue pattern instead — the prerequisite was skipped,
+  not satisfied. The item should be reworded to reflect that the menu redesign proceeded without
+  it (so it's back to a structural nice-to-have, not a blocking dependency) rather than implying
+  it's still blocking work that has, in fact, already happened.
+- **New open item found during implementation, not part of the original design:** an
+  `AppScreenLegacy`/`HomeMenuLegacy` compatibility screen exists, preserving the old direct-
+  button-shortcut flow alongside the new menu. This file's target design below never mentions a
+  "Legacy" menu item — worth a decision on whether it's kept long-term or removed once the new
+  Scan/GPS/Settings/About screens are trusted to fully replace it.
+- **New open item:** the Scan screen (today's 2-item Wi-Fi/BLE picker) and the GPS screen (still
+  stub-only) both still need the actual target-design work below — they are placeholders that
+  happen to occupy the right menu slot, not partial implementations to build incrementally on.

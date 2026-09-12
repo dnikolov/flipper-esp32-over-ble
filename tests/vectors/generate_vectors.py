@@ -985,13 +985,15 @@ def wardriving_ble_payload(address: bytes, name, rssi_dbm: int) -> bytes:
     return out
 
 
-def wardriving_record(timestamp_ms: int, lat: float, lon: float, source: str, payload: bytes) -> bytes:
+def wardriving_record(timestamp_ms: int, utc_timestamp_s: int, lat: float, lon: float,
+                       source: str, payload: bytes) -> bytes:
     lat_e7_offset = int(round(lat * 1e7)) + 900000000
     lon_e7_offset = int(round(lon * 1e7)) + 1800000000
     assert 1 <= lat_e7_offset <= 1800000001
     assert 1 <= lon_e7_offset <= 3600000001
-    out = cbor_map_header(5)
+    out = cbor_map_header(6)
     out += cbor_text("timestamp_ms") + cbor_uint(timestamp_ms)
+    out += cbor_text("utc_timestamp_s") + cbor_uint(utc_timestamp_s)
     out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
     out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
     out += cbor_text("source") + cbor_text(source)
@@ -1047,11 +1049,11 @@ WARDRIVING_BLE_PAYLOAD = wardriving_ble_payload(bytes.fromhex("112233445566"), "
 WARDRIVING_BLE_PAYLOAD_NO_NAME = wardriving_ble_payload(bytes.fromhex("665544332211"), None, -85)
 
 WARDRIVING_RECORD_WIFI = wardriving_record(
-    1000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "wifi", WARDRIVING_WIFI_PAYLOAD)
+    1000, 1757667010, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "wifi", WARDRIVING_WIFI_PAYLOAD)
 WARDRIVING_RECORD_BLE = wardriving_record(
-    2000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD)
+    2000, 1757667012, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD)
 WARDRIVING_RECORD_BLE_NO_NAME = wardriving_record(
-    3000, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD_NO_NAME)
+    3000, 1757667014, WARDRIVING_STUB_LAT, WARDRIVING_STUB_LON, "ble", WARDRIVING_BLE_PAYLOAD_NO_NAME)
 
 # ---- status.result vectors: a data batch with one wifi record and one ble record
 # (exercises the nesting-depth-critical shape end to end), and an empty-records batch
@@ -1066,6 +1068,51 @@ WARDRIVING_STATUS_STARTED_PAYLOAD = raw(
 WARDRIVING_STATUS_STOPPED_PAYLOAD = raw(
     cbor_map_header(2), cbor_text("request_id"), cbor_uint(WARDRIVING_STOP_REQUEST_ID),
     cbor_text("state"), cbor_text("stopped"))
+
+
+# =====================================================================================
+# gps command/status payloads (docs/PROTOCOL.md "`gps` command and status payloads",
+# design frozen 2026-09-12). Payload-codec-only, same rationale as ble_scan/wardriving
+# above. `command`'s arguments are always an empty map (mirrors wifi_scan/ble_scan); a
+# non-empty arguments map is a main.c dispatch-layer invalid_command, not a codec error --
+# same split already established for wifi_scan/ble_scan's command payloads. `status`'s
+# `result` is present only for state = "fix".
+# =====================================================================================
+
+def gps_result(lat: float, lon: float, fix_quality: int, satellites: int, hdop_e1: int,
+               utc_timestamp_s: int, altitude_m: float) -> bytes:
+    lat_e7_offset = int(round(lat * 1e7)) + 900000000
+    lon_e7_offset = int(round(lon * 1e7)) + 1800000000
+    altitude_dm_offset = int(round(altitude_m * 10)) + 1000000
+    assert 1 <= lat_e7_offset <= 1800000001
+    assert 1 <= lon_e7_offset <= 3600000001
+    assert 0 <= altitude_dm_offset <= 2000000
+    out = cbor_map_header(7)
+    out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
+    out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
+    out += cbor_text("fix_quality") + cbor_uint(fix_quality)
+    out += cbor_text("satellites") + cbor_uint(satellites)
+    out += cbor_text("hdop_e1") + cbor_uint(hdop_e1)
+    out += cbor_text("utc_timestamp_s") + cbor_uint(utc_timestamp_s)
+    out += cbor_text("altitude_dm_offset") + cbor_uint(altitude_dm_offset)
+    return out
+
+
+GPS_REQUEST_ID = 601
+
+GPS_COMMAND_PAYLOAD = command_payload("gps", GPS_REQUEST_ID, cbor_map_header(0))
+GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
+    "gps", GPS_REQUEST_ID, cbor_map_header(1) + cbor_text("foo") + cbor_uint(1))
+
+GPS_RESULT_FIX = gps_result(42.3601, -71.0589, 1, 9, 20, 1757667010, 52.9)
+
+GPS_STATUS_NO_SIGNAL_PAYLOAD = raw(
+    cbor_map_header(2), cbor_text("request_id"), cbor_uint(GPS_REQUEST_ID),
+    cbor_text("state"), cbor_text("no_signal"))
+GPS_STATUS_ACQUIRING_PAYLOAD = raw(
+    cbor_map_header(2), cbor_text("request_id"), cbor_uint(GPS_REQUEST_ID),
+    cbor_text("state"), cbor_text("acquiring"))
+GPS_STATUS_FIX_PAYLOAD = status_payload(GPS_REQUEST_ID, "fix", GPS_RESULT_FIX)
 
 
 def c_bytes(name: str, data: bytes) -> str:
@@ -1396,6 +1443,26 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD", WARDRIVING_STATUS_DATA_PAYLOAD))
     f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_STARTED_PAYLOAD", WARDRIVING_STATUS_STARTED_PAYLOAD))
     f.write(c_bytes("FEB_VEC_WARDRIVING_STATUS_STOPPED_PAYLOAD", WARDRIVING_STATUS_STOPPED_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* ---- gps command/status payloads (docs/PROTOCOL.md \"`gps` command and status\n")
+    f.write("   payloads\", design frozen 2026-09-12). ---- */\n\n")
+
+    f.write("/* command payload: valid (empty arguments) and malformed (non-empty arguments,\n")
+    f.write("   must be rejected with error code invalid_command -- same split as\n")
+    f.write("   wifi_scan/ble_scan). */\n")
+    f.write(c_bytes("FEB_VEC_GPS_COMMAND_PAYLOAD", GPS_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD", GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* status.result vector: one fix (all seven fields). */\n")
+    f.write(c_bytes("FEB_VEC_GPS_RESULT_FIX", GPS_RESULT_FIX))
+    f.write("\n")
+
+    f.write("/* status payloads: no_signal/acquiring (no result field), fix (result present). */\n")
+    f.write(c_bytes("FEB_VEC_GPS_STATUS_NO_SIGNAL_PAYLOAD", GPS_STATUS_NO_SIGNAL_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_GPS_STATUS_ACQUIRING_PAYLOAD", GPS_STATUS_ACQUIRING_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_GPS_STATUS_FIX_PAYLOAD", GPS_STATUS_FIX_PAYLOAD))
 
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 

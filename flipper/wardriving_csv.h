@@ -10,13 +10,19 @@
    Furi-dependent and lives in flipper_esp32_over_ble.c instead, calling into this module only
    for the pure byte-formatting.
 
-   Format is WigleWifi-1.4 (MAC, SSID, AuthMode, FirstSeen, Channel, RSSI, CurrentLatitude,
-   CurrentLongitude, AltitudeMeters, AccuracyMeters, Type) -- the later WigleWifi-1.6 adds a
-   Frequency column plus RCOIs/MfgrId that this project has no data source for, so there is
-   no benefit to the newer version here. AltitudeMeters/AccuracyMeters are always written as
-   0 (no altitude/accuracy data exists behind the current GPS stub, and WiGLE's own consumers
-   tolerate a flat 0 in these columns). AuthMode for a `source="ble"` record is left blank
-   (WiGLE's AuthMode column has no BLE meaning); Channel is likewise blank for a BLE record. */
+   Format is WigleWifi-1.4 (MAC, SSID, AuthMode, FirstSeen, Channel, Frequency, RSSI,
+   CurrentLatitude, CurrentLongitude, AltitudeMeters, AccuracyMeters, Type) -- WigleWifi-1.6
+   additionally adds RCOIs/MfgrId, which this project genuinely has no data source for, so
+   there is no benefit to the newer version tag for those two. Frequency is different: it's a
+   deterministic function of a Wi-Fi Channel (2.4GHz only, matching this board's single radio),
+   not a field needing its own data source, so it's included here despite the older version
+   tag -- a WiGLE parser reads the column-header row itself, not just the version tag, to know
+   what's present. AltitudeMeters/AccuracyMeters are always written as 0 (no altitude/accuracy
+   data exists behind the current GPS stub, and WiGLE's own consumers tolerate a flat 0 in
+   these columns). AuthMode for a `source="ble"` record is left blank (WiGLE's AuthMode column
+   has no BLE meaning); Channel and Frequency are likewise blank for a BLE record -- BLE hops
+   across channels rather than occupying one fixed frequency, so there is no single correct
+   value to report, unlike Wi-Fi's fixed per-AP channel. */
 #ifndef FEB_WARDRIVING_CSV_H
 #define FEB_WARDRIVING_CSV_H
 
@@ -50,12 +56,13 @@
 size_t feb_wardriving_csv_format_header(char *out, size_t out_cap);
 
 /* One CSV data row (newline-terminated) for a single decoded <wardriving-record>.
-   `first_seen` is a caller-formatted "YYYY-MM-DD HH:MM:SS" string (see
-   feb_wardriving_backdate_first_seen below for computing the underlying UNIX time; the
-   UNIX-time -> calendar-string conversion itself needs datetime_timestamp_to_datetime(),
-   a Furi/lib API, so it stays in flipper_esp32_over_ble.c, keeping this module Furi-free).
-   Sanitizes SSID/BLE-name to printable ASCII and CSV-quotes any field containing a comma,
-   quote, or newline, same convention as this app's on-screen display sanitization. Returns
+   `first_seen` is a caller-formatted "YYYY-MM-DD HH:MM:SS" string, built by the caller
+   directly from the record's own `utc_timestamp_s` field (docs/PROTOCOL.md; always present
+   and valid -- see cbor_wardriving.h) via datetime_timestamp_to_datetime(), a Furi/lib API,
+   which is why that conversion stays in flipper_esp32_over_ble.c rather than here, keeping
+   this module Furi-free. Sanitizes SSID/BLE-name to printable ASCII and CSV-quotes any field
+   containing a comma, quote, or newline, same convention as this app's on-screen display
+   sanitization. Returns
    bytes written (excluding NUL), or 0 on failure (out_cap too small, or an unrecognized
    `record->payload_kind`). */
 size_t feb_wardriving_csv_format_row(
@@ -64,20 +71,6 @@ size_t feb_wardriving_csv_format_row(
     const feb_wardriving_record_t *record,
     const char *first_seen,
     size_t first_seen_len);
-
-/* Reconstructs an approximate wall-clock UNIX FirstSeen for a record whose only real
-   timestamp is boot-relative `timestamp_ms` (this board has no RTC) -- docs/CAPABILITIES.md:
-   "anchoring the newest drained record to the Flipper's current clock and backdating the
-   rest". `anchor_timestamp_ms` is the largest `timestamp_ms` seen so far in this export
-   session and `anchor_unix_time` is the Flipper's wall-clock UNIX time at the moment that
-   anchor record was processed; the caller updates the anchor to a new maximum (using
-   record_timestamp_ms as anchor_timestamp_ms and the current wall clock as anchor_unix_time)
-   before calling this for the anchor record itself, so record_timestamp_ms <=
-   anchor_timestamp_ms always holds here. Saturates at 0 (UNIX epoch) instead of underflowing
-   if the computed backdated time would be negative -- an approximation edge case (documented
-   as such in docs/CAPABILITIES.md), not an error to propagate. */
-uint32_t feb_wardriving_backdate_first_seen(
-    uint64_t record_timestamp_ms, uint64_t anchor_timestamp_ms, uint32_t anchor_unix_time);
 
 /* Per-BSSID/address CSV-row deduplication (docs/PROJECT_HISTORY.md's 2026-09-10 "wardriving
    duplicate records" discussion) -- the flash log and wire protocol stay exactly as-is (an

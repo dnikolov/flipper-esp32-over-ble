@@ -585,7 +585,7 @@ size_t feb_cbor_encode_wardriving_record(uint8_t *out, size_t out_cap, const feb
         return 0;
     }
 
-    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 5);
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 6);
     if (n == 0) return 0;
     pos += n;
 
@@ -593,6 +593,13 @@ size_t feb_cbor_encode_wardriving_record(uint8_t *out, size_t out_cap, const feb
     if (n == 0) return 0;
     pos += n;
     n = feb_cbor_encode_uint(out + pos, out_cap - pos, record->timestamp_ms);
+    if (n == 0) return 0;
+    pos += n;
+
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "utc_timestamp_s", FEB_CBOR_I_KLEN("utc_timestamp_s"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, record->utc_timestamp_s);
     if (n == 0) return 0;
     pos += n;
 
@@ -633,12 +640,13 @@ size_t feb_cbor_encode_wardriving_record(uint8_t *out, size_t out_cap, const feb
 
 size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_wardriving_record_t *record, feb_cbor_status_t *status)
 {
-    static const char *const names[5] = {"timestamp_ms", "lat_e7_offset", "lon_e7_offset", "source", "payload"};
+    static const char *const names[6] = {"timestamp_ms", "utc_timestamp_s", "lat_e7_offset",
+                                          "lon_e7_offset", "source", "payload"};
     size_t count;
     size_t pos;
     size_t i;
     size_t next_min = 0;
-    int seen[5] = {0, 0, 0, 0, 0};
+    int seen[6] = {0, 0, 0, 0, 0, 0};
     feb_cbor_status_t local_status;
     size_t consumed;
 
@@ -655,7 +663,7 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
         *status = local_status;
         return 0;
     }
-    if (count > 5) {
+    if (count > 6) {
         *status = FEB_CBOR_ERR_TOO_MANY_ENTRIES;
         return 0;
     }
@@ -678,7 +686,7 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
         pos += key_consumed;
 
         found = -1;
-        for (j = 0; j < 5; j++) {
+        for (j = 0; j < 6; j++) {
             if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
                 found = (int)j;
                 break;
@@ -713,7 +721,7 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
             size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &local_status);
 
             if (n == 0) { *status = local_status; return 0; }
-            record->lat_e7_offset = value;
+            record->utc_timestamp_s = value;
             pos += n;
             break;
         }
@@ -722,11 +730,20 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
             size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &local_status);
 
             if (n == 0) { *status = local_status; return 0; }
-            record->lon_e7_offset = value;
+            record->lat_e7_offset = value;
             pos += n;
             break;
         }
         case 3: {
+            uint64_t value;
+            size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &local_status);
+
+            if (n == 0) { *status = local_status; return 0; }
+            record->lon_e7_offset = value;
+            pos += n;
+            break;
+        }
+        case 4: {
             const char *data;
             size_t len;
             size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
@@ -746,19 +763,18 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
             pos += n;
             break;
         }
-        case 4: {
+        case 5: {
             size_t n;
 
-            if (!seen[3]) {
+            if (!seen[4]) {
                 /* `payload`'s shape depends on `payload_kind`, which is only set while
-                   decoding `source` (case 3 above) -- this guards against a map that
-                   includes `payload` without `source` ever having appeared at all (e.g.
-                   {timestamp_ms, lat_e7_offset, lon_e7_offset, payload}, skipping
-                   `source`), which the fixed field-order check above does not itself catch
-                   since indices only need to be non-decreasing, not contiguous. Without
-                   this guard, record->payload_kind would be read uninitialized. The
-                   "source missing" case is also caught by the all-fields-present check
-                   below, but only after this would already have used garbage. */
+                   decoding `source` (case 4 above) -- this guards against a map that
+                   includes `payload` without `source` ever having appeared at all, which
+                   the fixed field-order check above does not itself catch since indices
+                   only need to be non-decreasing, not contiguous. Without this guard,
+                   record->payload_kind would be read uninitialized. The "source missing"
+                   case is also caught by the all-fields-present check below, but only
+                   after this would already have used garbage. */
                 *status = FEB_CBOR_ERR_MISSING_FIELD;
                 return 0;
             }
@@ -779,7 +795,7 @@ size_t feb_cbor_decode_wardriving_record(const uint8_t *in, size_t in_len, feb_w
         next_min = field_index + 1;
     }
 
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < 6; i++) {
         if (!seen[i]) {
             *status = FEB_CBOR_ERR_MISSING_FIELD;
             return 0;

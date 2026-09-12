@@ -186,6 +186,16 @@ stopping the capture — wardriving runs autonomously on the ESP32 regardless of
 screen is open or the Flipper is even connected, so leaving the screen is pure navigation, not
 an implicit stop.
 
+While stopped, the footer's start hint reads `OK: start` when the board currently reports a real
+GPS fix, or `OK: start (delayed)` otherwise (no fix yet, still acquiring, or no GPS status polled
+yet this session) — this is a label only, matching the same button press either way; wardriving
+is never blocked on having a fix (see "Location data" below).
+
+**GPS fix indicator:** while this screen is open, the Flipper polls the board's `gps` status
+every 2 seconds and shows it appended to the records/source line as `GPS:Fix`, `GPS:Acq`
+(acquiring), `GPS:No sig` (no signal), or `GPS:?` (not polled yet this session). Only shown if
+the connected board advertises the `gps` capability.
+
 **Known issue:** if you press **OK** to start wardriving at the exact moment the ESP32 is still sending you a backlog of previously-buffered records from an earlier session (see "Backlog drain" below), the new start command can silently stop all further data from being sent — capture keeps running on the ESP32, but nothing more arrives on the Flipper until the connection times out and reconnects about 30 seconds later. No data is lost (the stalled records resend automatically on the next reconnect), but you may see the connection drop shortly after starting in this specific timing window. Not yet fixed; see `docs/BACKLOG.md` (item G07) for the tracked issue.
 
 **Screen contents:**
@@ -208,8 +218,13 @@ sends any wardriving records it has buffered since the last connection — this 
 or not wardriving is currently running, and whether or not you've opened this screen. These
 records are captured and exported the same as live results (see below).
 
-**Location data:** every record currently carries the same fixed placeholder coordinate — real
-GPS hardware is not yet wired to the board (see [CAPABILITIES.md](CAPABILITIES.md)).
+**Location data:** a real UART/NMEA GPS driver and per-record fix-dependency exist in the code as
+of 2026-09-12 (not yet hardware-verified, same caveat as the rest of this section). Any record
+captured while the board's location driver is not reporting a real fix (`GGA` fix quality > 0
+and `RMC` status `A`) is discarded rather than logged or sent — losing a fix mid-capture pauses
+logging until it returns, without stopping the capture itself. `start`/`stop` are never gated on
+having a fix (see "Starting and stopping" above). See [CAPABILITIES.md](CAPABILITIES.md) for the
+full design.
 
 **SD card export:** every wardriving record (both backlog-drained and live) is appended,
 incrementally and in WiGLE CSV format, to a daily file under
@@ -217,9 +232,11 @@ incrementally and in WiGLE CSV format, to a daily file under
 `wardriving_YYYYMMDD.csv` (calendar date only), so multiple sessions across the same calendar
 day all append to the same file. Records are written to the file as they arrive rather than
 held in memory, so a capture session can run for hours without growing the app's RAM usage.
-Because the ESP32 has no real-time clock, each record's exported timestamp is an approximation:
-the most recently received record is anchored to the Flipper's current clock, and older records
-are backdated from it using their reported time-since-boot — not a true wall-clock record.
+Each record's exported `FirstSeen` timestamp is now a real UTC wall-clock time derived from the
+board's GPS fix at capture time (`YYYY-MM-DD hh:mm:ss`, matching WiGLE's format), not the
+RTC-anchored approximation this project used before real GPS support existed — same
+not-yet-hardware-verified caveat as "Location data" above; this hasn't been confirmed against a
+real exported file on a real SD card yet.
 
 ## Factory-resetting the ESP32 without a PC
 

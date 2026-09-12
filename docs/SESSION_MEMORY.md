@@ -6,7 +6,7 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-12, commit 8fe4dc7)
+## Current state (as of 2026-09-12, commit a744bb4)
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete.** Steps 1-7 —
 build baselines, BLE transport, record framing, radio-coexistence validation, trusted-environment
@@ -14,19 +14,25 @@ X25519 pairing, authenticated AES-256-GCM runtime sessions, and the board-identi
 registry — are implemented **and hardware-verified** on real devices (ESP32-C6-DevKitC-1-N4 +
 Flipper Zero).
 
-**Current Phase 3a status:** the Home-first menu flow and the reconnect-retention follow-up are in
-place. The app no longer snaps back to the Home screen on session loss, and stale scan/wardriving
-state is cleared without abandoning the user’s active submenu. The next step is the runtime polish
-pass for the remaining capability screens: keep submenu state stable across reconnects, confirm the
-connection-lost banner is visible and consistent, and then finish the remaining menu-flow polish
-before moving deeper into product settings work.
+**Phase 3a (Flipper UI menu redesign) is substantially implemented, build-verified only —
+hardware verification not yet run.** The Home screen is menu-driven (`HomeMenuItem`:
+Wardriving/Scan/GPS/Settings/About/Legacy; Up/Down move, OK selects), with Wardriving/Scan/GPS
+hidden unless a session is active and the board's capability registry supports them, and
+Settings/About/Legacy always visible. A `connection_lost` flag keeps the active screen in place
+on disconnect/session-fatal and shows a banner instead of snapping back to Home. Settings and
+About remain deliberate placeholders (design decision in [docs/UI_REDESIGN.md](UI_REDESIGN.md)),
+not stale/unfinished content. See [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12
+entry for the implementing commits.
 
-**Immediate next step: Phase 3a (UI architecture + menu redesign), scheduled 2026-09-12.** The
-Flipper app is still flat and button-shortcut driven today, so the approved design in
-[docs/UI_REDESIGN.md](UI_REDESIGN.md) must begin with the architecture prerequisite:
-`ViewDispatcher`/scene-manager navigation, a single Home screen with capability-gated menu items,
-and the reconnect-stays-put behavior. This is intentionally scheduled before the remaining Phase 3
-wardriving polish because the menu architecture itself is the gating requirement for the redesign.
+**Still open against the design in [docs/UI_REDESIGN.md](UI_REDESIGN.md):** the app still runs on
+the original single `ViewPort`/`AppEvent`-queue — the `ViewDispatcher`/scene-manager rewrite that
+doc and [docs/BACKLOG.md](BACKLOG.md) call a hard prerequisite was skipped, not done; the Home
+menu shell was built directly on the old architecture instead. The "Scan" menu item is only a
+Wi-Fi-scan/BLE-scan picker over the existing one-shot capabilities, not the five-mode
+BLE-active/passive live-view screen the design describes (blocked on a runtime BLE
+active/passive toggle that still doesn't exist anywhere — see [docs/BACKLOG.md](BACKLOG.md)).
+The GPS screen is now wired to the real `gps` capability (2026-09-12, build-verified only) — see
+[docs/PLAN.md](PLAN.md)'s "Real GPS driver..." section for full status.
 
 **Phase 3 (production-ready wardriving) is underway.** `wifi_scan` and `ble_scan` are implemented
 and hardware-verified: both manual on-device scan triggers with results rendered in scrollable
@@ -79,6 +85,26 @@ implemented, and debugged — including every bug's root cause — see
   not against, the coexistence suspect; the plain `start_scan()` path remains unimplicated.
   Full investigation: `docs/LESSONS.md`'s "wardriving-passive-scan-reconnect-stall" entry and
   `docs/PROJECT_HISTORY.md`'s matching dated entries.
+
+**Real GPS driver + wardriving fix-dependency + real record timestamps: implemented on both
+firmwares 2026-09-12** (via a grill-me session — see [PLAN.md](PLAN.md)'s "Real GPS driver,
+wardriving fix-dependency, and real wardriving-record timestamps" for full status/detail).
+ESP32 side: real UART1/NMEA `GGA`+`RMC` driver (`esp32/main/location.c`/`nmea_parser.c`), new
+`gps` capability (`esp32/main/cbor_gps.c`/`.h`), wardriving's per-record fix-dependency, the
+`utc_timestamp_s` field, and (added since, same session) `GGA` MSL altitude parsing into the
+`gps` result payload's new `altitude_dm_offset` field (build- and host-test-verified, not yet
+hardware-tested; see PROTOCOL.md's `gps` status table). Flipper side: `gps` command client/status parsing
+(`flipper/cbor_gps.c`/`.h`), the Wardriving screen's fix indicator + Start-label toggle, the GPS
+screen wired to real status/coordinates/time (fixed a capability-gating bug found along the way:
+`HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
+`capability_has_gps`), and WiGLE CSV `FirstSeen` now built directly from `utc_timestamp_s`. Both
+sides build- and host-test-verified independently. **Both boards flashed 2026-09-12**: ESP32
+boot-verified clean (no crash, ~1.9s to running state, old-format flash-log records correctly
+still present per the accepted tradeoff) via a fixed `tools/build_esp32.ps1`; Flipper FAP
+transferred to SD card, **pending manual restart+launch on the device** (auto-launch always fails
+with a known, unrelated "not enough memory" preload error — see PROJECT_HISTORY.md). **Full-feature
+hardware verification (real GPS module cold-start-to-fix, wardriving discard/resume, WiGLE CSV on
+a real SD card) has not started** — see PROJECT_HISTORY.md's 2026-09-12 GPS entry for detail.
 
 **Immediately next once the above is resolved:**
 

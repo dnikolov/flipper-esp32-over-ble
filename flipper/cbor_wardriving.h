@@ -78,8 +78,13 @@ typedef struct {
     uint64_t rssi_offset; /* rssi_dbm + 128 */
 } feb_wardriving_ble_payload_t;
 
-/* `<wardriving-record>` fixed field order: timestamp_ms, lat_e7_offset, lon_e7_offset,
-   source, payload -- matches PROTOCOL.md exactly. `payload`'s shape is picked by `source`
+/* `<wardriving-record>` fixed field order: timestamp_ms, utc_timestamp_s, lat_e7_offset,
+   lon_e7_offset, source, payload -- matches PROTOCOL.md exactly (utc_timestamp_s added
+   2026-09-12, docs/PLAN.md "Real GPS driver, wardriving fix-dependency, and real
+   wardriving-record timestamps" -- Unix epoch seconds derived from the most recent valid
+   `RMC` sentence; always present and valid, per that design's decision 7, since a record is
+   only ever logged/streamed while the location driver reports a real fix, which requires a
+   valid RMC too -- no optional-field/fallback case to design around). `payload`'s shape is picked by `source`
    ("wifi" -> wifi payload, "ble" -> ble payload); any other `source` value is rejected
    FEB_CBOR_ERR_UNEXPECTED_TYPE by the decoder (this field IS validated here, unlike
    action/sources above, because it is structurally required to know which payload shape
@@ -100,6 +105,7 @@ typedef enum {
 
 typedef struct {
     uint64_t timestamp_ms;
+    uint64_t utc_timestamp_s;
     uint64_t lat_e7_offset;
     uint64_t lon_e7_offset;
     const char *source;

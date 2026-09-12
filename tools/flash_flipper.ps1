@@ -1,9 +1,13 @@
 # Transfers a built Flipper FAP onto the device's SD card via the pinned Unleashed checkout's
 # scripts/runfap.py -- the actual working transfer method (the Flipper's SD card does not mount
 # as a USB mass-storage drive, and runfap.py speaks the Flipper CLI's storage protocol over its
-# serial port instead). Never auto-launches the app afterward: a prior auto-launch attempt via
-# `fbt.cmd launch APPSRC=...` hit a transient "not enough memory" preload error -- restart the
-# Flipper and launch the app manually instead.
+# serial port instead). This wrapper never asks for a launch, but runfap.py itself unconditionally
+# sends a `loader open` after every transfer to launch the app, with no flag to suppress it -- and
+# that launch reliably fails with a transient "not enough memory" preload error on this device
+# (confirmed repeatedly, most recently 2026-09-12), which surfaces as a non-zero exit from this
+# script even though the file transfer itself succeeded. Restart the Flipper and launch the app
+# manually -- do not treat this script's exit code alone as proof the transfer failed; check its
+# output for "Transferred ... on the Flipper's SD card" first.
 #
 #   .\tools\flash_flipper.ps1 -Port COM8
 #   .\tools\flash_flipper.ps1 -Port COM8 -FapPath C:\path\to\some.fap

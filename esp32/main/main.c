@@ -294,7 +294,7 @@ static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
    session must stay strictly below this value or the AES-GCM nonce repeats. */
 #define FEB_SESSION_SEQUENCE_MAX 0xFFFFFFu
 
-static const char *const feb_features[] = {"wifi_scan", "ble_scan", "wardriving"};
+static const char *const feb_features[] = {"wifi_scan", "ble_scan", "wardriving", "gps"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
 
 /* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": wardriving's Wi-Fi/BLE
@@ -471,6 +471,7 @@ static void handle_capability_query(uint16_t conn_handle);
 static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wifi_scan_send_next_batch(uint16_t conn_handle);
 static void wifi_scan_done_cb(struct ble_npl_event *ev);
 static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
@@ -1168,10 +1169,10 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
            which wardriving's persistent capture log has no equivalent of; its own bound is
            flash capacity (sector eviction), not a wire-result count. */
         feb_location_t fix;
-        bool have_fix = location_get_fix(&fix);
+        feb_location_state_t loc_state = location_get_fix(&fix);
         uint16_t k;
 
-        if (!have_fix) {
+        if (loc_state != FEB_LOCATION_FIX) {
             ESP_LOGW(TAG, "wardriving: discarding %u wifi result(s), no GPS fix yet", (unsigned)raw_count);
         } else {
             for (k = 0; k < raw_count; k++) {
@@ -1181,6 +1182,7 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
 
                 memset(&record, 0, sizeof(record));
                 record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+                record.utc_timestamp_s = fix.utc_timestamp_s;
                 record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
                 record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
                 record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
@@ -1483,8 +1485,78 @@ static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payl
     ESP_LOGI(TAG, "ble_scan started (request_id=%llu)", (unsigned long long)cmd->request_id);
 }
 
+/* docs/PLAN.md "Real GPS driver, wardriving fix-dependency, and real wardriving-record
+   timestamps": `gps` is a poll-only, single-shot status query -- no scan-duration lifecycle,
+   no busy/exclusivity concept (the UART read is a passive background task independent of the
+   Wi-Fi/BLE radio), no request_id dedup cache (matches wifi_scan/ble_scan). `result` is
+   present only when state == "fix", per docs/PROTOCOL.md's `gps` status table. */
+static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    size_t arg_count;
+    feb_cbor_status_t status;
+    feb_location_t fix;
+    feb_location_state_t loc_state;
+    feb_status_payload_t status_payload = {0};
+    uint8_t result_buf[128];
+    size_t payload_len;
+
+    if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
+        arg_count != 0) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    loc_state = location_get_fix(&fix);
+    status_payload.request_id = cmd->request_id;
+    switch (loc_state) {
+    case FEB_LOCATION_FIX: status_payload.state = "fix"; break;
+    case FEB_LOCATION_ACQUIRING: status_payload.state = "acquiring"; break;
+    case FEB_LOCATION_NO_SIGNAL:
+    default: status_payload.state = "no_signal"; break;
+    }
+    status_payload.state_len = strlen(status_payload.state);
+
+    if (loc_state == FEB_LOCATION_FIX) {
+        feb_gps_result_payload_t result = {0};
+        size_t result_len;
+
+        result.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
+        result.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
+        result.fix_quality = fix.fix_quality;
+        result.satellites = fix.satellites;
+        result.hdop_e1 = fix.hdop_e1;
+        result.utc_timestamp_s = fix.utc_timestamp_s;
+        result.altitude_dm_offset = (uint64_t)((int64_t)fix.altitude_dm + FEB_GPS_ALTITUDE_DM_OFFSET);
+
+        result_len = feb_cbor_encode_gps_result_payload(result_buf, sizeof(result_buf), &result);
+        if (result_len == 0) {
+            if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
+                                      1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+        status_payload.result_span = result_buf;
+        status_payload.result_span_len = result_len;
+        status_payload.has_result = 1;
+    }
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+    if (payload_len == 0 ||
+        !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ESP_LOGI(TAG, "gps status query answered (request_id=%llu, state=%s)",
+             (unsigned long long)cmd->request_id, status_payload.state);
+}
+
 /* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": capability-name
-   dispatch. A lookup table isn't earned yet at two entries (docs/SESSION_MEMORY.md's design
+   dispatch. A lookup table isn't earned yet at four entries (docs/SESSION_MEMORY.md's design
    note). */
 static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
 {
@@ -1497,6 +1569,9 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
     } else if (cmd->capability_len == strlen("wardriving") &&
               memcmp(cmd->capability, "wardriving", cmd->capability_len) == 0) {
         handle_wardriving_command(conn_handle, cmd);
+    } else if (cmd->capability_len == strlen("gps") &&
+              memcmp(cmd->capability, "gps", cmd->capability_len) == 0) {
+        handle_gps_command(conn_handle, cmd);
     } else if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
                                      1, cmd->request_id)) {
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -1653,10 +1728,10 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
            is specific to ble_scan's one-shot *reporting* contract, which this persistent
            capture log has no equivalent of. */
         feb_location_t fix;
-        bool have_fix = location_get_fix(&fix);
+        feb_location_state_t loc_state = location_get_fix(&fix);
         uint16_t k;
 
-        if (!have_fix) {
+        if (loc_state != FEB_LOCATION_FIX) {
             ESP_LOGW(TAG, "wardriving: discarding %u ble result(s), no GPS fix yet",
                      (unsigned)ble_scan_raw_count);
         } else {
@@ -1666,6 +1741,7 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
 
                 memset(&record, 0, sizeof(record));
                 record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+                record.utc_timestamp_s = fix.utc_timestamp_s;
                 record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
                 record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
                 record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
@@ -2083,6 +2159,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     feb_cbor_status_t status;
     bool is_start;
     bool is_stop;
+    bool is_status_query;
     bool want_wifi = false;
     bool want_ble = false;
     size_t i;
@@ -2097,10 +2174,39 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
 
     is_start = (payload.action_len == strlen("start") && memcmp(payload.action, "start", payload.action_len) == 0);
     is_stop = (payload.action_len == strlen("stop") && memcmp(payload.action, "stop", payload.action_len) == 0);
-    if (!is_start && !is_stop) {
+    is_status_query =
+        (payload.action_len == strlen("status") && memcmp(payload.action, "status", payload.action_len) == 0);
+    if (!is_start && !is_stop && !is_status_query) {
         if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
+        return;
+    }
+
+    if (is_status_query) {
+        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+
+        feb_status_payload_t status_payload = {0};
+        size_t payload_len;
+
+        status_payload.request_id = cmd->request_id;
+        status_payload.state = (wardriving_wifi_active || wardriving_ble_active) ? "started" : "stopped";
+        status_payload.state_len = strlen(status_payload.state);
+        payload_len = feb_cbor_encode_status_payload(
+            pairing_payload_encode_buf, sizeof(pairing_payload_encode_buf), &status_payload);
+        if (payload_len == 0 ||
+            !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            return;
+        }
+        ESP_LOGI(TAG, "wardriving status query answered (request_id=%llu, running=%d)",
+                 (unsigned long long)cmd->request_id,
+                 (int)(wardriving_wifi_active || wardriving_ble_active));
         return;
     }
 

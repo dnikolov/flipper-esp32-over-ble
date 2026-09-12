@@ -39,6 +39,7 @@ $sources = @(
     (Join-Path $flipperDir "cbor_wifi_scan.c"),
     (Join-Path $flipperDir "cbor_ble_scan.c"),
     (Join-Path $flipperDir "cbor_wardriving.c"),
+    (Join-Path $flipperDir "cbor_gps.c"),
     (Join-Path $flipperDir "wardriving_csv.c")
 ) -join " "
 

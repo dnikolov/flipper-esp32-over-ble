@@ -125,3 +125,38 @@ detail, judgment calls made, and gaps found along the way. `idf.py build` and
 `fbt.cmd fap_flipper_esp32_over_ble` both pass clean. Neither board has been flashed with
 this code yet — the hardware verification pass is a separate follow-up requiring explicit
 user go-ahead, per this project's hardware-safety rule.
+
+## Phase 3 additions (real GPS driver / `gps` capability / wardriving `utc_timestamp_s`)
+
+`vectors/generate_vectors.py` also generates the `gps` capability's vectors (docs/PLAN.md
+"Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps"), built
+against `esp32/main/cbor_gps.h`/`.c` (and their byte-identical `flipper/` copies): a
+`command` payload (empty and non-empty arguments), and `status` payloads for all three
+`state` values (`no_signal`/`acquiring` with no `result`, `fix` with the full
+`lat_e7_offset`/`lon_e7_offset`/`fix_quality`/`satellites`/`hdop_e1`/`utc_timestamp_s`/
+`altitude_dm_offset` result map -- the seventh field, appended after `utc_timestamp_s`, added
+2026-09-12 same session). The existing `<wardriving-record>` vectors also gained the new
+`utc_timestamp_s` field (present right after `timestamp_ms`, per the updated field order).
+
+`tests/esp32/test_framing_cbor.c` (via `tests/esp32/build.ps1`, now also compiling
+`esp32/main/cbor_gps.c`) and `tests/flipper/test_flipper_codec.c` (via
+`tests/flipper/build.ps1`) both exercise these vectors.
+
+`esp32/main/nmea_parser.c`/`.h` -- the pure, zero-ESP-IDF-dependency GGA/RMC sentence
+parser underneath `location.c`'s real UART-driven GPS driver -- has its own host-native
+test (`tests/esp32/test_location.c`, via `tests/esp32/build_location.ps1`), retained under
+its original filename even though it no longer compiles `location.c` directly:
+`location.c` now depends on `driver/uart.h` and FreeRTOS (real hardware I/O, a dedicated
+background parse task) and is not host-buildable, the same split already established
+between `wardriving_record_format.c` (pure, host-tested) and `wardriving_log.c`
+(ESP-IDF-only, not host-tested). Test sentences are taken verbatim from
+`tools/gps_antenna_last_run.log`, a real hardware-captured NMEA sample, plus three synthetic
+sentences shaped to match the NMEA 0183 spec: "no fix yet" GGA, a "void" RMC, and a
+negative-altitude GGA (below mean sea level -- not present in the captured log).
+
+`idf.py build` passes clean with the real GPS driver, the new `gps` capability's
+command/status dispatch, and wardriving's per-record GPS-fix discard now reading the real
+3-state driver instead of the fixed-coordinate stub's binary `has_fix`. Hardware
+verification (a real module driving all three `gps` states through a cold-start-to-fix
+cycle, and wardriving's discard/resume behavior around a lost/regained fix) is a separate
+follow-up requiring explicit user go-ahead, per this project's hardware-safety rule.

@@ -173,8 +173,8 @@ static void test_start_interval_resolution(void)
     req.want_ble = true;
     check(wardriving_resolve_start_intervals(&req, &resolved),
           "start intervals: both sources requested, all interval fields absent -> accepted");
-    check(resolved.wifi_interval_ms == FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS,
-          "start intervals: wifi_interval_ms defaults to its default value when absent");
+    check(resolved.wifi_interval_ms == 30000u,
+          "start intervals: wifi_interval_ms defaults to a conservative 30s cadence when absent");
     check(resolved.ble_window_ms == FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS &&
           resolved.ble_interval_ms == FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS,
           "start intervals: ble_window_ms/ble_interval_ms default to their default values when absent");

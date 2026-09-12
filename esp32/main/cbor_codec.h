@@ -1,22 +1,23 @@
 /* Shared contract, mirrored byte-for-byte in flipper/cbor_codec.h. Changes here must be
    mirrored there and in docs/PROTOCOL.md, or the two firmwares diverge.
 
-   Umbrella header (docs/OPTIMIZATION.md item 1, split 2026-09-08): the codec implementation
-   is split per capability into cbor_primitives.c/.h, cbor_records.c/.h, cbor_wifi_scan.c/.h,
-   cbor_ble_scan.c/.h, cbor_wardriving.c/.h -- this file now holds only the macros/typedef
-   genuinely shared across every one of those (the CBOR status enum and the generic
-   length/nesting bounds), then #includes the five split headers so every declaration is
-   still reachable through `#include "cbor_codec.h"` exactly as before the split. See each
-   split header's own top comment for its scope; the split headers' comments preserve the
-   original section-boundary documentation (nesting-depth rationale, field-order notes,
-   etc.) verbatim from before the split.
+   Umbrella header (docs/OPTIMIZATION.md item 1, split 2026-09-08; cbor_gps.h added
+   2026-09-12): the codec implementation is split per capability into cbor_primitives.c/.h,
+   cbor_records.c/.h, cbor_wifi_scan.c/.h, cbor_ble_scan.c/.h, cbor_wardriving.c/.h,
+   cbor_gps.c/.h -- this file now holds only the macros/typedef genuinely shared across
+   every one of those (the CBOR status enum and the generic length/nesting bounds), then
+   #includes the six split headers so every declaration is still reachable through
+   `#include "cbor_codec.h"` exactly as before the split. See each split header's own top
+   comment for its scope; the split headers' comments preserve the original
+   section-boundary documentation (nesting-depth rationale, field-order notes, etc.)
+   verbatim from before the split.
 
    Scope note (docs/PLAN.md step 3): cbor_primitives.h implements the generic canonical-CBOR
    primitives; cbor_records.h implements the two fixed outer envelope shapes from
    docs/PROTOCOL.md#record-format, the self-contained `error` payload (used as the on-device
    smoke-test payload for step 3), the capability_query/capability_response payloads (step
    7), and the generic command/status payloads (Phase 3 wifi_scan-command step).
-   cbor_wifi_scan.h/cbor_ble_scan.h/cbor_wardriving.h implement their respective
+   cbor_wifi_scan.h/cbor_ble_scan.h/cbor_wardriving.h/cbor_gps.h implement their respective
    capability-specific payload shapes. None of these implement hello/pair_* (those live in
    session.h/pairing.h). */
 #ifndef FEB_CBOR_CODEC_H
@@ -61,5 +62,6 @@ typedef enum {
 #include "cbor_wifi_scan.h"
 #include "cbor_ble_scan.h"
 #include "cbor_wardriving.h"
+#include "cbor_gps.h"
 
 #endif /* FEB_CBOR_CODEC_H */

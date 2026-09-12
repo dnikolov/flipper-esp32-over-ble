@@ -70,11 +70,13 @@
 #define WD_RECORD_FLAG_UNDRAINED 0x01u
 
 /* Bound on feb_cbor_encode_wardriving_record()'s output for this protocol's
-   wardriving-record shape (timestamp_ms/lat_e7_offset/lon_e7_offset/source/payload).
-   Hand-computed worst case with a maxed-out 32-byte SSID and this firmware's longest real
-   auth string ("wpa3_ext_psk_mixed_mode", 23 bytes) is ~188 bytes; 240 leaves ~50 bytes of
-   margin without wasting much flash per record (a few hundred bytes across an entire
-   partition's worth of records). */
+   wardriving-record shape (timestamp_ms/utc_timestamp_s/lat_e7_offset/lon_e7_offset/source/
+   payload). Hand-computed worst case with a maxed-out 32-byte SSID and this firmware's
+   longest real auth string ("wpa3_ext_psk_mixed_mode", 23 bytes) was ~188 bytes before
+   utc_timestamp_s; that field's key+value adds up to 16 bytes (text key "utc_timestamp_s")
+   + 9 bytes (worst-case 9-byte CBOR uint64 encoding) = 25 bytes, for a new worst case of
+   ~213 bytes. 240 leaves ~27 bytes of margin without wasting much flash per record (a few
+   hundred bytes across an entire partition's worth of records). */
 #define WD_RECORD_MAX_PAYLOAD 240u
 
 static inline size_t wd_round_up_align(size_t value)

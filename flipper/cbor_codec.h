@@ -14,7 +14,10 @@
    "`ble_scan` command and status payloads" / "`wardriving` command and status payloads",
    frozen wire spec) added `<device-result>`/`ble_scan` result shapes and the `wardriving`
    command/status/`<wardriving-record>` shapes -- wire-format codec layer only, no
-   dispatch/UI. It does NOT implement hello/pair_* (those live in session.h/pairing.h).
+   dispatch/UI. The `gps` capability (docs/PROTOCOL.md "`gps` command and status payloads",
+   frozen 2026-09-12) added the flat `status.result` shape in cbor_gps.h, and
+   `<wardriving-record>` gained a new `utc_timestamp_s` field the same day (see
+   cbor_wardriving.h). It does NOT implement hello/pair_* (those live in session.h/pairing.h).
 
    This is a thin umbrella header (split 2026-09-08 per docs/OPTIMIZATION.md item 1): the
    generic primitives/envelope/payload declarations live in the five included headers below,
@@ -66,5 +69,6 @@ typedef enum {
 #include "cbor_wifi_scan.h"
 #include "cbor_ble_scan.h"
 #include "cbor_wardriving.h"
+#include "cbor_gps.h"
 
 #endif /* FEB_CBOR_CODEC_H */

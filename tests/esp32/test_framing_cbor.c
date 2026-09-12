@@ -630,11 +630,12 @@ static void test_wardriving_record_roundtrip(void)
     consumed = feb_cbor_decode_wardriving_record(FEB_VEC_WARDRIVING_RECORD_WIFI,
                                                   FEB_VEC_WARDRIVING_RECORD_WIFI_LEN, &record, &status);
     ok = (consumed == FEB_VEC_WARDRIVING_RECORD_WIFI_LEN && status == FEB_CBOR_OK);
-    ok = ok && record.timestamp_ms == 1000 && record.payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI;
+    ok = ok && record.timestamp_ms == 1000 && record.utc_timestamp_s == 1757667010 &&
+         record.payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI;
     ok = ok && record.payload.wifi.ssid_len == strlen("TestNetwork") &&
          memcmp(record.payload.wifi.ssid, "TestNetwork", record.payload.wifi.ssid_len) == 0;
     ok = ok && record.payload.wifi.channel == 6;
-    check(ok, "wardriving record (wifi-sourced): decodes timestamp/coords/source/payload");
+    check(ok, "wardriving record (wifi-sourced): decodes timestamp/utc_timestamp_s/coords/source/payload");
     encoded_len = feb_cbor_encode_wardriving_record(encode_buf, sizeof(encode_buf), &record);
     check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_RECORD_WIFI, FEB_VEC_WARDRIVING_RECORD_WIFI_LEN),
           "wardriving record (wifi-sourced): encode round-trip byte-identical");
@@ -717,6 +718,91 @@ static void test_wardriving_status_result_payload(void)
     ok = (status == FEB_CBOR_OK) && st.request_id == 502 && !st.has_result;
     ok = ok && st.state_len == strlen("stopped") && memcmp(st.state, "stopped", st.state_len) == 0;
     check(ok, "wardriving status (stopped): decodes request_id/state, no result field");
+}
+
+/* gps codec vectors (docs/PROTOCOL.md "`gps` command and status payloads", design frozen
+   2026-09-12). Mirrors ble_scan's command/status vector strategy above -- payload-codec-only,
+   no protected-record end-to-end wrap. */
+static void test_gps_command_payload(void)
+{
+    feb_command_payload_t cmd;
+    feb_cbor_status_t status;
+    size_t arg_count;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_GPS_COMMAND_PAYLOAD,
+                                              FEB_VEC_GPS_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && cmd.capability_len == strlen("gps") && memcmp(cmd.capability, "gps", cmd.capability_len) == 0;
+    ok = ok && cmd.request_id == 601;
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 0;
+    check(ok, "gps command payload: decodes capability/request_id/empty arguments");
+
+    encoded_len = feb_cbor_encode_command_payload(encode_buf, sizeof(encode_buf), &cmd);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_GPS_COMMAND_PAYLOAD, FEB_VEC_GPS_COMMAND_PAYLOAD_LEN),
+          "gps command payload: encode round-trip byte-identical");
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD,
+                                              FEB_VEC_GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 1;
+    check(ok, "gps command payload (non-empty arguments): decodes structurally OK; "
+              "rejection is a main.c dispatch-layer concern (invalid_command), not a codec error");
+}
+
+static void test_gps_status_payload(void)
+{
+    feb_status_payload_t st;
+    feb_gps_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_GPS_STATUS_NO_SIGNAL_PAYLOAD,
+                                             FEB_VEC_GPS_STATUS_NO_SIGNAL_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 601 && !st.has_result;
+    ok = ok && st.state_len == strlen("no_signal") && memcmp(st.state, "no_signal", st.state_len) == 0;
+    check(ok, "gps status (no_signal): decodes request_id/state, no result field");
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_GPS_STATUS_ACQUIRING_PAYLOAD,
+                                             FEB_VEC_GPS_STATUS_ACQUIRING_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 601 && !st.has_result;
+    ok = ok && st.state_len == strlen("acquiring") && memcmp(st.state, "acquiring", st.state_len) == 0;
+    check(ok, "gps status (acquiring): decodes request_id/state, no result field");
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_GPS_STATUS_FIX_PAYLOAD,
+                                             FEB_VEC_GPS_STATUS_FIX_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 601 && st.has_result;
+    ok = ok && st.state_len == strlen("fix") && memcmp(st.state, "fix", st.state_len) == 0;
+    check(ok, "gps status (fix): decodes request_id/state/result");
+
+    if (ok) {
+        status = feb_cbor_decode_gps_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.fix_quality == 1 && result.satellites == 9 &&
+             result.hdop_e1 == 20 && result.utc_timestamp_s == 1757667010 &&
+             result.altitude_dm_offset == 1000529;
+    }
+    check(ok, "gps status (fix): result decodes fix_quality/satellites/hdop_e1/utc_timestamp_s/"
+              "altitude_dm_offset");
+
+    if (ok) {
+        encoded_len = feb_cbor_encode_gps_result_payload(encode_buf, sizeof(encode_buf), &result);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_GPS_RESULT_FIX, FEB_VEC_GPS_RESULT_FIX_LEN),
+              "gps status (fix): result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_GPS_STATUS_FIX_PAYLOAD,
+                       FEB_VEC_GPS_STATUS_FIX_PAYLOAD_LEN),
+              "gps status (fix): full status payload encode round-trip byte-identical");
+    } else {
+        check(0, "gps status (fix): result encode round-trip byte-identical");
+        check(0, "gps status (fix): full status payload encode round-trip byte-identical");
+    }
 }
 
 int main(void)
@@ -834,6 +920,9 @@ int main(void)
     test_wardriving_command_payload();
     test_wardriving_record_roundtrip();
     test_wardriving_status_result_payload();
+
+    test_gps_command_payload();
+    test_gps_status_payload();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

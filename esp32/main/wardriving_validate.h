@@ -59,12 +59,12 @@
    validation is not trustworthy evidence for picking a duty value and was not relied on
    here; 20% was chosen as a conservative step up from the already-hardware-verified 6%,
    not because the old sweep endorsed it.
-   wifi_interval_ms's default is still point-4's 0 (continuous, no gap) -- WiFi scanning
-   was active in that same reproduction and is suspected to independently compete for the
-   same shared 2.4GHz radio via IDF's coexistence arbiter, but this has not yet been
-   isolated/validated the way step 4 validated the original points; flagged in
-   docs/PLAN.md, not yet fixed. */
-#define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 0u
+   wifi_interval_ms default was left at point-4's 0 (continuous, no gap) through
+   2026-09-11, but live wardriving reconnect tests showed a concurrent, gapless Wi-Fi scan
+   can starve the shared 2.4GHz radio while the BLE side is reconnecting. The default is
+   now 30000ms (30s) to keep the BLE path stable while leaving a per-session override in
+   the protocol for higher-throughput use cases. */
+#define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 30000u
 #define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 100u
 #define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 500u
 

@@ -134,38 +134,73 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   currently zero.
 - Manual "disconnect current board" Flipper UI action, to free the BLE connection slot without
   powering a board off (step 7 scope).
+- **No unpair UI action exists at all yet** (a broader gap than the disconnect item above) —
+  confirmed a real practical cost 2026-09-12: after adding the `gps` capability to the ESP32,
+  an already-paired board's Flipper-side capability cache (`docs/CAPABILITIES.md`'s "queried
+  exactly once, never auto-refreshed" rule) kept it permanently invisible until the cached
+  `capabilities/<board_id>.dat` file was deleted by hand via the Unleashed checkout's
+  `scripts/storage.py -p COM8 remove ...` over the Flipper's CLI port — the only available
+  workaround today. Any future capability added to an already-paired board will hit the exact
+  same silent staleness until a real unpair action exists in the app.
 - Automatic BLE arbitration between multiple paired boards — gated on an unresolved BLE-HAL
   question: can the Flipper's peripheral role advertise while already connected?
-- **Implement real GPS support** — swap `esp32/main/location.c`'s fixed-coordinate stub for a
-  real UART-based NMEA-0183 driver reading the GY-NEO6MV2/NEO-6M module, behind the existing
-  `location_init()`/`location_get_fix()` interface in `location.h` (see PLAN.md's "GPS-stub
-  reorder" for why that interface exists — callers in `wardriving_log.c` etc. should need no
-  changes). Confirmed-working settings from the `esp32/gps_antenna_test/` smoke test
-  (2026-09-12, hardware-verified via `tools/test_gps_antenna.ps1`): UART1, 9600 baud 8N1, no
-  flow control, RX=GPIO18, TX=GPIO19 (ESP32 side), and **RX-only** — send nothing to the
-  module; an earlier wake/cold-start command burst was proven unnecessary and actively
-  harmful (it forced the receiver to re-acquire on every reconnect). Parse `$..GGA` sentences
-  for fix quality/satellite count/HDOP/lat-lon the same way the smoke test's log parsing does.
-  Prerequisite for the two items directly below.
-- GPS backfill-to-first-fix as a Flipper-settable option, instead of discarding every
-  pre-fix wardriving result outright (step 7/GPS capability).
-- **Replace the CSV `FirstSeen` backdating approximation with a real timestamp once GPS lands.**
-  `record->timestamp_ms` is ESP32 boot-uptime (`esp_timer_get_time()`, no RTC on that board —
-  `esp32/main/main.c`), not wall-clock time; the Flipper reconstructs an approximate wall-clock
-  `FirstSeen` for the WiGLE CSV export by anchoring the newest drained record to its own RTC and
-  backdating the rest (`feb_wardriving_backdate_first_seen()`, `flipper/wardriving_csv.h` /
-  `wardriving_csv.c`, `flipper_esp32_over_ble.c`'s `wardriving_csv_write_record()`). This is only
-  as accurate as the Flipper's RTC and drifts further from real capture time under reorder or a
-  stalled drain. Once a real GPS module supplies its own fix time (or the ESP32 gets an RTC), the
-  wire protocol/CSV export should carry that instead of reconstructing it after the fact — revisit
-  the whole backdating mechanism at that point rather than layering GPS time on top of it.
+- **Real GPS driver + wardriving fix-dependency + real record timestamps** — **implemented on
+  both firmwares 2026-09-12**, build- and host-test-verified independently on each side; hardware
+  verification of the complete feature (both sides together, on a real module) not yet started.
+  Full design: [PLAN.md](PLAN.md)'s "Real GPS driver, wardriving fix-dependency, and real
+  wardriving-record timestamps" (see its "Known implementation notes" for the accepted
+  old-flash-record data loss and the GPS-screen-wiring follow-on); wire contract:
+  [PROTOCOL.md](PROTOCOL.md)'s new `gps` section and `utc_timestamp_s` field;
+  [CAPABILITIES.md](CAPABILITIES.md)'s `gps` and updated `wardriving` entries. Follow-on items
+  this design deliberately left backlogged, not folded in:
+  - GPS backfill-to-first-fix (buffer and retroactively backfill pre-fix records instead of
+    discarding them) — considered as an alternative to the chosen continuous-discard behavior,
+    not built.
+  - A user-configurable fix-quality/HDOP acceptance threshold, as a board setting (the frozen
+    design uses "any non-zero fix quality," no threshold).
+  - Research into improving on-board GPS accuracy (antenna choice, SBAS/WAAS config, update
+    rate, etc.) — raised during the design session, not investigated yet.
+  - Real speed/heading on the GPS screen, from `RMC`'s speed/course fields — the frozen design
+    already parses `RMC` for date/time, so this is now a smaller follow-on (read two fields
+    already being parsed) than it would otherwise be, but is still not part of the frozen scope.
+  - `wardriving_csv.c`'s WigleWifi-1.4 `AltitudeMeters`/`AccuracyMeters` columns are still
+    hardcoded `"0,0"` (added 2026-09-12, GGA `altitude_dm` now exists in `feb_location_t` and
+    the `gps` capability's own `altitude_dm_offset` result field — see PROTOCOL.md — but
+    wardriving records/`<wardriving-record>` carry no altitude field of their own yet, so the
+    CSV exporter has nothing to read). `AccuracyMeters` has no real source at all — the GPS
+    module reports HDOP, not a meters-based error estimate (see docs/PROTOCOL.md's `gps`
+    `hdop_e1` field) — so filling it would mean either an HDOP-derived approximation, documented
+    as such, or leaving it `0`. Not folded into this altitude change since it requires a
+    wardriving-record wire-format change (a new field on both firmwares), out of scope for a
+    `gps`-capability-only addition.
+  - Board-side autostart wardriving, independent of the Flipper initiating the session (a
+    board-specific setting) — a new item raised during the design session, unscoped.
+  - Runtime-configurable GPS UART GPIO pins via a Flipper Settings screen — the user's original
+    ask included this, deliberately split out of the frozen design (see PLAN.md's "Scope
+    boundary" note) because it needs a form/pin-entry widget this project doesn't have yet and a
+    new get/set wire config surface. Defaults stay compile-time constants for now.
 - Non-ASCII SSID rendering is untested on real hardware (host-native codec tests cover the
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
   single-`ViewPort`/`AppEvent`-queue pattern every screen has been bolted onto. Structural,
-  no deadline. **Promoted to a hard prerequisite by [docs/UI_REDESIGN.md](UI_REDESIGN.md)**
-  (2026-09-12 design pass) — that design's menu-driven navigation cannot be built on today's
-  flat event-queue pattern.
+  no deadline. **Corrected 2026-09-12 (was stale):** this was previously framed as a hard
+  prerequisite for [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s menu redesign, but that redesign
+  shipped the same day built directly on the existing `ViewPort`/`AppEvent`-queue pattern instead
+  — the prerequisite was skipped, not satisfied. Back to a structural nice-to-have with no
+  blocking dependency, not a blocker for anything currently in flight.
+- **New (2026-09-12):** the Flipper's "Scan" menu screen is only a placeholder-level Wi-Fi-scan/
+  BLE-scan picker, not [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s actual five-mode BLE-active/passive
+  live-view design (reusing Wardriving's capture engine without persistence). Needs its own
+  implementation pass once the runtime BLE active/passive toggle above exists.
+- **New (2026-09-12):** decide whether `AppScreenLegacy`/`HomeMenuLegacy` (a compatibility screen
+  preserving the old direct-button-shortcut flow, found during the Phase 3a implementation but
+  never part of [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s original design) is kept long-term or
+  removed once Scan/GPS/Settings/About are trusted to fully replace it.
+- **New (2026-09-12), cosmetic, needs a hardware/visual check:** the Home menu's "Connection
+  lost" banner and each non-Home screen's own title may visually overlap — both are drawn at
+  nearly the same canvas position (banner at y=12 `FontSecondary`, titles at y=11 `FontPrimary`).
+  Found while reading `draw_callback` during the Phase 3a docs-accuracy pass; not confirmed on a
+  real screen.
 - **Consolidating/grouping wardriving records on the Flipper side** (e.g. de-duplicating or
   rolling up repeated/nearby sightings for display, as distinct from the ESP32-side capture-time
   dedup that already exists). Not scoped yet — needs its own planning/grill-me session before
@@ -206,10 +241,11 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
 - **G29** — ✅ done, see `docs/PROJECT_HISTORY.md`'s 2026-09-11 "Wardriving CSV dedup reset on
   restart fixed" entry (chosen scope: file lifetime, documented in `docs/CAPABILITIES.md`).
   Hardware re-verification (a real stop/restart mid-capture) still pending.
-- **WiFi-source duty cycle** (`wifi_interval_ms` default `0`, continuous) is unvalidated with an
-  active connection — suspected to compete for the same radio via IDF's coexistence arbiter, but
-  never isolated the way step 4 isolated the BLE points. Needs its own coexistence check before
-  picking a different default.
+- **WiFi-source duty cycle** (`wifi_interval_ms` default `30000`, conservative) is now backed by
+  the live reconnect-stall investigation and the same BLE coexistence guardrail; the default is set
+  to 30s to avoid starving the shared radio during reconnect attempts while leaving a per-session
+  override available for throughput-heavy experiments. The remaining work is to validate a non-zero
+  Wi‑Fi duty-cycle on a real wardriving run rather than treat it as a fallback-only choice.
 
 ## Accepted, not a bug — do not "fix"
 
@@ -218,8 +254,14 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
 - The 30-second idle disconnect is specified behavior; only a heartbeat *redesign* (above) is
   backlogged, not the current mechanism itself.
 - `capability_query`'s `requested` field is intentionally unimplemented (full registry only).
-- GPS is a fixed-coordinate stub; discarding pre-fix captures is specified behavior until real
-  GPS lands.
+- GPS is a fixed-coordinate stub until hardware-verified (real driver + wardriving fix-dependency
+  implemented and build/host-test-verified 2026-09-12, hardware verification pending — see
+  PLAN.md's "Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps").
+  Discarding captures made without a real fix is specified behavior.
+- Old on-flash wardriving records failing to decode (and being silently skipped) once the new
+  mandatory `utc_timestamp_s` field ships is an accepted one-time cost of that format upgrade, not
+  a bug — the existing decode-failure path already handles it safely, and the circular log
+  self-heals as it rotates. Accepted by the user 2026-09-12; see PLAN.md's GPS section.
 - `pairing_crypto.c`'s X25519 ladder is not constant-time (`mbedtls_mpi_mod_mpi()`). Accepted for
   the current threat model — physical possession of either device is already fully compromising.
 - Step 4's radio-coexistence sweep is not trustworthy evidence for a wardriving duty-cycle

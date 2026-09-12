@@ -32,6 +32,7 @@ HEADER_PAIRS = [
     ("esp32/main/cbor_wifi_scan.h", "flipper/cbor_wifi_scan.h"),
     ("esp32/main/cbor_ble_scan.h", "flipper/cbor_ble_scan.h"),
     ("esp32/main/cbor_wardriving.h", "flipper/cbor_wardriving.h"),
+    ("esp32/main/cbor_gps.h", "flipper/cbor_gps.h"),
     ("esp32/main/framing.h", "flipper/framing.h"),
     ("esp32/main/pairing.h", "flipper/pairing.h"),
     ("esp32/main/pairing_crypto.h", "flipper/pairing_crypto.h"),

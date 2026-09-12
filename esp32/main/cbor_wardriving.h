@@ -76,8 +76,13 @@ typedef struct {
 size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, const feb_wardriving_command_payload_t *payload);
 feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, size_t in_len, feb_wardriving_command_payload_t *payload);
 
-/* `<wardriving-record>` fixed field order: timestamp_ms, lat_e7_offset, lon_e7_offset,
-   source, payload -- matches PROTOCOL.md's table exactly. `payload`'s shape depends on
+/* `<wardriving-record>` fixed field order: timestamp_ms, utc_timestamp_s, lat_e7_offset,
+   lon_e7_offset, source, payload -- matches PROTOCOL.md's table exactly (utc_timestamp_s
+   added 2026-09-12, "Real GPS driver, wardriving fix-dependency, and real wardriving-record
+   timestamps": Unix epoch seconds derived from the most recent valid RMC sentence; always
+   present and valid on every logged record since a record is only ever logged while the
+   location driver reports state = "fix", which requires a valid RMC alongside the valid GGA
+   -- see location.h). `payload`'s shape depends on
    `source` ("wifi" -> ssid/bssid/rssi_offset/channel/auth; "ble" -> address/name
    (optional)/rssi_offset) -- modeled here as a tagged union: `payload_kind` discriminates
    which of `payload.wifi`/`payload.ble` is valid. `source`/`source_len` are populated by
@@ -132,6 +137,7 @@ typedef struct {
 
 typedef struct {
     uint64_t timestamp_ms;
+    uint64_t utc_timestamp_s;
     uint64_t lat_e7_offset;
     uint64_t lon_e7_offset;
     const char *source; /* raw wire text ("wifi"/"ble"), decoder-only -- see comment above */

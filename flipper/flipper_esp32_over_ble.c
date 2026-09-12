@@ -58,6 +58,13 @@
    (2000ms) so a stalled fragment sequence is reclaimed promptly rather than right at the
    deadline. */
 #define REASSEMBLY_TIMEOUT_CHECK_PERIOD_MS 500
+/* `gps` poll cadence while the Wardriving screen is open (docs/PLAN.md "Real GPS driver...",
+   decision 5: "GPS position changing at walking/driving speed doesn't need push latency").
+   2 seconds is far below anything that would feel sluggish for a fix/no-fix indicator, and
+   far above the cost of one more round-trip encrypted command every tick -- no bound is
+   specified in PROTOCOL.md, so this is a judgment call, not a re-derivation of a frozen
+   number. */
+#define GPS_POLL_PERIOD_MS 2000
 
 typedef enum {
     CharacteristicWrite,
@@ -111,6 +118,17 @@ typedef enum {
     ScanMenuCount,
 } ScanMenuItem;
 
+/* `gps` capability status (docs/PROTOCOL.md "`gps` command and status payloads", frozen
+   2026-09-12): the wire's three states, `no_signal`/`acquiring`/`fix`. Distinct from
+   `gps_status_known` (Esp32App/AppEvent) tracking whether this session has polled at all
+   yet -- matches wardriving_running_known's own "no evidence yet" pattern
+   (docs/LESSONS.md "UI must derive from real state"). */
+typedef enum {
+    GpsFixStateNoSignal = 0,
+    GpsFixStateAcquiring,
+    GpsFixStateFix,
+} GpsFixState;
+
 typedef enum {
     AppEventInput,
     AppEventBtStatus,
@@ -138,6 +156,13 @@ typedef enum {
     AppEventWardrivingRunState,
     AppEventWardrivingBatch,
     AppEventWardrivingError,
+    /* `gps` (docs/PLAN.md "Real GPS driver..."): AppEventGpsStatus carries a decoded status
+       reply (posted from the BLE thread, see handle_gps_status()); AppEventGpsPollTick is
+       posted by gps_poll_timer's callback (Furi timer-service thread) purely to make the
+       main thread do the actual send -- see send_gps_command()'s and gps_poll_timer's own
+       comments for why the send itself never happens directly on the timer thread. */
+    AppEventGpsStatus,
+    AppEventGpsPollTick,
 } AppEventType;
 
 /* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
@@ -186,6 +211,17 @@ typedef struct {
     bool wardriving_last_is_ble;
     char wardriving_last_summary[40];
     char wardriving_error_message[48];
+    bool capability_has_gps;
+    /* AppEventGpsStatus fields; gps_lat_e7_offset..gps_utc_timestamp_s are only meaningful
+       when gps_state == GpsFixStateFix (see post_gps_status()). */
+    uint8_t gps_state; /* GpsFixState value */
+    uint64_t gps_lat_e7_offset;
+    uint64_t gps_lon_e7_offset;
+    uint64_t gps_fix_quality;
+    uint64_t gps_satellites;
+    uint64_t gps_hdop_e1;
+    uint64_t gps_utc_timestamp_s;
+    uint64_t gps_altitude_dm_offset;
 } AppEvent;
 
 typedef struct {
@@ -238,6 +274,20 @@ typedef struct {
        reset_scan_ui_state() -- a user preference for this app run, not scan-result state. */
     bool wardriving_use_wifi;
     bool wardriving_use_ble;
+    bool capability_has_gps;
+    /* gps_status_known false means this session has never received a `gps` status reply yet
+       (docs/LESSONS.md "UI must derive from real state") -- distinct from any particular
+       GpsFixState value, same "unknown" pattern as wardriving_running_known above. Fix
+       fields are only meaningful when gps_state == GpsFixStateFix. */
+    bool gps_status_known;
+    GpsFixState gps_state;
+    uint64_t gps_lat_e7_offset;
+    uint64_t gps_lon_e7_offset;
+    uint64_t gps_fix_quality;
+    uint64_t gps_satellites;
+    uint64_t gps_hdop_e1;
+    uint64_t gps_utc_timestamp_s;
+    uint64_t gps_altitude_dm_offset;
 } Esp32App;
 
 typedef struct {
@@ -314,6 +364,15 @@ static feb_reassembly_t reassembly;
 static FuriMutex* reassembly_mutex;
 static FuriTimer* reassembly_timeout_timer;
 static uint8_t outgoing_message_id;
+
+/* `gps` poll timer (docs/PLAN.md "Real GPS driver...", decision 5: poll only while a screen
+   that needs live status is open -- today, only the Wardriving screen; see
+   gps_poll_timer_callback()'s own comment). Allocated/freed alongside
+   reassembly_timeout_timer; started/stopped on Wardriving-screen entry/exit rather than at
+   profile start/stop, since the whole point is "only while that screen is open", not "only
+   while connected" (a poll tick with no active session is just a harmless no-op send
+   attempt -- see send_gps_command()'s own profile/pairing_phase guard). */
+static FuriTimer* gps_poll_timer;
 
 static const FuriHalBleProfileTemplate profile_callbacks;
 
@@ -1087,6 +1146,7 @@ typedef enum {
     PendingCommandBleScan,
     PendingCommandWardrivingStart,
     PendingCommandWardrivingStop,
+    PendingCommandWardrivingStatus,
 } PendingCommandKind;
 static PendingCommandKind pending_command_kind = PendingCommandNone;
 
@@ -1356,6 +1416,7 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
     event.capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
     event.capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
     event.capability_has_wardriving = capability_has_feature(payload, "wardriving");
+    event.capability_has_gps = capability_has_feature(payload, "gps");
     furi_message_queue_put(app->queue, &event, 0);
 }
 
@@ -1627,6 +1688,76 @@ static void
     }
 }
 
+/* ---- `gps` capability (docs/PROTOCOL.md "`gps` command and status payloads", frozen
+   2026-09-12) ---- poll-only status query, no scan lifecycle and no busy/error concept of
+   its own (PROTOCOL.md: "a `gps` command never blocks on or conflicts with wifi_scan/
+   ble_scan/wardriving"), so unlike wifi_scan/ble_scan there is no PendingCommandKind entry
+   for it and handle_runtime_error() never routes anything here. */
+static void post_gps_status(
+    Esp32App* app, GpsFixState state, const feb_gps_result_payload_t* result) {
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventGpsStatus;
+    event.gps_state = (uint8_t)state;
+    if(state == GpsFixStateFix && result != NULL) {
+        event.gps_lat_e7_offset = result->lat_e7_offset;
+        event.gps_lon_e7_offset = result->lon_e7_offset;
+        event.gps_fix_quality = result->fix_quality;
+        event.gps_satellites = result->satellites;
+        event.gps_hdop_e1 = result->hdop_e1;
+        event.gps_utc_timestamp_s = result->utc_timestamp_s;
+        event.gps_altitude_dm_offset = result->altitude_dm_offset;
+    }
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* `status` for `gps` (docs/PROTOCOL.md): single-shot, `state` one of "no_signal"/
+   "acquiring"/"fix"; `result` present only for "fix". Routed here by profile_event_handler's
+   status dispatch matching directly on the state text -- gps's three states are never
+   ambiguous with wifi_scan/ble_scan's ("partial"/"complete") or wardriving's own
+   ("started"/"data"/"stopped"), same convention wardriving's own dispatch already relies on. */
+static void
+    handle_gps_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_status_payload_t status_payload;
+    feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "gps status payload decode failed: %d; dropping", status);
+        return;
+    }
+    GpsFixState state;
+    if(text_matches(status_payload.state, status_payload.state_len, "no_signal")) {
+        state = GpsFixStateNoSignal;
+    } else if(text_matches(status_payload.state, status_payload.state_len, "acquiring")) {
+        state = GpsFixStateAcquiring;
+    } else if(text_matches(status_payload.state, status_payload.state_len, "fix")) {
+        state = GpsFixStateFix;
+    } else {
+        FURI_LOG_W(
+            TAG,
+            "gps status: unexpected state '%.*s'; dropping",
+            (int)status_payload.state_len,
+            status_payload.state);
+        return;
+    }
+    if(state != GpsFixStateFix) {
+        post_gps_status(app, state, NULL);
+        return;
+    }
+    if(!status_payload.has_result) {
+        FURI_LOG_W(TAG, "gps status: state=fix but no result; dropping");
+        return;
+    }
+    static feb_gps_result_payload_t result;
+    feb_cbor_status_t result_status = feb_cbor_decode_gps_result_payload(
+        status_payload.result_span, status_payload.result_span_len, &result);
+    if(result_status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "gps status.result decode failed: %d; dropping", result_status);
+        return;
+    }
+    post_gps_status(app, state, &result);
+}
+
 /* ---- wardriving capability (docs/PROTOCOL.md "`wardriving` command and status payloads",
    docs/CAPABILITIES.md's wardriving bullet) ---- */
 
@@ -1682,8 +1813,6 @@ static void post_wardriving_error(Esp32App* app, const char* message) {
    again, defeating the whole policy). */
 static File* wardriving_csv_file;
 static char wardriving_csv_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-static uint64_t wardriving_csv_anchor_timestamp_ms;
-static uint32_t wardriving_csv_anchor_unix_time;
 static uint32_t wardriving_csv_records_since_sync;
 static bool wardriving_csv_write_failed;
 /* wardriving_flush_led_active (the solid-green-while-flushing / solid-blue-when-idle LED
@@ -1704,8 +1833,6 @@ static feb_wardriving_dedup_table_t wardriving_dedup_table;
 #define FEB_WARDRIVING_CSV_SYNC_EVERY_N_RECORDS 8u
 
 static void wardriving_csv_reset_state(void) {
-    wardriving_csv_anchor_timestamp_ms = 0;
-    wardriving_csv_anchor_unix_time = 0;
     wardriving_csv_records_since_sync = 0;
     wardriving_csv_write_failed = false;
     feb_wardriving_dedup_reset(&wardriving_dedup_table);
@@ -1768,29 +1895,22 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
     return true;
 }
 
-/* FirstSeen reconstruction (docs/CAPABILITIES.md): tracks the largest timestamp_ms seen so
-   far this export session and the Flipper wall-clock time at the moment it was seen, then
-   backdates every record (including, trivially, the anchor record itself) from that pair --
-   see feb_wardriving_backdate_first_seen()'s own comment (wardriving_csv.h) for the exact
-   arithmetic. Records normally arrive in non-decreasing timestamp_ms order (the ESP32's flash
-   log is itself sequential), so in practice the anchor advances roughly once per record and
-   tracks close to "now" for the most recent data; a real reorder would just mean an older
-   anchor briefly persists, backdating slightly less accurately, not a crash or corrupt row. */
+/* FirstSeen (docs/CAPABILITIES.md, docs/PROTOCOL.md's `utc_timestamp_s` wardriving-record
+   field, docs/PLAN.md "Real GPS driver..." decision 7): every decoded record is now
+   guaranteed to carry a valid `utc_timestamp_s` (feb_cbor_decode_wardriving_record() rejects
+   any record missing it -- see cbor_wardriving.c), so this is a direct Unix-epoch-seconds ->
+   calendar conversion, not the RTC-anchored backdating approximation this replaced (former
+   feb_wardriving_backdate_first_seen(), which assumed the only available timestamp was
+   boot-relative `timestamp_ms` with no real wall-clock reference at all). No fallback path
+   for a missing/zero utc_timestamp_s is implemented here: the wire contract already rules
+   that case out by construction, so one would be dead code (docs/PLAN.md's own framing). */
 static bool
     wardriving_csv_write_record(Storage* storage, const feb_wardriving_record_t* record) {
     if(!wardriving_csv_ensure_open(storage)) {
         return false;
     }
-    if(record->timestamp_ms >= wardriving_csv_anchor_timestamp_ms) {
-        wardriving_csv_anchor_timestamp_ms = record->timestamp_ms;
-        DateTime now;
-        furi_hal_rtc_get_datetime(&now);
-        wardriving_csv_anchor_unix_time = datetime_datetime_to_timestamp(&now);
-    }
-    uint32_t first_seen_unix = feb_wardriving_backdate_first_seen(
-        record->timestamp_ms, wardriving_csv_anchor_timestamp_ms, wardriving_csv_anchor_unix_time);
     DateTime first_seen_dt;
-    datetime_timestamp_to_datetime(first_seen_unix, &first_seen_dt);
+    datetime_timestamp_to_datetime((uint32_t)record->utc_timestamp_s, &first_seen_dt);
     static char first_seen_str[FEB_WARDRIVING_CSV_FIRST_SEEN_LEN];
     snprintf(
         first_seen_str,
@@ -1876,6 +1996,12 @@ static void
     if(!status_payload.has_result) {
         return;
     }
+
+    /* A live wardriving session is already active as soon as the ESP32 emits a real
+       `status(state="data")` batch, even before a fresh "started" ack is seen in this
+       session. Without this update, the UI stays in the "unknown" fallback forever after a
+       reconnect or a reopened screen, and the user sees Start instead of Stop. */
+    post_wardriving_run_state(app, true, false);
 
     static feb_wardriving_status_result_payload_t result;
     feb_cbor_status_t result_status = feb_cbor_decode_wardriving_status_result_payload(
@@ -2164,6 +2290,79 @@ static bool send_ble_scan_command(Esp32App* app) {
     return true;
 }
 
+/* Sends the `gps` `command` (capability="gps", fresh request_id, always-empty arguments per
+   docs/PROTOCOL.md). Unlike wifi_scan/ble_scan (button-triggered) this is triggered by
+   gps_poll_timer's periodic tick while the Wardriving screen is open, but the send itself
+   still only ever runs on this app's own main thread (the timer callback just posts
+   AppEventGpsPollTick; the main loop's handler for it calls this) -- same
+   no-cross-thread-race argument as send_wifi_scan_command()'s own comment, extended to cover
+   the timer thread as a third possible caller alongside the main thread and the BLE thread. */
+#define FEB_GPS_CMD_PAYLOAD_MAX_LEN 64u
+static uint8_t gps_cmd_payload_buf[FEB_GPS_CMD_PAYLOAD_MAX_LEN];
+static uint8_t gps_cmd_ciphertext_buf[FEB_GPS_CMD_PAYLOAD_MAX_LEN];
+static uint8_t gps_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+static uint64_t gps_next_request_id = 1;
+
+static bool send_gps_command(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    uint8_t arguments_buf[2];
+    size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "gps command: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "gps",
+        .capability_len = sizeof("gps") - 1,
+        .request_id = gps_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        gps_cmd_payload_buf, sizeof(gps_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "gps command: payload encode failed");
+        return false;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "gps command: session sequence at cap; reconnect required");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        gps_cmd_payload_buf,
+        payload_len,
+        gps_cmd_ciphertext_buf,
+        sizeof(gps_cmd_ciphertext_buf),
+        gps_cmd_record_buf,
+        sizeof(gps_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "gps command: record encode failed");
+        return false;
+    }
+    if(!send_pairing_record(profile, gps_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "gps command: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(TAG, "gps command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    return true;
+}
+
 /* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
    values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see
    FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN's own comment for why this project no longer shaves
@@ -2276,6 +2475,81 @@ static bool send_wardriving_start_command(Esp32App* app) {
     FURI_LOG_I(
         TAG,
         "wardriving start command sent (request_id=%llu)",
+        (unsigned long long)command.request_id);
+    return true;
+}
+
+/* Sends a wardriving status-query (`arguments = {action:"status"}`) to refresh the UI's
+   current running/stopped state immediately after session auth or when the wardriving screen
+   is reopened before any fresh `started`/`data` packet has arrived. This is a second guard
+   against the reconnect/unknown-state bug: a live board will respond with its current state
+   even if no new record has yet drained across the connection. */
+static bool send_wardriving_status_query(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    feb_wardriving_command_payload_t command_args;
+    memset(&command_args, 0, sizeof(command_args));
+    command_args.action = "status";
+    command_args.action_len = sizeof("status") - 1;
+
+    uint8_t arguments_buf[32];
+    size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
+        arguments_buf, sizeof(arguments_buf), &command_args);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "wardriving status query: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "wardriving",
+        .capability_len = sizeof("wardriving") - 1,
+        .request_id = wardriving_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "wardriving status query: payload encode failed");
+        return false;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "wardriving status query: session sequence at cap; reconnect required");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        wardriving_cmd_payload_buf,
+        payload_len,
+        wardriving_cmd_ciphertext_buf,
+        sizeof(wardriving_cmd_ciphertext_buf),
+        wardriving_cmd_record_buf,
+        sizeof(wardriving_cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "wardriving status query: record encode failed");
+        return false;
+    }
+    pending_command_kind = PendingCommandWardrivingStatus;
+    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "wardriving status query: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(
+        TAG,
+        "wardriving status query sent (request_id=%llu)",
         (unsigned long long)command.request_id);
     return true;
 }
@@ -2418,6 +2692,9 @@ static void handle_client_auth(Esp32BleProfile* profile, const feb_unencrypted_r
     post_pairing_phase(profile->app, PairingPhaseSessionActive, NULL);
     FURI_LOG_I(TAG, "Runtime session authenticated for board '%s'", session_board_id);
     capability_bootstrap(profile);
+    if(profile->app->capability_has_wardriving && !profile->app->wardriving_running_known) {
+        send_wardriving_status_query(profile->app);
+    }
 }
 
 /* Runs on the Furi timer-service thread (not BleEventWorker) — see reassembly_mutex's
@@ -2432,6 +2709,17 @@ static void reassembly_timeout_timer_callback(void* context) {
     if(status == FEB_FRAME_TIMEOUT) {
         FURI_LOG_W(TAG, "Fragment reassembly timed out, buffer reclaimed");
     }
+}
+
+/* Runs on the Furi timer-service thread, same as reassembly_timeout_timer_callback above --
+   but unlike that one, this must NOT touch session_seq_out/the gps_cmd_* statics itself
+   (those are the main thread's alone to write, per send_wifi_scan_command()'s own
+   cross-thread-safety argument). It only posts AppEventGpsPollTick; the main loop's own
+   handler for that event is what actually calls send_gps_command(). */
+static void gps_poll_timer_callback(void* context) {
+    Esp32App* app = context;
+    AppEvent event = {.type = AppEventGpsPollTick};
+    furi_message_queue_put(app->queue, &event, 0);
 }
 
 static BleEventAckStatus profile_event_handler(void* event, void* context) {
@@ -2597,6 +2885,11 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                             text_matches(status_peek.state, status_peek.state_len, "data") ||
                             text_matches(status_peek.state, status_peek.state_len, "stopped")) {
                             handle_wardriving_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        } else if(
+                            text_matches(status_peek.state, status_peek.state_len, "no_signal") ||
+                            text_matches(status_peek.state, status_peek.state_len, "acquiring") ||
+                            text_matches(status_peek.state, status_peek.state_len, "fix")) {
+                            handle_gps_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else if(pending_command_kind == PendingCommandBleScan) {
                             handle_ble_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else {
@@ -2879,6 +3172,29 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     char line[80];
     bool wardriving_is_running = app->wardriving_running_known && app->wardriving_running;
     bool both_sources_advertised = app->capability_has_wifi_scan && app->capability_has_ble_scan;
+
+    /* `gps` fix indicator (docs/PLAN.md "Real GPS driver...", decision 6): three-state, not
+       binary -- "?" (never polled/no gps capability), "No sig"/"Acq"/"Fix" once polled at
+       least once this session. Squeezed onto this row (rather than a dedicated new one)
+       since every other row on this fixed-layout screen is already conditionally occupied --
+       see this function's own row budget below. Blank entirely when the board doesn't
+       advertise `gps` at all, matching this file's existing capability-gating convention. */
+    char gps_suffix[16];
+    gps_suffix[0] = '\0';
+    if(app->capability_has_gps) {
+        const char* gps_label;
+        if(!app->gps_status_known) {
+            gps_label = "?";
+        } else if(app->gps_state == GpsFixStateFix) {
+            gps_label = "Fix";
+        } else if(app->gps_state == GpsFixStateAcquiring) {
+            gps_label = "Acq";
+        } else {
+            gps_label = "No sig";
+        }
+        snprintf(gps_suffix, sizeof(gps_suffix), "  GPS:%s", gps_label);
+    }
+
     /* While stopped and both sources are advertised, this line shows what the next `start`
        will request (toggled via Left/Right below) instead of the Recs/Backlog line -- picking
        a source is only actionable before OK is pressed, so it takes the slot back once
@@ -2892,17 +3208,22 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
         } else {
             source_label = "BLE only";
         }
-        snprintf(line, sizeof(line), "Source: %s", source_label);
+        snprintf(line, sizeof(line), "Source: %s%s", source_label, gps_suffix);
     } else if(app->wardriving_backlog_remaining > 0) {
         snprintf(
             line,
             sizeof(line),
-            "Recs: %lu  Backlog: %llu",
+            "Recs: %lu  Backlog: %llu%s",
             (unsigned long)app->wardriving_records_this_session,
-            (unsigned long long)app->wardriving_backlog_remaining);
+            (unsigned long long)app->wardriving_backlog_remaining,
+            gps_suffix);
     } else {
         snprintf(
-            line, sizeof(line), "Recs: %lu  Live", (unsigned long)app->wardriving_records_this_session);
+            line,
+            sizeof(line),
+            "Recs: %lu  Live%s",
+            (unsigned long)app->wardriving_records_this_session,
+            gps_suffix);
     }
     canvas_draw_str(canvas, 2, 22, line);
 
@@ -2922,12 +3243,26 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     }
 
     const char* footer;
+    char footer_buf[40];
     if(wardriving_is_running) {
         footer = "OK: stop  Back: exit";
-    } else if(both_sources_advertised) {
-        footer = "OK:start L/R:src Back:exit";
     } else {
-        footer = "OK: start  Back: exit";
+        /* Start action's label only (docs/PLAN.md decision 6) -- the action itself is
+           unchanged either way (send_wardriving_start_command() is called regardless), and
+           this never disables/greys out OK. Only ever "(delayed)" when the board actually
+           advertises `gps` (see gps_suffix's own comment above); a board with no gps
+           capability keeps the original plain "start" wording unconditionally, since there is
+           no signal to reason about and CAPABILITIES.md's own framing already treats a board
+           with no real GPS driver as equivalent to an always-fixed stub. */
+        bool gps_delayed =
+            app->capability_has_gps && !(app->gps_status_known && app->gps_state == GpsFixStateFix);
+        const char* start_label = gps_delayed ? "start (delayed)" : "start";
+        if(both_sources_advertised) {
+            snprintf(footer_buf, sizeof(footer_buf), "OK:%s L/R:src Back:exit", start_label);
+        } else {
+            snprintf(footer_buf, sizeof(footer_buf), "OK: %s  Back: exit", start_label);
+        }
+        footer = footer_buf;
     }
     canvas_draw_str(canvas, 2, 56, footer);
 }
@@ -2962,7 +3297,7 @@ static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
         return app->pairing_phase == PairingPhaseSessionActive &&
                (app->capability_has_wifi_scan || app->capability_has_ble_scan);
     case HomeMenuGps:
-        return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_wardriving;
+        return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_gps;
     case HomeMenuSettings:
     case HomeMenuAbout:
     case HomeMenuLegacy:
@@ -3102,33 +3437,82 @@ static void draw_legacy_screen(Canvas* canvas, Esp32App* app) {
     UNUSED(app);
 }
 
-static void draw_gps_screen(Canvas* canvas, Esp32App* app) {
+static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "GPS");
     canvas_set_font(canvas, FontSecondary);
 
-    DateTime now;
-    furi_hal_rtc_get_datetime(&now);
+    bool has_fix = app->gps_status_known && app->gps_state == GpsFixStateFix;
+    const char* fix_label;
+    if(!app->gps_status_known) {
+        fix_label = "unknown";
+    } else if(has_fix) {
+        fix_label = "fix";
+    } else if(app->gps_state == GpsFixStateAcquiring) {
+        fix_label = "acquiring";
+    } else {
+        fix_label = "no signal";
+    }
 
+    /* Row y-coordinates below: 22/32/42/52/62, this file's established 10px-row-pitch/y=62-footer
+       convention (see the Home screen's earlier overlap fix) -- previously 22/33/44/48/56, whose
+       4px gap between the Time and Speed rows visually collided. */
     char line[64];
-    snprintf(line, sizeof(line), "Mode: simulated");
+    snprintf(line, sizeof(line), "Fix: %s", fix_label);
     canvas_draw_str(canvas, 2, 22, line);
-    snprintf(line, sizeof(line), "Fix: no fix (simulated)");
-    canvas_draw_str(canvas, 2, 33, line);
+
+    if(has_fix) {
+        /* Same lat/lon recovery formula as wardriving_csv.c's own conversion
+           (docs/PROTOCOL.md's lat_e7_offset/lon_e7_offset field definitions) -- kept in sync
+           by hand, since that module has no Furi dependency to share a helper through. */
+        double lat =
+            ((double)(int64_t)app->gps_lat_e7_offset - (double)900000000) / (double)10000000;
+        double lon =
+            ((double)(int64_t)app->gps_lon_e7_offset - (double)1800000000) / (double)10000000;
+        snprintf(line, sizeof(line), "Lat/Lon: %.5f,%.5f", lat, lon);
+    } else {
+        snprintf(line, sizeof(line), "Lat/Lon: --");
+    }
+    canvas_draw_str(canvas, 2, 32, line);
+
+    /* Time source depends on fix state (docs/UI_REDESIGN.md's GPS-screen design): a real
+       `fix` uses the result's own utc_timestamp_s (same epoch->calendar conversion the CSV
+       exporter uses for FirstSeen); otherwise this falls back to the Flipper's own RTC clock,
+       explicitly labeled as such rather than presented as GPS-derived. */
+    DateTime dt;
+    const char* time_label;
+    if(has_fix) {
+        datetime_timestamp_to_datetime((uint32_t)app->gps_utc_timestamp_s, &dt);
+        time_label = "GPS";
+    } else {
+        furi_hal_rtc_get_datetime(&dt);
+        time_label = "RTC";
+    }
     snprintf(
         line,
         sizeof(line),
-        "Time: %04u-%02u-%02u %02u:%02u:%02u",
-        now.year,
-        now.month,
-        now.day,
-        now.hour,
-        now.minute,
-        now.second);
-    canvas_draw_str(canvas, 2, 44, line);
-    canvas_draw_str(canvas, 2, 48, "Lat/Lon: --   Speed: --");
-    canvas_draw_str(canvas, 2, 56, "Back: return");
-    UNUSED(app);
+        "Time(%s): %04u-%02u-%02u %02u:%02u:%02u",
+        time_label,
+        dt.year,
+        dt.month,
+        dt.day,
+        dt.hour,
+        dt.minute,
+        dt.second);
+    canvas_draw_str(canvas, 2, 42, line);
+
+    /* Same offset-recovery convention as the Lat/Lon row above (cbor_gps.h's
+       FEB_GPS_ALTITUDE_DM_OFFSET), decimeters -> meters with one decimal place retained.
+       Speed/heading parsing from RMC is still backlogged (docs/BACKLOG.md) -- always `--`. */
+    if(has_fix) {
+        double altitude_m =
+            ((double)(int64_t)app->gps_altitude_dm_offset - (double)1000000) / (double)10;
+        snprintf(line, sizeof(line), "Alt: %.1fm  Speed: --", altitude_m);
+    } else {
+        snprintf(line, sizeof(line), "Alt: --  Speed: --");
+    }
+    canvas_draw_str(canvas, 2, 52, line);
+    canvas_draw_str(canvas, 2, 62, "Back: return");
 }
 
 static void draw_scan_screen(Canvas* canvas, Esp32App* app) {
@@ -3309,6 +3693,11 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     app->wardriving_last_summary[0] = '\0';
     app->wardriving_error_message[0] = '\0';
     wardriving_csv_close();
+    /* This Flipper's knowledge of the ESP32's gps status does not survive a lost session
+       either (same "UI must derive from real state" argument as wardriving_running_known
+       above) -- the next authenticated session starts genuinely not knowing until the next
+       poll tick's reply arrives. */
+    app->gps_status_known = false;
 }
 
 static void reset_scan_ui_state(Esp32App* app) {
@@ -3404,6 +3793,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     reassembly_timeout_timer = furi_timer_alloc(
         reassembly_timeout_timer_callback, FuriTimerTypePeriodic, NULL);
     furi_check(reassembly_timeout_timer);
+    gps_poll_timer = furi_timer_alloc(gps_poll_timer_callback, FuriTimerTypePeriodic, &app);
+    furi_check(gps_poll_timer);
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, draw_callback, &app);
@@ -3479,6 +3870,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.capability_has_wifi_scan = event.capability_has_wifi_scan;
             app.capability_has_ble_scan = event.capability_has_ble_scan;
             app.capability_has_wardriving = event.capability_has_wardriving;
+            app.capability_has_gps = event.capability_has_gps;
         } else if(event.type == AppEventWifiScanAp) {
             if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
                 WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
@@ -3552,6 +3944,28 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 event.wardriving_error_message,
                 sizeof(app.wardriving_error_message) - 1);
             app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
+        } else if(event.type == AppEventGpsStatus) {
+            app.gps_status_known = true;
+            app.gps_state = (GpsFixState)event.gps_state;
+            if(app.gps_state == GpsFixStateFix) {
+                app.gps_lat_e7_offset = event.gps_lat_e7_offset;
+                app.gps_lon_e7_offset = event.gps_lon_e7_offset;
+                app.gps_fix_quality = event.gps_fix_quality;
+                app.gps_satellites = event.gps_satellites;
+                app.gps_hdop_e1 = event.gps_hdop_e1;
+                app.gps_utc_timestamp_s = event.gps_utc_timestamp_s;
+                app.gps_altitude_dm_offset = event.gps_altitude_dm_offset;
+            }
+        } else if(event.type == AppEventGpsPollTick) {
+            /* Only actually sends while the Wardriving or GPS screen is genuinely open (the
+               only two gps_poll_timer users, never open simultaneously) and a session is
+               active (docs/PLAN.md decision 5) -- a stray tick that arrives just after Back
+               has already left one of those screens, or while disconnected, is a harmless
+               no-op (send_gps_command() itself also guards on pairing_phase). */
+            if((app.screen == AppScreenWardriving || app.screen == AppScreenGps) &&
+               app.capability_has_gps) {
+                send_gps_command(&app);
+            }
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
             if(app.connection_lost) {
                 if(event.input.key == InputKeyBack) {
@@ -3570,6 +3984,16 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     switch(app.home_menu_index) {
                     case HomeMenuWardriving:
                         app.screen = AppScreenWardriving;
+                        if(app.pairing_phase == PairingPhaseSessionActive &&
+                           app.capability_has_wardriving && !app.wardriving_running_known) {
+                            send_wardriving_status_query(&app);
+                        }
+                        /* Poll `gps` status only while this screen is open (docs/PLAN.md
+                           decision 5) -- restarted (not just started) every entry in case a
+                           prior Back already stopped it, matching the stop-then-start pattern
+                           used elsewhere in this file for idempotent timer (re)starts. */
+                        furi_timer_stop(gps_poll_timer);
+                        furi_timer_start(gps_poll_timer, furi_ms_to_ticks(GPS_POLL_PERIOD_MS));
                         break;
                     case HomeMenuScan:
                         if(app.capability_has_wifi_scan && app.capability_has_ble_scan) {
@@ -3599,6 +4023,12 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         break;
                     case HomeMenuGps:
                         app.screen = AppScreenGps;
+                        /* Same poll-while-open pattern as the Wardriving screen above (both
+                           share gps_poll_timer -- they are never open at the same time, so
+                           there is no contention) -- restarted rather than just started for
+                           the same idempotent-reentry reason. */
+                        furi_timer_stop(gps_poll_timer);
+                        furi_timer_start(gps_poll_timer, furi_ms_to_ticks(GPS_POLL_PERIOD_MS));
                         break;
                     case HomeMenuSettings:
                         app.screen = AppScreenSettings;
@@ -3643,8 +4073,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         }
                     }
                 }
-            } else if(app.screen == AppScreenGps || app.screen == AppScreenSettings ||
-                      app.screen == AppScreenAbout || app.screen == AppScreenLegacy) {
+            } else if(app.screen == AppScreenGps) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenHome;
+                    furi_timer_stop(gps_poll_timer);
+                }
+            } else if(app.screen == AppScreenSettings || app.screen == AppScreenAbout ||
+                      app.screen == AppScreenLegacy) {
                 if(event.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
                 }
@@ -3701,6 +4136,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                        stop are already-sent, already-acked actions by the time this screen
                        reflects them). */
                     app.screen = AppScreenHome;
+                    furi_timer_stop(gps_poll_timer);
                 } else if(event.input.key == InputKeyOk) {
                     if(app.wardriving_running_known && app.wardriving_running) {
                         send_wardriving_stop_command(&app);
@@ -3778,6 +4214,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     if(app.profile) stop_service(&app);
     furi_timer_free(reassembly_timeout_timer);
     reassembly_timeout_timer = NULL;
+    furi_timer_stop(gps_poll_timer);
+    furi_timer_free(gps_poll_timer);
+    gps_poll_timer = NULL;
     furi_mutex_free(reassembly_mutex);
     reassembly_mutex = NULL;
     gui_remove_view_port(gui, view_port);

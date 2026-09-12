@@ -1675,6 +1675,107 @@ All three still prompt for approval like any other script in `tools/`/`tests/` (
 `.claude/settings.json`); a user or agent can pre-approve them the same way `tools/build_esp32.ps1`
 was already pre-approved.
 
+## 2026-09-12: Phase 3a Home/menu UI redesign implemented (build-verified, hardware verification not yet run)
+
+Five commits landed the [docs/UI_REDESIGN.md](UI_REDESIGN.md) Home/menu shell in
+`flipper/flipper_esp32_over_ble.c`: `0c54d18` (Home menu placeholder screens and capability-aware
+routing), `19c3485` (fixed a regression where becoming session-active forced navigation back to
+Home mid-submenu, and fixed Home-screen text pitch/overlap by adopting this file's existing
+10px-pitch/y=62-footer convention plus scroll-windowing for the menu), `8fe4dc7`/`c85711e`/
+`8052c8c`/`de1350e` (reconnect-state stabilization: a new `connection_lost` flag, set on a
+BLE-unavailable event, a fatal session error, or a "connection lost" pairing failure, keeps the
+active screen in place and shows a banner instead of forcing navigation to Home; all input except
+Back is ignored while lost), `ac89109` (fixed the Home menu visually overlapping the status
+header by offsetting the menu's start row by the header's actual height), and `a744bb4`
+("Complete Phase 3a UI polish" — reverted an intermediate version of the Settings/About screens
+that had started showing real data, back to explicit "TBD" placeholder text, matching
+[docs/UI_REDESIGN.md](UI_REDESIGN.md)'s decision #6 that both stay deliberately unscoped for
+this pass).
+
+Resulting `AppScreen` enum: `AppScreenHome`, `AppScreenScan`, `AppScreenGps`,
+`AppScreenSettings`, `AppScreenAbout`, `AppScreenLegacy` (a new compatibility screen preserving
+the old direct-button-shortcut flow, not part of the original design), plus the pre-existing
+`AppScreenWifiScanResults`/`AppScreenBleScanResults`/`AppScreenWardriving`. `HomeMenuItem` drives
+the Home screen's list (Wardriving/Scan/GPS/Settings/About/Legacy); `home_menu_visible()` hides
+Wardriving/Scan/GPS unless a session is active and the paired board's capability registry
+supports them, while Settings/About/Legacy stay always visible.
+
+**Notable gap versus the design doc, found and confirmed by reading the code directly:** the
+`ViewDispatcher`/scene-manager architecture change that [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s
+"Implementation sequencing" listed as step 1, and that [docs/BACKLOG.md](BACKLOG.md) called a
+"hard prerequisite," was never done — the Home menu shell was built directly on top of the
+existing single `ViewPort`/`AppEvent`-queue pattern instead. The Scan screen also does not yet
+match the design's five-mode BLE-active/passive live-view screen; today it is only a 2-item
+Wi-Fi-scan/BLE-scan picker into the existing one-shot `wifi_scan`/`ble_scan` results screens,
+gated on a runtime BLE active/passive toggle that still doesn't exist anywhere in the wire
+protocol or either firmware. The GPS screen still renders hardcoded stub text, not yet wired to
+the real `gps` capability/UART-NMEA driver implemented on the ESP32 in this same session (see
+this file's own entries and [docs/PLAN.md](PLAN.md)'s "Real GPS driver..." section) — tracked as
+a separate, already-acknowledged follow-on pass, not a regression.
+
+Verified: `fbt.cmd fap_flipper_esp32_over_ble` clean across all five commits. Not yet flashed or
+hardware-verified.
+
+## 2026-09-12: Real GPS driver implemented on both firmwares, initial hardware pass
+
+Following the grill-me design session earlier this date (see [docs/PLAN.md](PLAN.md)'s "Real GPS
+driver, wardriving fix-dependency, and real wardriving-record timestamps" for the frozen design),
+the feature was implemented and flashed the same day.
+
+**Implementation.** ESP32: `esp32/main/nmea_parser.c`/`.h` (new, pure `GGA`/`RMC` parser),
+`esp32/main/location.c`/`.h` rewritten into a real UART1 driver with a dedicated `gps_parse`
+FreeRTOS task, `esp32/main/cbor_gps.c`/`.h` (new `gps` capability codec), wardriving's per-record
+fix-dependency, and the new `utc_timestamp_s` wardriving-record field. Flipper: matching
+`flipper/cbor_gps.c`/`.h`, the `utc_timestamp_s` field in `cbor_wardriving.c`/`.h`, a poll-only
+`gps` status query while the Wardriving screen is open, the Wardriving screen's fix indicator and
+"Start"/"Start (delayed)" label toggle, and the WiGLE CSV `FirstSeen` column now built from real
+GPS time (the old RTC-anchored backdating approximation and `feb_wardriving_backdate_first_seen()`
+were removed as dead code). As a same-session follow-on, the existing (previously-stub)
+`AppScreenGps` screen was wired to this same live status — along the way, a pre-existing
+capability-gating bug was found and fixed: `HomeMenuGps`'s visibility was checking
+`capability_has_wardriving` instead of `capability_has_gps`. Both sides built and passed their
+full host-native test suites independently before any hardware step.
+
+**Accepted tradeoff (confirmed with the user before flashing):** old on-flash wardriving records
+from prior test sessions predate the now-mandatory `utc_timestamp_s` field and will fail to
+decode once this ships — the existing checksum/decode-failure path in `wardriving_log.c` already
+handles this safely (skip, warn, no crash), and the circular log self-heals as it rotates. No
+migration was built; this is a one-time, accepted cost of the format upgrade.
+
+**Hardware pass.** Both boards flashed the same session (COM9 ESP32, COM8 Flipper), with 11 other
+Claude Code sessions concurrently active on this repo at the time — checked with the user first
+per this project's own convention, proceeded on their go-ahead. ESP32: `idf.py` build+flash
+succeeded; a 12-second boot-log capture (after fixing a `tools/build_esp32.ps1` bug below) showed
+a clean boot with no crash, panic, or watchdog reset — `wardriving_log` resumed with "7 pending
+record(s)" from the old on-flash format (the accepted-tradeoff case above, not yet exercised
+through an actual backlog-drain in this pass), and the app reached its normal running state
+(BLE scanning for the Flipper's service) within ~1.9 seconds. Flipper: `fbt.cmd` build succeeded
+and the FAP transferred cleanly to `/ext/apps/Connectivity/flipper_esp32_over_ble.fap` via
+`runfap.py`; the app was not auto-launched (see the script-bug note below) — the user needs to
+restart the Flipper and launch it manually.
+
+**Two tooling bugs found and fixed during this pass, both pre-existing, neither related to the
+GPS feature itself:**
+- `tools/build_esp32.ps1`'s boot-log capture block called `Receive-Job` under the script's global
+  `$ErrorActionPreference = "Stop"`, which turned a completely benign `idf_monitor` stderr notice
+  ("GDB cannot open serial ports accessed as COMx") into a script-aborting terminating error
+  before any real boot-log output was printed — silently denying exactly the crash/watchdog
+  evidence the capture exists to provide. Fixed by scoping `-ErrorAction Continue` onto that one
+  `Receive-Job` call.
+- `tools/flash_flipper.ps1`'s header comment claimed the script "never auto-launches the app,"
+  but the auto-launch attempt and its failure actually come from `runfap.py` itself (which
+  unconditionally sends a `loader open` after every transfer, with no flag to suppress it), not
+  from anything this wrapper controls. That launch reliably fails with a transient "not enough
+  memory" preload error on this device, which surfaces as a non-zero exit even though the file
+  transfer itself succeeded — reproduced again during this pass. Comment corrected to describe
+  what's actually happening and to point at the "Transferred ... on the Flipper's SD card" success
+  line rather than the exit code as the real signal.
+
+**What's still open:** full-feature hardware verification — a real GPS module's cold-start-to-fix
+cycle, wardriving's discard/resume behavior around a lost fix, and the Flipper's exported WiGLE
+CSV `FirstSeen` on a real SD card — has not been exercised. This pass confirms the new code boots
+and transfers cleanly, not that the complete feature works end-to-end on real hardware yet.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

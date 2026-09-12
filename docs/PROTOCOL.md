@@ -257,6 +257,45 @@ same `request_id` if a manual `ble_scan` is already in progress; no `request_id`
 BLE source (see below) is currently active — the ESP32 has one NimBLE discovery state machine
 and does not run two independently-parameterized concurrent scans.
 
+### `gps` command and status payloads
+
+**Design frozen 2026-09-12, not yet implemented** — see [PLAN.md](PLAN.md)'s "Real GPS driver,
+wardriving fix-dependency, and real wardriving-record timestamps" for the design session this
+came out of. The `gps` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is a poll-only status
+query — unlike `wifi_scan`/`ble_scan` it has no scan-duration lifecycle and never runs to
+completion; it just reports the location driver's current state on demand. There is no
+push/unsolicited variant: the ESP32 only ever replies to an explicit request, driven by whichever
+Flipper screen is currently open (the GPS screen, and the Wardriving screen's fix indicator)
+polling only while visible.
+
+- `command` for `gps`: `capability = "gps"`, `arguments = {}` (always an empty map — a non-empty
+  `arguments` map is rejected as `invalid_command`).
+- `status` for `gps`: single-shot, `state` is one of `"no_signal"`, `"acquiring"`, or `"fix"`.
+  `result` is present only when `state = "fix"`.
+
+| `state` | Meaning |
+| --- | --- |
+| `"no_signal"` | No NMEA data has ever been received on the GPS UART since boot — most likely a wiring/power problem with the module, not a normal transient condition. |
+| `"acquiring"` | Valid NMEA traffic is being received, but the most recent `GGA` fix quality is `0` and/or the most recent `RMC` status is `V` (void) — the receiver is still acquiring satellites. Normal for the first tens of seconds to a couple of minutes after cold start. |
+| `"fix"` | The most recent `GGA` reports a non-zero fix quality AND the most recent `RMC` reports status `A` (valid). `result` is populated. |
+
+`result` (present only on `state = "fix"`) field order:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `lat_e7_offset` | unsigned integer | Same encoding as `wardriving`'s record field below. |
+| `lon_e7_offset` | unsigned integer | Same encoding as `wardriving`'s record field below. |
+| `fix_quality` | unsigned integer | Raw NMEA `GGA` fix-quality value (`1` = GPS fix, `2` = DGPS, etc.) passed through as-is, not collapsed to a bool — the ESP32 applies no quality threshold of its own (see [CAPABILITIES.md](CAPABILITIES.md)). |
+| `satellites` | unsigned integer | `GGA`'s satellite-in-use count. |
+| `hdop_e1` | unsigned integer | `GGA`'s HDOP, scaled by 10 and truncated to an integer (this protocol's fields are never negative or floating-point) — e.g. HDOP `2.3` encodes as `23`. |
+| `utc_timestamp_s` | unsigned integer | Unix epoch seconds derived from the most recent valid `RMC` date+time — same derivation as `wardriving`'s new record field below. |
+| `altitude_dm_offset` | unsigned integer | `GGA`'s MSL altitude (field 9), scaled by 10 (decimeters) and offset to stay positive: `(int32_t)(altitude_m * 10) + 1000000`. Unlike `lat_e7_offset`/`lon_e7_offset`, altitude has no natural bounded range — `1,000,000` (±100,000.0 m) is a generous symmetric bound comfortably beyond the u-blox NEO-6 module's documented ±operational altitude limit (50,000 m). Recovered as `(altitude_dm_offset - 1000000) / 10.0`. Appended after `utc_timestamp_s` (added 2026-09-12, same design session as the rest of this table) rather than inserted next to `lat_e7_offset`/`lon_e7_offset` — this map's field order is meaningful (both codecs reject out-of-order keys), so appending is the minimal, additive change. |
+
+**Busy/error handling.** `gps` has no exclusivity/busy concept — the UART read is a passive
+background task independent of the Wi-Fi/BLE radio the other capabilities contend over, so a
+`gps` command never blocks on or conflicts with `wifi_scan`/`ble_scan`/`wardriving`. No
+`request_id` dedup cache, matching `wifi_scan`/`ble_scan` (read-only, side-effect-free).
+
 ### `wardriving` command and status payloads
 
 The `wardriving` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is a composite capability:
@@ -302,16 +341,12 @@ the link was torn down locally every ~30-40s. **`ble_interval_ms`'s default is n
 chance of missing every nearby device's advertisement purely by bad luck (not a capture bug —
 longer runs did eventually see BLE records). **`ble_window_ms`'s default is now 100ms**
 (interval unchanged at 500ms, ~20% duty) — more than 3x the listen time per burst, while still
-far below the 100% duty that caused the starvation above. Note: step 4's coexistence sweep
-(referenced for the bounds above) claimed 10%-100% duty "proven stable," but that sweep used a
-synthetic throwaway test harness that also completely missed the starvation bug found later
-under real authenticated-session traffic — it is not trustworthy evidence for picking a duty
-value on its own; 20% was chosen as a conservative step up from the already-hardware-verified
-6%, not because the step 4 sweep endorsed it. `wifi_interval_ms`'s default remains 0
-(continuous); WiFi scanning was active in that same reproduction and is suspected to
-independently compete for the same shared radio via IDF's coexistence arbiter, but this has not
-yet been isolated/validated — see [BACKLOG.md](BACKLOG.md). A
-per-session override for either source remains available via the fields above regardless.
+far below the 100% duty that caused the starvation above. A follow-up live disconnect test
+(2026-09-12) also showed that a concurrent, gapless Wi‑Fi scan can starve the shared 2.4GHz
+radio during reconnect attempts. **`wifi_interval_ms`'s default is now 30000ms (30s)**
+for the same reason: it keeps the BLE reconnect path stable while preserving a per-session
+override if deeper capture throughput is needed. A per-session override for either source
+remains available via the fields above regardless.
 
 **Busy/not-running handling.** `action = "start"` while wardriving is already running is
 rejected `busy`. `action = "stop"` while wardriving is genuinely idle is rejected `not_running`.
@@ -351,18 +386,24 @@ unmatched reply.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `timestamp_ms` | unsigned integer | Milliseconds since ESP32 boot (`esp_timer_get_time() / 1000`) — this board has no real-time clock, so this is boot-relative, not wall-clock. See CAPABILITIES.md for how the Flipper reconstructs an approximate wall-clock time for WiGLE export. |
+| `timestamp_ms` | unsigned integer | Milliseconds since ESP32 boot (`esp_timer_get_time() / 1000`) — this board has no real-time clock, so this is boot-relative, not wall-clock. Retained for any boot-relative-timing use; superseded for wall-clock purposes by `utc_timestamp_s` below. |
+| `utc_timestamp_s` | unsigned integer | **Design frozen 2026-09-12, not yet implemented** — see [PLAN.md](PLAN.md)'s "Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps". Unix epoch seconds derived from the most recent valid `RMC` sentence's date+time. Always present and valid on every record once implemented, because a record is only ever logged while the location driver reports `state = "fix"` (see `gps` capability above and CAPABILITIES.md's wardriving fix-dependency), which requires a valid `RMC` fix alongside the valid `GGA` fix. The Flipper uses this directly for WiGLE CSV export's `FirstSeen` column (`YYYY-MM-DD hh:mm:ss`, UTC — see https://api.wigle.net/csvFormat.html), replacing the RTC-anchored backdating approximation described below for any record carrying this field. |
 | `lat_e7_offset` | unsigned integer | Latitude, scaled by `1e7` and offset to stay positive: `(int32_t)(lat * 1e7) + 900000000`. Latitude's ±90° range scales to ±900,000,000, so the offset keeps the encoded value in `[1, 1800000001]`, comfortably within an unsigned 32-bit range. The Flipper recovers real latitude as `(lat_e7_offset - 900000000) / 1e7`. |
 | `lon_e7_offset` | unsigned integer | Longitude, same treatment: `(int32_t)(lon * 1e7) + 1800000000`. Longitude's ±180° range scales to ±1,800,000,000; the offset keeps the encoded value in `[1, 3600000001]`. Recovered as `(lon_e7_offset - 1800000000) / 1e7`. |
 | `source` | text string | `"wifi"` or `"ble"` — discriminates `payload`'s shape below. |
 | `payload` | map | A cut-down `wifi_scan`-like map (`ssid`, `bssid`, `rssi_offset`, `channel`, `auth` — the same fields and encodings as `<ap-result>` above, minus `phy`, which wardriving does not need) when `source = "wifi"`; a cut-down `ble_scan`-like map (`address`, `name` optional, `rssi_offset` — the same fields/encodings as `<device-result>` above, minus `addr_type`) when `source = "ble"`. |
 
-**Location source.** Until real GPS hardware is wired to the board, `lat_e7_offset`/
-`lon_e7_offset` come from a fixed, hardcoded coordinate stub behind a swappable location-source
-interface (see [PLAN.md](PLAN.md)) — every record currently carries the same coordinate. This
-is a deliberate, temporary simplification: the wire format already carries a real per-record
-location field, so wiring up real GPS later is a location-source implementation change only,
-with no wire-format or Flipper-side change required.
+**Location source.** As of 2026-09-12, `lat_e7_offset`/`lon_e7_offset` still come from a fixed,
+hardcoded coordinate stub behind a swappable location-source interface (see [PLAN.md](PLAN.md))
+— every record currently carries the same coordinate. A real UART/NMEA GPS driver replacing this
+stub is designed (not yet implemented) in [PLAN.md](PLAN.md)'s "Real GPS driver, wardriving
+fix-dependency, and real wardriving-record timestamps" section — confirming the original framing
+here: the swap needs no change to `lat_e7_offset`/`lon_e7_offset`'s wire encoding, only to what
+populates them. **Fix-dependency (new in that design):** once implemented, a record is discarded
+— never logged to flash, never streamed — unless the location driver reports a real fix (`GGA`
+fix quality > 0 and `RMC` status `A`) at capture time; this applies continuously, so a fix lost
+mid-capture pauses logging until it returns, and is not limited to "before the first fix." This
+does not apply today since the stub always reports a fix.
 
 **Nesting depth.** This shape is `result` (depth 0) -> `records` array (depth 1) ->
 `<wardriving-record>` map (depth 2) -> `payload` map (depth 3) -> `payload`'s own scalar fields

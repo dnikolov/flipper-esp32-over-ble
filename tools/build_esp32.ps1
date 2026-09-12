@@ -67,7 +67,12 @@ if ($CaptureBootLog) {
     } -ArgumentList $Port, $esp32Dir
     Start-Sleep -Seconds $CaptureSeconds
     Stop-Job $job | Out-Null
-    Receive-Job $job
+    # -ErrorAction Continue overrides this script's global "Stop" for this one call: idf_monitor
+    # writes benign notices (e.g. "GDB cannot open serial ports accessed as COMx") to its error
+    # stream, and Receive-Job re-emits those as error records -- under "Stop" that silently
+    # aborted this whole script before any boot-log output was printed. Continue just prints them
+    # alongside the real log instead of treating them as fatal.
+    Receive-Job $job -ErrorAction Continue
     Remove-Job $job -Force
 }
 

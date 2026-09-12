@@ -6,7 +6,7 @@ This plan implements the trusted-environment BLE pairing decision in [DECISIONS.
 
 - **Phase 1 (done):** board/SDK/firmware/build baselines — see `docs/BASELINES.md`.
 - **Phase 2 (done):** core BLE transport, record framing, trusted-environment pairing, and authenticated runtime sessions on the ESP32-C6 — steps 1-9 below are this phase's implementation detail. Steps 1-7 are implemented and hardware-verified; see `docs/SESSION_MEMORY.md` for current status.
-- **Phase 3a (immediate next step, 2026-09-12):** Flipper UI architecture + menu redesign. This is the first implementation slice for the user-approved Home/menu design in [UI_REDESIGN.md](UI_REDESIGN.md). It covers the `ViewDispatcher`/scene-manager prerequisite, Home screen menu shell, capability-gated item visibility, reconnect-stays-put behavior, and the GPS/Settings/About placeholders. It does not supersede the remaining Phase 3 wardriving validation work; it is intentionally scheduled immediately before the next production polish pass because the app architecture itself is the gating prerequisite for the redesign.
+- **Phase 3a (2026-09-12):** Flipper UI menu redesign, the first implementation slice for the user-approved Home/menu design in [UI_REDESIGN.md](UI_REDESIGN.md). **Substantially implemented and build-verified, hardware verification not yet run.** Done: Home screen menu shell (`HomeMenuItem`-driven, Up/Down/OK navigation), capability- and session-gated item visibility, reconnect-stays-put behavior (a `connection_lost` flag keeps the active screen and shows a banner instead of forcing navigation to Home), and the GPS/Settings/About screens (Settings/About are deliberate placeholders per the design, not unfinished work). **Not done:** the `ViewDispatcher`/scene-manager architecture step — the menu shell was built directly on the existing single `ViewPort`/`AppEvent`-queue pattern instead, contradicting [UI_REDESIGN.md](UI_REDESIGN.md)'s original sequencing; and the Scan screen's real five-mode BLE-active/passive design — today it's only a placeholder-level Wi-Fi-scan/BLE-scan picker, blocked on the not-yet-built runtime BLE active/passive toggle. See [UI_REDESIGN.md](UI_REDESIGN.md)'s "Current-state baseline" for full detail and [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits.
 - **Phase 3 (in progress, decided 2026-09-07):** production-ready wardriving on the ESP32-C6. Covers the follow-on `wifi_scan`-command step (done), the GPS/`ble_scan`/`wardriving` capability, step 8 (hardened persistence for both the pairing record and the wardriving log), and step 9 (full-system validation). "Production-ready" means field-usable unattended for hours, survives power loss without corrupting the wardriving log, and passes step 9's negative-security-test suite — not just "the happy path works once on a bench."
 - **Phase 4 (later, decided 2026-09-07):** Heltec WiFi LoRa 32 V2 board support — a second, structurally different target (classic ESP32/Xtensa, not C6) adding display and LoRa capabilities. Does not start until Phase 3 is complete.
 - **Phase 5 (later, much larger, decided 2026-09-07):** Zigbee/Thread and `gpio_control`. Zigbee/Thread recon (passive scanning, Phase 5a) first, then participation (active stack join / possible border-router role, Phase 5b) as a separately-scoped, order-of-magnitude-larger effort with no committed timeline. `gpio_control` rides along in this phase rather than blocking Phase 3's wardriving focus.
@@ -269,6 +269,131 @@ open per the "done when" bar — see `docs/SESSION_MEMORY.md`'s "Known open item
 what remains: forced-disconnect test under live BLE capture (ran 2026-09-11, found and fixed a
 real bug — see the "Accepted gap" note above and `docs/SESSION_MEMORY.md`), extended unattended
 flash-log wraparound/power-loss run, and CSV export SD-card confirmation.
+
+## Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps (Phase 3, decided 2026-09-12)
+
+Reached via a grill-me design session with the user. Replaces `esp32/main/location.c`'s
+fixed-coordinate stub with a real UART/NMEA-0183 driver, and closes two backlog items that
+depended on it (wardriving's discard-on-no-fix behavior becoming real, and replacing the CSV
+`FirstSeen` backdating approximation with a real timestamp). Full wire contract:
+[PROTOCOL.md](PROTOCOL.md)'s new "`gps` command and status payloads" section, the new
+`utc_timestamp_s` wardriving-record field, and the updated "Location source" note; capability
+description: [CAPABILITIES.md](CAPABILITIES.md)'s `gps` and updated `wardriving` entries. Not yet
+implemented — this section is the frozen design, not a "done when" bar met.
+
+**Scope boundary (deliberately excluded from this design):** making the GPS UART's GPIO pin
+assignment runtime-configurable from a Flipper Settings screen — the user's original ask included
+this, but it was split out during grilling because it drags in a prerequisite this project
+doesn't have yet (any form/pin-entry widget on the Flipper — see [UI_REDESIGN.md](UI_REDESIGN.md)'s
+own note that Settings is still an unscoped placeholder) and a new wire-protocol surface (a
+get/set config command, ESP32-side persistence, safe re-init of an already-open UART driver).
+Pins stay a compile-time constant (`UART_NUM_1`, RX=GPIO18, TX=GPIO19, 9600 8N1, no flow control —
+the values [tools/test_gps_antenna.ps1](../tools/test_gps_antenna.ps1) already hardware-verified)
+until that later slice happens. See "Backlog" below for the deferred item.
+
+Key decisions from the design session:
+
+1. **Driver behavior.** `location_init()` opens UART1 and starts a background parse task, RX-only
+   (never transmits to the module — an earlier wake/cold-start command burst was proven actively
+   harmful in the antenna smoke test, forcing re-acquisition on every reconnect). Tracks three
+   states — `no_signal`, `acquiring` (valid NMEA traffic, no valid fix yet), `fix` (both `GGA` fix
+   quality > 0 and `RMC` status `A`) — rather than the interface's current binary `has_fix`.
+   **`no_signal`'s exact definition (reconciled 2026-09-12 after implementation):** any
+   checksum-valid `$`-prefixed NMEA sentence of *any* type (not only `GGA`/`RMC`) flips
+   `no_signal` → `acquiring` — chosen over the stricter "only `GGA`/`RMC` count" reading because it
+   correctly keeps garbage bytes from a wrong baud rate or bad wiring at `no_signal` rather than
+   misreporting `acquiring`. (This section's decision list previously said "never seen a byte,"
+   which was the same intent stated less precisely — no behavior change, just a wording fix.)
+2. **Sentence types parsed: `GGA` and `RMC` only.** `GGA` gives fix quality/satellite
+   count/HDOP/lat-lon; `RMC` gives date+time (used for `utc_timestamp_s`) and, incidentally,
+   speed/course (parsed but not yet wired to anything — see "Backlog" below). `ZDA` was
+   considered for date+time but rejected: the real captured antenna-test log
+   (`tools/gps_antenna_last_run.log`) shows the actual module never emits `ZDA` at all, only
+   `GGA`/`RMC`/`VTG` — designing against an NMEA sentence this hardware has never been observed
+   to send would be a real feasibility risk, whereas `RMC` is already confirmed present and
+   carries both fields needed. `VTG` is not parsed (its only content — speed/course — is already
+   available from `RMC`).
+3. **No fix-quality/HDOP/satellite-count threshold.** Any non-zero `GGA` fix quality counts as a
+   fix — a NEO-6M-class module's first fix is typically loose (HDOP 3-10+, 4-6 satellites),
+   requiring quality ≥ 2 (DGPS) would likely never be satisfied on this hardware at all, and
+   wardriving's own accuracy tolerance (tens of meters, same as any WiGLE-style capture) doesn't
+   need tighter. A user-configurable threshold is backlogged separately, not built now.
+4. **Wardriving's "depends on a GPS fix" is a record-level filter, not a `start`-level gate.**
+   `wardriving start` is never rejected for lack of a fix — it behaves exactly as it does today
+   (rejected only for the existing reasons: already running, unsupported source, busy). Instead,
+   any record captured while the location driver is not reporting `state = "fix"` is discarded —
+   never logged to flash, never streamed to the Flipper — and this is a continuous rule, not a
+   one-time "before the first fix" check: a fix lost mid-capture (module unplugged, tunnel, etc.)
+   pauses logging until the fix returns, without auto-stopping the capture. Rejected alternative:
+   gating `start` itself on an existing fix, considered and then walked back once it became clear
+   it just reinvents the record-level discard behavior [CAPABILITIES.md](CAPABILITIES.md) already
+   documented as accepted, with worse UX (a hard rejection instead of "start now, it'll catch up").
+5. **New `gps` capability + poll-only `gps_status`-shaped command**, not a push/unsolicited
+   mechanism. Both the GPS screen (coordinates/time/speed in [UI_REDESIGN.md](UI_REDESIGN.md)) and
+   the Wardriving screen's fix icon need live status independent of whether a capture is running,
+   which nothing in the wire protocol provided before this — but GPS position changing at
+   walking/driving speed doesn't need push latency, so polling only while the relevant screen is
+   open is sufficient and keeps this idle-cost-free otherwise (this board runs unattended for
+   hours during a real wardriving session).
+6. **Wardriving screen's Start action gets a cosmetic label toggle** ("Start" when a fix exists,
+   "Start (delayed)" otherwise, read from the same `gps` status the fix icon already needs) rather
+   than being disabled/greyed when no fix — matches decision 4: the action always behaves the
+   same regardless of label, so disabling it would be misleading, not protective. This applies to
+   whichever Wardriving screen ships it — today's existing flat-button screen
+   (`flipper/flipper_esp32_over_ble.c`) now, and [UI_REDESIGN.md](UI_REDESIGN.md)'s future
+   redesigned screen later, both reading the same underlying `gps` status.
+7. **New `utc_timestamp_s` wardriving-record field, additive (not replacing `timestamp_ms`).**
+   Unix epoch seconds derived from `RMC`. Guaranteed present and valid on every logged record
+   (decision 4 already requires a valid fix, which requires a valid `RMC`, to log at all) — no
+   backward-compatibility/optional-field case to design around. The Flipper's CSV exporter uses it
+   directly for WiGLE's `FirstSeen` column, in the exact format WiGLE's spec requires
+   (`YYYY-MM-DD hh:mm:ss`, UTC — confirmed against https://api.wigle.net/csvFormat.html during
+   this design session), replacing the current RTC-anchored backdating approximation for any
+   record that carries the new field.
+
+**Done when:** matches the project's established two-stage bar — both firmwares build- and
+host-test-verified against the frozen contract above (including shared vectors for the new `gps`
+status shape and the `utc_timestamp_s` field), then hardware-verified: the real module correctly
+drives all three `gps` states through a cold-start-to-fix cycle, a wardriving capture started
+before a fix arrives logs nothing until `state = "fix"`, a fix lost mid-capture pauses logging and
+resumes correctly when it returns, and the Flipper's exported CSV `FirstSeen` column matches
+WiGLE's format using the new real timestamp.
+
+**Both sides implemented 2026-09-12, build- and host-test-verified independently, hardware
+verification of the complete feature not yet started.**
+
+- **ESP32 side:** `esp32/main/nmea_parser.c`/`.h` (new, pure/host-testable `GGA`/`RMC` parser, no
+  floats, Howard Hinnant `days_from_civil` for UTC→Unix time), `esp32/main/location.c`/`.h`
+  (rewritten: real UART1 driver, dedicated `gps_parse` FreeRTOS task with its own stack and
+  file-scope line buffer, `portMUX`-guarded state snapshot read by the NimBLE host task),
+  `esp32/main/cbor_gps.c`/`.h` (new, the `gps` capability's wire codec), `"gps"` added to the
+  capability list, `handle_gps_command()` in `main.c`, and both wardriving record-capture call
+  sites updated for the fix-dependency and `utc_timestamp_s`. `idf.py build` clean; all host-native
+  test suites pass, including new `gps` vectors added to the shared `tests/vectors/vectors.h`.
+- **Flipper side:** new `gps` command client/status parsing (`flipper/cbor_gps.c`/`.h`), the
+  `utc_timestamp_s` wardriving-record field (`flipper/cbor_wardriving.c`/`.h`), a poll-only `gps`
+  status query while the Wardriving screen is open (2s cadence, a `FuriTimer` started/stopped on
+  screen entry/exit — see `flipper_esp32_over_ble.c`'s `gps_poll_timer`), the Wardriving screen's
+  three-state fix indicator and "Start"/"Start (delayed)" label toggle (decision 6), and the WiGLE
+  CSV `FirstSeen` column now built directly from `utc_timestamp_s` (the old RTC-anchored
+  backdating approximation and `feb_wardriving_backdate_first_seen()` were removed as dead code
+  once the field became mandatory on the wire). `fbt.cmd fap_flipper_esp32_over_ble` clean;
+  523/523 host-native checks pass; `tools/check_shared_headers.py` confirms both sides'
+  `cbor_gps.h`/`cbor_wardriving.h` agree on field order/types.
+- **Known implementation notes, not covered by the frozen design above:**
+  - **Old on-flash wardriving records will fail to decode and be silently skipped** once this
+    ships, since they predate the mandatory `utc_timestamp_s` field — the existing
+    checksum/decode-failure path in `wardriving_log.c` already handles this safely (skip, warn,
+    don't crash or misread), and the circular log naturally rotates them out as new captures
+    continue. **Accepted by the user 2026-09-12** as a one-time cost of this format upgrade — not
+    a bug, no migration built.
+  - **The already-existing GPS screen** (`draw_gps_screen`, part of the Phase 3a menu shell — see
+    [UI_REDESIGN.md](UI_REDESIGN.md)) is now wired to the new live `gps` status (2026-09-12,
+    build-verified only, explicitly-approved follow-on) — real fix state, coordinates, and
+    GPS-derived UTC time when fixed, falling back to the Flipper's RTC clock otherwise, speed
+    still `--`. Found and fixed a pre-existing capability-gating bug along the way:
+    `HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
+    `capability_has_gps`.
 
 ## Backlog
 

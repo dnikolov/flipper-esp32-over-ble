@@ -1,24 +1,51 @@
-/* Location-source interface (docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub
-   reorder"). Today's implementation is a fixed-coordinate stub; a real GPS/NMEA driver is
-   the deferred swap this interface exists to make a body-only change (see location.c). */
+/* Location-source interface (docs/PLAN.md "Real GPS driver, wardriving fix-dependency, and
+   real wardriving-record timestamps", design frozen 2026-09-12). Backed by a real UART/
+   NMEA-0183 GPS module (location.c opens UART1 and runs a dedicated background parse task
+   built on nmea_parser.c/.h's pure sentence parsing); replaces the earlier fixed-coordinate
+   stub. Consumed by main.c's wardriving record-capture call sites and the new `gps`
+   capability's handle_gps_command(). */
 #ifndef FEB_LOCATION_H
 #define FEB_LOCATION_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Matches docs/PROTOCOL.md's `gps` status `state` field exactly. no_signal: no NMEA byte
+   ever received since boot. acquiring: valid NMEA traffic seen, but the most recent GGA
+   fix quality is 0 and/or the most recent RMC status is not 'A'. fix: both conditions hold
+   -- location_get_fix()'s *out is only meaningful in this state. */
+typedef enum {
+    FEB_LOCATION_NO_SIGNAL = 0,
+    FEB_LOCATION_ACQUIRING = 1,
+    FEB_LOCATION_FIX = 2,
+} feb_location_state_t;
+
 typedef struct {
-    int32_t lat_e7; /* latitude * 1e7 */
-    int32_t lon_e7; /* longitude * 1e7 */
-    bool has_fix;
+    int32_t lat_e7;         /* latitude * 1e7 */
+    int32_t lon_e7;         /* longitude * 1e7 */
+    uint32_t fix_quality;   /* raw GGA fix-quality value, uncollapsed */
+    uint32_t satellites;    /* GGA satellites-in-use count */
+    uint32_t hdop_e1;       /* GGA HDOP * 10, truncated */
+    int32_t altitude_dm;    /* GGA MSL altitude * 10, truncated, sign preserved */
+    uint64_t utc_timestamp_s; /* Unix epoch seconds from the most recent valid RMC */
 } feb_location_t;
 
+/* Opens the GPS UART (UART1, RX=GPIO18, TX=GPIO19, 9600 8N1, no flow control -- compile-time
+   constant per docs/PLAN.md's scope boundary) and starts a dedicated background parse task,
+   RX-only (never transmits to the module). A UART/task-start failure is logged and leaves
+   the driver permanently in FEB_LOCATION_NO_SIGNAL -- GPS is optional peripheral hardware,
+   not required for the board to boot. */
 void location_init(void);
 
-/* Always call this fresh per captured record, never cache the result at a longer-lived
-   scope -- see location.c's comment on why. Returns true when *out was populated (today,
-   always true from the stub; a real driver may legitimately return false before its first
-   fix). */
-bool location_get_fix(feb_location_t *out);
+/* Always call this fresh per captured record or per `gps` command reply, never cache the
+   result at a longer-lived scope -- the underlying fix changes continuously and readers must
+   see the current state, not a snapshot from an earlier point in time. Returns the current
+   3-state status; *out is populated with the latest known values whenever state is not
+   FEB_LOCATION_NO_SIGNAL (harmless zeros otherwise), but only state == FEB_LOCATION_FIX
+   means *out represents an actual satellite fix -- callers gating on "do we have a fix"
+   (wardriving's record-level discard, the `gps` command's `result` presence) must check the
+   returned state, not merely whether *out was written. Thread-safe: takes a snapshot of the
+   background parse task's state under a short critical section. */
+feb_location_state_t location_get_fix(feb_location_t *out);
 
 #endif /* FEB_LOCATION_H */

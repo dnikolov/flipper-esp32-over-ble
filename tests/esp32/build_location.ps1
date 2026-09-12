@@ -1,6 +1,9 @@
-# Builds and runs the host-native location.c test with MSVC (cl.exe). Mirrors build.ps1's
-# vswhere/vcvars64 setup; location.c has no BLE/flash/mbedtls dependency so no shared
-# vectors are needed.
+# Builds and runs the host-native nmea_parser.c test with MSVC (cl.exe). Mirrors build.ps1's
+# vswhere/vcvars64 setup. location.c itself now depends on driver/uart.h and FreeRTOS (the
+# real GPS driver, docs/PLAN.md "Real GPS driver, wardriving fix-dependency, and real
+# wardriving-record timestamps") and is not host-buildable -- same treatment as
+# wardriving_log.c/wardriving_record_format.c's split; this script (kept under its original
+# name/location) now targets nmea_parser.c, the pure sentence-parsing module underneath it.
 $ErrorActionPreference = "Stop"
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -32,7 +35,7 @@ if(-not (Test-Path $outDir)) {
 
 $sources = @(
     (Join-Path $scriptDir "test_location.c"),
-    (Join-Path $esp32Dir "location.c")
+    (Join-Path $esp32Dir "nmea_parser.c")
 ) -join " "
 
 $includeDirs = "/I `"$esp32Dir`""
