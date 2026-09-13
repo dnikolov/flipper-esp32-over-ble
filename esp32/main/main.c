@@ -191,6 +191,11 @@ static uint32_t scan_summary_elapsed_ms;
 
 static feb_reassembly_t rx_reassembly;
 static struct ble_npl_callout reassembly_timeout_co;
+/* G19 fix: a single reused callout for both reconnect backoff paths below, instead of
+   xTaskCreate()-ing a 3072-byte one-shot task just to vTaskDelay() once then start_scan() --
+   same cross-task-timer pattern as every other *_co callout in this file. reconnect_task_active
+   still gates re-entrancy exactly as before; only the sleep mechanism changed. */
+static struct ble_npl_callout reconnect_co;
 
 static char board_id_buf[FEB_PAIRING_BOARD_ID_MAX_LEN + 1];
 static size_t board_id_len;
@@ -356,12 +361,12 @@ static bool wardriving_tx_in_flight;
    records that were never actually delivered. */
 static size_t wardriving_pending_drain_count;
 static uint8_t wardriving_flash_failure_count;
-/* Set from wifi_scan_done_handler()/ble_scan_catalog_advertisement()'s window-close path
-   (sys_evt task / NimBLE host task respectively) when FEB_WARDRIVING_FLASH_FAILURE_LIMIT is
-   reached; consumed by wifi_scan_done_cb()/ble_scan_window_close_cb() on the NimBLE host
-   task, which is where wardriving_self_stop() is actually safe to run from (it touches
-   connection_handle/tx_fragment_* state owned by that task, matching every other
-   cross-task handoff in this file). */
+/* Set and consumed within the same NimBLE-host-task function (wifi_scan_done_cb()/
+   ble_scan_window_close_cb() respectively) when FEB_WARDRIVING_FLASH_FAILURE_LIMIT is
+   reached mid-loop -- deferred via this flag rather than calling wardriving_self_stop()
+   directly from inside the loop so the loop can `break` and unwind cleanly first. (Before
+   the G30 fix, the Wi-Fi source's loop ran on sys_evt and this flag really did cross a task
+   boundary; now both sources are symmetric: same task sets and reads it.) */
 static bool wardriving_wifi_self_stop_pending;
 static bool wardriving_ble_self_stop_pending;
 
@@ -375,6 +380,14 @@ static bool wardriving_ble_self_stop_pending;
    that handoff's consumer clears it, so there is never a concurrent writer while the NimBLE
    task is reading. */
 static wifi_ap_record_t wifi_scan_raw_records[FEB_WIFI_SCAN_RAW_MAX];
+/* G30 fix: number of valid entries in wifi_scan_raw_records[] from the scan that just
+   completed -- set by wifi_scan_done_handler() (sys_evt task) right before it hands off to
+   wifi_scan_done_cb() (NimBLE host task) via wifi_scan_done_co, same handoff shape as
+   ble_scan_raw_count already uses for the BLE source. Needed because the wardriving-source
+   dedup/append loop that used to run directly in wifi_scan_done_handler() (a real cross-task
+   race against the NimBLE-host-task-only wardriving log reader -- see docs/BACKLOG.md G30) now
+   runs in wifi_scan_done_cb() instead, so it needs this count carried across the handoff. */
+static uint16_t wifi_scan_raw_count;
 static feb_wifi_scan_ap_t wifi_scan_selected[FEB_WIFI_SCAN_MAX_APS_PER_RECORD];
 static uint16_t wifi_scan_found_count;
 static uint16_t wifi_scan_send_next_index;
@@ -659,14 +672,13 @@ static void start_scan(void)
     }
 }
 
-static void reconnect_task(void *arg)
+/* Runs on the NimBLE host task (reconnect_co's queue) once the scheduled backoff delay
+   elapses -- see reconnect_co's own comment for why this replaced a per-call xTaskCreate(). */
+static void reconnect_timer_cb(struct ble_npl_event *ev)
 {
-    TickType_t delay = (TickType_t)(uintptr_t)arg;
-
-    vTaskDelay(delay);
+    (void)ev;
     reconnect_task_active = false;
     start_scan();
-    vTaskDelete(NULL);
 }
 
 /* Mirrors runtime_auth_backoff_delay_ms()'s exponential-then-flatten shape, but with its
@@ -705,11 +717,7 @@ static void schedule_reconnect(void)
         ESP_LOGI(TAG, "reconnect retry %u/%u in %lu ms", reconnect_retries,
                  MAX_RECONNECT_RETRIES, (unsigned long)delay_ms);
     }
-    if (xTaskCreate(reconnect_task, "ble_reconnect", 3072,
-                    (void *)(uintptr_t)pdMS_TO_TICKS(delay_ms), 4, NULL) != pdPASS) {
-        reconnect_task_active = false;
-        ESP_LOGE(TAG, "could not schedule reconnect");
-    }
+    ble_npl_callout_reset(&reconnect_co, ble_npl_time_ms_to_ticks32(delay_ms));
 }
 
 /* Independent of reconnect_retries/MAX_RECONNECT_RETRIES above (which now means "length of
@@ -727,11 +735,7 @@ static void schedule_runtime_auth_backoff(void)
     reconnect_task_active = true;
     ESP_LOGI(TAG, "runtime auth backoff: retry in %lu ms (consecutive failures=%u)",
              (unsigned long)delay_ms, runtime_auth_failure_count);
-    if (xTaskCreate(reconnect_task, "ble_reconnect", 3072,
-                    (void *)(uintptr_t)pdMS_TO_TICKS(delay_ms), 4, NULL) != pdPASS) {
-        reconnect_task_active = false;
-        ESP_LOGE(TAG, "could not schedule runtime-auth backoff reconnect");
-    }
+    ble_npl_callout_reset(&reconnect_co, ble_npl_time_ms_to_ticks32(delay_ms));
 }
 
 static int mtu_exchanged(uint16_t conn_handle,
@@ -1147,51 +1151,13 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
     }
 
     if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
-        /* wardriving logs every discovered AP (up to the same FEB_WIFI_SCAN_RAW_MAX
-           self-imposed raw-fetch bound above), not just the top
-           FEB_WIFI_SCAN_MAX_APS_PER_RECORD by RSSI -- that 32-result cap is specific to
-           wifi_scan's one-shot *reporting* contract (docs/PROTOCOL.md's "Result cap"),
-           which wardriving's persistent capture log has no equivalent of; its own bound is
-           flash capacity (sector eviction), not a wire-result count. */
-        feb_location_t fix;
-        feb_location_state_t loc_state = location_get_fix(&fix);
-        uint16_t k;
-
-        if (loc_state != FEB_LOCATION_FIX) {
-            ESP_LOGW(TAG, "wardriving: discarding %u wifi result(s), no GPS fix yet", (unsigned)raw_count);
-        } else {
-            for (k = 0; k < raw_count; k++) {
-                wifi_ap_record_t *rec = &wifi_scan_raw_records[k];
-                const char *auth = wifi_scan_auth_str(rec->authmode);
-                feb_wardriving_record_t record;
-
-                memset(&record, 0, sizeof(record));
-                record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
-                record.utc_timestamp_s = fix.utc_timestamp_s;
-                record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
-                record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
-                record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
-                record.payload.wifi.ssid = rec->ssid;
-                record.payload.wifi.ssid_len = strnlen((const char *)rec->ssid, sizeof(rec->ssid) - 1u);
-                memcpy(record.payload.wifi.bssid, rec->bssid, FEB_WIFI_SCAN_BSSID_LEN);
-                record.payload.wifi.rssi_offset = (uint64_t)((int)rec->rssi + 128);
-                record.payload.wifi.channel = rec->primary;
-                record.payload.wifi.auth = auth;
-                record.payload.wifi.auth_len = strlen(auth);
-                if (!wardriving_dedup_and_maybe_append(&record)) {
-                    ESP_LOGW(TAG, "wardriving: failed to append wifi record to flash log");
-                    if (wardriving_flash_failure_count < 0xFFu) {
-                        wardriving_flash_failure_count++;
-                    }
-                    if (wardriving_flash_failure_count >= FEB_WARDRIVING_FLASH_FAILURE_LIMIT) {
-                        wardriving_wifi_self_stop_pending = true;
-                        break;
-                    }
-                } else {
-                    wardriving_flash_failure_count = 0;
-                }
-            }
-        }
+        /* G30 fix: the wardriving dedup/append loop that used to run right here (on sys_evt)
+           now runs in wifi_scan_done_cb() on the NimBLE host task instead -- the same task
+           that reads this log via wardriving_send_next_batch() -- so the two can never
+           interleave. This handler's only remaining job for the wardriving source is to hand
+           the raw scan results across that task boundary, same shape as the non-wardriving
+           branch below already uses wifi_scan_done_co for. */
+        wifi_scan_raw_count = raw_count;
         ble_npl_callout_reset(&wifi_scan_done_co, 0);
         return;
     }
@@ -1251,6 +1217,54 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
     (void)ev;
 
     if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
+        /* G30 fix: this dedup/append loop used to run in wifi_scan_done_handler() on the
+           sys_evt task -- a real race against wardriving_send_next_batch()'s log reads, which
+           only ever run here on the NimBLE host task (see docs/BACKLOG.md G30). Moved here so
+           the wardriving log's writer and reader are always the same task, matching the
+           BLE-source sibling below (ble_scan_window_close_cb()), which was already safe for
+           exactly this reason. wifi_scan_raw_count/wifi_scan_raw_records are populated by
+           wifi_scan_done_handler() just before it hands off to this callout. */
+        feb_location_t fix;
+        feb_location_state_t loc_state = location_get_fix(&fix);
+        uint16_t k;
+
+        if (loc_state != FEB_LOCATION_FIX) {
+            ESP_LOGW(TAG, "wardriving: discarding %u wifi result(s), no GPS fix yet",
+                     (unsigned)wifi_scan_raw_count);
+        } else {
+            for (k = 0; k < wifi_scan_raw_count; k++) {
+                wifi_ap_record_t *rec = &wifi_scan_raw_records[k];
+                const char *auth = wifi_scan_auth_str(rec->authmode);
+                feb_wardriving_record_t record;
+
+                memset(&record, 0, sizeof(record));
+                record.timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000);
+                record.utc_timestamp_s = fix.utc_timestamp_s;
+                record.lat_e7_offset = (uint64_t)((int64_t)fix.lat_e7 + 900000000LL);
+                record.lon_e7_offset = (uint64_t)((int64_t)fix.lon_e7 + 1800000000LL);
+                record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+                record.payload.wifi.ssid = rec->ssid;
+                record.payload.wifi.ssid_len = strnlen((const char *)rec->ssid, sizeof(rec->ssid) - 1u);
+                memcpy(record.payload.wifi.bssid, rec->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+                record.payload.wifi.rssi_offset = (uint64_t)((int)rec->rssi + 128);
+                record.payload.wifi.channel = rec->primary;
+                record.payload.wifi.auth = auth;
+                record.payload.wifi.auth_len = strlen(auth);
+                if (!wardriving_dedup_and_maybe_append(&record)) {
+                    ESP_LOGW(TAG, "wardriving: failed to append wifi record to flash log");
+                    if (wardriving_flash_failure_count < 0xFFu) {
+                        wardriving_flash_failure_count++;
+                    }
+                    if (wardriving_flash_failure_count >= FEB_WARDRIVING_FLASH_FAILURE_LIMIT) {
+                        wardriving_wifi_self_stop_pending = true;
+                        break;
+                    }
+                } else {
+                    wardriving_flash_failure_count = 0;
+                }
+            }
+        }
+
         if (wardriving_wifi_self_stop_pending) {
             wardriving_wifi_self_stop_pending = false;
             wardriving_self_stop("internal_error");
@@ -3344,6 +3358,7 @@ static void host_synced(void)
                         wardriving_wifi_interval_cb, NULL);
     ble_npl_callout_init(&wardriving_ble_interval_co, nimble_port_get_dflt_eventq(),
                         wardriving_ble_interval_cb, NULL);
+    ble_npl_callout_init(&reconnect_co, nimble_port_get_dflt_eventq(), reconnect_timer_cb, NULL);
     ESP_LOGI(TAG, "starting v2 service-filtered scan");
     start_scan();
 }

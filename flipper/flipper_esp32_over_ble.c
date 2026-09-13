@@ -30,24 +30,37 @@
 
 #define TAG "Esp32OverBle"
 #define PAYLOAD_MAX 64
-/* Default (pre-MTU-negotiation) BLE ATT MTU. Pairing records are exchanged before/around
-   MTU negotiation, so outgoing pairing-phase records are always fragmented against this
-   conservative worst-case value rather than an MTU that may not have taken effect yet. */
+/* Default (pre-MTU-negotiation) BLE ATT MTU. Used as negotiated_att_mtu's initial/reset value
+   until the real ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE event arrives (see profile_event_handler,
+   G12 fix) -- send_pairing_record() falls back to this conservative value for any record sent
+   before that happens. */
 #define FEB_DEFAULT_ATT_MTU 23
+/* G12 fix: the real cap on an outgoing fragment is not the negotiated ATT MTU alone -- it's
+   whichever is smaller of that and this Notify characteristic's own fixed 64-byte declared max
+   value length (PAYLOAD_MAX). Exceeding the characteristic's own cap fails independently of MTU
+   headroom (ATT_ERR_INVALID_ATTR_VALUE_LEN) -- see docs/LESSONS.md's "att-mtu-vs-attribute-
+   length" entry, which is exactly this same fact on the ESP32's Write-characteristic direction
+   (FEB_FLIPPER_WRITE_EFFECTIVE_MTU there); this mirrors it for the Flipper's Notify direction. */
+#define FEB_NOTIFY_CHAR_EFFECTIVE_MTU (PAYLOAD_MAX + FEB_ATT_WRITE_OVERHEAD)
 #define PAIRING_REASON_MAX_LEN 32
 #define PAIRING_DIR_NAME "pairings"
-#define FEB_PAIRINGS_PATH_MAX_LEN 96
+/* Real worst case is dir("/ext/apps_data/flipper_esp32_over_ble/pairings", ~46 bytes) + "/"
+   + board_id (FEB_PAIRING_BOARD_ID_MAX_LEN=32) + ".dat.tmp" (8) = ~87 -- 96 left almost no
+   margin, and build_pairing_path()'s truncation check (fails closed, does not overflow) could
+   still spuriously fail a persist for a legitimate max-length board_id. Sized to 160 with real
+   margin, matching this project's usual buffer-sizing convention elsewhere. */
+#define FEB_PAIRINGS_PATH_MAX_LEN 160
 /* docs/PLAN.md step 7: capability-cache file, own subdirectory next to (not inside)
    "pairings", same atomic-write pattern, one file per board_id. */
 #define CAPABILITY_DIR_NAME "capabilities"
-#define FEB_CAPABILITIES_PATH_MAX_LEN 96
+#define FEB_CAPABILITIES_PATH_MAX_LEN 160
 /* wardriving WiGLE CSV export directory (docs/CAPABILITIES.md's wardriving bullet), own
    subdirectory next to "pairings"/"capabilities", same resolve-once-from-this-app's-own-
    thread pattern -- see resolve_pairings_dir_path()'s comment for why. Unlike those two,
    files here are append-only exports, not atomically-replaced state, so there is no
    "*.tmp"/rename pattern for them (see wardriving_csv_ensure_open()). */
 #define WARDRIVING_EXPORT_DIR_NAME "wardriving"
-#define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 96
+#define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 160
 /* Compact on-screen capability line: "<board>: <features>". Real values today are short
    ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
    full 64 bytes -- a real scrollable capability view is backlogged for when `features`
@@ -397,6 +410,12 @@ static uint8_t pair_secret[FEB_PAIRING_SECRET_LEN];
 static uint8_t pairing_payload_buf[256];
 static uint8_t pairing_record_buf[FEB_MAX_RECORD_SIZE];
 
+/* G12 fix: the real negotiated ATT MTU, once known -- see profile_event_handler's
+   ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE case. Starts at (and is reset back to on disconnect)
+   FEB_DEFAULT_ATT_MTU, matching the ESP32's own negotiated_att_mtu reset-on-connect
+   convention, so a stale large value from a previous connection can never carry over. */
+static uint16_t negotiated_att_mtu = FEB_DEFAULT_ATT_MTU;
+
 static void emit_fragment(const uint8_t* fragment, size_t fragment_len, void* ctx) {
     Esp32BleProfile* profile = ctx;
     NotifyFragment notify_fragment = {.data = fragment, .len = (uint16_t)fragment_len};
@@ -405,7 +424,15 @@ static void emit_fragment(const uint8_t* fragment, size_t fragment_len, void* ct
 }
 
 static bool send_pairing_record(Esp32BleProfile* profile, const uint8_t* record, size_t record_len) {
-    size_t capacity = feb_fragment_capacity(FEB_DEFAULT_ATT_MTU);
+    /* G12 fix: use whichever is smaller of the real negotiated MTU and this Notify
+       characteristic's own fixed 64-byte cap (FEB_NOTIFY_CHAR_EFFECTIVE_MTU) -- never the raw
+       negotiated MTU alone (see that define's own comment). Before MTU negotiation completes,
+       negotiated_att_mtu is still FEB_DEFAULT_ATT_MTU (23), so early pairing-phase records
+       naturally get the same conservative fragmentation as before this fix. */
+    uint16_t effective_mtu = (negotiated_att_mtu < FEB_NOTIFY_CHAR_EFFECTIVE_MTU) ?
+                             negotiated_att_mtu :
+                             FEB_NOTIFY_CHAR_EFFECTIVE_MTU;
+    size_t capacity = feb_fragment_capacity(effective_mtu);
     if(capacity == 0) {
         return false;
     }
@@ -591,10 +618,12 @@ static bool resolve_wardriving_export_dir_path(Storage* storage) {
    replacing one board's pairing can never touch another's. */
 static bool
     pairing_storage_save(Storage* storage, const char* board_id, size_t board_id_len, const uint8_t* secret) {
-    static char final_path[96];
-    static char tmp_path[96];
+    static char final_path[FEB_PAIRINGS_PATH_MAX_LEN];
+    static char tmp_path[FEB_PAIRINGS_PATH_MAX_LEN];
     if(!build_pairing_path(final_path, sizeof(final_path), board_id, board_id_len, false) ||
        !build_pairing_path(tmp_path, sizeof(tmp_path), board_id, board_id_len, true)) {
+        FURI_LOG_E(TAG, "pairing_storage_save: path build failed for board_id '%.*s'",
+                   (int)board_id_len, board_id);
         return false;
     }
 
@@ -628,8 +657,10 @@ static bool
    logged locally for diagnostics. */
 static bool
     pairing_storage_load(Storage* storage, const char* board_id, size_t board_id_len, uint8_t* secret_out) {
-    static char path[96];
+    static char path[FEB_PAIRINGS_PATH_MAX_LEN];
     if(!build_pairing_path(path, sizeof(path), board_id, board_id_len, false)) {
+        FURI_LOG_E(TAG, "pairing_storage_load: path build failed for board_id '%.*s'",
+                   (int)board_id_len, board_id);
         return false;
     }
     File* file = storage_file_alloc(storage);
@@ -670,8 +701,10 @@ static bool any_saved_pairing_exists(Storage* storage) {
 
 static bool
     capability_storage_exists(Storage* storage, const char* board_id, size_t board_id_len) {
-    static char path[96];
+    static char path[FEB_CAPABILITIES_PATH_MAX_LEN];
     if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
+        FURI_LOG_E(TAG, "capability_storage_exists: path build failed for board_id '%.*s'",
+                   (int)board_id_len, board_id);
         return false;
     }
     return storage_file_exists(storage, path);
@@ -687,10 +720,12 @@ static bool capability_storage_save(
     size_t board_id_len,
     const uint8_t* payload,
     size_t payload_len) {
-    static char final_path[96];
-    static char tmp_path[96];
+    static char final_path[FEB_CAPABILITIES_PATH_MAX_LEN];
+    static char tmp_path[FEB_CAPABILITIES_PATH_MAX_LEN];
     if(!build_capability_path(final_path, sizeof(final_path), board_id, board_id_len, false) ||
        !build_capability_path(tmp_path, sizeof(tmp_path), board_id, board_id_len, true)) {
+        FURI_LOG_E(TAG, "capability_storage_save: path build failed for board_id '%.*s'",
+                   (int)board_id_len, board_id);
         return false;
     }
 
@@ -728,8 +763,10 @@ static bool capability_storage_load(
     uint8_t* out,
     size_t out_cap,
     size_t* out_len) {
-    static char path[96];
+    static char path[FEB_CAPABILITIES_PATH_MAX_LEN];
     if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
+        FURI_LOG_E(TAG, "capability_storage_load: path build failed for board_id '%.*s'",
+                   (int)board_id_len, board_id);
         return false;
     }
     File* file = storage_file_alloc(storage);
@@ -2927,6 +2964,24 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
             }
         }
     }
+
+    /* G12 fix: this dispatcher is invoked for every raw BLE event before Furi's own internal
+       GAP handler gets a chance (furi_ble/event_dispatcher.c's ble_event_dispatcher_process_event()
+       only falls through to ble_event_app_notification() -- gap.c's own handler -- once every
+       registered service handler, including this one, has returned BleEventNotAck). That means
+       this same ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE event that gap.c logs internally
+       (GapEventTypeUpdateMTU, never exposed to app code via any public API) is also visible
+       right here, letting the app learn the real negotiated MTU without needing one. Returns
+       BleEventNotAck (not handled/consumed) so gap.c's own internal handling of this same event
+       still runs afterward, unchanged. */
+    if(event_packet->evt == HCI_VENDOR_SPECIFIC_DEBUG_EVT_CODE &&
+       ble_event->ecode == ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE) {
+        aci_att_exchange_mtu_resp_event_rp0* mtu_resp =
+            (aci_att_exchange_mtu_resp_event_rp0*)ble_event->data;
+        negotiated_att_mtu = mtu_resp->Server_RX_MTU;
+        FURI_LOG_I(TAG, "negotiated ATT MTU: %u", (unsigned)negotiated_att_mtu);
+    }
+
     return BleEventNotAck;
 }
 
@@ -2934,6 +2989,11 @@ static FuriHalBleProfileBase* profile_start(FuriHalBleProfileParams params) {
     feb_reassembly_reset(&reassembly);
     pairing_reset_state();
     session_reset_state();
+    /* G12 fix: reset back to the conservative default for a fresh profile activation, matching
+       the ESP32's own negotiated_att_mtu reset-on-connect -- a stale large value from a
+       previous connection must never carry over and be assumed valid before the new
+       connection's own MTU exchange completes. */
+    negotiated_att_mtu = FEB_DEFAULT_ATT_MTU;
     Esp32BleProfile* profile = malloc(sizeof(Esp32BleProfile));
     furi_check(profile);
     profile->base.config = &profile_callbacks;
