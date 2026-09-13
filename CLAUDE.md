@@ -21,6 +21,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria. |
 | [docs/BACKLOG.md](docs/BACKLOG.md) | The single centralized list of open, actionable items — defects, deferred product decisions, cost/efficiency work. Check before starting anything not already in the current roadmap step. |
 | [docs/HARDENING_BACKLOG.md](docs/HARDENING_BACKLOG.md) | Deeper structural/robustness issues found during live testing that need their own investigation/design pass before fixing — distinct from BACKLOG.md's ready-to-fix items. |
+| [docs/BACKLOG_COMPLETED.md](docs/BACKLOG_COMPLETED.md) | Scannable one-line-per-item archive of resolved BACKLOG.md rows. Full narrative for any of them is in PROJECT_HISTORY.md. |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why pairing/transport/delivery choices were made, and their accepted tradeoffs. |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The v2 wire contract — CBOR shapes, crypto derivations, UUIDs. Source of truth for both firmwares. |
 | [docs/PAIRING.md](docs/PAIRING.md) | The reset-gated X25519 pairing ceremony, step by step. |

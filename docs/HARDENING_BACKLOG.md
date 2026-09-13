@@ -95,3 +95,52 @@ force this overlap:
 **Known complication:** this exact test scenario (forced disconnect during active wardriving) is
 also where H01 currently causes a reconnect stall — H01 needs to be fixed first, or the test
 needs to tolerate/work around it, before G30's fix can actually be exercised end-to-end this way.
+
+## H03 — G07 reproduces on the reconnect handshake itself, not just `start`/`stop`
+
+**Discovered:** 2026-09-13, same live-test session as H01. Confirmed via ESP32 serial log
+(`logs/esp32_COM9_2026-09-13_10-17-34.log`). `docs/BACKLOG.md` G07 ("Any `send_protected*`
+clobbers an in-flight wardriving backlog drain") was already an open, explicitly-deferred
+finding; this is fresh evidence of a trigger path not previously documented, not a new bug.
+
+**Evidence — full sequence from the live log:**
+
+```
+10:33:28.157  idle-timeout disconnect (normal -- 30s no traffic)
+10:33:28.159  reconnect: found peer, connecting
+10:33:28.495  connected, MTU negotiated: 256
+10:33:29.089  notifications subscribed, hello sent
+10:33:29.245  hello_ack received, client_auth sent
+10:33:29.297  "runtime session authenticated"           <- clean auth
+10:33:29.351  sending wardriving status(data), 1 backlog record
+10:33:29.395  received 2 fragments from Flipper (auto wardriving-status query, per BL02)
+10:33:29.395  "wardriving status query answered"        <- a SECOND protected record, sent
+              almost simultaneously with the first
+10:33:29.592  one more GATT write (27 bytes)
+10:33:29.848  discovery re-arms (wardriving's own BLE window cycling -- unrelated)
+10:33:29.851  "disconnected: reason=531"
+```
+
+`reason=531` decodes to NimBLE-base(512) + HCI 0x13 ("Remote User Terminated Connection") -- the
+**Flipper** closed the connection, not the ESP32.
+
+**Diagnosis:** right after auth completes, two protected records get queued almost back-to-back:
+the ESP32's wardriving backlog-drain data, and its answer to the Flipper's automatic
+wardriving-status query (a BL02 behavior -- the Flipper queries running-state on every fresh
+session-auth). This is the shared single-in-flight `tx_fragment_*` state getting clobbered by
+the second send racing the first (G07's known mechanism), corrupting one of the records. The
+Flipper then detects a bad sequence/GCM tag on the corrupted record and -- correctly, per G11's
+fix -- disconnects rather than silently accepting it.
+
+**New trigger path this adds to G07's existing scope:** previously tracked as `start`-only, then
+generalized to `stop`/`capability_query`. This adds **the reconnect handshake itself**
+(wardriving-status-query-answer racing the backlog-drain data send) as a fourth confirmed
+trigger -- meaning G07 can now cause a full disconnect/reconnect/immediate-re-disconnect loop
+any time wardriving is running and the Flipper reconnects with backlog pending, independent of
+any explicit `start`/`stop`/`capability_query` action.
+
+**Status:** still deferred per the user's standing decision (see `docs/BACKLOG.md`'s "Deferred
+by explicit product decision" section) -- this evidence does not change that decision, it just
+means the deferred item's practical impact is broader than previously documented (routine
+reconnect-with-pending-backlog, not just explicit commands). Re-confirm the deferral still
+stands, now with this fuller picture, before it comes up again.

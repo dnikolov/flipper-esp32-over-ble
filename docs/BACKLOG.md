@@ -9,9 +9,10 @@ already blocking the phase in progress.
   [SESSION_MEMORY.md](SESSION_MEMORY.md), not here.
 - **Roadmap steps and their "done when" bars** live in [PLAN.md](PLAN.md), not here.
 - **Finished work** (bug found, root-caused, fixed, verified) belongs in
-  [PROJECT_HISTORY.md](PROJECT_HISTORY.md) — mark an item `DONE YYYY-MM-DD (commit)` below only
-  long enough for the next session to notice, then delete the row once the PROJECT_HISTORY.md
-  entry exists.
+  [BACKLOG_COMPLETED.md](BACKLOG_COMPLETED.md) (a scannable one-line-per-item archive) and
+  [PROJECT_HISTORY.md](PROJECT_HISTORY.md) (the full narrative) — mark an item `DONE
+  YYYY-MM-DD (commit)` below only long enough for the next session to notice, then move the
+  row to BACKLOG_COMPLETED.md once the PROJECT_HISTORY.md entry exists.
 
 Each row is a one-line pointer, not the full write-up — follow the link for exact file/line
 evidence, a suggested fix, and tests to add. Do not re-derive detail that already lives
@@ -34,16 +35,10 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | ID | Title | Status |
 | --- | --- | --- |
 | G03 | ESP32 marks the session `AUTHENTICATED` on its own GATT write-complete, not on peer confirmation | Open — needs a product decision on the `capability_query`-caveat (see appendix) |
-| G04 | Pairing ceremony (`pair_init`→`pair_complete`) has no application-level timeout | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G05 | Absolute `uint32_t` millisecond deadlines wrap at ~49.7 days uptime | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G06 | Neither firmware sends the spec-mandated `unsupported_version` error + close | Open |
-| G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below) |
+| G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below). Fresh evidence 2026-09-13: also reproduces on the reconnect handshake itself (wardriving-status-query-answer racing a backlog-drain send), causing a full disconnect loop — see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H03. |
 | G09 | Flipper advances `session_seq_out` even when notify delivery is unknown | Open |
-| G11 | Flipper never closes the connection on auth/GCM/sequence failure (relies on ESP32's 30s idle timeout) | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | BL01 | Flipper's `handle_pair_init()` runs unconditionally on any incoming `pair_init` — no local user-gesture/authorization-state check, contradicting [PAIRING.md](PAIRING.md) step 3's "user selects Add ESP32 board" | Open — low severity, works in practice; needs design clarification |
-
-`G26` (AES-GCM 24-bit sequence cap not enforced) — **DONE 2026-09-11** (`3111fa2`); see
-[PROJECT_HISTORY.md](PROJECT_HISTORY.md).
 
 ## P1 — real bugs in normal use
 
@@ -51,73 +46,34 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | --- | --- | --- |
 | G08 | SD-card I/O (pairing, capability cache, CSV) runs on `BleEventWorker`, the BLE-pump thread | Open |
 | G10 | Flipper `session_key`/`session_seq_out`/`outgoing_message_id` accessed from two threads with no lock | Open |
-| G14 | `any_saved_pairing_exists()` matches any directory entry, including a crashed-save `.dat.tmp` leftover | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G17 | `client_auth` proof failure leaves the Flipper UI stuck on "Authenticating…" | ✅ DONE 2026-09-12 (commit `3ffffc2`) — see PROJECT_HISTORY.md. USER_GUIDE.md already documents the "Failed: proof verification failed" text (confirmed 2026-09-13); the earlier "sync still pending" note was stale. |
-| G27 | `pending_command_kind` is never cleared; a stray `internal_error` always looks like a wardriving self-stop | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G28 | Wardriving CSV writes a WiGLE header on every `FSOM_OPEN_APPEND`, not only on a genuinely new file | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G30 | Wardriving log/dedup state has no lock between the Wi-Fi `sys_evt` writer and the NimBLE-host drain reader | ✅ DONE 2026-09-13 — moved the Wi-Fi-source dedup/append loop out of `wifi_scan_done_handler()` (sys_evt task) into `wifi_scan_done_cb()` (NimBLE host task), matching the already-safe BLE-source sibling. The wardriving log API is now single-threaded by construction; no mutex needed. Build-verified clean, all ESP32 host suites pass. **Live concurrent-load test still needed** — tracked as [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H02. |
-| G31 | `backlog_remaining` uses an unlocked `size_t` subtract — can underflow under G30's race | **DONE 2026-09-12** — see PROJECT_HISTORY.md (G30's underlying race is still open) |
 | G13 | ESP32 NVS pairing blob has no version, validity marker, or atomic replacement | **Roadmap-gated → PLAN.md step 8.** Do not fix as a drive-by. |
 | G36 | Wardriving BLE reconnect can stall permanently | **Partially explained, not fully resolved.** BLE-only isolation test (7/7 successful reconnects) confirmed Wi-Fi coexistence starvation is *a* cause. But a live retest 2026-09-13 (after removing BL07's throttle) found a stall with a *different* mechanism — `wardriving_ble_interval_cb()`'s periodic re-arm colliding with its own in-flight connect attempt, independent of Wi-Fi entirely. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01 for the full evidence and proposed fix. Do not treat this as closed. |
-| BL02 | Flipper doesn't query wardriving status on (re)connect — closing/reopening the FAP while the ESP32 is still capturing shows "status unknown" on the wardriving screen instead of the real running state | ✅ DONE 2026-09-12 (commit 1f0cb8e); hardware-verified 2026-09-13. |
-| BL03 | Wardriving CSV filename is timestamped to the second and a new file opens on every reconnect — idle-timeout reconnect churn alone can mint many near-empty files per outing | ✅ DONE 2026-09-12; file lifetime changed to per-calendar-day; hardware-verified 2026-09-13 (USER_GUIDE.md updated). |
 | BL04 | Wardriving CSV dedup table resets on disconnect, but file lifetime is per-calendar-day — same-day reconnect can re-log an address already written earlier that day | Open — lower priority (correctness is preserved, just allows edge-case duplicate rows within a day); candidate fix is to seed dedup table from existing file on reopen. |
-| BL05 | Staying on Wardriving screen while wardriving is active breaks the connection; other screens are fine | ✅ DONE 2026-09-12 (commit 424aecd); multi-capability re-entrancy guard added to `queue_and_send_protected()`; hardware-verified 2026-09-13. |
-| BL06 | LED is constantly solid green during wardriving when design intends to show caught-up state | ✅ INVESTIGATED 2026-09-12; hardware-verified correct per-protocol (2026-09-13). Behavior is correct: backlog is continuously replenished (old flash log + live captures), so "solid green" while draining is expected. No code change needed. |
-| BL07 | ESP32 disconnects after a while and does not reconnect until Flipper FAP is restarted | ✅ DONE 2026-09-13 — removed an undocumented reconnect-time throttle (`FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS = 400u`) that forced wardriving's Wi-Fi source to scan *more* frequently during a reconnect attempt than the steady-state default, starving the BLE reconnect scan. **Hardware-confirmed 2026-09-13** via live serial log: a plain disconnect/reconnect (wardriving not yet active) completed cleanly — MTU negotiated, session re-authenticated. **Note:** reconnect *while wardriving is actively running* hit a separate, unrelated stall — see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01. That is not a BL07 regression; H01's root cause (`wardriving_ble_interval_cb()`) is independent of the throttle this fix removed. |
 
 ## P2 — robustness / cost / defense-in-depth
 
 | ID | Title | Status |
 | --- | --- | --- |
-| G12 | Flipper fragments every record at ATT MTU 23 (16-byte payload) even after MTU negotiation | ✅ DONE 2026-09-13 — added `negotiated_att_mtu` tracking in `profile_event_handler()` (reads `ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE` directly off the raw BLE event stream — no public Furi API exposes this otherwise). `send_pairing_record()` now uses `feb_fragment_capacity(min(negotiated_att_mtu, FEB_NOTIFY_CHAR_EFFECTIVE_MTU))`, mirroring the ESP32's `FEB_FLIPPER_WRITE_EFFECTIVE_MTU` pattern (docs/LESSONS.md's "att-mtu-vs-attribute-length"). **Hardware-confirmed 2026-09-13** via live serial log: `negotiated ATT MTU: 256`, `hello_ack` arrived in 2×64-byte fragments (vs. ~6+ tiny ones at the old MTU-23 default), full session auth completed cleanly. |
-| G15 | ESP32 HMAC `full[32]` scratch not zeroized after truncating to the 16-byte wire value | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G16 | Factory reset doesn't zeroize in-RAM `stored_pairing_secret` before `esp_restart()` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
 | G18 | Flipper X25519 donna static ladder scratch (~3-4 KB) never zeroized, resident for the app's lifetime | Open |
-| G19 | Reconnect still `xTaskCreate(..., 3072)` just to sleep once, every ~30s during a prolonged outage | ✅ DONE 2026-09-13 — replaced with a reused `ble_npl_callout` (`reconnect_co`), same pattern as every other timer in this file. Eliminates the periodic 3KB task alloc/free during any prolonged outage. Build-verified clean. |
-| G20 | `notify_data_callback`'s NULL-context path sets `*data_len = PAYLOAD_MAX` instead of `0` | **Not a bug — the suggested fix was wrong and broke runtime auth.** Reverted 2026-09-12; see PROJECT_HISTORY.md. |
-| G21 | Pairing/capability/CSV path buffers sized at 96 bytes, one constant short of the real max (~137) | ✅ DONE 2026-09-13 — bumped `FEB_PAIRINGS_PATH_MAX_LEN`/`FEB_CAPABILITIES_PATH_MAX_LEN`/`FEB_WARDRIVING_EXPORT_PATH_MAX_LEN` from 96 to 160; all 5 previously-hardcoded `[96]` local path buffers now reference the shared constants instead. Added `FURI_LOG_E` on each path-build failure (previously silent). Build-verified clean, 527/527 host tests pass. |
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
-| G24 | ESP32 built with `-Og`, not `-Os` | **Product choice, not a bug** — record in BASELINES.md if changed |
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
-| G32 | Factory-reset LED RMT channel leaks on partial init failure | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G33 | `board_id_len` takes `snprintf()`'s return value verbatim; `<stdio.h>` not directly included | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| G34 | ESP32 `feb_gcm_encrypt` failure path uses `memset`, not `feb_secure_zero` | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-
-`G35` (ESP32 `wardriving_dedup_reset()` wiped the flash-log-gating dedup table on every
-`start`/`stop`) — ✅ done, see [PROJECT_HISTORY.md](PROJECT_HISTORY.md).
-
-`G22` (wardriving dedup table shared 128 slots across Wi-Fi/BLE with silent collision
-eviction) — ✅ done, see [PROJECT_HISTORY.md](PROJECT_HISTORY.md).
 
 ## Codebase & agent cost-efficiency
-
-Carried over from the retired `docs/OPTIMIZATION.md` (folded here 2026-09-11; its "done" items
-are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
 
 - **Extract a capability-dispatch layer** from both `main.c`/`flipper_esp32_over_ble.c` — pays
   off on every future capability. Hold until a natural roadmap boundary; decide the
   static-buffer-arena question first (see
   [LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety](LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety)).
-- **BLE active scanning**: enabled for `ble_scan` 2026-09-11 (`e92aad9`), and confirmed
-  2026-09-12 to already be hardcoded on for `wardriving`'s own capture engine too — all four
-  `ble_gap_disc()` call sites in `esp32/main/main.c` set `passive=0` (the "extending it to
-  wardriving's own capture engine" item once tracked here is done, not open). Still open: a
-  **runtime active/passive toggle** (nothing today can request passive scanning — a
-  prerequisite for [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s "Scan" menu's two passive modes),
-  and measuring the real-world name-discovery improvement once hardware-tested.
+- Still open: a **runtime active/passive BLE scanning toggle** (nothing today can request
+  passive scanning — a prerequisite for [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s "Scan" menu's
+  two passive modes), and measuring the real-world name-discovery improvement once
+  hardware-tested. (Active scanning itself is already enabled — see BACKLOG_COMPLETED.md.)
 - Do **not** split `flipper/pairing_crypto.c` (kept diffable against upstream curve25519-donna
   for auditability) or `tests/vectors/vectors.h` (98KB, generated — never `Read` it whole).
 - `tests/flipper/build.ps1` fails out-of-the-box on a machine where Visual Studio's
   `vcvars64.bat` shells out to `vswhere.exe` by bare name and the VS Installer directory isn't
   already on `PATH` (surfaced 2026-09-12 while verifying the LED-indicator feature). Needs a
   one-line `PATH` prepend in that script; not yet fixed.
-- **No canonical, agent-usable build/flash scripts for either platform** — ✅ done 2026-09-12, see
-  PROJECT_HISTORY.md. `tools/build_esp32.ps1` (extended: build, plus optional `-Port`,
-  `-SkipBuild`, `-CaptureBootLog`/`-CaptureSeconds`), `tools/build_flipper.ps1` (new: syncs into
-  the pinned Unleashed checkout's `applications_user/` and builds, optional `-Port` to also
-  transfer), and `tools/flash_flipper.ps1` (new: transfers a built FAP to the Flipper's SD card
-  via `runfap.py`, never auto-launches) are the canonical entry points now.
 
 ## Other open items (not covered by the cross-model review)
 
@@ -150,15 +106,8 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   same silent staleness until a real unpair action exists in the app.
 - Automatic BLE arbitration between multiple paired boards — gated on an unresolved BLE-HAL
   question: can the Flipper's peripheral role advertise while already connected?
-- **Real GPS driver + wardriving fix-dependency + real record timestamps** — **implemented on
-  both firmwares 2026-09-12**, build- and host-test-verified independently on each side; hardware
-  verification of the complete feature (both sides together, on a real module) not yet started.
-  Full design: [PLAN.md](PLAN.md)'s "Real GPS driver, wardriving fix-dependency, and real
-  wardriving-record timestamps" (see its "Known implementation notes" for the accepted
-  old-flash-record data loss and the GPS-screen-wiring follow-on); wire contract:
-  [PROTOCOL.md](PROTOCOL.md)'s new `gps` section and `utc_timestamp_s` field;
-  [CAPABILITIES.md](CAPABILITIES.md)'s `gps` and updated `wardriving` entries. Follow-on items
-  this design deliberately left backlogged, not folded in:
+- Follow-on items deliberately left backlogged from the real-GPS-driver design (implemented and
+  hardware-verified 2026-09-13 — see [PLAN.md](PLAN.md)'s "Real GPS driver..." section):
   - GPS backfill-to-first-fix (buffer and retroactively backfill pre-fix records instead of
     discarding them) — considered as an alternative to the chosen continuous-discard behavior,
     not built.
@@ -170,43 +119,36 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
     already parses `RMC` for date/time, so this is now a smaller follow-on (read two fields
     already being parsed) than it would otherwise be, but is still not part of the frozen scope.
   - `wardriving_csv.c`'s WigleWifi-1.4 `AltitudeMeters`/`AccuracyMeters` columns are still
-    hardcoded `"0,0"` (added 2026-09-12, GGA `altitude_dm` now exists in `feb_location_t` and
-    the `gps` capability's own `altitude_dm_offset` result field — see PROTOCOL.md — but
-    wardriving records/`<wardriving-record>` carry no altitude field of their own yet, so the
-    CSV exporter has nothing to read). `AccuracyMeters` has no real source at all — the GPS
-    module reports HDOP, not a meters-based error estimate (see docs/PROTOCOL.md's `gps`
-    `hdop_e1` field) — so filling it would mean either an HDOP-derived approximation, documented
-    as such, or leaving it `0`. Not folded into this altitude change since it requires a
-    wardriving-record wire-format change (a new field on both firmwares), out of scope for a
-    `gps`-capability-only addition.
+    hardcoded `"0,0"` — GGA `altitude_dm` exists in `feb_location_t` and the `gps` capability's
+    own `altitude_dm_offset` result field, but wardriving records carry no altitude field of
+    their own yet, so the CSV exporter has nothing to read; `AccuracyMeters` has no real source
+    at all (the GPS module reports HDOP, not a meters-based error estimate). Not folded into the
+    GPS-capability addition since it requires a wardriving-record wire-format change on both
+    firmwares.
   - Board-side autostart wardriving, independent of the Flipper initiating the session (a
-    board-specific setting) — a new item raised during the design session, unscoped.
-  - Runtime-configurable GPS UART GPIO pins via a Flipper Settings screen — the user's original
-    ask included this, deliberately split out of the frozen design (see PLAN.md's "Scope
-    boundary" note) because it needs a form/pin-entry widget this project doesn't have yet and a
-    new get/set wire config surface. Defaults stay compile-time constants for now.
+    board-specific setting) — unscoped.
+  - Runtime-configurable GPS UART GPIO pins via a Flipper Settings screen — deliberately split
+    out of the frozen design (see PLAN.md's "Scope boundary" note) because it needs a
+    form/pin-entry widget this project doesn't have yet and a new get/set wire config surface.
+    Defaults stay compile-time constants for now.
 - Non-ASCII SSID rendering is untested on real hardware (host-native codec tests cover the
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
   single-`ViewPort`/`AppEvent`-queue pattern every screen has been bolted onto. Structural,
-  no deadline. **Corrected 2026-09-12 (was stale):** this was previously framed as a hard
-  prerequisite for [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s menu redesign, but that redesign
-  shipped the same day built directly on the existing `ViewPort`/`AppEvent`-queue pattern instead
-  — the prerequisite was skipped, not satisfied. Back to a structural nice-to-have with no
-  blocking dependency, not a blocker for anything currently in flight.
-- **New (2026-09-12):** the Flipper's "Scan" menu screen is only a placeholder-level Wi-Fi-scan/
-  BLE-scan picker, not [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s actual five-mode BLE-active/passive
-  live-view design (reusing Wardriving's capture engine without persistence). Needs its own
-  implementation pass once the runtime BLE active/passive toggle above exists.
-- **New (2026-09-12):** decide whether `AppScreenLegacy`/`HomeMenuLegacy` (a compatibility screen
-  preserving the old direct-button-shortcut flow, found during the Phase 3a implementation but
-  never part of [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s original design) is kept long-term or
-  removed once Scan/GPS/Settings/About are trusted to fully replace it.
-- **New (2026-09-12), cosmetic, needs a hardware/visual check:** the Home menu's "Connection
-  lost" banner and each non-Home screen's own title may visually overlap — both are drawn at
-  nearly the same canvas position (banner at y=12 `FontSecondary`, titles at y=11 `FontPrimary`).
-  Found while reading `draw_callback` during the Phase 3a docs-accuracy pass; not confirmed on a
-  real screen.
+  no deadline, not a blocker for anything currently in flight (the Phase 3a menu redesign
+  shipped directly on the existing pattern instead — see [docs/UI_REDESIGN.md](UI_REDESIGN.md)).
+- The Flipper's "Scan" menu screen is only a placeholder-level Wi-Fi-scan/BLE-scan picker, not
+  [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s actual five-mode BLE-active/passive live-view design
+  (reusing Wardriving's capture engine without persistence). Needs its own implementation pass
+  once the runtime BLE active/passive toggle above exists.
+- Decide whether `AppScreenLegacy`/`HomeMenuLegacy` (a compatibility screen preserving the old
+  direct-button-shortcut flow, found during the Phase 3a implementation but never part of
+  [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s original design) is kept long-term or removed once
+  Scan/GPS/Settings/About are trusted to fully replace it.
+- **Cosmetic, needs a hardware/visual check:** the Home menu's "Connection lost" banner and each
+  non-Home screen's own title may visually overlap — both are drawn at nearly the same canvas
+  position (banner at y=12 `FontSecondary`, titles at y=11 `FontPrimary`). Found while reading
+  `draw_callback`; not confirmed on a real screen.
 - **Consolidating/grouping wardriving records on the Flipper side** (e.g. de-duplicating or
   rolling up repeated/nearby sightings for display, as distinct from the ESP32-side capture-time
   dedup that already exists). Not scoped yet — needs its own planning/grill-me session before
@@ -216,18 +158,13 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   `flipper/wardriving_csv.c`'s `feb_wardriving_dedup_should_write()` re-trigger a write when RSSI
   improves ≥6dB versus the *last-written* observation for that address — which lets a signal that
   is merely fluctuating (not trending stronger), especially BLE's noisier RSSI, repeatedly clear
-  the gate (e.g. -92→-82→-74 dBm, three writes, none of which beat an earlier peak). Investigated
-  against WiGLE's own reference Android app (`wigle-wifi-wardriving`,
-  `DatabaseHelper.java`'s `addObservation()`, `db/DatabaseHelper.java` on GitHub): its gate is a
-  hybrid — a 64-entry in-memory LRU cache (`previousWrittenLocationsCache`) makes it compare
-  against last-written for addresses still warm in cache (same behavior as this project), falling
-  back to the DB's true best-ever `network.bestlevel` column only on a cache miss (likely the
-  common case once a session exceeds ~64 concurrently-active addresses). Worth deciding whether to
-  switch to (or approximate) a best-ever comparison here, which would stop repeat-fluctuation
-  writes at the cost of never re-logging a device that's still below its historical peak. Related
-  to the "Consolidating/grouping wardriving records" item above but narrower — this is about the
-  comparison basis inside the existing per-address gate, not a new consolidation feature. Not
-  scoped/decided yet.
+  the gate. Investigated against WiGLE's own reference Android app
+  (`wigle-wifi-wardriving`, `DatabaseHelper.java`'s `addObservation()`): its gate is a hybrid — a
+  64-entry in-memory LRU cache makes it compare against last-written for addresses still warm in
+  cache (same behavior as this project), falling back to the DB's true best-ever
+  `network.bestlevel` column only on a cache miss. Worth deciding whether to switch to (or
+  approximate) a best-ever comparison here. Related to the "Consolidating/grouping" item above
+  but narrower. Not scoped/decided yet.
 - **Explore throttling the Wi-Fi source specifically during wardriving results-flush to the
   Flipper** — the flush was observed getting stuck before the recent dedup/sequence-cap fixes
   (`e616d81`, `3111fa2`). Possibly the same BLE/Wi-Fi coexistence starvation as G36, just
@@ -254,11 +191,10 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   firmwares) needing its own design session — backlogged at the user's explicit request, not a
   quick patch.
 - **G07** (TX single-flight clobbers wardriving drain) — user previously deferred the
-  narrower `start`-only form; this entry generalizes it to `stop`/`capability_query` too.
+  narrower `start`-only form; this entry generalizes it to `stop`/`capability_query` too, and
+  as of 2026-09-13 to the reconnect handshake itself (see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md)
+  H03 — it can now cause a full disconnect loop, not just a one-off clobbered send).
   Re-confirm the deferral still stands before implementing.
-- **G29** — ✅ done, see `docs/PROJECT_HISTORY.md`'s 2026-09-11 "Wardriving CSV dedup reset on
-  restart fixed" entry (chosen scope: file lifetime, documented in `docs/CAPABILITIES.md`).
-  Hardware re-verification (a real stop/restart mid-capture) still pending.
 
 ## Accepted, not a bug — do not "fix"
 
