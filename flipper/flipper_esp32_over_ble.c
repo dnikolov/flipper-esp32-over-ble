@@ -789,31 +789,60 @@ static bool capability_storage_load(
 }
 
 /* docs/PLAN.md step 7 grew AppEvent past this file's ~100-byte static-storage threshold
-   (added capability_board/capability_features) -- event is now static, not stack-local, to
+   (added capability_board/capability_features) -- event is static, not stack-local, to
    keep it off the 1280-byte BleEventWorker stack (this function is reachable from
    profile_event_handler via the handle_pair_ and handle_hello/handle_client_auth
    callbacks). A static local with a designated initializer only runs that initializer once
    at program load, not per call (docs/SESSION_MEMORY.md's cmult() trap), so every field is
-   explicitly reset here instead. */
+   explicitly reset here instead.
+
+   shared_ble_event is one instance shared by every post_*() function below that only ever
+   posts from inside profile_event_handler's call chain (BleEventWorker thread: synchronous,
+   single-in-flight, never reentrant) -- safe to consolidate since furi_message_queue_put()
+   copies the struct by value before any of these functions returns, so nothing depends on
+   the buffer's contents surviving past that call. bt_status_callback/gps_poll_timer_callback/
+   input_callback run on other system threads (Bt service/Timer service/GuiSrv) and keep
+   their own separate static AppEvent for that reason -- sharing across threads would be a
+   real data race, not just an in-flight one. */
+static AppEvent shared_ble_event;
+
+/* shared_status_result: same single-in-flight BLE-thread reasoning as shared_ble_event just
+   above, applied to the per-capability decode-scratch struct each status handler below
+   (handle_wifi_scan_status/handle_ble_scan_status/handle_gps_status/
+   handle_wardriving_status) declares for its own feb_cbor_decode_*_result_payload() call.
+   Unlike shared_ble_event these are four different struct types, not four instances of one
+   type, so a union rather than a single typed static -- each handler fully decodes into and
+   drains its own member (posted onward as AppEvents, or written to the wardriving CSV/dedup
+   table) before returning, and none holds a pointer into it across a call boundary or into a
+   different handler, so the four can safely overlay the same storage. Sized to the largest
+   member (wardriving's, the only one holding up to 32 full records) instead of the sum of
+   all four. */
+static union {
+    feb_wifi_scan_result_payload_t wifi_scan;
+    feb_ble_scan_result_payload_t ble_scan;
+    feb_gps_result_payload_t gps;
+    feb_wardriving_status_result_payload_t wardriving;
+} shared_status_result;
+
 static void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* reason) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventPairingPhase;
-    event.pairing_phase = phase;
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventPairingPhase;
+    event->pairing_phase = phase;
     if(reason) {
-        strncpy(event.pairing_reason, reason, sizeof(event.pairing_reason) - 1);
-        event.pairing_reason[sizeof(event.pairing_reason) - 1] = '\0';
+        strncpy(event->pairing_reason, reason, sizeof(event->pairing_reason) - 1);
+        event->pairing_reason[sizeof(event->pairing_reason) - 1] = '\0';
     } else {
-        event.pairing_reason[0] = '\0';
+        event->pairing_reason[0] = '\0';
     }
-    furi_message_queue_put(app->queue, &event, 0);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_session_fatal(Esp32App* app) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventSessionFatal;
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventSessionFatal;
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void pairing_reset_state(void) {
@@ -1116,13 +1145,14 @@ static uint64_t session_seq_in;
    size" on purpose, matching the project's own 256-vs-512 lesson (docs/PLAN.md step 3
    backlog) about payload buffers silently rejecting a legitimate larger record later. */
 static uint8_t session_plaintext_buf[FEB_CBOR_MAX_PAYLOAD];
-/* capability_query's own plaintext payload and its GCM ciphertext scratch: this firmware
-   always sends an empty map (`requested` omitted, docs/PLAN.md step 7), so a few bytes of
-   margin over the 1-byte real encoding is enough -- sized to what's actually reachable
-   here, not FEB_CBOR_MAX_PAYLOAD's full 512 (docs/SESSION_MEMORY.md's static-buffer
-   sizing guidance). */
+/* capability_query's own plaintext payload reuses pairing_payload_buf (256 bytes, well
+   above the few real bytes an always-empty-map `requested`-omitted encoding needs,
+   docs/PLAN.md step 7) rather than a dedicated array -- both are BLE-thread-only
+   (capability_bootstrap() runs from handle_client_auth(), synchronously inside
+   profile_event_handler, same as the pairing ceremony functions that also use
+   pairing_payload_buf) and never overlap in time. Only the GCM ciphertext scratch still
+   needs its own buffer (cannot alias the plaintext it's encrypting from). */
 #define FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN 16u
-static uint8_t capability_query_payload_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN];
 static uint8_t capability_query_ciphertext_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_LEN];
 
 /* ---- wifi_scan capability (docs/PLAN.md's Wi-Fi scan capability follow-on step) ----
@@ -1130,34 +1160,39 @@ static uint8_t capability_query_ciphertext_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_
    inside a BLE-thread callback, in direct response to an incoming record), the `command`
    that triggers a scan is sent from this app's own main thread, in direct response to a
    user OK-press on the results screen -- there is no incoming BLE event to key it off of.
-   Dedicated scratch buffers (separate from pairing_record_buf/capability_query_*_buf, which
-   remain BLE-thread-only) avoid any aliasing between the two independent senders, even
-   though in practice they cannot run concurrently: the "Scan now" action is gated on
-   app.capability_has_wifi_scan, which can only become true after capability_bootstrap()'s
-   own send (if any, on the BLE thread) has already returned and its response has been
-   processed -- see send_wifi_scan_command()'s own comment below for the full argument. */
-/* map(1) + "capability" key(1+10) + "wifi_scan" value(1+9) + "request_id" key(1+10) +
-   uint value(1-9) + "arguments" key(1+9) + empty-map value(1) = 45-53 bytes worst case.
-   The original 32u only counted value bytes, forgetting the three CBOR map *key* text
+   cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf below are kept separate from
+   pairing_record_buf/capability_query_*_buf (which remain BLE-thread-only) to avoid any
+   aliasing between the two independent senders, even though in practice they cannot run
+   concurrently: the "Scan now" action is gated on app.capability_has_wifi_scan, which can
+   only become true after capability_bootstrap()'s own send (if any, on the BLE thread) has
+   already returned and its response has been processed -- see send_wifi_scan_command()'s
+   own comment below for the full argument.
+
+   One shared triple, not one set per capability: wifi_scan/ble_scan/gps/wardriving's command
+   sends (send_wifi_scan_command/send_ble_scan_command/send_gps_command/
+   send_wardriving_start_command/send_wardriving_status_query/send_wardriving_stop_command,
+   all further below) run only on this app's own main thread, each a single synchronous
+   encode-encrypt-send call with no state retained in these buffers across calls, and
+   pending_command_kind's own one-command-in-flight convention (see its declaration below)
+   already establishes only one of these can be in progress at a time -- the same
+   single-in-flight reasoning this file already applies to shared_ble_event above, just on
+   the main thread instead of BleEventWorker. Sized to 96 bytes, the largest of the four
+   capabilities' worst-case payload encodings (wardriving's `{action:"start",
+   sources:[...]}` -- see its own send_wardriving_start_command() comment further below for
+   the byte count); wifi_scan/ble_scan/gps's smaller ~45-53-byte worst case (map(1) +
+   "capability" key(1+10) + value(1+9) + "request_id" key(1+10) + uint value(1-9) +
+   "arguments" key(1+9) + empty-map value(1)) fits with margin to spare. The original
+   per-capability 32u sizing only counted value bytes, forgetting the CBOR map *key* text
    strings entirely -- feb_cbor_encode_command_payload() silently returned 0 (out_cap
    exhausted partway through encoding "request_id"'s key) on every single call, so
    send_wifi_scan_command() failed 100% of the time (hardware-verified 2026-09-07: OK-press
-   never reached the ESP32). Sized with real margin now, not shaved to the byte. */
-#define FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN 64u
-static uint8_t wifi_scan_cmd_payload_buf[FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN];
-static uint8_t wifi_scan_cmd_ciphertext_buf[FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN];
-static uint8_t wifi_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+   never reached the ESP32) before that fix; sized with real margin now, not shaved to the
+   byte. */
+#define FEB_CMD_PAYLOAD_MAX_LEN 96u
+static uint8_t cmd_payload_buf[FEB_CMD_PAYLOAD_MAX_LEN];
+static uint8_t cmd_ciphertext_buf[FEB_CMD_PAYLOAD_MAX_LEN];
+static uint8_t cmd_record_buf[FEB_MAX_RECORD_SIZE];
 static uint64_t wifi_scan_next_request_id = 1;
-
-/* ble_scan mirrors wifi_scan's command scratch buffers exactly -- same sizing rationale
-   (see FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN's comment above), "ble_scan" (8 bytes) being one
-   byte shorter than "wifi_scan" (9 bytes) leaves even more margin against the same 64-byte
-   cap. Kept as its own dedicated set of statics, not shared with wifi_scan's, for the same
-   independent-sender reasoning given above. */
-#define FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN 64u
-static uint8_t ble_scan_cmd_payload_buf[FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN];
-static uint8_t ble_scan_cmd_ciphertext_buf[FEB_BLE_SCAN_CMD_PAYLOAD_MAX_LEN];
-static uint8_t ble_scan_cmd_record_buf[FEB_MAX_RECORD_SIZE];
 static uint64_t ble_scan_next_request_id = 1;
 
 /* `error` records (busy/not_running/invalid_command) carry no capability field
@@ -1395,9 +1430,10 @@ static void handle_hello(Esp32BleProfile* profile, const feb_unencrypted_record_
 
 /* ---- board identity / capability registry (docs/PLAN.md step 7) ----
    Fires automatically the moment runtime auth succeeds (handle_client_auth() below), no UI
-   gesture. `session_plaintext_buf`/`capability_query_payload_buf`/
-   `capability_query_ciphertext_buf` are declared with this file's other session statics
-   above; safe as static for the same single-in-flight-BLE-event-dispatch reason. */
+   gesture. `session_plaintext_buf`/`capability_query_ciphertext_buf` are declared with this
+   file's other session statics above (capability_query's plaintext payload itself reuses
+   pairing_payload_buf, see that declaration's comment); safe as static for the same
+   single-in-flight-BLE-event-dispatch reason. */
 
 static void format_capability_display(
     const feb_capability_response_payload_t* payload,
@@ -1439,22 +1475,22 @@ static bool capability_has_feature(const feb_capability_response_payload_t* payl
 }
 
 static void post_capability_info(Esp32App* app, const feb_capability_response_payload_t* payload) {
-    /* static, not stack-local -- see post_pairing_phase()'s comment above; same rationale
-       and same reset-every-call requirement apply here. */
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventCapabilityInfo;
+    /* shared_ble_event -- see post_pairing_phase()'s comment above; same rationale and same
+       reset-every-call requirement apply here. */
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventCapabilityInfo;
     format_capability_display(
         payload,
-        event.capability_board,
-        sizeof(event.capability_board),
-        event.capability_features,
-        sizeof(event.capability_features));
-    event.capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
-    event.capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
-    event.capability_has_wardriving = capability_has_feature(payload, "wardriving");
-    event.capability_has_gps = capability_has_feature(payload, "gps");
-    furi_message_queue_put(app->queue, &event, 0);
+        event->capability_board,
+        sizeof(event->capability_board),
+        event->capability_features,
+        sizeof(event->capability_features));
+    event->capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
+    event->capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
+    event->capability_has_wardriving = capability_has_feature(payload, "wardriving");
+    event->capability_has_gps = capability_has_feature(payload, "gps");
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 /* Persists the just-received capability_response payload verbatim (docs/CAPABILITIES.md)
@@ -1510,7 +1546,7 @@ static void capability_bootstrap(Esp32BleProfile* profile) {
     static feb_capability_query_payload_t query_payload;
     query_payload.has_requested = 0;
     size_t payload_len = feb_cbor_encode_capability_query_payload(
-        capability_query_payload_buf, sizeof(capability_query_payload_buf), &query_payload);
+        pairing_payload_buf, sizeof(pairing_payload_buf), &query_payload);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "capability_query: payload encode failed");
         return;
@@ -1529,7 +1565,7 @@ static void capability_bootstrap(Esp32BleProfile* profile) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        capability_query_payload_buf,
+        pairing_payload_buf,
         payload_len,
         capability_query_ciphertext_buf,
         sizeof(capability_query_ciphertext_buf),
@@ -1562,36 +1598,36 @@ static void copy_clamped_text(char* dst, size_t dst_cap, const char* src, size_t
    PROTOCOL.md: "not guaranteed valid UTF-8"), so every non-printable-ASCII byte is replaced
    with '.' here, once, rather than deferring sanitization to every later draw call. */
 static void post_wifi_scan_ap(Esp32App* app, const feb_wifi_scan_ap_t* ap) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWifiScanAp;
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWifiScanAp;
     size_t ssid_len = ap->ssid_len > FEB_WIFI_SCAN_SSID_MAX_LEN ? FEB_WIFI_SCAN_SSID_MAX_LEN : ap->ssid_len;
     for(size_t i = 0; i < ssid_len; i++) {
         uint8_t b = ap->ssid[i];
-        event.wifi_scan_ap_ssid[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+        event->wifi_scan_ap_ssid[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
     }
-    event.wifi_scan_ap_ssid[ssid_len] = '\0';
-    memcpy(event.wifi_scan_ap_bssid, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
-    event.wifi_scan_ap_rssi_dbm = (int32_t)ap->rssi_offset - 128;
-    event.wifi_scan_ap_channel = (uint32_t)ap->channel;
-    copy_clamped_text(event.wifi_scan_ap_phy, sizeof(event.wifi_scan_ap_phy), ap->phy, ap->phy_len);
-    copy_clamped_text(event.wifi_scan_ap_auth, sizeof(event.wifi_scan_ap_auth), ap->auth, ap->auth_len);
-    furi_message_queue_put(app->queue, &event, 0);
+    event->wifi_scan_ap_ssid[ssid_len] = '\0';
+    memcpy(event->wifi_scan_ap_bssid, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    event->wifi_scan_ap_rssi_dbm = (int32_t)ap->rssi_offset - 128;
+    event->wifi_scan_ap_channel = (uint32_t)ap->channel;
+    copy_clamped_text(event->wifi_scan_ap_phy, sizeof(event->wifi_scan_ap_phy), ap->phy, ap->phy_len);
+    copy_clamped_text(event->wifi_scan_ap_auth, sizeof(event->wifi_scan_ap_auth), ap->auth, ap->auth_len);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_wifi_scan_complete(Esp32App* app) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWifiScanDone;
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWifiScanDone;
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_wifi_scan_error(Esp32App* app, const char* message) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWifiScanError;
-    strncpy(event.wifi_scan_error_message, message, sizeof(event.wifi_scan_error_message) - 1);
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWifiScanError;
+    strncpy(event->wifi_scan_error_message, message, sizeof(event->wifi_scan_error_message) - 1);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 /* `status` (docs/PROTOCOL.md's "`wifi_scan` command and status payloads"). `result` is
@@ -1620,15 +1656,15 @@ static void
         return;
     }
     if(status_payload.has_result) {
-        static feb_wifi_scan_result_payload_t result;
+        feb_wifi_scan_result_payload_t* result = &shared_status_result.wifi_scan;
         feb_cbor_status_t result_status = feb_cbor_decode_wifi_scan_result_payload(
-            status_payload.result_span, status_payload.result_span_len, &result);
+            status_payload.result_span, status_payload.result_span_len, result);
         if(result_status != FEB_CBOR_OK) {
             FURI_LOG_W(TAG, "wifi_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
-        for(size_t i = 0; i < result.ap_count; i++) {
-            post_wifi_scan_ap(app, &result.aps[i]);
+        for(size_t i = 0; i < result->ap_count; i++) {
+            post_wifi_scan_ap(app, &result->aps[i]);
         }
     }
     if(is_complete) {
@@ -1646,42 +1682,42 @@ static void
    non-printable-ASCII-to-'.' treatment post_wifi_scan_ap() gives `ssid` is applied here too,
    once, rather than deferring sanitization to every later draw call. */
 static void post_ble_scan_device(Esp32App* app, const feb_ble_scan_device_t* device) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventBleScanDevice;
-    memcpy(event.ble_scan_device_address, device->address, FEB_BLE_SCAN_ADDRESS_LEN);
-    event.ble_scan_device_has_name = device->has_name;
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventBleScanDevice;
+    memcpy(event->ble_scan_device_address, device->address, FEB_BLE_SCAN_ADDRESS_LEN);
+    event->ble_scan_device_has_name = device->has_name;
     if(device->has_name) {
         size_t name_len =
             device->name_len > FEB_BLE_SCAN_NAME_MAX_LEN ? FEB_BLE_SCAN_NAME_MAX_LEN : device->name_len;
         for(size_t i = 0; i < name_len; i++) {
             uint8_t b = (uint8_t)device->name[i];
-            event.ble_scan_device_name[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+            event->ble_scan_device_name[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
         }
-        event.ble_scan_device_name[name_len] = '\0';
+        event->ble_scan_device_name[name_len] = '\0';
     }
-    event.ble_scan_device_rssi_dbm = (int32_t)device->rssi_offset - 128;
+    event->ble_scan_device_rssi_dbm = (int32_t)device->rssi_offset - 128;
     copy_clamped_text(
-        event.ble_scan_device_addr_type,
-        sizeof(event.ble_scan_device_addr_type),
+        event->ble_scan_device_addr_type,
+        sizeof(event->ble_scan_device_addr_type),
         device->addr_type,
         device->addr_type_len);
-    furi_message_queue_put(app->queue, &event, 0);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_ble_scan_complete(Esp32App* app) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventBleScanDone;
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventBleScanDone;
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_ble_scan_error(Esp32App* app, const char* message) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventBleScanError;
-    strncpy(event.ble_scan_error_message, message, sizeof(event.ble_scan_error_message) - 1);
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventBleScanError;
+    strncpy(event->ble_scan_error_message, message, sizeof(event->ble_scan_error_message) - 1);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 /* `status` (docs/PROTOCOL.md's "`ble_scan` command and status payloads") -- same two-state
@@ -1708,15 +1744,15 @@ static void
         return;
     }
     if(status_payload.has_result) {
-        static feb_ble_scan_result_payload_t result;
+        feb_ble_scan_result_payload_t* result = &shared_status_result.ble_scan;
         feb_cbor_status_t result_status = feb_cbor_decode_ble_scan_result_payload(
-            status_payload.result_span, status_payload.result_span_len, &result);
+            status_payload.result_span, status_payload.result_span_len, result);
         if(result_status != FEB_CBOR_OK) {
             FURI_LOG_W(TAG, "ble_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
-        for(size_t i = 0; i < result.device_count; i++) {
-            post_ble_scan_device(app, &result.devices[i]);
+        for(size_t i = 0; i < result->device_count; i++) {
+            post_ble_scan_device(app, &result->devices[i]);
         }
     }
     if(is_complete) {
@@ -1732,20 +1768,20 @@ static void
    for it and handle_runtime_error() never routes anything here. */
 static void post_gps_status(
     Esp32App* app, GpsFixState state, const feb_gps_result_payload_t* result) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventGpsStatus;
-    event.gps_state = (uint8_t)state;
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventGpsStatus;
+    event->gps_state = (uint8_t)state;
     if(state == GpsFixStateFix && result != NULL) {
-        event.gps_lat_e7_offset = result->lat_e7_offset;
-        event.gps_lon_e7_offset = result->lon_e7_offset;
-        event.gps_fix_quality = result->fix_quality;
-        event.gps_satellites = result->satellites;
-        event.gps_hdop_e1 = result->hdop_e1;
-        event.gps_utc_timestamp_s = result->utc_timestamp_s;
-        event.gps_altitude_dm_offset = result->altitude_dm_offset;
+        event->gps_lat_e7_offset = result->lat_e7_offset;
+        event->gps_lon_e7_offset = result->lon_e7_offset;
+        event->gps_fix_quality = result->fix_quality;
+        event->gps_satellites = result->satellites;
+        event->gps_hdop_e1 = result->hdop_e1;
+        event->gps_utc_timestamp_s = result->utc_timestamp_s;
+        event->gps_altitude_dm_offset = result->altitude_dm_offset;
     }
-    furi_message_queue_put(app->queue, &event, 0);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 /* `status` for `gps` (docs/PROTOCOL.md): single-shot, `state` one of "no_signal"/
@@ -1785,26 +1821,26 @@ static void
         FURI_LOG_W(TAG, "gps status: state=fix but no result; dropping");
         return;
     }
-    static feb_gps_result_payload_t result;
+    feb_gps_result_payload_t* result = &shared_status_result.gps;
     feb_cbor_status_t result_status = feb_cbor_decode_gps_result_payload(
-        status_payload.result_span, status_payload.result_span_len, &result);
+        status_payload.result_span, status_payload.result_span_len, result);
     if(result_status != FEB_CBOR_OK) {
         FURI_LOG_W(TAG, "gps status.result decode failed: %d; dropping", result_status);
         return;
     }
-    post_gps_status(app, state, &result);
+    post_gps_status(app, state, result);
 }
 
 /* ---- wardriving capability (docs/PROTOCOL.md "`wardriving` command and status payloads",
    docs/CAPABILITIES.md's wardriving bullet) ---- */
 
 static void post_wardriving_run_state(Esp32App* app, bool running, bool is_fresh_start) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWardrivingRunState;
-    event.wardriving_running = running;
-    event.wardriving_is_fresh_start = is_fresh_start;
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWardrivingRunState;
+    event->wardriving_running = running;
+    event->wardriving_is_fresh_start = is_fresh_start;
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_wardriving_batch(
@@ -1813,23 +1849,23 @@ static void post_wardriving_batch(
     uint64_t backlog_remaining,
     bool last_is_ble,
     const char* last_summary) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWardrivingBatch;
-    event.wardriving_batch_count = batch_count;
-    event.wardriving_backlog_remaining = backlog_remaining;
-    event.wardriving_last_is_ble = last_is_ble;
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWardrivingBatch;
+    event->wardriving_batch_count = batch_count;
+    event->wardriving_backlog_remaining = backlog_remaining;
+    event->wardriving_last_is_ble = last_is_ble;
     strncpy(
-        event.wardriving_last_summary, last_summary, sizeof(event.wardriving_last_summary) - 1);
-    furi_message_queue_put(app->queue, &event, 0);
+        event->wardriving_last_summary, last_summary, sizeof(event->wardriving_last_summary) - 1);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 static void post_wardriving_error(Esp32App* app, const char* message) {
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventWardrivingError;
-    strncpy(event.wardriving_error_message, message, sizeof(event.wardriving_error_message) - 1);
-    furi_message_queue_put(app->queue, &event, 0);
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWardrivingError;
+    strncpy(event->wardriving_error_message, message, sizeof(event->wardriving_error_message) - 1);
+    furi_message_queue_put(app->queue, event, 0);
 }
 
 /* CSV export file state -- BLE-thread-only (handle_wardriving_status(), further below, runs
@@ -2040,9 +2076,9 @@ static void
        reconnect or a reopened screen, and the user sees Start instead of Stop. */
     post_wardriving_run_state(app, true, false);
 
-    static feb_wardriving_status_result_payload_t result;
+    feb_wardriving_status_result_payload_t* result = &shared_status_result.wardriving;
     feb_cbor_status_t result_status = feb_cbor_decode_wardriving_status_result_payload(
-        status_payload.result_span, status_payload.result_span_len, &result);
+        status_payload.result_span, status_payload.result_span_len, result);
     if(result_status != FEB_CBOR_OK) {
         FURI_LOG_W(TAG, "wardriving status.result decode failed: %d; dropping", result_status);
         return;
@@ -2056,8 +2092,8 @@ static void
     bool last_is_ble = false;
     static char last_summary[40];
     last_summary[0] = '\0';
-    for(size_t i = 0; i < result.record_count; i++) {
-        const feb_wardriving_record_t* record = &result.records[i];
+    for(size_t i = 0; i < result->record_count; i++) {
+        const feb_wardriving_record_t* record = &result->records[i];
         if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record)) {
             if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
                 wardriving_csv_write_failed = true;
@@ -2096,9 +2132,9 @@ static void
     }
 
     post_wardriving_batch(
-        app, (uint32_t)result.record_count, result.backlog_remaining, last_is_ble, last_summary);
+        app, (uint32_t)result->record_count, result->backlog_remaining, last_is_ble, last_summary);
 
-    if(wardriving_flush_led_active && result.backlog_remaining == 0 && app->notifications) {
+    if(wardriving_flush_led_active && result->backlog_remaining == 0 && app->notifications) {
         notification_message(app->notifications, &sequence_set_only_blue_255);
         wardriving_flush_led_active = false;
     }
@@ -2214,7 +2250,7 @@ static bool send_wifi_scan_command(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        wifi_scan_cmd_payload_buf, sizeof(wifi_scan_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "wifi_scan command: payload encode failed");
         return false;
@@ -2234,18 +2270,18 @@ static bool send_wifi_scan_command(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        wifi_scan_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        wifi_scan_cmd_ciphertext_buf,
-        sizeof(wifi_scan_cmd_ciphertext_buf),
-        wifi_scan_cmd_record_buf,
-        sizeof(wifi_scan_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "wifi_scan command: record encode failed");
         return false;
     }
     pending_command_kind = PendingCommandWifiScan;
-    if(!send_pairing_record(profile, wifi_scan_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wifi_scan command: send failed");
         return false;
     }
@@ -2287,7 +2323,7 @@ static bool send_ble_scan_command(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        ble_scan_cmd_payload_buf, sizeof(ble_scan_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "ble_scan command: payload encode failed");
         return false;
@@ -2307,18 +2343,18 @@ static bool send_ble_scan_command(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        ble_scan_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        ble_scan_cmd_ciphertext_buf,
-        sizeof(ble_scan_cmd_ciphertext_buf),
-        ble_scan_cmd_record_buf,
-        sizeof(ble_scan_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "ble_scan command: record encode failed");
         return false;
     }
     pending_command_kind = PendingCommandBleScan;
-    if(!send_pairing_record(profile, ble_scan_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "ble_scan command: send failed");
         return false;
     }
@@ -2333,11 +2369,10 @@ static bool send_ble_scan_command(Esp32App* app) {
    still only ever runs on this app's own main thread (the timer callback just posts
    AppEventGpsPollTick; the main loop's handler for it calls this) -- same
    no-cross-thread-race argument as send_wifi_scan_command()'s own comment, extended to cover
-   the timer thread as a third possible caller alongside the main thread and the BLE thread. */
-#define FEB_GPS_CMD_PAYLOAD_MAX_LEN 64u
-static uint8_t gps_cmd_payload_buf[FEB_GPS_CMD_PAYLOAD_MAX_LEN];
-static uint8_t gps_cmd_ciphertext_buf[FEB_GPS_CMD_PAYLOAD_MAX_LEN];
-static uint8_t gps_cmd_record_buf[FEB_MAX_RECORD_SIZE];
+   the timer thread as a third possible caller alongside the main thread and the BLE thread.
+   Uses the shared cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with
+   wifi_scan's command scratch above -- same main-thread-only, single-in-flight
+   reasoning. */
 static uint64_t gps_next_request_id = 1;
 
 static bool send_gps_command(Esp32App* app) {
@@ -2361,7 +2396,7 @@ static bool send_gps_command(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        gps_cmd_payload_buf, sizeof(gps_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "gps command: payload encode failed");
         return false;
@@ -2381,17 +2416,17 @@ static bool send_gps_command(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        gps_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        gps_cmd_ciphertext_buf,
-        sizeof(gps_cmd_ciphertext_buf),
-        gps_cmd_record_buf,
-        sizeof(gps_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "gps command: record encode failed");
         return false;
     }
-    if(!send_pairing_record(profile, gps_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "gps command: send failed");
         return false;
     }
@@ -2401,13 +2436,14 @@ static bool send_gps_command(Esp32App* app) {
 }
 
 /* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
-   values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see
-   FEB_WIFI_SCAN_CMD_PAYLOAD_MAX_LEN's own comment for why this project no longer shaves
-   these to the byte). */
+   values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see the
+   shared cmd_payload_buf declaration's own comment above for why this project no longer
+   shaves these to the byte, and why FEB_CMD_PAYLOAD_MAX_LEN is sized off this capability's
+   96-byte worst case). FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size
+   this function's local `arguments_buf`; the command payload/ciphertext/record scratch is
+   the shared cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with wifi_scan's
+   command scratch above. */
 #define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 96u
-static uint8_t wardriving_cmd_payload_buf[FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN];
-static uint8_t wardriving_cmd_ciphertext_buf[FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN];
-static uint8_t wardriving_cmd_record_buf[FEB_MAX_RECORD_SIZE];
 static uint64_t wardriving_next_request_id = 1;
 
 /* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
@@ -2473,7 +2509,7 @@ static bool send_wardriving_start_command(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "wardriving start: payload encode failed");
         return false;
@@ -2493,18 +2529,18 @@ static bool send_wardriving_start_command(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        wardriving_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        wardriving_cmd_ciphertext_buf,
-        sizeof(wardriving_cmd_ciphertext_buf),
-        wardriving_cmd_record_buf,
-        sizeof(wardriving_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "wardriving start: record encode failed");
         return false;
     }
     pending_command_kind = PendingCommandWardrivingStart;
-    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving start: send failed");
         return false;
     }
@@ -2548,7 +2584,7 @@ static bool send_wardriving_status_query(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "wardriving status query: payload encode failed");
         return false;
@@ -2568,18 +2604,18 @@ static bool send_wardriving_status_query(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        wardriving_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        wardriving_cmd_ciphertext_buf,
-        sizeof(wardriving_cmd_ciphertext_buf),
-        wardriving_cmd_record_buf,
-        sizeof(wardriving_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "wardriving status query: record encode failed");
         return false;
     }
     pending_command_kind = PendingCommandWardrivingStatus;
-    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving status query: send failed");
         return false;
     }
@@ -2620,7 +2656,7 @@ static bool send_wardriving_stop_command(Esp32App* app) {
         .arguments_span_len = arguments_len,
     };
     size_t payload_len = feb_cbor_encode_command_payload(
-        wardriving_cmd_payload_buf, sizeof(wardriving_cmd_payload_buf), &command);
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
     if(payload_len == 0) {
         FURI_LOG_W(TAG, "wardriving stop: payload encode failed");
         return false;
@@ -2640,18 +2676,18 @@ static bool send_wardriving_stop_command(Esp32App* app) {
         session_board_id_len,
         FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
         session_seq_out,
-        wardriving_cmd_payload_buf,
+        cmd_payload_buf,
         payload_len,
-        wardriving_cmd_ciphertext_buf,
-        sizeof(wardriving_cmd_ciphertext_buf),
-        wardriving_cmd_record_buf,
-        sizeof(wardriving_cmd_record_buf));
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
     if(record_len == 0) {
         FURI_LOG_W(TAG, "wardriving stop: record encode failed");
         return false;
     }
     pending_command_kind = PendingCommandWardrivingStop;
-    if(!send_pairing_record(profile, wardriving_cmd_record_buf, record_len)) {
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving stop: send failed");
         return false;
     }
@@ -2749,10 +2785,11 @@ static void reassembly_timeout_timer_callback(void* context) {
 }
 
 /* Runs on the Furi timer-service thread, same as reassembly_timeout_timer_callback above --
-   but unlike that one, this must NOT touch session_seq_out/the gps_cmd_* statics itself
-   (those are the main thread's alone to write, per send_wifi_scan_command()'s own
-   cross-thread-safety argument). It only posts AppEventGpsPollTick; the main loop's own
-   handler for that event is what actually calls send_gps_command(). */
+   but unlike that one, this must NOT touch session_seq_out/the shared cmd_payload_buf/
+   cmd_ciphertext_buf/cmd_record_buf itself (those are the main thread's alone to write, per
+   send_wifi_scan_command()'s own cross-thread-safety argument). It only posts
+   AppEventGpsPollTick; the main loop's own handler for that event is what actually calls
+   send_gps_command(). */
 static void gps_poll_timer_callback(void* context) {
     Esp32App* app = context;
     /* static, not stack-local: AppEvent is now large enough (~500+ bytes, grown further by
@@ -2763,8 +2800,11 @@ static void gps_poll_timer_callback(void* context) {
        shares, not one this app owns. Matches reassembly_timeout_timer_callback's own
        static-buffer convention above and every post_*() function's in this file (see
        docs/LESSONS.md's BleEventWorker entry for the general rule this generalizes to any
-       tight system thread, not just BleEventWorker). Explicit reset below because a static
-       initializer only runs once at load time, not per call. */
+       tight system thread, not just BleEventWorker). Deliberately its own static, not
+       shared_ble_event (see that declaration's comment) -- this thread can run concurrently
+       with BleEventWorker/Bt/GuiSrv, so sharing one buffer across threads would be a real
+       race, not just an in-flight one. Explicit reset below because a static initializer
+       only runs once at load time, not per call. */
     static AppEvent event;
     memset(&event, 0, sizeof(event));
     event.type = AppEventGpsPollTick;
@@ -3059,8 +3099,10 @@ static void bt_status_callback(BtStatus status, void* context) {
        measured 480 bytes before this session's gps_* field additions and 536 after --
        essentially half that thread's entire stack for one frame, before counting the Bt
        service's own dispatch call chain on top. Matches every post_*() function's static
-       convention elsewhere in this file. Explicit reset below because a static initializer
-       only runs once at load time, not per call. */
+       convention elsewhere in this file, but deliberately its own instance rather than
+       shared_ble_event (see that declaration's comment) -- the Bt thread can run
+       concurrently with BleEventWorker/Timer/GuiSrv. Explicit reset below because a static
+       initializer only runs once at load time, not per call. */
     static AppEvent event;
     memset(&event, 0, sizeof(event));
     event.type = AppEventBtStatus;
@@ -3744,8 +3786,9 @@ static void input_callback(InputEvent* input, void* context) {
        gps_poll_timer_callback above: this runs on the GuiSrv thread (stack_size=2048,
        applications/services/gui/application.fam), a larger budget than Bt's/the Timer
        Service's but the same risk class as AppEvent keeps growing with new capabilities.
-       Explicit reset below because a static initializer only runs once at load time, not
-       per call. */
+       Deliberately its own static, not shared_ble_event (see that declaration's comment) --
+       GuiSrv can run concurrently with BleEventWorker/Bt/Timer. Explicit reset below because
+       a static initializer only runs once at load time, not per call. */
     static AppEvent event;
     memset(&event, 0, sizeof(event));
     event.type = AppEventInput;

@@ -54,6 +54,11 @@ attempt. Tracked as [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01. **This mea
 BLE reconnect stall (G36) is not fully resolved** — the earlier "RESOLVED" note based on the
 BLE-only isolation test's 7/7 result explained *a* cause, not the only one. Treat G36 as open.
 
+**2026-09-13: Flipper app OOM-on-launch root-caused, `.bss` reduced ~26%** (44812 → 32972 bytes)
+by consolidating duplicate static scratch (`AppEvent` locals, per-capability command buffers,
+per-capability decode-scratch structs) — ✅ done, see `docs/PROJECT_HISTORY.md`. Remaining
+`.bss`-reduction items tracked in [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04.
+
 ## Known backlog (other open items)
 
 Step 8 (hardened persistent state, pairing-record/capability-file atomicity) and Step 9 (full

@@ -1796,6 +1796,59 @@ All hardware-acceptance items from Phase 3a (UI redesign) and Phase 3 (productio
 
 **Impact:** Phase 3 is now production-ready. Phase 3a and 3 both complete and hardware-verified. Step 8 (pairing-record/capability-file hardening) remains future work; Step 9 (full negative-security-test suite) is partially complete (production workloads tested, structured negative tests backlogged).
 
+## 2026-09-13: Flipper app OOM-on-launch root-caused and partially fixed (`.bss` reduced ~26%)
+
+**Symptom:** the Flipper app intermittently failed to launch entirely, with an OOM message and
+the Flipper itself rebooting.
+
+**Root cause (confirmed by reading the actual Unleashed FAP loader source, not assumed):** an
+external FAP's `.bss` is not a fixed firmware region the way it would be in normal embedded
+firmware — `lib/flipper_application/elf/elf_file.c` allocates each ELF section (including `.bss`)
+as its own `aligned_malloc()` from the live Flipper system heap at launch, checked against
+`memmgr_heap_get_max_free_block()` first (a contiguous-block requirement). This app's `.bss`
+measured 44812 bytes via `arm-none-eabi-size` against the real built artifact — large enough that
+the allocation can fail on a fragmented heap, explaining the "often, not always" character of the
+symptom. Full investigation, per-symbol `.bss` breakdown, and remaining open items are in
+[HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04 (kept there rather than duplicated here since
+H04 is still partially open).
+
+**Fixed this session**, all mechanical/zero-behavior-change consolidations of static scratch this
+file's own comments already established were safe to share (BLE dispatch on this app is
+synchronous and single-in-flight, never reentrant):
+- 16 duplicate `static AppEvent event` locals (one per `post_*()` function) → 13 collapsed into
+  one shared `shared_ble_event`; 3 (`gps_poll_timer_callback`/`bt_status_callback`/
+  `input_callback`) deliberately kept separate since they run on different system threads that
+  *can* genuinely preempt each other (Timer service/`Bt` service/`GuiSrv`) — sharing those would
+  have been a real cross-thread race, not a reuse of the same single-in-flight guarantee.
+- 5 duplicate per-capability `{payload,ciphertext,record}` command-scratch buffer sets (pairing,
+  capability_query, wifi_scan, ble_scan, gps, wardriving) → one shared `cmd_payload_buf`/
+  `cmd_ciphertext_buf`/`cmd_record_buf` trio for the four main-thread-sent commands, with
+  `capability_query`'s plaintext payload reusing `pairing_payload_buf` (both BLE-thread-only,
+  never overlapping) — kept separate from the BLE-thread group for the same reason the 3 events
+  above were kept separate.
+- 4 per-capability decode-scratch `result` structs (wifi_scan/ble_scan/gps/wardriving status
+  handlers) → one shared `union` (sized to the largest member, wardriving's), since all four are
+  BLE-thread-only, single-call, fully drained before their handler returns.
+
+**Measured, verified via `arm-none-eabi-size` after each step:** `.bss` 44812 → 35864 (first two
+fixes) → 32972 (+ result-struct union) — a total reduction of **11840 bytes (~26%)**. Build clean
+throughout (`tools/build_flipper.ps1` / `fbt.cmd fap_flipper_esp32_over_ble`), no new warnings, no
+hardware flashed. The actual OOM-frequency improvement in the field still needs to be observed —
+this session's verification was build+static (`arm-none-eabi-size`/`nm`) only.
+
+**Deliberately not touched, decided not deferred:** the X25519 scratch in `pairing_crypto.c`
+(`fmonty`/`cmult`/`crecip`/`x25519_donna_scalarmult`, 3600 bytes) and `framing.c`'s `frag_buf`
+(772 bytes) — both are static specifically to prevent a stack-overflow bug class this project has
+hit four times before (`docs/LESSONS.md`), and `pairing_crypto.c`'s own header states matching
+upstream curve25519-donna line-by-line for audit purposes is worth more than the space. At 3600
+bytes combined, they were also the smallest category found, not the largest — no case for
+reopening either tradeoff.
+
+**Still open** (see HARDENING_BACKLOG.md H04 for full detail): `wardriving_dedup_table` (8200
+bytes — shrink-vs-lazy-heap-alloc decision needed) and `wifi_scan_aps`/`ble_scan_devices` (~4.2 KB
+— main-thread display-array lifetimes need tracing before any consolidation, higher risk than
+what was fixed this session).
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

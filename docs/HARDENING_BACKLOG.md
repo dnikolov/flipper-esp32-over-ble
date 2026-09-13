@@ -144,3 +144,99 @@ by explicit product decision" section) -- this evidence does not change that dec
 means the deferred item's practical impact is broader than previously documented (routine
 reconnect-with-pending-backlog, not just explicit commands). Re-confirm the deferral still
 stands, now with this fuller picture, before it comes up again.
+
+## H04 — Flipper app intermittently fails to launch with an OOM message (Flipper reboots)
+
+**Discovered:** 2026-09-13, from a live user-reported symptom ("app often cannot start causing
+flipper restart and an OOM message"), investigated by reading the actual Unleashed FAP loader
+source and measuring the built artifact rather than guessing.
+
+**Root cause mechanism (confirmed):** an external FAP is not linked into a fixed memory layout
+like normal firmware -- it's an ELF loaded at runtime by
+`lib/flipper_application/elf/elf_file.c`. Every allocatable section (`.text`/`.rodata`/`.data`/
+`.bss`) gets its own `aligned_malloc()` from the *live Flipper system heap* at launch
+(`elf_file.c` ~line 488), and the loader explicitly checks `memmgr_heap_get_max_free_block()`
+against each section's size first (~line 482) -- a **contiguous free block** requirement, not
+just total free bytes. So this app's static scratch buffers are not "free" the way they would be
+in normal firmware; they're an unconditional contiguous-heap demand at every launch, competing
+with whatever the rest of the firmware (GUI, BT stack, prior apps' heap fragmentation) already
+holds. That explains the "often" (not "always") character of the failure -- it depends on
+current heap fragmentation, not on anything this app does at runtime.
+
+**Measured (this session, via `arm-none-eabi-size`/`arm-none-eabi-nm` against the real built
+`flipper_esp32_over_ble_d.elf`):**
+
+```
+.text   56840
+.rodata 10336
+.data      56
+.bss    44812   <- one contiguous malloc, checked against max-free-block at load
+```
+
+`.bss` breakdown, largest symbols:
+
+| Symbol | Bytes | Note |
+|---|---|---|
+| `wardriving_dedup_table` | 8200 | see below |
+| 16x duplicate `static AppEvent event` locals | 8320 total | fixed this session, see `docs/PROJECT_HISTORY.md` |
+| `result.21` | 2832 | capability-response-shaped decode scratch, needs investigation |
+| `wifi_scan_aps` | 2560 | scan-results display scratch |
+| `ble_scan_devices` | 1664 | scan-results display scratch |
+| `result.5` / `result.9` | 1544 / 1288 | per-capability decode scratch |
+| 5x per-capability cmd buffer sets | ~4340 total | fixed this session, see `docs/PROJECT_HISTORY.md` |
+| X25519 scratch (`fmonty`/`cmult`/`crecip`/scalarmult) | 3600 | deliberately excluded, see below |
+
+**Fixed this session (mechanical, zero-behavior-change, safe by this file's own established
+single-in-flight/synchronous-BLE-dispatch rationale):** the 16 duplicate `AppEvent` locals, the 5
+duplicate per-capability `{payload,ciphertext,record}` buffer sets, and the 4 per-capability
+decode-scratch `result` structs (wifi_scan/ble_scan/gps/wardriving status handlers), each
+collapsed to one shared instance (the last of these via a `union`, since the four are different
+struct types -- sized to the largest member, wardriving's, not the sum of all four). Measured
+`.bss`: 44812 -> 35864 (AppEvent + cmd buffers) -> 32972 (+ result-struct union) -- a total
+reduction of 11840 bytes, ~26%. See `docs/PROJECT_HISTORY.md` for the full verified numbers.
+
+**Still open, needs its own design pass before fixing:**
+
+1. **`wardriving_dedup_table` (8200 bytes, `flipper/wardriving_csv.h`)** -- currently a permanent
+   `.bss` resident (`FEB_WARDRIVING_DEDUP_CAPACITY` = 256 entries x ~32 bytes) even though it's
+   only meaningful while a wardriving session is active (reset per CSV-export-file lifetime, see
+   `wardriving_csv.h`'s own comment). Two candidate fixes, not yet decided between: (a) shrink the
+   capacity (256 was picked as "more conservative than wardriver_rev3's 512," not from a measured
+   real-world address-density need), or (b) stop making it static entirely and heap-allocate it
+   only for the duration of an active wardriving session (alloc on first record, free in
+   `wardriving_csv_close()`) -- removes the whole 8.2 KB from the unconditional launch-time
+   footprint, at the cost of a runtime `malloc`/`free` and needing to handle allocation failure.
+   Needs a decision on which approach, plus a check of whether (b) reintroduces any of the
+   heap-fragmentation risk this whole investigation is about (a session-scoped alloc/free cycle
+   during runtime is different from -- and probably safer than -- a permanent load-time
+   allocation, but should be reasoned through rather than assumed). (a) is low risk (one constant,
+   a dedup-quality tradeoff under dense sessions, no correctness risk); (b) is medium risk (real
+   alloc/free lifecycle, needs a graceful-failure path).
+
+2. **`wifi_scan_aps` / `ble_scan_devices` (~4.2 KB combined)** -- the scan-results screens' backing
+   display arrays (`WifiScanApDisplay`/`BleScanDeviceDisplay`), main-thread-owned and long-lived
+   for as long as a results screen is on-screen -- a different ownership/lifetime category from
+   the decode-scratch `result` structs above (which were BLE-thread-only, single-call, already
+   fixed). Not touched this session because the screen-transition/`pending_command_kind`
+   busy-gating state machine needs to be traced first to confirm a new capability's incoming data
+   can never land in the array while the *other* capability's results are still being displayed --
+   get that wrong and the failure mode is a live UI glitch (wrong/garbage rows on screen), not a
+   build error, so this is medium-to-higher risk and the smallest remaining win. Do this one last,
+   if at all.
+
+**Explicitly out of scope, decided this session, not just deferred:** the X25519 scratch
+(`pairing_crypto.c`'s `fmonty`/`cmult`/`crecip`/`x25519_donna_scalarmult`, 3600 bytes total) and
+`framing.c`'s `frag_buf` (772 bytes). Both are deliberately `static` to prevent a documented,
+previously-hit-four-times stack-overflow bug class on the 1280-byte `BleEventWorker` thread (see
+`docs/LESSONS.md`'s "any buffer >=100 bytes reachable from `BleEventWorker` must be `static`"
+rule), and `pairing_crypto.c`'s own file header states that matching upstream curve25519-donna
+line-by-line for audit purposes is a deliberate tradeoff worth more here than space savings. At
+3600 bytes combined -- the smallest of the categories above, not the largest -- there's no case
+for reopening either the stack-overflow risk or the audit-diffability tradeoff to chase it.
+
+**Severity:** P1-equivalent -- this is a full app-unusable-until-reboot failure, not a cosmetic or
+edge-case bug, and it's user-visible ("often"). The mechanical fixes this session reduced `.bss`
+by 11840 bytes (~26%, confirmed via `arm-none-eabi-size`); items 1-2 above are the next lever if
+launch failures are still observed after that -- the actual OOM-frequency improvement on real
+hardware still needs to be observed in the field, this session's verification was build+static
+only (no flashing).
