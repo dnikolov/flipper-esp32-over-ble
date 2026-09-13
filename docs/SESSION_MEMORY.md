@@ -35,7 +35,9 @@ For the full roadmap, phase boundaries, and each step's "done when" criteria, se
 
 ## Active investigation — needs hardware re-verification
 
-**ESP32 disconnect without reconnect (BL07) — fix applied 2026-09-13, not yet hardware-retested.** After flashing `wifi_interval_ms=5000`, the ESP32 would go silent after 5-15 minutes and never reconnect until the Flipper FAP was restarted. Root cause (found via code review, no usable serial log was captured): an undocumented reconnect-time throttle forced wardriving's Wi-Fi source to scan *more* aggressively (every 400ms) during a reconnect attempt than the steady-state default — starving the BLE reconnect scan exactly when it needed radio time. Removed the entire throttle mechanism; wardriving's Wi-Fi source now scans at its configured interval (5s) unthrottled through reconnect. Build-verified clean, flashed to hardware; needs a live extended wardriving run with a forced disconnect to confirm reconnection now works reliably. See BACKLOG.md BL07 for full detail.
+**ESP32 disconnect without reconnect (BL07) — fix applied 2026-09-13, hardware-tested.** After flashing `wifi_interval_ms=5000`, the ESP32 would go silent after 5-15 minutes and never reconnect until the Flipper FAP was restarted. Root cause (found via code review): an undocumented reconnect-time throttle forced wardriving's Wi-Fi source to scan *more* aggressively (every 400ms) during a reconnect attempt than the steady-state default. Removed the throttle mechanism — confirmed via live serial log that MTU negotiation and session auth now complete cleanly on reconnect (G12 also verified working: `negotiated ATT MTU: 256`).
+
+**However, a live forced-disconnect-during-active-wardriving retest the same day found a *separate* reconnect stall** with a different root cause than BL07 or the Wi-Fi-coexistence theory: `wardriving_ble_interval_cb()`'s periodic BLE re-arm can collide with its own in-flight connect attempt, independent of Wi-Fi. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01 for full evidence — **the wardriving BLE reconnect stall (G36) is not fully resolved**; treat it as still open.
 
 ## Known backlog (other open items)
 

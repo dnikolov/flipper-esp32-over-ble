@@ -1,0 +1,71 @@
+# Hardening backlog
+
+Separate from [BACKLOG.md](BACKLOG.md): this file tracks deeper structural/robustness issues
+found during live testing that are not quick fixes and need their own investigation/design pass
+before being implemented — as distinct from BACKLOG.md's mix of ready-to-fix bugs and deferred
+product decisions. An item moves here when it's confirmed real but deliberately not actioned
+immediately; it moves back out (with a `docs/PROJECT_HISTORY.md` entry) once fixed and verified.
+
+## H01 — Wardriving's periodic BLE re-arm can collide with its own in-flight connect attempt
+
+**Discovered:** 2026-09-13, during a live forced-disconnect/reconnect test of the BL07/G30/G12/G19/G21
+fix batch (`docs/BACKLOG.md`). Confirmed via ESP32 serial log
+(`logs/esp32_COM9_2026-09-13_10-17-34.log`), not yet fixed.
+
+**Not caused by today's fixes** — `wardriving_ble_interval_cb()` (`esp32/main/main.c`) was not
+touched by any of BL07/G30/G12/G19/G21. This is a separate, pre-existing gap in the "merged
+reconnect scan" design (docs/PLAN.md step 2's "Revised long-run reconnect policy") that this
+specific live test happened to expose. It's timing-dependent/probabilistic — consistent with
+earlier tests sometimes showing clean reconnects (e.g. the 7/7 BLE-only isolation test that
+resolved G36) and sometimes not.
+
+**Root cause:** `wardriving_ble_interval_cb()` re-arms BLE discovery on its own independent
+~500ms timer (`wardriving_ble_interval_co`), with **no check for whether a connect attempt is
+already in flight**. Exact sequence captured live:
+
+```
+10:23:43.684  GAP: discovery starts
+10:23:43.685  "found v2 peer, connecting" -> connect attempt #1 begins
+10:23:44.440  GAP: discovery starts AGAIN (756ms later -- before attempt #1 resolved!)
+10:23:44.652  "found v2 peer, connecting" -> connect attempt #2
+10:23:44.652  "connect start failed: 6"   <- attempt #2 collides with attempt #1
+10:23:44.653  reconnect retry 1/5 scheduled (schedule_reconnect(), see note below)
+10:23:44.653  NimBLE auto-reattempts connection #1 (reason 0x3e = supervision timeout)
+10:23:45.411  GAP: discovery starts AGAIN -- collides with the reattempt too
+```
+
+When a peer match happens right as the independent interval timer is about to fire again, the
+periodic re-arm restarts discovery mid-connect, killing the very connection attempt it just
+triggered. This cascades: the interrupted connect fails, NimBLE tries to auto-reattempt, the
+*next* interval tick collides with that reattempt too -- the discovery loop and the connect
+attempt now permanently fight each other every ~500ms, never letting a connection land.
+
+**Secondary note (not the root cause, but adds confusion when reading logs):** the
+`schedule_reconnect()`/`reconnect retry N/M` backoff path also fires here (triggered by
+`ble_gap_connect()` itself returning non-zero), but since `wardriving_ble_active` is true, that
+backoff path's eventual `start_scan()` call is a no-op (gated by `wardriving_ble_active`) --
+the real driver of the observed loop is `wardriving_ble_interval_cb()`'s own cycle, not this
+backoff path. The `reconnect retry` log line is a red herring for diagnosing this specific
+failure mode; don't chase it as the primary lead.
+
+**Proposed fix (not yet implemented):** add a guard so `wardriving_ble_interval_cb()` skips
+re-arming discovery while a connect attempt is already pending -- e.g. track a new
+"connect attempt in flight" flag (set when `BLE_GAP_EVENT_DISC`'s match branch calls
+`ble_gap_connect()`, cleared on the corresponding `BLE_GAP_EVENT_CONNECT`, success or failure)
+and have the interval callback no-op (rescheduling itself for the next window) while that flag
+is set, mirroring how `BLE_GAP_EVENT_DISC_COMPLETE` already guards against `start_scan()`
+running concurrently with `wardriving_ble_active`.
+
+**Needs before implementing:**
+- Confirm this reproduces reliably enough to verify a fix against (it's timing-dependent).
+- Decide whether the same guard should also apply to the non-wardriving `start_scan()` path
+  (its own reconnect scan) for symmetry, even though that path already isn't reachable
+  concurrently with wardriving's BLE source today (`BLE_GAP_EVENT_DISC_COMPLETE` already skips
+  it while `wardriving_ble_active`).
+- A live retest after the fix, same forced-disconnect-during-active-wardriving scenario.
+
+**Severity:** P1-equivalent in practice -- this is the actual mechanism behind the still-unresolved
+tail of G36/BL07 (wardriving BLE reconnect stall) that "Wi-Fi coexistence starvation" was
+believed to fully explain. That theory may still be a contributing factor in other captures:
+this file doesn't rule it out, it just proves at least one independent failure mode exists that
+has nothing to do with Wi-Fi at all.
