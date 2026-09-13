@@ -195,25 +195,21 @@ struct types -- sized to the largest member, wardriving's, not the sum of all fo
 `.bss`: 44812 -> 35864 (AppEvent + cmd buffers) -> 32972 (+ result-struct union) -- a total
 reduction of 11840 bytes, ~26%. See `docs/PROJECT_HISTORY.md` for the full verified numbers.
 
+**Also fixed, same session:** `wardriving_dedup_table` split into independent Wi-Fi (48-slot) /
+BLE (96-slot) sub-tables instead of one shared 256-slot ring (the ESP32's own independent dedup
+layer, `esp32/main/wardriving_dedup.c`, already uses two separate tables at the same 1:2 ratio, for
+the same reason: BLE's faster churn was evicting still-relevant Wi-Fi entries out of a shared
+ring, causing avoidable duplicate CSV rows). This combined the split with a capacity shrink
+(256 -> 144 total entries), cutting this table from 8200 to 4624 bytes. `.bss`: 32972 -> 29400.
+Zero caller changes needed (same outer struct/function signatures); a new host test
+(`test_wardriving_dedup_wifi_survives_ble_eviction`) proves Wi-Fi entries now survive BLE-table
+churn. See `docs/PROJECT_HISTORY.md` for the full writeup.
+
+**Total so far:** `.bss` 44812 -> 29400 (-15412 bytes, ~34%).
+
 **Still open, needs its own design pass before fixing:**
 
-1. **`wardriving_dedup_table` (8200 bytes, `flipper/wardriving_csv.h`)** -- currently a permanent
-   `.bss` resident (`FEB_WARDRIVING_DEDUP_CAPACITY` = 256 entries x ~32 bytes) even though it's
-   only meaningful while a wardriving session is active (reset per CSV-export-file lifetime, see
-   `wardriving_csv.h`'s own comment). Two candidate fixes, not yet decided between: (a) shrink the
-   capacity (256 was picked as "more conservative than wardriver_rev3's 512," not from a measured
-   real-world address-density need), or (b) stop making it static entirely and heap-allocate it
-   only for the duration of an active wardriving session (alloc on first record, free in
-   `wardriving_csv_close()`) -- removes the whole 8.2 KB from the unconditional launch-time
-   footprint, at the cost of a runtime `malloc`/`free` and needing to handle allocation failure.
-   Needs a decision on which approach, plus a check of whether (b) reintroduces any of the
-   heap-fragmentation risk this whole investigation is about (a session-scoped alloc/free cycle
-   during runtime is different from -- and probably safer than -- a permanent load-time
-   allocation, but should be reasoned through rather than assumed). (a) is low risk (one constant,
-   a dedup-quality tradeoff under dense sessions, no correctness risk); (b) is medium risk (real
-   alloc/free lifecycle, needs a graceful-failure path).
-
-2. **`wifi_scan_aps` / `ble_scan_devices` (~4.2 KB combined)** -- the scan-results screens' backing
+1. **`wifi_scan_aps` / `ble_scan_devices` (~4.2 KB combined)** -- the scan-results screens' backing
    display arrays (`WifiScanApDisplay`/`BleScanDeviceDisplay`), main-thread-owned and long-lived
    for as long as a results screen is on-screen -- a different ownership/lifetime category from
    the decode-scratch `result` structs above (which were BLE-thread-only, single-call, already
@@ -236,7 +232,7 @@ for reopening either the stack-overflow risk or the audit-diffability tradeoff t
 
 **Severity:** P1-equivalent -- this is a full app-unusable-until-reboot failure, not a cosmetic or
 edge-case bug, and it's user-visible ("often"). The mechanical fixes this session reduced `.bss`
-by 11840 bytes (~26%, confirmed via `arm-none-eabi-size`); items 1-2 above are the next lever if
+by 15412 bytes (~34%, confirmed via `arm-none-eabi-size`); item 1 above is the next lever if
 launch failures are still observed after that -- the actual OOM-frequency improvement on real
 hardware still needs to be observed in the field, this session's verification was build+static
 only (no flashing).

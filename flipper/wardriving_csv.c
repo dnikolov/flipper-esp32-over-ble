@@ -268,44 +268,73 @@ void feb_wardriving_dedup_reset(feb_wardriving_dedup_table_t *table) {
     memset(table, 0, sizeof(*table));
 }
 
+/* Shared lookup-or-evict logic for one sub-table (Wi-Fi or BLE) -- the caller has already
+   picked the right `entries`/`capacity`/`next_evict_index` for the record's payload_kind, so
+   there is no per-entry kind comparison here (each sub-table only ever holds one kind). */
+static bool wardriving_dedup_table_should_write(
+    feb_wardriving_dedup_entry_t *entries,
+    size_t capacity,
+    uint32_t *next_evict_index,
+    const uint8_t address[6],
+    int32_t rssi_dbm,
+    uint64_t lat_e7_offset,
+    uint64_t lon_e7_offset) {
+    for (size_t i = 0; i < capacity; i++) {
+        feb_wardriving_dedup_entry_t *entry = &entries[i];
+
+        if (entry->occupied && memcmp(entry->address, address, 6) == 0) {
+            bool stronger = (rssi_dbm - entry->last_rssi_dbm) >= FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB;
+            bool moved = wardriving_dedup_distance_meters(
+                             entry->last_lat_e7_offset,
+                             entry->last_lon_e7_offset,
+                             lat_e7_offset,
+                             lon_e7_offset) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
+
+            if (!stronger && !moved) {
+                return false;
+            }
+            entry->last_rssi_dbm = rssi_dbm;
+            entry->last_lat_e7_offset = lat_e7_offset;
+            entry->last_lon_e7_offset = lon_e7_offset;
+            return true;
+        }
+    }
+
+    {
+        feb_wardriving_dedup_entry_t *slot = &entries[*next_evict_index];
+
+        memcpy(slot->address, address, 6);
+        slot->occupied = true;
+        slot->last_rssi_dbm = rssi_dbm;
+        slot->last_lat_e7_offset = lat_e7_offset;
+        slot->last_lon_e7_offset = lon_e7_offset;
+        *next_evict_index = (*next_evict_index + 1) % capacity;
+    }
+    return true;
+}
+
 bool feb_wardriving_dedup_should_write(
     feb_wardriving_dedup_table_t *table, const feb_wardriving_record_t *record) {
     uint8_t address[6];
     wardriving_dedup_record_address(record, address);
     int32_t rssi_dbm = wardriving_dedup_record_rssi_dbm(record);
 
-    for (size_t i = 0; i < FEB_WARDRIVING_DEDUP_CAPACITY; i++) {
-        feb_wardriving_dedup_entry_t *entry = &table->entries[i];
-
-        if (entry->occupied && entry->payload_kind == record->payload_kind &&
-            memcmp(entry->address, address, sizeof(address)) == 0) {
-            bool stronger = (rssi_dbm - entry->last_rssi_dbm) >= FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB;
-            bool moved = wardriving_dedup_distance_meters(
-                             entry->last_lat_e7_offset,
-                             entry->last_lon_e7_offset,
-                             record->lat_e7_offset,
-                             record->lon_e7_offset) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
-
-            if (!stronger && !moved) {
-                return false;
-            }
-            entry->last_rssi_dbm = rssi_dbm;
-            entry->last_lat_e7_offset = record->lat_e7_offset;
-            entry->last_lon_e7_offset = record->lon_e7_offset;
-            return true;
-        }
+    if (record->payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI) {
+        return wardriving_dedup_table_should_write(
+            table->wifi.entries,
+            FEB_WARDRIVING_DEDUP_WIFI_CAPACITY,
+            &table->wifi.next_evict_index,
+            address,
+            rssi_dbm,
+            record->lat_e7_offset,
+            record->lon_e7_offset);
     }
-
-    {
-        feb_wardriving_dedup_entry_t *slot = &table->entries[table->next_evict_index];
-
-        memcpy(slot->address, address, sizeof(address));
-        slot->payload_kind = record->payload_kind;
-        slot->occupied = true;
-        slot->last_rssi_dbm = rssi_dbm;
-        slot->last_lat_e7_offset = record->lat_e7_offset;
-        slot->last_lon_e7_offset = record->lon_e7_offset;
-        table->next_evict_index = (table->next_evict_index + 1) % FEB_WARDRIVING_DEDUP_CAPACITY;
-    }
-    return true;
+    return wardriving_dedup_table_should_write(
+        table->ble.entries,
+        FEB_WARDRIVING_DEDUP_BLE_CAPACITY,
+        &table->ble.next_evict_index,
+        address,
+        rssi_dbm,
+        record->lat_e7_offset,
+        record->lon_e7_offset);
 }

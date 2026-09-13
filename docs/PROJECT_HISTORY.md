@@ -1844,10 +1844,42 @@ upstream curve25519-donna line-by-line for audit purposes is worth more than the
 bytes combined, they were also the smallest category found, not the largest — no case for
 reopening either tradeoff.
 
-**Still open** (see HARDENING_BACKLOG.md H04 for full detail): `wardriving_dedup_table` (8200
-bytes — shrink-vs-lazy-heap-alloc decision needed) and `wifi_scan_aps`/`ble_scan_devices` (~4.2 KB
-— main-thread display-array lifetimes need tracing before any consolidation, higher risk than
-what was fixed this session).
+**Still open** (see HARDENING_BACKLOG.md H04 for full detail): `wifi_scan_aps`/`ble_scan_devices`
+(~4.2 KB — main-thread display-array lifetimes need tracing before any consolidation, higher risk
+than what was fixed this session).
+
+## 2026-09-13: `wardriving_dedup_table` split by payload kind and shrunk (H04, continued)
+
+Followed up on the H04 `.bss` investigation above: `wardriving_dedup_table` (8200 bytes) was a
+single 256-slot ring shared between Wi-Fi and BLE addresses, with one shared eviction cursor. The
+ESP32's own independent dedup layer (`esp32/main/wardriving_dedup.c`) already treats these as two
+separate tables (256 Wi-Fi / 512 BLE) — the Flipper side sharing one ring meant BLE's faster churn
+(default 500ms scan interval vs Wi-Fi's 5000ms, plus BLE's common use of rotating private
+addresses) could evict still-relevant Wi-Fi entries purely because they shared storage, causing
+avoidable duplicate Wi-Fi CSV rows.
+
+**Fix:** split into independent `feb_wardriving_dedup_wifi_table_t` (48 slots) /
+`feb_wardriving_dedup_ble_table_t` (96 slots) sub-tables nested inside the same outer
+`feb_wardriving_dedup_table_t`, keeping the same 1:2 ratio as the ESP32 side but scaled down (this
+table only needs to catch duplicates within one calendar-day CSV file's window, not gate the whole
+capture pipeline). Combined with the split, this also shrinks total capacity 256 → 144 entries.
+Zero caller changes needed in `flipper_esp32_over_ble.c` — same outer type, same
+`feb_wardriving_dedup_reset()`/`feb_wardriving_dedup_should_write()` signatures. The redundant
+`payload_kind` field was dropped from `feb_wardriving_dedup_entry_t` (each sub-table now only ever
+holds one kind), though this alone saves no bytes — it already sat in alignment padding ahead of
+the struct's `uint64_t` members.
+
+Added a new host test, `test_wardriving_dedup_wifi_survives_ble_eviction`, that floods the BLE
+sub-table past capacity and confirms an earlier Wi-Fi entry is still recognized as a repeat — this
+is the actual regression test for the cross-type-cannibalization bug being fixed; it would have
+failed under the old shared-ring design. All 425 host tests pass
+(`tests/flipper/build.ps1`).
+
+**Measured:** `wardriving_dedup_table` 8200 → 4624 bytes. `.bss`: 32972 → 29400. Combined with the
+earlier fixes this session, total `.bss` reduction is **44812 → 29400 bytes (-15412, ~34%)**. Build
+clean (`tools/build_flipper.ps1`), no hardware flashed.
+
+**Still open:** `wifi_scan_aps`/`ble_scan_devices` (~4.2 KB) — see HARDENING_BACKLOG.md H04.
 
 ## Current project state and handoff
 

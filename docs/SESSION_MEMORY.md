@@ -20,7 +20,7 @@ here.
 - **Real GPS driver** (2026-09-12, hardware-verified 2026-09-13): UART1/NMEA GGA+RMC parser, three-state fix tracking (no_signal/acquiring/fix), per-record timestamps, live status polling for display.
 - **LED indicators** (both firmwares): connection/session/flush-state visual feedback, hardware-confirmed working.
 - **BLE active scanning** in `ble_scan` and within wardriving's capture engine.
-- **Wardriving dedup** (128-slot address hash table with RSSI-improve gate and distance threshold).
+- **Wardriving dedup** (separate Wi-Fi/BLE address tables, 48/96 slots, RSSI-improve gate and distance threshold).
 - **CSV export dedup**: per-calendar-day files, no duplicate rows for the same address on the same day.
 
 **All Phase 3 hardware-acceptance items complete:**
@@ -54,10 +54,11 @@ attempt. Tracked as [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01. **This mea
 BLE reconnect stall (G36) is not fully resolved** — the earlier "RESOLVED" note based on the
 BLE-only isolation test's 7/7 result explained *a* cause, not the only one. Treat G36 as open.
 
-**2026-09-13: Flipper app OOM-on-launch root-caused, `.bss` reduced ~26%** (44812 → 32972 bytes)
-by consolidating duplicate static scratch (`AppEvent` locals, per-capability command buffers,
-per-capability decode-scratch structs) — ✅ done, see `docs/PROJECT_HISTORY.md`. Remaining
-`.bss`-reduction items tracked in [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04.
+**2026-09-13: Flipper app OOM-on-launch root-caused, `.bss` reduced ~34%** (44812 → 29400 bytes) by
+consolidating duplicate static scratch (`AppEvent` locals, per-capability command buffers,
+per-capability decode-scratch structs) and splitting/shrinking the wardriving dedup table into
+separate Wi-Fi/BLE sub-tables — ✅ done, see `docs/PROJECT_HISTORY.md`. Remaining `.bss`-reduction
+item (`wifi_scan_aps`/`ble_scan_devices`) tracked in [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04.
 
 ## Known backlog (other open items)
 

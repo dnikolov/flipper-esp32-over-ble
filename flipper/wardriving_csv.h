@@ -101,14 +101,29 @@ size_t feb_wardriving_csv_format_row(
    firmware than that project's dedicated board. A table full of distinct addresses evicts its
    oldest entry (simple ring cursor, not LRU, matching wardriver_rev3's own simplification) --
    not a correctness problem, just a soft floor on how well an unusually address-dense session
-   gets deduplicated. */
-#define FEB_WARDRIVING_DEDUP_CAPACITY 256u
+   gets deduplicated.
+
+   Split into two independent sub-tables (Wi-Fi / BLE), each with its own eviction cursor,
+   rather than one shared 256-slot ring keyed by payload_kind (docs/HARDENING_BACKLOG.md H04
+   follow-up) -- BLE churns far faster than Wi-Fi (default scan interval 500ms vs Wi-Fi's
+   5000ms, plus BLE's common use of rotating private addresses), so a shared ring let BLE
+   insertions evict still-relevant Wi-Fi entries purely for sharing a ring, causing avoidable
+   duplicate Wi-Fi CSV rows. The ESP32's own independent dedup layer
+   (esp32/main/wardriving_dedup.c) already treats these as two separate tables (256 Wi-Fi /
+   512 BLE) for exactly this reason. Capacities kept at the same 1:2 ratio but scaled down
+   (144 total vs the ESP32's 768) since this table only needs to catch duplicates within one
+   calendar-day CSV file's dedup window, not gate the whole capture pipeline the way the
+   ESP32's own table does. */
+#define FEB_WARDRIVING_DEDUP_WIFI_CAPACITY 48u
+#define FEB_WARDRIVING_DEDUP_BLE_CAPACITY 96u
 #define FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB 6
 #define FEB_WARDRIVING_DEDUP_MOVE_METERS ((double)30.0)
 
+/* No payload_kind field: each sub-table below only ever holds one kind, so the field
+   dropped here is redundant, not a size optimization -- it previously sat in what would
+   otherwise be alignment padding before the uint64_t fields, so sizeof(entry) is unchanged. */
 typedef struct {
     uint8_t address[6];
-    feb_wardriving_payload_kind_t payload_kind;
     bool occupied;
     int32_t last_rssi_dbm;
     uint64_t last_lat_e7_offset;
@@ -116,8 +131,18 @@ typedef struct {
 } feb_wardriving_dedup_entry_t;
 
 typedef struct {
-    feb_wardriving_dedup_entry_t entries[FEB_WARDRIVING_DEDUP_CAPACITY];
+    feb_wardriving_dedup_entry_t entries[FEB_WARDRIVING_DEDUP_WIFI_CAPACITY];
     uint32_t next_evict_index;
+} feb_wardriving_dedup_wifi_table_t;
+
+typedef struct {
+    feb_wardriving_dedup_entry_t entries[FEB_WARDRIVING_DEDUP_BLE_CAPACITY];
+    uint32_t next_evict_index;
+} feb_wardriving_dedup_ble_table_t;
+
+typedef struct {
+    feb_wardriving_dedup_wifi_table_t wifi;
+    feb_wardriving_dedup_ble_table_t ble;
 } feb_wardriving_dedup_table_t;
 
 /* Zeroes the table (all entries unoccupied, cursor at 0). Call once per new CSV export

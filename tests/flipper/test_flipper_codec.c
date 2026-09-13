@@ -1608,20 +1608,24 @@ static void test_wardriving_dedup(void) {
         feb_wardriving_dedup_should_write(&table, &r9),
         "DEDUP: a second, distinct address is written regardless of the first address's state");
 
-    /* Same 6-byte value as addr_b, but as a WiFi BSSID instead of a BLE address -- payload_kind
-       is part of the key, so this must be treated as a different entry, not a repeat of r9. */
+    /* Same 6-byte value as addr_b, but as a WiFi BSSID instead of a BLE address -- Wi-Fi and
+       BLE addresses now live in entirely separate sub-tables, so this lands in a different
+       table from r9 and is never compared against it at all, not just distinguished by a
+       payload_kind key check. */
     feb_wardriving_record_t r10 = make_dedup_wifi_record(addr_b, -70, DEDUP_BASE_LAT, DEDUP_BASE_LON);
     CHECK(
         feb_wardriving_dedup_should_write(&table, &r10),
-        "DEDUP: same 6 bytes but a different payload_kind (wifi vs ble) is not treated as a repeat");
+        "DEDUP: same 6 bytes but wifi vs ble lands in a separate sub-table, not treated as a repeat");
 }
 
 static void test_wardriving_dedup_eviction(void) {
     feb_wardriving_dedup_table_t table;
     feb_wardriving_dedup_reset(&table);
 
-    /* Fill the table with FEB_WARDRIVING_DEDUP_CAPACITY distinct addresses. */
-    for(uint32_t i = 0; i < FEB_WARDRIVING_DEDUP_CAPACITY; i++) {
+    /* Fill the Wi-Fi sub-table with FEB_WARDRIVING_DEDUP_WIFI_CAPACITY distinct addresses
+       (every insertion here is a Wi-Fi record, so this only exercises the Wi-Fi sub-table's
+       own eviction ring). */
+    for(uint32_t i = 0; i < FEB_WARDRIVING_DEDUP_WIFI_CAPACITY; i++) {
         uint8_t addr[6] = {
             0,
             0,
@@ -1654,6 +1658,47 @@ static void test_wardriving_dedup_eviction(void) {
     CHECK(
         feb_wardriving_dedup_should_write(&table, &first_record_again),
         "DEDUP_EVICT: the oldest entry was evicted to make room, so it's no longer remembered");
+}
+
+/* Regression test for the cross-type-cannibalization bug this split fixes: a Wi-Fi entry
+   must survive any number of BLE insertions/evictions, since BLE now has its own dedicated
+   sub-table and can never evict a Wi-Fi slot. */
+static void test_wardriving_dedup_wifi_survives_ble_eviction(void) {
+    feb_wardriving_dedup_table_t table;
+    feb_wardriving_dedup_reset(&table);
+
+    static const uint8_t wifi_addr[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    feb_wardriving_record_t wifi_record =
+        make_dedup_wifi_record(wifi_addr, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &wifi_record),
+        "DEDUP_CROSS: the Wi-Fi address is written once, up front");
+
+    /* Fill the BLE sub-table to (and past) its own capacity with distinct BLE addresses,
+       forcing BLE-side evictions. None of this touches the Wi-Fi sub-table at all. */
+    for(uint32_t i = 0; i < FEB_WARDRIVING_DEDUP_BLE_CAPACITY + 8u; i++) {
+        uint8_t addr[6] = {
+            0x10,
+            0x00,
+            (uint8_t)(i >> 24),
+            (uint8_t)(i >> 16),
+            (uint8_t)(i >> 8),
+            (uint8_t)i,
+        };
+        feb_wardriving_record_t ble_record =
+            make_dedup_ble_record(addr, -70, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+        CHECK(
+            feb_wardriving_dedup_should_write(&table, &ble_record),
+            "DEDUP_CROSS: filling/overflowing the BLE sub-table, every distinct BLE address is written");
+    }
+
+    /* The Wi-Fi entry, unchanged in RSSI/position, must still be recognized as a repeat --
+       proving BLE churn in its own sub-table never evicted the still-fresh Wi-Fi entry. */
+    feb_wardriving_record_t wifi_record_again =
+        make_dedup_wifi_record(wifi_addr, -60, DEDUP_BASE_LAT, DEDUP_BASE_LON);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &wifi_record_again),
+        "DEDUP_CROSS: the Wi-Fi entry survives BLE sub-table churn, still recognized as a repeat");
 }
 
 int main(void) {
@@ -1753,6 +1798,7 @@ int main(void) {
     test_wardriving_csv_format_row();
     test_wardriving_dedup();
     test_wardriving_dedup_eviction();
+    test_wardriving_dedup_wifi_survives_ble_eviction();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
