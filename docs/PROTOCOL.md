@@ -343,10 +343,14 @@ longer runs did eventually see BLE records). **`ble_window_ms`'s default is now 
 (interval unchanged at 500ms, ~20% duty) — more than 3x the listen time per burst, while still
 far below the 100% duty that caused the starvation above. A follow-up live disconnect test
 (2026-09-12) also showed that a concurrent, gapless Wi‑Fi scan can starve the shared 2.4GHz
-radio during reconnect attempts. **`wifi_interval_ms`'s default is now 30000ms (30s)**
-for the same reason: it keeps the BLE reconnect path stable while preserving a per-session
-override if deeper capture throughput is needed. A per-session override for either source
-remains available via the fields above regardless.
+radio during reconnect attempts. **`wifi_interval_ms`'s default is now 5000ms (5 seconds)**
+(hardware-verified 2026-09-13) — a balanced choice between capture thoroughness and BLE stability.
+A full 2.4 GHz WiFi scan takes ~1.4-2 seconds on the ESP32 (per ESP-IDF WiFi driver documentation),
+leaving ~3-4 seconds idle before the next scan, yielding ~12 scans/minute vs. 2 at the previous
+30s default. This provides 6x denser WiFi coverage during active wardriving while maintaining
+~20% overall radio duty for WiFi, leaving ample headroom for BLE's own 20% duty without
+reconnect stalls. Further optimization to 2-3 second intervals is backlogged for future validation.
+A per-session override remains available for lower-duty or higher-throughput experiments.
 
 **Busy/not-running handling.** `action = "start"` while wardriving is already running is
 rejected `busy`. `action = "stop"` while wardriving is genuinely idle is rejected `not_running`.

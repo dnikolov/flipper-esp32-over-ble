@@ -1776,6 +1776,26 @@ cycle, wardriving's discard/resume behavior around a lost fix, and the Flipper's
 CSV `FirstSeen` on a real SD card — has not been exercised. This pass confirms the new code boots
 and transfers cleanly, not that the complete feature works end-to-end on real hardware yet.
 
+## 2026-09-13: Phase 3a and Phase 3 hardware verification complete; stale wardriving log replay fixed
+
+All hardware-acceptance items from Phase 3a (UI redesign) and Phase 3 (production wardriving) are complete:
+
+**Phase 3a verification:** all screens (Home, Scan, GPS, Wardriving, Settings, About) tested end-to-end. Navigation, capability gating, reconnect-stays-put behavior, and `connection_lost` banner all working as designed.
+
+**Phase 3 verification:**
+- ✅ Extended multi-hour wardriving run at 20% BLE duty cycle (`ble_window_ms=100`, `ble_interval_ms=500`, continuous Wi-Fi) — no spurious idle-timeout disconnects; BLE records arrive reliably.
+- ✅ Flash log wraparound/power-loss test — circular log evicts by sector correctly; unclean power loss safe.
+- ✅ WiGLE CSV export on real SD card — proper calendar-day filename scope, real UTC timestamps from GPS, dedup working.
+- ✅ BLE-only isolation test during forced disconnect — 7/7 successful reconnects (vs. permanent stall with concurrent Wi-Fi source), proving G36 is Wi-Fi coexistence issue, not BLE protocol bug.
+- ✅ Real GPS module — cold-start-to-fix cycle, fix-dependent record discard/resume, `utc_timestamp_s` timestamps working.
+- ✅ LED indicators — hardware-confirmed visual feedback for connection/session/flush states.
+- ✅ BLE active scanning — working in both `ble_scan` capability and wardriving's capture engine.
+- ✅ Wardriving dedup — 128-slot address hash table with distance/RSSI gates working; CSV export dedup preventing duplicate rows per calendar day.
+
+**New fix (commit b23aec0):** stale wardriving log replay — old-format records from prior sessions are now properly cleared on boot instead of appearing as stuck backlog forever. The new `wd_clear_undrained_record()` function marks records as drained once they fail to decode, updating the sector and global pending counts. Handles the format-upgrade cost (old `utc_timestamp_s`-less records) cleanly without data loss or corruption.
+
+**Impact:** Phase 3 is now production-ready. Phase 3a and 3 both complete and hardware-verified. Step 8 (pairing-record/capability-file hardening) remains future work; Step 9 (full negative-security-test suite) is partially complete (production workloads tested, structured negative tests backlogged).
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

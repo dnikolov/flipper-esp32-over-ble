@@ -1,12 +1,6 @@
 # Flipper FAP UI redesign
 
-**Status: Home/menu shell substantially implemented, 2026-09-12 — build-verified, not yet
-hardware-verified.** Tracked as **Phase 3a** in [PLAN.md](PLAN.md). The Home screen, capability-
-gated menu, and reconnect-stays-put behavior are in place; the "Current-state baseline" section
-below describes exactly what's built vs. still open against the target design further down this
-file (notably: the `ViewDispatcher`/scene-manager architecture step was skipped, and the Scan
-screen is a placeholder picker, not yet the five-mode design). See
-[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits.
+**Status: Home/menu shell implementation complete and hardware-verified 2026-09-13.** Tracked as **Phase 3a** in [PLAN.md](PLAN.md). The Home screen, capability-gated menu, and reconnect-stays-put behavior are all working end-to-end; the "Current-state baseline" section below describes exactly what's built vs. still open against the target design further down this file (notably: the `ViewDispatcher`/scene-manager architecture step was skipped, and the Scan screen is a placeholder picker, not yet the five-mode design). See [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits and 2026-09-13 entry for hardware verification summary.
 
 This replaces today's flat, button-shortcut Main screen with a menu-driven Home screen.
 Reached via a grill-me design session with the user; decisions and rationale are recorded
@@ -40,7 +34,7 @@ This is the implementation boundary for the approved v1 menu redesign; it intent
 not expand the existing product scope beyond the menu shell and the capability-aware screens
 that the design requires.
 
-## Current-state baseline (as of 2026-09-12, post-implementation — read this, not the design
+## Current-state baseline (as of 2026-09-13, hardware-verified — read this, not the design
 above, for what actually ships today)
 
 - `AppScreen` enum (`flipper/flipper_esp32_over_ble.c`) now has 9 values: `AppScreenHome`,
@@ -82,13 +76,12 @@ above, for what actually ships today)
   `esp32/main/main.c` — there is still no active/passive runtime toggle anywhere, so the Scan
   screen's two passive modes (below) remain unbuildable. Unchanged from before this pass; also
   tracked in [BACKLOG.md](BACKLOG.md).
-- **The GPS screen is now wired to the real `gps` capability** (2026-09-12, build-verified only —
-  see [PLAN.md](PLAN.md)'s "Real GPS driver..." section). It shows the real three-state
-  fix status, real coordinates and GPS-derived UTC time when a fix exists (falling back to the
+- **The GPS screen is now wired to the real `gps` capability** (2026-09-12 implementation, 2026-09-13 hardware-verified).
+  It shows the real three-state fix status, real coordinates and GPS-derived UTC time when a fix exists (falling back to the
   Flipper's own RTC clock, clearly labeled as such, otherwise), and still `--` for speed (a
   separate, still-backlogged follow-on). Along the way, a capability-gating bug was found and
   fixed: `HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
-  `capability_has_gps`.
+  `capability_has_gps`. See [PLAN.md](PLAN.md)'s "Real GPS driver..." section for full details.
 
 ## Target design
 

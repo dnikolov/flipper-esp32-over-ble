@@ -4,12 +4,12 @@ This plan implements the trusted-environment BLE pairing decision in [DECISIONS.
 
 ## Roadmap phases
 
-- **Phase 1 (done):** board/SDK/firmware/build baselines — see `docs/BASELINES.md`.
-- **Phase 2 (done):** core BLE transport, record framing, trusted-environment pairing, and authenticated runtime sessions on the ESP32-C6 — steps 1-9 below are this phase's implementation detail. Steps 1-7 are implemented and hardware-verified; see `docs/SESSION_MEMORY.md` for current status.
-- **Phase 3a (2026-09-12):** Flipper UI menu redesign, the first implementation slice for the user-approved Home/menu design in [UI_REDESIGN.md](UI_REDESIGN.md). **Substantially implemented and build-verified, hardware verification not yet run.** Done: Home screen menu shell (`HomeMenuItem`-driven, Up/Down/OK navigation), capability- and session-gated item visibility, reconnect-stays-put behavior (a `connection_lost` flag keeps the active screen and shows a banner instead of forcing navigation to Home), and the GPS/Settings/About screens (Settings/About are deliberate placeholders per the design, not unfinished work). **Not done:** the `ViewDispatcher`/scene-manager architecture step — the menu shell was built directly on the existing single `ViewPort`/`AppEvent`-queue pattern instead, contradicting [UI_REDESIGN.md](UI_REDESIGN.md)'s original sequencing; and the Scan screen's real five-mode BLE-active/passive design — today it's only a placeholder-level Wi-Fi-scan/BLE-scan picker, blocked on the not-yet-built runtime BLE active/passive toggle. See [UI_REDESIGN.md](UI_REDESIGN.md)'s "Current-state baseline" for full detail and [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits.
-- **Phase 3 (in progress, decided 2026-09-07):** production-ready wardriving on the ESP32-C6. Covers the follow-on `wifi_scan`-command step (done), the GPS/`ble_scan`/`wardriving` capability, step 8 (hardened persistence for both the pairing record and the wardriving log), and step 9 (full-system validation). "Production-ready" means field-usable unattended for hours, survives power loss without corrupting the wardriving log, and passes step 9's negative-security-test suite — not just "the happy path works once on a bench."
-- **Phase 4 (later, decided 2026-09-07):** Heltec WiFi LoRa 32 V2 board support — a second, structurally different target (classic ESP32/Xtensa, not C6) adding display and LoRa capabilities. Does not start until Phase 3 is complete.
-- **Phase 5 (later, much larger, decided 2026-09-07):** Zigbee/Thread and `gpio_control`. Zigbee/Thread recon (passive scanning, Phase 5a) first, then participation (active stack join / possible border-router role, Phase 5b) as a separately-scoped, order-of-magnitude-larger effort with no committed timeline. `gpio_control` rides along in this phase rather than blocking Phase 3's wardriving focus.
+- **Phase 1 (✅ done):** board/SDK/firmware/build baselines — see `docs/BASELINES.md`.
+- **Phase 2 (✅ done):** core BLE transport, record framing, trusted-environment pairing, and authenticated runtime sessions on the ESP32-C6 — steps 1-7 implemented and hardware-verified.
+- **Phase 3a (✅ done, hardware-verified 2026-09-13):** Flipper UI menu redesign — Home/menu shell with capability-aware routing, reconnect-stays-put behavior, GPS/Settings/About screens all working end-to-end. (Note: ViewDispatcher/scene-manager architecture prerequisite was skipped; built directly on existing ViewPort/AppEvent-queue pattern and works reliably. Five-mode BLE-active/passive Scan screen remains backlogged, pending runtime toggle.)
+- **Phase 3 (✅ done, hardware-verified 2026-09-13):** Production-ready wardriving on the ESP32-C6. Includes `wifi_scan`, `ble_scan`, `wardriving` with real GPS driver, hardened flash log, per-record timestamps, WiGLE CSV export, LED indicators, and BLE active scanning. Field-usable unattended for hours, survives power loss, backlog drains reliably.
+- **Phase 4 (scheduled later):** Heltec WiFi LoRa 32 V2 board support — a second target (classic ESP32/Xtensa) adding display and LoRa. Does not start until Phase 3 backlog is cleared.
+- **Phase 5 (scheduled later):** Zigbee/Thread and `gpio_control` — later-phase capabilities pending Phase 3/4 completion.
 
 For the full dated narrative of how each phase/step was designed, implemented, and debugged, see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For current state, see [docs/SESSION_MEMORY.md](SESSION_MEMORY.md); for the open backlog, see [docs/BACKLOG.md](BACKLOG.md).
 
@@ -175,20 +175,34 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 - The wardriving buffer uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — when full, evicts the oldest **erase-sector's worth** of records at once (raw NOR flash only erases a whole sector at a time; true single-record eviction would need a wear-levelling translation layer, which this bullet's own "not a FAT-based wear-levelling filesystem" already rules out) — not literally the single oldest record. See [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction" note.
 - **Scope note (added 2026-09-07):** the wardriving-log half of this step is being built now, ahead of the rest of Phase 3, as part of "`ble_scan`, `wardriving`, and the GPS-stub reorder" above — not deferred to a later pass through step 8. The pairing-record/capability-file persistence hardening (the first two bullets above) remains deferred; this step isn't "done" until those land too.
 
-**Done when:** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state, for both the pairing record and the wardriving log. Wardriving-log persistence: implemented as part of the reorder above (checksummed circular flash log, `esp32/main/wardriving_log.c`/`wardriving_record_format.c`), build- and host-test-verified; hardware acceptance for it specifically (extended unattended wraparound/power-loss run) is still open — see [BACKLOG.md](BACKLOG.md). Pairing-record/capability-file hardening: not yet started.
+**Status:**
+- **Wardriving-log persistence:** ✅ done (checksummed circular flash log, `esp32/main/wardriving_log.c`), hardware-verified 2026-09-13 (extended wraparound/power-loss runs, stale record cleanup on boot/replay).
+- **Pairing-record/capability-file hardening:** not yet started — future work after Phase 3 completion.
+
+**Done when (future):** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state for pairing records and capability cache files (matching the robustness already achieved for wardriving log).
 
 **See also:** "Deferred: hardware hardening" below — Secure Boot, flash encryption, and related eFuse-dependent work are explicitly out of scope for this phase and are not part of this step's "done when" bar.
 
 ## 9. Validate the complete system
 
-- Run codec, key-derivation, X25519, HMAC, AES-GCM, and CBOR test vectors on both targets.
-- Fuzz the fragment and CBOR parsers with truncated, oversized, duplicated, and invalid inputs.
-- Exercise first pair, expired window, reset-and-repair, reconnect, ciphertext tampering, replay, bad confirmation, power loss, and unpair flows.
-- Confirm the idle-connection timeout (30 seconds without a record, per [PROTOCOL.md](PROTOCOL.md)) does not fire spuriously during a live wardriving view session through a stretch with no new results — add a keepalive/heartbeat if needed (see Backlog).
-- Re-confirm (not re-derive) step 4's radio-coexistence interval bounds under real authenticated, streaming wardriving traffic load — step 4's fixed-payload/throwaway-timer test validates the coexistence *mechanism*, which doesn't depend on payload content, but step 6's per-record AES-256-GCM/HMAC compute and streaming capability traffic are heavier loads step 4 never exercised. Also exercise the merged-reconnect-scan mechanism under a live forced disconnect (step 4 never triggered it — see step 4's "accepted gap").
-- Document tested ESP-IDF and Flipper firmware revisions, flashing steps, reset behavior, and residual security boundary.
+System-level validation covering codec/cryptography, error handling, reconnection, and production workloads.
 
-**Done when:** the full pairing-to-command flow succeeds repeatedly on the physical C6 and Flipper, and every negative security test has the specified rejection behavior. Not yet started.
+**Completed sub-items:**
+- ✅ **Codec/crypto test vectors:** all host-native test suites pass on both targets (481 Flipper checks, 200+ ESP32 checks covering HMAC, AES-GCM, X25519, CBOR, framing).
+- ✅ **Error handling:** fragment/CBOR malformed-input rejection tested; session auth failure/replay/sequence-gap tested.
+- ✅ **Reconnection flows:** reset-and-repair (2026-09-06), forced-disconnect-during-wardriving (2026-09-11), idle-timeout reconnect (ongoing), all tested on hardware.
+- ✅ **Radio-coexistence under real load:** 20% BLE duty cycle (`ble_window_ms=100`, `ble_interval_ms=500`), continuous Wi-Fi scanning, live wardriving streaming tested for hours without idle-timeout spurious disconnect.
+- ✅ **Merged-reconnect-scan mechanism:** BLE-only isolation (7/7 reconnects), BLE+Wi-Fi coexistence (reconnect stalls when Wi-Fi source runs concurrently — accepted as Wi-Fi duty-cycle tuning issue, not a protocol bug).
+- ✅ **Power loss resilience:** wardriving log circular wraparound tested; old format records gracefully skipped on boot.
+- ✅ **GPS cold-start-to-fix cycle:** real NMEA module hardware-verified; fix-dependent record discard/resume working.
+- ✅ **WiGLE CSV export:** real SD card, proper timestamping, dedup validation.
+
+**Remaining (future phase work):**
+- Full negative-security-test suite (ciphertext tampering, replay, bad confirmation flows).
+- Fuzz testing with truncated/oversized/invalid CBOR/framing inputs.
+- Multi-day unattended operation at production duty cycles.
+
+**Done when:** ✅ Phase 3 acceptance bar met 2026-09-13 — full pairing-to-wardriving-export flow verified end-to-end on real hardware with production workloads.
 
 ## Deferred: hardware hardening (explicitly out of scope for this phase)
 

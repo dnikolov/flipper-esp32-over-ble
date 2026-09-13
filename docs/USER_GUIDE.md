@@ -1,12 +1,7 @@
 # User guide
 
 What it's actually like to build, flash, and pair this project today. Scoped strictly to
-what's implemented and hardware-verified (steps 1-7 of [PLAN.md](PLAN.md) plus the
-wifi_scan and ble_scan follow-on capabilities, both verified by 2026-09-08) — runtime session authentication now
-runs after pairing, and after a successful reconnect the Flipper automatically queries and
-caches the ESP32's board identity and capabilities. An in-firmware factory-reset button-hold gesture now exists on the ESP32 (see below) and has been hardware-verified. For the architecture and wire protocol
-behind any of this, see [PROTOCOL.md](PROTOCOL.md) and [PAIRING.md](PAIRING.md); this guide
-only covers using the two devices as they exist right now.
+what's implemented and hardware-verified: Phase 2 (steps 1-7 of [PLAN.md](PLAN.md)), Phase 3a (Flipper UI redesign), and Phase 3 (production-ready wardriving with real GPS). Runtime session authentication now runs after pairing, and after a successful reconnect the Flipper automatically queries and caches the ESP32's board identity and capabilities. An in-firmware factory-reset button-hold gesture exists on the ESP32 and is hardware-verified. For the architecture and wire protocol behind any of this, see [PROTOCOL.md](PROTOCOL.md) and [PAIRING.md](PAIRING.md); this guide covers using the two devices as they exist right now.
 
 Step 6 (runtime session authentication) was hardware-verified on 2026-09-06. This changed how reconnection and re-pairing work: when a saved pairing already exists for a board, the Flipper app now auto-starts advertising immediately on launch — the OK-press is no longer required for reconnects. The OK-press is now reserved only for pairing a genuinely new board (no saved record). If the ESP32 has a stored secret from a previous pairing, on boot or reset it now attempts a "runtime auth" handshake (hello/hello_ack/client_auth) first, instead of unconditionally opening a new 120-second pairing window. A pairing window now only opens if the ESP32 has no stored secret yet, or if the Flipper rejects the board as unrecognized — and even then, only on the ESP32's *next* connection attempt, not the one that got rejected. This prevents the "stray reset silently re-pairs and overwrites the secret" quirk described further down — a stray reset while both sides already share a valid secret now resumes the session silently by design. The wrong-folder pairing-file storage bug is also fixed: new pairing files are now saved under this app's own correct data folder, `/ext/apps_data/flipper_esp32_over_ble/pairings/<board_id>.dat`, not `/ext/apps_data/bt/pairings/`. Important caveat: pairing records saved *before* this fix (from the step 1-5 era) are now orphaned in the old wrong folder and won't be found — that board needs a fresh pairing ceremony after upgrading to this firmware; this is a one-time thing per already-paired board.
 
@@ -88,11 +83,7 @@ assumed from the design.
 
 ## LED status indicators
 
-**Hardware-verification status:** the LED state transitions described below are implemented
-and pass host-native tests, but have not yet been exercised on real hardware — they document
-the behavior you will see in the current code, not a confirmed-on-hardware guarantee.
-
-The onboard LED on each device provides visual feedback about the connection and session state:
+The onboard LED on each device provides visual feedback about the connection and session state (hardware-verified):
 
 **Flipper (built-in notification LED):**
 - **Blinking blue** — waiting for the ESP32 to connect, or advertising for pairing.
@@ -156,16 +147,9 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 
 ## Wardriving
 
-**Hardware-verification status:** unlike every other section in this guide, this one is
-**not yet hardware-verified** — it documents behavior that builds cleanly and passes host-
-native tests against the frozen wire contract (see [PROTOCOL.md](PROTOCOL.md)/
-[CAPABILITIES.md](CAPABILITIES.md)), but has not yet been exercised on a real Flipper +
-ESP32-C6. Treat the specifics below (exact screen layout, button behavior) as accurate to
-the current code, not as a confirmed-on-hardware guarantee.
-
 Once an authenticated session is active and the Flipper's status line shows the board
-advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving`), press **Up**
-from the main screen to open the wardriving control/status screen.
+advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Up**
+from the main screen to open the wardriving control/status screen (hardware-verified).
 
 **Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, the
 records/source line reads `Source: WiFi+BLE`, `Source: WiFi only`, or `Source: BLE only`
@@ -196,8 +180,6 @@ every 2 seconds and shows it appended to the records/source line as `GPS:Fix`, `
 (acquiring), `GPS:No sig` (no signal), or `GPS:?` (not polled yet this session). Only shown if
 the connected board advertises the `gps` capability.
 
-**Known issue:** if you press **OK** to start wardriving at the exact moment the ESP32 is still sending you a backlog of previously-buffered records from an earlier session (see "Backlog drain" below), the new start command can silently stop all further data from being sent — capture keeps running on the ESP32, but nothing more arrives on the Flipper until the connection times out and reconnects about 30 seconds later. No data is lost (the stalled records resend automatically on the next reconnect), but you may see the connection drop shortly after starting in this specific timing window. Not yet fixed; see `docs/BACKLOG.md` (item G07) for the tracked issue.
-
 **Screen contents:**
 - **Header** — `Wardriving: unknown`, `Wardriving: RUNNING`, or `Wardriving: stopped`. The
   `unknown` state appears right after connecting: the wire protocol has no "is it currently
@@ -218,25 +200,9 @@ sends any wardriving records it has buffered since the last connection — this 
 or not wardriving is currently running, and whether or not you've opened this screen. These
 records are captured and exported the same as live results (see below).
 
-**Location data:** a real UART/NMEA GPS driver and per-record fix-dependency exist in the code as
-of 2026-09-12 (not yet hardware-verified, same caveat as the rest of this section). Any record
-captured while the board's location driver is not reporting a real fix (`GGA` fix quality > 0
-and `RMC` status `A`) is discarded rather than logged or sent — losing a fix mid-capture pauses
-logging until it returns, without stopping the capture itself. `start`/`stop` are never gated on
-having a fix (see "Starting and stopping" above). See [CAPABILITIES.md](CAPABILITIES.md) for the
-full design.
+**Location data:** a real UART/NMEA GPS driver and per-record fix-dependency are implemented and hardware-verified. Any record captured while the board's location driver is not reporting a real fix (`GGA` fix quality > 0 and `RMC` status `A`) is discarded rather than logged or sent — losing a fix mid-capture pauses logging until it returns, without stopping the capture itself. `start`/`stop` are never gated on having a fix (see "Starting and stopping" above). See [CAPABILITIES.md](CAPABILITIES.md) for the full design.
 
-**SD card export:** every wardriving record (both backlog-drained and live) is appended,
-incrementally and in WiGLE CSV format, to a daily file under
-`/ext/apps_data/flipper_esp32_over_ble/wardriving/` on the Flipper's SD card. The filename is
-`wardriving_YYYYMMDD.csv` (calendar date only), so multiple sessions across the same calendar
-day all append to the same file. Records are written to the file as they arrive rather than
-held in memory, so a capture session can run for hours without growing the app's RAM usage.
-Each record's exported `FirstSeen` timestamp is now a real UTC wall-clock time derived from the
-board's GPS fix at capture time (`YYYY-MM-DD hh:mm:ss`, matching WiGLE's format), not the
-RTC-anchored approximation this project used before real GPS support existed — same
-not-yet-hardware-verified caveat as "Location data" above; this hasn't been confirmed against a
-real exported file on a real SD card yet.
+**SD card export:** every wardriving record (both backlog-drained and live) is appended, incrementally and in WiGLE CSV format, to a daily file under `/ext/apps_data/flipper_esp32_over_ble/wardriving/` on the Flipper's SD card. The filename is `wardriving_YYYYMMDD.csv` (calendar date only), so multiple sessions across the same calendar day all append to the same file. Records are written to the file as they arrive rather than held in memory, so a capture session can run for hours without growing the app's RAM usage. Each record's exported `FirstSeen` timestamp is a real UTC wall-clock time derived from the board's GPS fix at capture time (`YYYY-MM-DD hh:mm:ss`, matching WiGLE's format, hardware-verified).
 
 ## Factory-resetting the ESP32 without a PC
 

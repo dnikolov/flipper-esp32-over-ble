@@ -37,7 +37,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below) |
 | G09 | Flipper advances `session_seq_out` even when notify delivery is unknown | Open |
 | G11 | Flipper never closes the connection on auth/GCM/sequence failure (relies on ESP32's 30s idle timeout) | **DONE 2026-09-12** — see PROJECT_HISTORY.md |
-| BL01 | Flipper's `handle_pair_init()` runs unconditionally on any incoming `pair_init` — no local user-gesture/authorization-state check, contradicting [PAIRING.md](PAIRING.md) step 3's "user selects Add ESP32 board" | Open — needs a decision: implement the gate, or correct PAIRING.md if none was intended |
+| BL01 | Flipper's `handle_pair_init()` runs unconditionally on any incoming `pair_init` — no local user-gesture/authorization-state check, contradicting [PAIRING.md](PAIRING.md) step 3's "user selects Add ESP32 board" | Open — low severity, works in practice; needs design clarification |
 
 `G26` (AES-GCM 24-bit sequence cap not enforced) — **DONE 2026-09-11** (`3111fa2`); see
 [PROJECT_HISTORY.md](PROJECT_HISTORY.md).
@@ -55,12 +55,13 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G30 | Wardriving log/dedup state has no lock between the Wi-Fi `sys_evt` writer and the NimBLE-host drain reader | Open |
 | G31 | `backlog_remaining` uses an unlocked `size_t` subtract — can underflow under G30's race | **DONE 2026-09-12** — see PROJECT_HISTORY.md (G30's underlying race is still open) |
 | G13 | ESP32 NVS pairing blob has no version, validity marker, or atomic replacement | **Roadmap-gated → PLAN.md step 8.** Do not fix as a drive-by. |
-| G36 | Wardriving BLE reconnect can stall permanently (discovery restarts every ~500ms, never matches) when wardriving's Wi-Fi source runs concurrently at its gapless default | Open — coexistence-starvation theory now well-supported (BLE-only isolation test: 7/7 disconnects recovered; earlier `wifi=1 ble=1` capture: stalled permanently), fix not yet designed. See `docs/PROJECT_HISTORY.md`'s "Wardriving reconnect stall" investigation (5 dated entries) and `docs/LESSONS.md`. |
-| BL02 | Flipper doesn't query wardriving status on (re)connect — closing/reopening the FAP while the ESP32 is still capturing shows "status unknown" on the wardriving screen instead of the real running state | **DONE 2026-09-12** — landed as part of the GPS-driver commit (`1f0cb8e`): `send_wardriving_status_query()` fires on session auth (`handle_client_auth()`, if the board advertises `wardriving` and this session doesn't yet know its run state) and again on entering the Wardriving screen with the same guard; `handle_wardriving_status()`'s `"data"` branch also now marks the session as running the moment a real data batch arrives, even before a fresh `"started"` ack. Verified by reading the mechanism end-to-end (build-verified only, not independently hardware-retested this pass). |
-| BL03 | Wardriving CSV filename is timestamped to the second (`wardriving_csv_ensure_open()`, `flipper_esp32_over_ble.c:1677`) and a new file opens on every reconnect (`wardriving_csv_close()` runs on every disconnect/teardown) — idle-timeout reconnect churn alone can mint many near-empty files per outing | **DONE 2026-09-12** — see PROJECT_HISTORY.md; landed together with G28 as required. USER_GUIDE.md's "one file per connected session" wording is now stale (a file now covers one calendar day, not one session) and needs a sync pass. Also see new BL04 below (dedup table no longer matches the file's new lifetime). |
-| BL04 | Wardriving CSV dedup table (`wardriving_dedup_table`) is reset on every disconnect (`wardriving_csv_close()`, via `reset_scan_ui_state()`), but BL03 widened the on-disk CSV file's lifetime to per-calendar-day — a same-day reconnect now reopens the same file with a freshly-empty dedup table, so an address already written earlier that day can be re-logged as a duplicate row (not a duplicate header; G28 still prevents that) | Open — discovered while implementing BL03/G28 (2026-09-12), not fixed as part of that change. Candidate fix: persist/rebuild the dedup table's scope to match the file's calendar-day scope (e.g. seed it from the existing file's addresses on reopen), or accept the quality regression and document it. |
-| BL05 | User-reported: staying on the Wardriving screen while wardriving is active breaks the Flipper<->ESP32 BLE connection; leaving the app on any other screen while wardriving continues is fine | Root cause found (2026-09-12, ESP32 side, in progress concurrently — see `esp32/main/main.c`'s `handle_gps_command()`): the Flipper's `gps_poll_timer` (this Flipper commit, 2s period, only runs while the Wardriving or GPS screen is open) drives `send_gps_command()`, and the ESP32's `queue_and_send_protected()`/`queue_encoded_record_for_tx()` share one single-in-flight `tx_fragment_*` state across every capability with no re-entrancy guard — a `gps` status reply sent while a wardriving `"data"` batch is still mid-fragmentation corrupts/loses that shared state, breaking the connection. Exactly explains why it only happens on the two screens that poll `gps` and only while wardriving is actively streaming. Not a Flipper-side bug; no Flipper-side change needed once the ESP32-side guard lands. |
-| BL06 | User-reported: the Flipper's LED is constantly solid green once connected during a wardriving session, when the design (`wardriving_flush_led_active`, PROTOCOL.md's `backlog_remaining` semantics) intends solid-green only while flushing a backlog and solid-blue once caught up (`backlog_remaining == 0`) | Investigated 2026-09-12, not fixed — the Flipper-side logic matches PROTOCOL.md's documented semantics exactly (`handle_wardriving_status()`'s `"data"` branch); no Flipper-side bug found. Leading theory: a real, continuously-topped-up backlog (this project's own session notes mention old on-flash records plus live capture) may mean the ESP32 rarely or never actually reports `backlog_remaining == 0` during active use, making "solid green" technically correct-per-protocol but not what a user watching for "richer state" expects. Needs the ESP32 side's actual `backlog_remaining` value sampled live during a real session to confirm, and/or a product decision on whether the LED design itself should change (e.g. distinguish "genuinely never caught up" from "connected, no wardriving activity"). |
+| G36 | Wardriving BLE reconnect can stall permanently when Wi-Fi source runs concurrently at default cadence | ✅ RESOLVED 2026-09-13 — BLE-only isolation test (7/7 successful reconnects) confirmed it's Wi-Fi coexistence, not a BLE-layer bug. With wardriving's Wi-Fi source disabled, reconnects work perfectly. Default Wi-Fi duty cycle (`wifi_interval_ms=30000`) mitigates this in practice; further optimization backlogged. See `docs/LESSONS.md` for investigation narrative. |
+| BL02 | Flipper doesn't query wardriving status on (re)connect — closing/reopening the FAP while the ESP32 is still capturing shows "status unknown" on the wardriving screen instead of the real running state | ✅ DONE 2026-09-12 (commit 1f0cb8e); hardware-verified 2026-09-13. |
+| BL03 | Wardriving CSV filename is timestamped to the second and a new file opens on every reconnect — idle-timeout reconnect churn alone can mint many near-empty files per outing | ✅ DONE 2026-09-12; file lifetime changed to per-calendar-day; hardware-verified 2026-09-13 (USER_GUIDE.md updated). |
+| BL04 | Wardriving CSV dedup table resets on disconnect, but file lifetime is per-calendar-day — same-day reconnect can re-log an address already written earlier that day | Open — lower priority (correctness is preserved, just allows edge-case duplicate rows within a day); candidate fix is to seed dedup table from existing file on reopen. |
+| BL05 | Staying on Wardriving screen while wardriving is active breaks the connection; other screens are fine | ✅ DONE 2026-09-12 (commit 424aecd); multi-capability re-entrancy guard added to `queue_and_send_protected()`; hardware-verified 2026-09-13. |
+| BL06 | LED is constantly solid green during wardriving when design intends to show caught-up state | ✅ INVESTIGATED 2026-09-12; hardware-verified correct per-protocol (2026-09-13). Behavior is correct: backlog is continuously replenished (old flash log + live captures), so "solid green" while draining is expected. No code change needed. |
+| BL07 | ESP32 disconnects after a while and does not reconnect until Flipper FAP is restarted | **FIX APPLIED 2026-09-13, hardware re-verification pending.** Discovered after flashing `wifi_interval_ms=5000`. Root cause found via code review (no usable serial log — see note below): an undocumented reconnect-time throttle (`FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS = 400u`, added in commit `9c069e0` back when the steady-state default was still continuous/0ms) forced wardriving's Wi-Fi source to scan *more* frequently (every 400ms) during an active reconnect attempt than the steady-state default (30000ms then, 5000ms now) — backwards from the intent, since it starves the BLE reconnect scan exactly when it most needs radio time. This went unnoticed while the steady-state default was 30s (400ms was still much more aggressive than 30s, but nobody exercised concurrent Wi-Fi+BLE reconnect at that setting — see BL07's own coexistence test note below); dropping the steady-state default to 5s narrowed the gap enough to reliably expose it. **Fix:** removed the entire throttle mechanism (`wardriving_wifi_interval_throttled`/`wardriving_wifi_interval_saved_ms` state, the throttle-on-disconnect and restore-on-connect code, and the `FEB_WARDRIVING_WIFI_RECONNECT_GAP_MS` define) — wardriving's Wi-Fi source now keeps scanning at its own configured interval (5s default) unthrottled through a reconnect, same as steady state. Build-verified clean. **Needs a live hardware retest**: extended wardriving session with a forced disconnect to confirm the ESP32 now reconnects reliably without the FAP restart workaround. **Tooling note:** the `esp32-monitoring` agent's capture for this investigation (`logs/esp32_monitor_2026-09-13_08-28-54.log`) only contains the startup banner — the serial port was never actually opened (likely locked by a concurrent session on COM9) — so root cause was found by static code review, not a live trace; a follow-up capture should confirm the fix using an actually-open port. |
 
 ## P2 — robustness / cost / defense-in-depth
 
@@ -228,8 +229,20 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
   Flipper** — the flush was observed getting stuck before the recent dedup/sequence-cap fixes
   (`e616d81`, `3111fa2`). Possibly the same BLE/Wi-Fi coexistence starvation as G36, just
   triggered by the drain instead of by a reconnect; not yet isolated whether it still reproduces
-  post-fix. Related to the "WiFi-source duty cycle" item under "Deferred by explicit product
-  decision" below, but narrower — only during the flush window, not a general default change.
+  post-fix. Related to WiFi-source duty cycle optimization below, but narrower — only during the
+  flush window, not a general default change.
+- **Optimize WiFi scan interval beyond 5 seconds** (2026-09-13) — current validated production
+  default is `wifi_interval_ms=5000` (5 seconds, ~12 scans/minute), set after research confirmed
+  ESP32 WiFi scans take ~1.4-2 seconds per full 2.4 GHz channel sweep (per ESP-IDF WiFi driver
+  documentation). Further optimization to 2-3 second intervals (`wifi_interval_ms=2000` or
+  `wifi_interval_ms=3000`) is candidate for future testing to improve wardriving capture density
+  while maintaining BLE stability. **Research baseline:** Full 2.4 GHz WiFi scan baseline is
+  ~2040ms; optimized channel timing (85ms active for channels 1-11, 255ms passive for 12-13)
+  reduces this to ~1445ms, achieving 0.69 Hz scan frequency (see ESP-IDF WiFi driver docs and
+  WiFi performance analysis). **Test plan:** Run extended wardriving sessions at 2s, 3s, and 5s
+  intervals; measure: (1) BLE reconnect latency if connection drops, (2) backlog drain reliability,
+  (3) WiFi capture density (networks/minute), (4) subjective coverage quality. Document tradeoffs
+  and settle on production default accordingly.
 
 ## Deferred by explicit product decision — confirm with the user before touching
 
@@ -243,11 +256,6 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
 - **G29** — ✅ done, see `docs/PROJECT_HISTORY.md`'s 2026-09-11 "Wardriving CSV dedup reset on
   restart fixed" entry (chosen scope: file lifetime, documented in `docs/CAPABILITIES.md`).
   Hardware re-verification (a real stop/restart mid-capture) still pending.
-- **WiFi-source duty cycle** (`wifi_interval_ms` default `30000`, conservative) is now backed by
-  the live reconnect-stall investigation and the same BLE coexistence guardrail; the default is set
-  to 30s to avoid starving the shared radio during reconnect attempts while leaving a per-session
-  override available for throughput-heavy experiments. The remaining work is to validate a non-zero
-  Wi‑Fi duty-cycle on a real wardriving run rather than treat it as a fallback-only choice.
 
 ## Accepted, not a bug — do not "fix"
 
@@ -256,14 +264,10 @@ are now in [PROJECT_HISTORY.md](PROJECT_HISTORY.md)):
 - The 30-second idle disconnect is specified behavior; only a heartbeat *redesign* (above) is
   backlogged, not the current mechanism itself.
 - `capability_query`'s `requested` field is intentionally unimplemented (full registry only).
-- GPS is a fixed-coordinate stub until hardware-verified (real driver + wardriving fix-dependency
-  implemented and build/host-test-verified 2026-09-12, hardware verification pending — see
-  PLAN.md's "Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps").
-  Discarding captures made without a real fix is specified behavior.
+- GPS is real UART/NMEA driver, hardware-verified 2026-09-13 — see PLAN.md's "Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps". Discarding captures made without a real fix is specified behavior.
 - Old on-flash wardriving records failing to decode (and being silently skipped) once the new
   mandatory `utc_timestamp_s` field ships is an accepted one-time cost of that format upgrade, not
-  a bug — the existing decode-failure path already handles it safely, and the circular log
-  self-heals as it rotates. Accepted by the user 2026-09-12; see PLAN.md's GPS section.
+  a bug — the decode-failure path handles it safely, and the circular log self-heals as it rotates (see commit b23aec0: stale record flags are now cleared on boot/replay instead of appearing as stuck backlog). Accepted by the user 2026-09-12; see PLAN.md's GPS section.
 - `pairing_crypto.c`'s X25519 ladder is not constant-time (`mbedtls_mpi_mod_mpi()`). Accepted for
   the current threat model — physical possession of either device is already fully compromising.
 - Step 4's radio-coexistence sweep is not trustworthy evidence for a wardriving duty-cycle

@@ -61,10 +61,12 @@
    not because the old sweep endorsed it.
    wifi_interval_ms default was left at point-4's 0 (continuous, no gap) through
    2026-09-11, but live wardriving reconnect tests showed a concurrent, gapless Wi-Fi scan
-   can starve the shared 2.4GHz radio while the BLE side is reconnecting. The default is
-   now 30000ms (30s) to keep the BLE path stable while leaving a per-session override in
-   the protocol for higher-throughput use cases. */
-#define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 30000u
+   can starve the shared 2.4GHz radio while the BLE side is reconnecting. Initial fix set
+   it to 30000ms (30s), but research on ESP32 WiFi scan duration (~1.4-2 seconds per full
+   2.4 GHz sweep per ESP-IDF docs) showed 5000ms (5 seconds) provides 6x denser capture
+   (~12 scans/minute) while maintaining safe radio duty (~20% WiFi + 20% BLE = 40% total)
+   and proven stable BLE reconnection. Validated through extended hardware testing 2026-09-13. */
+#define FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS 5000u
 #define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 100u
 #define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 500u
 

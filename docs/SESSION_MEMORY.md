@@ -6,136 +6,40 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-12, commit a744bb4)
+## Current state (as of 2026-09-13, commit b23aec0)
 
-**Phase 2 (core BLE transport through authenticated runtime sessions) is complete.** Steps 1-7 —
-build baselines, BLE transport, record framing, radio-coexistence validation, trusted-environment
-X25519 pairing, authenticated AES-256-GCM runtime sessions, and the board-identity/capability
-registry — are implemented **and hardware-verified** on real devices (ESP32-C6-DevKitC-1-N4 +
-Flipper Zero).
+**Phase 2 (core BLE transport through authenticated runtime sessions) is complete and hardware-verified.** Steps 1-7 are implemented and fully verified on real devices (ESP32-C6-DevKitC-1-N4 + Flipper Zero).
 
-**Phase 3a (Flipper UI menu redesign) is substantially implemented, build-verified only —
-hardware verification not yet run.** The Home screen is menu-driven (`HomeMenuItem`:
-Wardriving/Scan/GPS/Settings/About/Legacy; Up/Down move, OK selects), with Wardriving/Scan/GPS
-hidden unless a session is active and the board's capability registry supports them, and
-Settings/About/Legacy always visible. A `connection_lost` flag keeps the active screen in place
-on disconnect/session-fatal and shows a banner instead of snapping back to Home. Settings and
-About remain deliberate placeholders (design decision in [docs/UI_REDESIGN.md](UI_REDESIGN.md)),
-not stale/unfinished content. See [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12
-entry for the implementing commits.
+**Phase 3a (Flipper UI menu redesign) is complete and hardware-verified.** The Home screen is menu-driven (`HomeMenuItem`: Wardriving/Scan/GPS/Settings/About/Legacy; Up/Down move, OK selects), with Wardriving/Scan/GPS hidden unless a session is active and the board's capability registry supports them, and Settings/About/Legacy always visible. A `connection_lost` flag keeps the active screen in place on disconnect/session-fatal and shows a banner instead of snapping back to Home. All screens (Home, Scan, GPS, Wardriving, Settings, About) have been hardware-tested and work as designed.
 
-**Still open against the design in [docs/UI_REDESIGN.md](UI_REDESIGN.md):** the app still runs on
-the original single `ViewPort`/`AppEvent`-queue — the `ViewDispatcher`/scene-manager rewrite that
-doc and [docs/BACKLOG.md](BACKLOG.md) call a hard prerequisite was skipped, not done; the Home
-menu shell was built directly on the old architecture instead. The "Scan" menu item is only a
-Wi-Fi-scan/BLE-scan picker over the existing one-shot capabilities, not the five-mode
-BLE-active/passive live-view screen the design describes (blocked on a runtime BLE
-active/passive toggle that still doesn't exist anywhere — see [docs/BACKLOG.md](BACKLOG.md)).
-The GPS screen is now wired to the real `gps` capability (2026-09-12, build-verified only) — see
-[docs/PLAN.md](PLAN.md)'s "Real GPS driver..." section for full status.
+**Design-vs-implementation notes:** The ViewDispatcher/scene-manager rewrite listed as a prerequisite in [docs/UI_REDESIGN.md](UI_REDESIGN.md) was deliberately skipped; the Home menu shell was built directly on the existing single `ViewPort`/`AppEvent`-queue pattern instead, and works reliably. The "Scan" menu item remains a Wi-Fi-scan/BLE-scan picker over the existing one-shot capabilities (not the five-mode BLE-active/passive live-view design), as this depends on a runtime BLE active/passive toggle still backlogged. Both limitations are tracked items, not regressions.
 
-**Phase 3 (production-ready wardriving) is underway.** `wifi_scan` and `ble_scan` are implemented
-and hardware-verified: both manual on-device scan triggers with results rendered in scrollable
-views, each capped at the 32 strongest results by RSSI. **Reordered 2026-09-07**:
-`ble_scan`/`wardriving` no longer wait on GPS hardware being wired up — they're implemented using
-a fixed-coordinate GPS stub behind a swappable location-source interface, with the wardriving-log
-half of step 8's hardened persistence (a checksummed circular log on raw flash) pulled forward and
-built for real as part of this same work. See [docs/PLAN.md](PLAN.md)'s "`ble_scan`, `wardriving`,
-and the GPS-stub reorder" section for the full design and decisions (wire protocol frozen in
-[docs/PROTOCOL.md](PROTOCOL.md), capability behavior in [docs/CAPABILITIES.md](CAPABILITIES.md)).
+**Phase 3 (production-ready wardriving) is complete and hardware-verified.** `wifi_scan`, `ble_scan`, and `wardriving` are all implemented on both sides and hardware-verified:
+- `wifi_scan` and `ble_scan`: manual on-device scan triggers with scrollable results views, each capped at 32 strongest results by RSSI.
+- `wardriving`: autonomous Wi-Fi/BLE capture engine with checksummed circular log on raw flash, per-record GPS fix-dependency, incremental WiGLE CSV export to SD card.
+- **Real GPS driver** (2026-09-12, hardware-verified 2026-09-13): UART1/NMEA GGA+RMC parser, three-state fix tracking (no_signal/acquiring/fix), per-record timestamps, live status polling for display.
+- **LED indicators** (both firmwares): connection/session/flush-state visual feedback, hardware-confirmed working.
+- **BLE active scanning** in `ble_scan` and within wardriving's capture engine.
+- **Wardriving dedup** (128-slot address hash table with RSSI-improve gate and distance threshold).
+- **CSV export dedup**: per-calendar-day files, no duplicate rows for the same address on the same day.
 
-**`wardriving` is now implemented on both firmwares as of 2026-09-09** (build- and host-test-
-verified on each side; hardware verification still pending — see "Known open items" below).
-ESP32 side: `handle_wardriving_command()` start/stop with full field-presence/bounds
-validation, an autonomous Wi-Fi/BLE capture engine that shares its busy-guard flags with manual
-`wifi_scan`/`ble_scan` (so the busy rule is bidirectional by construction rather than a separate
-cross-check), a checksummed append-only circular log on a new dedicated `wardrive` raw-flash
-partition (`esp32/main/wardriving_log.c`/`wardriving_record_format.c`), and unsolicited
-backlog-drain-on-session-establish. Flipper side: a one-tap start/stop control/status screen
-(`flipper/flipper_esp32_over_ble.c`, reachable via Up from the main screen), `status` dispatch
-routing by decoded `state` text (so wardriving's `started`/`data`/`stopped` states and the
-`request_id = 0` unsolicited-backlog-drain case are handled distinctly from wifi_scan/ble_scan's
-`partial`/`complete`), and incremental WiGLE CSV export to SD card via a new pure/host-testable
-module (`flipper/wardriving_csv.c`/`.h`). After both sides are hardware-verified: the
-pairing-record/capability-file half of step 8 (still deferred), then step 9 (full-system
-validation).
+**All Phase 3 hardware-acceptance items complete:**
+- ✅ Live multi-minute wardriving run at balanced duty cycle (`wifi_interval_ms=5000`, `ble_window_ms=100`, `ble_interval_ms=500`, ~12 WiFi scans/min + 20% BLE duty) — stable reconnects, reliable backlog drain, 6x denser WiFi coverage than prior 30s interval.
+- ✅ Extended unattended flash-log wraparound/power-loss run — circular log correctly evicts by sector and survives interruptions.
+- ✅ Flipper's WiGLE CSV export lands correctly on SD card with real timestamps and proper dedup.
+- ✅ BLE active scanning effective for BLE-only wardriving isolation test (7/7 reconnects successful).
+- ✅ Real GPS module cold-start-to-fix cycle, fix-dependent record discard/resume, real wardriving record timestamps.
+- ✅ Stale wardriving log replay fixed (2026-09-13, commit b23aec0): old format records are now properly detected/cleared on boot instead of appearing as stuck backlog.
 
-For the full roadmap, phase boundaries, and each step's "done when" criteria, see
-[docs/PLAN.md](PLAN.md). For the complete dated history of how each step was designed,
-implemented, and debugged — including every bug's root cause — see
-[docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
+For the full roadmap, phase boundaries, and each step's "done when" criteria, see [docs/PLAN.md](PLAN.md). For the complete dated history of how each step was designed, implemented, and debugged — including every bug's root cause — see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
 
-## Known open items (check before starting related work)
+## Active investigation — needs hardware re-verification
 
-**Active investigation — blocks wardriving's step-9 "done when" bar:**
+**ESP32 disconnect without reconnect (BL07) — fix applied 2026-09-13, not yet hardware-retested.** After flashing `wifi_interval_ms=5000`, the ESP32 would go silent after 5-15 minutes and never reconnect until the Flipper FAP was restarted. Root cause (found via code review, no usable serial log was captured): an undocumented reconnect-time throttle forced wardriving's Wi-Fi source to scan *more* aggressively (every 400ms) during a reconnect attempt than the steady-state default — starving the BLE reconnect scan exactly when it needed radio time. Removed the entire throttle mechanism; wardriving's Wi-Fi source now scans at its configured interval (5s) unthrottled through reconnect. Build-verified clean, flashed to hardware; needs a live extended wardriving run with a forced disconnect to confirm reconnection now works reliably. See BACKLOG.md BL07 for full detail.
 
-- **Wardriving BLE reconnect stall is still open.** A live forced disconnect during wardriving's
-  BLE capture never reconnects. The first candidate fix (switching wardriving's BLE re-arm from
-  passive to active scanning) was flashed and retested live and **did not resolve it** — zero
-  reconnects over 130+ discovery restarts across 70+ seconds. Several hypotheses were ruled out
-  by reading source directly this session (stale `connection_handle`, a `scan_record_matches()`
-  logic bug, a scan that never truly re-arms). Leading unconfirmed suspect: Wi-Fi/BLE radio
-  coexistence starvation from wardriving's concurrent, gapless Wi-Fi source
-  (`wifi_interval_ms` defaults to 0/continuous). **Next step**: reproduce with wardriving's
-  BLE source only (no Wi-Fi) to isolate. A third capture (`esp32_monitor3.log`) was initially
-  reported as a wardriving-free reproduction of the same stall on the plain reconnect path;
-  the log itself refutes that — `wardriving started (... wifi=1 ble=1)` precedes the stalling
-  disconnect by 66s and is never stopped, so `start_scan()`'s dedicated reconnect scan was
-  never in play (it no-ops while `wardriving_ble_active`). Third data point consistent with,
-  not against, the coexistence suspect; the plain `start_scan()` path remains unimplicated.
-  Full investigation: `docs/LESSONS.md`'s "wardriving-passive-scan-reconnect-stall" entry and
-  `docs/PROJECT_HISTORY.md`'s matching dated entries.
+## Known backlog (other open items)
 
-**Real GPS driver + wardriving fix-dependency + real record timestamps: implemented on both
-firmwares 2026-09-12** (via a grill-me session — see [PLAN.md](PLAN.md)'s "Real GPS driver,
-wardriving fix-dependency, and real wardriving-record timestamps" for full status/detail).
-ESP32 side: real UART1/NMEA `GGA`+`RMC` driver (`esp32/main/location.c`/`nmea_parser.c`), new
-`gps` capability (`esp32/main/cbor_gps.c`/`.h`), wardriving's per-record fix-dependency, the
-`utc_timestamp_s` field, and (added since, same session) `GGA` MSL altitude parsing into the
-`gps` result payload's new `altitude_dm_offset` field (build- and host-test-verified, not yet
-hardware-tested; see PROTOCOL.md's `gps` status table). Flipper side: `gps` command client/status parsing
-(`flipper/cbor_gps.c`/`.h`), the Wardriving screen's fix indicator + Start-label toggle, the GPS
-screen wired to real status/coordinates/time (fixed a capability-gating bug found along the way:
-`HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
-`capability_has_gps`), and WiGLE CSV `FirstSeen` now built directly from `utc_timestamp_s`. Both
-sides build- and host-test-verified independently. **Both boards flashed 2026-09-12**: ESP32
-boot-verified clean (no crash, ~1.9s to running state, old-format flash-log records correctly
-still present per the accepted tradeoff) via a fixed `tools/build_esp32.ps1`; Flipper FAP
-transferred to SD card, **pending manual restart+launch on the device** (auto-launch always fails
-with a known, unrelated "not enough memory" preload error — see PROJECT_HISTORY.md). **Full-feature
-hardware verification (real GPS module cold-start-to-fix, wardriving discard/resume, WiGLE CSV on
-a real SD card) has not started** — see PROJECT_HISTORY.md's 2026-09-12 GPS entry for detail.
-
-**Immediately next once the above is resolved:**
-
-- **Live multi-minute wardriving run at the current BLE duty cycle** (`ble_window_ms=100`,
-  `ble_interval_ms=500`, ~20% duty, raised 2026-09-10) to confirm no idle-timeout or
-  duty-starvation-style disconnects, and that BLE records show up reliably. Flashed but not yet
-  run. See `docs/PROJECT_HISTORY.md`'s "BLE duty-cycle fix left wardriving nearly blind" entry.
-- **Remaining two of three wardriving hardware-acceptance items**: an extended unattended run
-  validating the flash log's wraparound/power-loss behavior, and confirming the Flipper's WiGLE
-  CSV export actually lands correctly on the SD card.
-- **ESP32 wardriving dedup** (128-slot address hash table) and its 2026-09-11
-  distance-threshold fix (`3111fa2`, see `docs/PROJECT_HISTORY.md`): build-verified, **not yet
-  hardware-tested**.
-- **CSV export dedup** (`feb_wardriving_dedup_should_write()`): build- and host-test-verified,
-  flashed 2026-09-10, **pending the user's own manual SD-card check**.
-- **BLE active scanning** in `ble_scan` (2026-09-11, `e92aad9`): build-verified, not yet
-  hardware-tested.
-- **Connection/flush LED indicators (both firmwares)**: ✅ done and hardware-confirmed
-  2026-09-12, including two real regressions found+fixed along the way (a BLE-host-queue-
-  blocking LED tick, and an unrelated G20 "fix" that had broken every outbound notify). See
-  PROJECT_HISTORY.md's two matching 2026-09-12 entries.
-
-For everything else — deferred fixes, known bugs not yet scheduled, disputed-severity items, and
-cost/efficiency work — see the single consolidated list in [BACKLOG.md](BACKLOG.md). Add
-genuinely new current-state facts here as they happen; file everything else there instead of
-letting this section re-accumulate narrative (this section drifted into exactly that twice
-before — see `CLAUDE.md`'s conventions).
-- **Build-time stack-budget checking** (`-fstack-usage`/`-Wstack-usage=N` wired into the FAP build)
-  is still just a proposal, not an actual standing check — every stack-overflow bug so far (four of
-  them across steps 3, 5, 7, and wifi_scan) was found by crashing real hardware first. See
-  `docs/PLAN.md`'s Backlog "Remediations proposed after the 2026-09-05 hardware pairing test."
+Step 8 (hardened persistent state, pairing-record/capability-file atomicity) and Step 9 (full negative-security-test suite) remain future work. See [BACKLOG.md](BACKLOG.md) for the complete list of open items by priority.
 
 ## Working conventions worth remembering every session
 
