@@ -327,6 +327,7 @@ static ble_scan_source_t ble_scan_active_source;
    scan/window is actually in flight). */
 static bool wardriving_wifi_active;
 static bool wardriving_ble_active;
+static bool wardriving_ble_connect_in_flight;
 static uint32_t wardriving_wifi_interval_ms;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
@@ -1891,6 +1892,14 @@ static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
     if (!wardriving_ble_active) {
         return;
     }
+    if (wardriving_ble_connect_in_flight) {
+        /* The periodic BLE re-arm must not restart discovery while a connect attempt is already
+           in flight. That is the root cause of the BL06 reconnect stall: the timer and the
+           in-flight connect fight each other, repeatedly restarting discovery mid-connect. */
+        ble_npl_callout_reset(&wardriving_ble_interval_co,
+                              ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
+        return;
+    }
     ble_scan_raw_count = 0;
     /* Active, not passive (was passive through 2026-09-10): this window is also the merged
        reconnect-scan pass (docs/PLAN.md "Revised long-run reconnect policy") while wardriving's
@@ -2913,11 +2922,19 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                 ble_gap_disc_cancel();
                 return 0;
             }
+            if (wardriving_ble_connect_in_flight) {
+                /* A connect from this same discovery pass is already pending; don't stack another
+                   while the wardriving BLE timer re-armed discovery for the next window. */
+                ble_gap_disc_cancel();
+                return 0;
+            }
             ESP_LOGI(TAG, "found v2 peer, connecting");
             ble_gap_disc_cancel();
+            wardriving_ble_connect_in_flight = true;
             rc = ble_gap_connect(own_addr_type, &event->disc.addr, 30000, NULL,
                                  gap_event, NULL);
             if (rc != 0) {
+                wardriving_ble_connect_in_flight = false;
                 ESP_LOGW(TAG, "connect start failed: %d", rc);
                 schedule_reconnect();
             }
@@ -2936,6 +2953,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_CONNECT:
+        wardriving_ble_connect_in_flight = false;
         if (event->connect.status != 0) {
             ESP_LOGW(TAG, "connection failed: %d", event->connect.status);
             schedule_reconnect();
@@ -2995,6 +3013,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         feb_reassembly_reset(&rx_reassembly);
         pairing_attempt_zeroize();
         runtime_auth_zeroize();
+        wardriving_ble_connect_in_flight = false;
         wardriving_tx_in_flight = false;
         if (wifi_scan_in_progress && wifi_scan_active_source == WIFI_SCAN_SOURCE_MANUAL) {
             /* Don't clear wifi_scan_in_progress directly here -- the radio scan this

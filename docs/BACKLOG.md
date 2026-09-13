@@ -47,6 +47,8 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G08 | SD-card I/O (pairing, capability cache, CSV) runs on `BleEventWorker`, the BLE-pump thread | Open |
 | G10 | Flipper `session_key`/`session_seq_out`/`outgoing_message_id` accessed from two threads with no lock | Open |
 | G13 | ESP32 NVS pairing blob has no version, validity marker, or atomic replacement | **Roadmap-gated → PLAN.md step 8.** Do not fix as a drive-by. |
+| BL05 | Flipper reboots with `furi_check_failed` on app relaunch after wardriving | Open |
+| BL06 | Flipper does not reconnect when coming back in range of ESP32 while on wardriving screen during wardriving | Open |
 | G36 | Wardriving BLE reconnect can stall permanently | **Partially explained, not fully resolved.** BLE-only isolation test (7/7 successful reconnects) confirmed Wi-Fi coexistence starvation is *a* cause. But a live retest 2026-09-13 (after removing BL07's throttle) found a stall with a *different* mechanism — `wardriving_ble_interval_cb()`'s periodic re-arm colliding with its own in-flight connect attempt, independent of Wi-Fi entirely. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01 for the full evidence and proposed fix. Do not treat this as closed. |
 | BL04 | Wardriving CSV dedup table resets on disconnect, but file lifetime is per-calendar-day — same-day reconnect can re-log an address already written earlier that day | Open — lower priority (correctness is preserved, just allows edge-case duplicate rows within a day); candidate fix is to seed dedup table from existing file on reopen. |
 
@@ -57,6 +59,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G18 | Flipper X25519 donna static ladder scratch (~3-4 KB) never zeroized, resident for the app's lifetime | Open |
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
+| BL07 | ESP32 status LED does not turn green when Flipper connects during wardriving session and starts flushing ESP backlog | Open |
 
 ## Codebase & agent cost-efficiency
 
@@ -77,6 +80,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 
 ## Other open items (not covered by the cross-model review)
 
+- **BL08 — Home screen space optimization:** consolidate display by showing "Pairing:Y/N" instead of "saved pairing" and "ESP:waiting"/"ESP:session" instead of "Waiting for ESP"; move all current status data to settings screen in a scrollable view for full visibility.
 - Promote implicit cross-firmware constants into the shared contract — e.g. the Flipper's
   `PAYLOAD_MAX` (64) is silently duplicated as the ESP32's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN`
   rather than living in `framing.h`/PROTOCOL.md where both sides' tests would catch drift.

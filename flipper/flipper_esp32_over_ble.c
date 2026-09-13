@@ -254,6 +254,7 @@ typedef struct {
     AppScreen screen;
     HomeMenuItem home_menu_index;
     size_t home_menu_scroll_offset;
+    size_t settings_scroll_offset;
     ScanMenuItem scan_menu_index;
     bool wifi_scan_in_progress;
     bool wifi_scan_complete;
@@ -3134,6 +3135,24 @@ static const char* pairing_phase_text(PairingPhase phase) {
     }
 }
 
+static const char* esp_status_text(const Esp32App* app) {
+    switch(app->pairing_phase) {
+    case PairingPhaseWaiting:
+    case PairingPhaseExchanging:
+    case PairingPhaseConfirming:
+    case PairingPhaseSaving:
+    case PairingPhaseAuthenticating:
+    case PairingPhaseFailed:
+        return "waiting";
+    case PairingPhaseSessionActive:
+    case PairingPhaseDone:
+        return "session";
+    case PairingPhaseNone:
+    default:
+        return "idle";
+    }
+}
+
 /* wifi_scan results view (docs/PLAN.md's Wi-Fi scan capability follow-on step): a dedicated
    scrollable list, separate from the fixed-layout main screen above, showing every reported
    AP (scrolled with Up/Down, not truncated to a summary). `wifi_scan_aps`/`wifi_scan_ap_count`
@@ -3407,12 +3426,9 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
 #define HOME_FOOTER_Y 62
 #define HOME_MAX_ROWS 4
 
-static uint8_t home_header_height(Esp32App* app) {
-    return app->has_capability_info ? 3 : 2;
-}
-
 static uint8_t home_menu_visible_rows(Esp32App* app) {
-    return (uint8_t)(HOME_MAX_ROWS - home_header_height(app));
+    UNUSED(app);
+    return HOME_MAX_ROWS;
 }
 
 static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
@@ -3523,16 +3539,178 @@ static void scan_menu_fix_selection(Esp32App* app) {
     }
 }
 
+static size_t wrapped_field_lines(const char* label, const char* value) {
+    size_t value_len = strlen(value);
+    if(value_len == 0u) {
+        return 1u;
+    }
+
+    size_t pos = 0u;
+    size_t lines = 1u;
+    size_t label_len = strlen(label);
+    while(pos < value_len) {
+        size_t width = 22u - (lines == 1u ? label_len : 2u);
+        if(width > 20u) {
+            width = 20u;
+        }
+        size_t chunk = value_len - pos;
+        if(chunk > width) {
+            chunk = width;
+            while(chunk > 1u && value[pos + chunk - 1u] != ' ') {
+                chunk--;
+            }
+            if(chunk == 1u && value[pos] != ' ') {
+                chunk = width;
+            }
+        }
+        pos += chunk;
+        while(pos < value_len && value[pos] == ' ') {
+            pos++;
+        }
+        if(pos < value_len) {
+            lines++;
+        }
+    }
+    return lines;
+}
+
+static void wrap_field_rows(
+    char rows[][64],
+    size_t rows_cap,
+    const char* label,
+    const char* value,
+    size_t* out_count) {
+    *out_count = 0u;
+    if(rows_cap == 0u) {
+        return;
+    }
+
+    size_t value_len = strlen(value);
+    if(value_len == 0u) {
+        snprintf(rows[0], 64, "%s", label);
+        *out_count = 1u;
+        return;
+    }
+
+    size_t pos = 0u;
+    size_t line_index = 0u;
+    size_t label_len = strlen(label);
+    while(pos < value_len && line_index < rows_cap) {
+        size_t width = 22u - (line_index == 0u ? label_len : 2u);
+        if(width > 20u) {
+            width = 20u;
+        }
+        size_t chunk = value_len - pos;
+        if(chunk > width) {
+            chunk = width;
+            while(chunk > 1u && value[pos + chunk - 1u] != ' ') {
+                chunk--;
+            }
+            if(chunk == 1u && value[pos] != ' ') {
+                chunk = width;
+            }
+        }
+        snprintf(
+            rows[line_index],
+            64,
+            "%s%.*s",
+            line_index == 0u ? label : "  ",
+            (int)chunk,
+            value + pos);
+        pos += chunk;
+        while(pos < value_len && value[pos] == ' ') {
+            pos++;
+        }
+        line_index++;
+    }
+    *out_count = line_index;
+}
+
+static size_t settings_row_count(const Esp32App* app) {
+    size_t count = 3u; /* Pairing, ESP, State */
+    if(app->has_capability_info) {
+        count += wrapped_field_lines("Board: ", app->capability_board);
+        count += wrapped_field_lines("Features: ", app->capability_features);
+    } else {
+        count += 2u; /* Board: unknown + Features: none */
+    }
+    if(app->capability_has_wardriving) {
+        count += 1u;
+    }
+    if(app->capability_has_gps) {
+        count += 1u;
+    }
+    return count;
+}
+
 static void draw_settings_screen(Canvas* canvas, Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "Settings");
     canvas_set_font(canvas, FontSecondary);
 
-    canvas_draw_str(canvas, 2, 22, "Placeholder");
-    canvas_draw_str(canvas, 2, 33, "Scan preferences TBD");
-    canvas_draw_str(canvas, 2, 44, "BLE toggle TBD");
-    canvas_draw_str(canvas, 2, 56, "Back: return");
-    UNUSED(app);
+    char rows[10][64];
+    size_t row_count = 0u;
+
+    snprintf(rows[row_count++], sizeof(rows[0]), "Pairing: %s", app->has_saved_pairing ? "Y" : "N");
+    snprintf(rows[row_count++], sizeof(rows[0]), "ESP: %s", esp_status_text(app));
+
+    const char* phase_text = pairing_phase_text(app->pairing_phase);
+    if(phase_text != NULL) {
+        snprintf(rows[row_count++], sizeof(rows[0]), "State: %s", phase_text);
+    } else {
+        snprintf(rows[row_count++], sizeof(rows[0]), "State: %s", app->pairing_reason);
+    }
+
+    if(app->has_capability_info) {
+        size_t board_lines = 0u;
+        wrap_field_rows(rows + row_count, 2u, "Board: ", app->capability_board, &board_lines);
+        row_count += board_lines;
+        size_t feature_lines = 0u;
+        wrap_field_rows(rows + row_count, 2u, "Features: ", app->capability_features, &feature_lines);
+        row_count += feature_lines;
+    } else {
+        snprintf(rows[row_count++], sizeof(rows[0]), "Board: unknown");
+        snprintf(rows[row_count++], sizeof(rows[0]), "Features: none");
+    }
+
+    if(app->capability_has_wardriving) {
+        snprintf(
+            rows[row_count++],
+            sizeof(rows[0]),
+            "Wardriving: %s",
+            app->wardriving_running_known && app->wardriving_running ? "running" : "stopped");
+    }
+
+    if(app->capability_has_gps) {
+        const char* gps_label = "unknown";
+        if(app->gps_status_known) {
+            if(app->gps_state == GpsFixStateFix) {
+                gps_label = "fix";
+            } else if(app->gps_state == GpsFixStateAcquiring) {
+                gps_label = "acquiring";
+            } else {
+                gps_label = "no signal";
+            }
+        }
+        snprintf(rows[row_count++], sizeof(rows[0]), "GPS: %s", gps_label);
+    }
+
+    size_t visible_rows = 4u;
+    size_t start = app->settings_scroll_offset;
+    if(start >= row_count) {
+        start = 0u;
+        app->settings_scroll_offset = 0u;
+    }
+
+    for(size_t idx = 0u; idx < visible_rows && start + idx < row_count; idx++) {
+        canvas_draw_str(canvas, 2, 22 + (uint8_t)(idx * HOME_ROW_HEIGHT), rows[start + idx]);
+    }
+
+    if(row_count > visible_rows) {
+        canvas_draw_str(canvas, 2, 62, "Up/Down: scroll  Back: return");
+    } else {
+        canvas_draw_str(canvas, 2, 62, "Back: return");
+    }
 }
 
 static void draw_about_screen(Canvas* canvas, Esp32App* app) {
@@ -3569,20 +3747,9 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
     canvas_set_font(canvas, FontSecondary);
 
     bool has_fix = app->gps_status_known && app->gps_state == GpsFixStateFix;
-    const char* fix_label;
-    if(!app->gps_status_known) {
-        fix_label = "unknown";
-    } else if(has_fix) {
-        fix_label = "fix";
-    } else if(app->gps_state == GpsFixStateAcquiring) {
-        fix_label = "acquiring";
-    } else {
-        fix_label = "no signal";
-    }
+    const char* fix_label = has_fix ? "Y" : "N";
 
-    /* Row y-coordinates below: 22/32/42/52/62, this file's established 10px-row-pitch/y=62-footer
-       convention (see the Home screen's earlier overlap fix) -- previously 22/33/44/48/56, whose
-       4px gap between the Time and Speed rows visually collided. */
+    /* Row y-coordinates below: 22/32/42/52, matching the compact screen layout with no footer. */
     char line[64];
     snprintf(line, sizeof(line), "Fix: %s", fix_label);
     canvas_draw_str(canvas, 2, 22, line);
@@ -3595,36 +3762,28 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
             ((double)(int64_t)app->gps_lat_e7_offset - (double)900000000) / (double)10000000;
         double lon =
             ((double)(int64_t)app->gps_lon_e7_offset - (double)1800000000) / (double)10000000;
-        snprintf(line, sizeof(line), "Lat/Lon: %.5f,%.5f", lat, lon);
+        snprintf(line, sizeof(line), "%.5f,%.5f", lat, lon);
     } else {
-        snprintf(line, sizeof(line), "Lat/Lon: --");
+        snprintf(line, sizeof(line), "--");
     }
     canvas_draw_str(canvas, 2, 32, line);
 
-    /* Time source depends on fix state (docs/UI_REDESIGN.md's GPS-screen design): a real
-       `fix` uses the result's own utc_timestamp_s (same epoch->calendar conversion the CSV
-       exporter uses for FirstSeen); otherwise this falls back to the Flipper's own RTC clock,
-       explicitly labeled as such rather than presented as GPS-derived. */
-    DateTime dt;
-    const char* time_label;
     if(has_fix) {
+        DateTime dt;
         datetime_timestamp_to_datetime((uint32_t)app->gps_utc_timestamp_s, &dt);
-        time_label = "GPS";
+        snprintf(
+            line,
+            sizeof(line),
+            "%04u-%02u-%02u %02u:%02u:%02u",
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+            dt.second);
     } else {
-        furi_hal_rtc_get_datetime(&dt);
-        time_label = "RTC";
+        snprintf(line, sizeof(line), "--");
     }
-    snprintf(
-        line,
-        sizeof(line),
-        "Time(%s): %04u-%02u-%02u %02u:%02u:%02u",
-        time_label,
-        dt.year,
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dt.second);
     canvas_draw_str(canvas, 2, 42, line);
 
     /* Same offset-recovery convention as the Lat/Lon row above (cbor_gps.h's
@@ -3638,7 +3797,6 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
         snprintf(line, sizeof(line), "Alt: --  Speed: --");
     }
     canvas_draw_str(canvas, 2, 52, line);
-    canvas_draw_str(canvas, 2, 62, "Back: return");
 }
 
 static void draw_scan_screen(Canvas* canvas, Esp32App* app) {
@@ -3668,30 +3826,19 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
     canvas_draw_str(canvas, 2, 11, "Home");
     canvas_set_font(canvas, FontSecondary);
 
-    uint8_t header_rows = home_header_height(app);
     uint8_t y = HOME_FIRST_ROW_Y;
-    canvas_draw_str(canvas, 2, y, app->has_saved_pairing ? "Have saved pairing" : "No saved pairing");
+    char status_line[32];
+    snprintf(
+        status_line,
+        sizeof(status_line),
+        "Pairing:%s  ESP:%s",
+        app->has_saved_pairing ? "Y" : "N",
+        esp_status_text(app));
+    canvas_draw_str(canvas, 2, y, status_line);
     y += HOME_ROW_HEIGHT;
 
-    if(app->pairing_phase == PairingPhaseFailed) {
-        char line[48];
-        snprintf(line, sizeof(line), "Failed: %s", app->pairing_reason);
-        canvas_draw_str(canvas, 2, y, line);
-    } else {
-        canvas_draw_str(canvas, 2, y, pairing_phase_text(app->pairing_phase));
-    }
-    y += HOME_ROW_HEIGHT;
-
-    if(app->has_capability_info) {
-        char line[CAPABILITY_BOARD_MAX_LEN + CAPABILITY_FEATURES_MAX_LEN + 4];
-        snprintf(line, sizeof(line), "%s: %s", app->capability_board, app->capability_features);
-        canvas_draw_str(canvas, 2, y, line);
-        y += HOME_ROW_HEIGHT;
-    }
-
-    /* Keep the menu below the header block. Without this offset, the menu starts at the same
-       Y coordinates as the final status line and visually overlaps it. */
-    uint8_t menu_y = HOME_FIRST_ROW_Y + header_rows * HOME_ROW_HEIGHT;
+    /* Leave the bottom section for the selectable menu to fill the remaining vertical space. */
+    uint8_t menu_y = 32u;
 
     static const char* labels[HomeMenuCount] = {
         "Wardriving",
@@ -3715,13 +3862,14 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
                 "%s%s",
                 app->home_menu_index == (HomeMenuItem)i ? "> " : "  ",
                 labels[i]);
+            canvas_set_font(
+                canvas,
+                app->home_menu_index == (HomeMenuItem)i ? FontPrimary : FontSecondary);
             canvas_draw_str(canvas, 2, menu_y, line);
             menu_y += HOME_ROW_HEIGHT;
         }
         rank++;
     }
-
-    canvas_draw_str(canvas, 2, HOME_FOOTER_Y, "Up/Down: move  OK: select");
 }
 
 static void draw_callback(Canvas* canvas, void* context) {
@@ -4190,6 +4338,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         break;
                     case HomeMenuSettings:
                         app.screen = AppScreenSettings;
+                        app.settings_scroll_offset = 0;
                         break;
                     case HomeMenuAbout:
                         app.screen = AppScreenAbout;
@@ -4236,8 +4385,21 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
                 }
-            } else if(app.screen == AppScreenSettings || app.screen == AppScreenAbout ||
-                      app.screen == AppScreenLegacy) {
+            } else if(app.screen == AppScreenSettings) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenHome;
+                    app.settings_scroll_offset = 0;
+                } else if(event.input.key == InputKeyUp) {
+                    if(app.settings_scroll_offset > 0) {
+                        app.settings_scroll_offset--;
+                    }
+                } else if(event.input.key == InputKeyDown) {
+                    size_t max_scroll = settings_row_count(&app) > 4 ? settings_row_count(&app) - 4 : 0;
+                    if(app.settings_scroll_offset < max_scroll) {
+                        app.settings_scroll_offset++;
+                    }
+                }
+            } else if(app.screen == AppScreenAbout || app.screen == AppScreenLegacy) {
                 if(event.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
                 }
