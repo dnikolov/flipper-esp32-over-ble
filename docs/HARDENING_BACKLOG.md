@@ -69,3 +69,29 @@ tail of G36/BL07 (wardriving BLE reconnect stall) that "Wi-Fi coexistence starva
 believed to fully explain. That theory may still be a contributing factor in other captures:
 this file doesn't rule it out, it just proves at least one independent failure mode exists that
 has nothing to do with Wi-Fi at all.
+
+## H02 — Live concurrent-load test for the G30 wardriving-log race fix
+
+**Status:** fix implemented and build-verified 2026-09-13 (see `docs/BACKLOG.md` G30), not yet
+hardware-tested under the specific condition it was meant to fix.
+
+**What G30 changed:** the wardriving Wi-Fi-source dedup/append loop moved from the `sys_evt`
+task (`wifi_scan_done_handler()`) to the NimBLE host task (`wifi_scan_done_cb()`), eliminating a
+cross-task race against `wardriving_send_next_batch()`'s log reads. The BLE-source path was
+already safe; this made Wi-Fi symmetric with it.
+
+**What still needs to happen:** a live test where the ESP32 is actively appending *new* Wi-Fi
+wardriving records to the flash log **at the same moment** the Flipper is draining a backlog of
+*previously buffered* records — the exact overlap the race depended on. The cleanest way to
+force this overlap:
+
+1. Start wardriving with both Wi-Fi and BLE sources.
+2. Disconnect the Flipper for 30-60s so a backlog builds up while Wi-Fi/BLE capture keeps running.
+3. Reconnect — the backlog drain will begin while live Wi-Fi captures are still landing.
+4. Watch the ESP32 serial log for: no `wardriving_log_mark_drained(...) exceeds last peek's ...
+   result; clamping` warnings, no duplicate/lost records in the Flipper's WiGLE CSV, and a
+   backlog count that decreases monotonically rather than jumping erratically.
+
+**Known complication:** this exact test scenario (forced disconnect during active wardriving) is
+also where H01 currently causes a reconnect stall — H01 needs to be fixed first, or the test
+needs to tolerate/work around it, before G30's fix can actually be exercised end-to-end this way.

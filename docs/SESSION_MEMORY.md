@@ -6,7 +6,7 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-13, commit b23aec0)
+## Current state (as of 2026-09-13, commit 6481400)
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete and hardware-verified.** Steps 1-7 are implemented and fully verified on real devices (ESP32-C6-DevKitC-1-N4 + Flipper Zero).
 
@@ -33,15 +33,33 @@ here.
 
 For the full roadmap, phase boundaries, and each step's "done when" criteria, see [docs/PLAN.md](PLAN.md). For the complete dated history of how each step was designed, implemented, and debugged — including every bug's root cause — see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
 
-## Active investigation — needs hardware re-verification
+## 2026-09-13 fix batch: G30, G12, G19, G21, BL07
 
-**ESP32 disconnect without reconnect (BL07) — fix applied 2026-09-13, hardware-tested.** After flashing `wifi_interval_ms=5000`, the ESP32 would go silent after 5-15 minutes and never reconnect until the Flipper FAP was restarted. Root cause (found via code review): an undocumented reconnect-time throttle forced wardriving's Wi-Fi source to scan *more* aggressively (every 400ms) during a reconnect attempt than the steady-state default. Removed the throttle mechanism — confirmed via live serial log that MTU negotiation and session auth now complete cleanly on reconnect (G12 also verified working: `negotiated ATT MTU: 256`).
+Five items fixed and code-reviewed this session (`102a50f`, `6481400`), on top of the earlier
+wardriving WiFi-duty-cycle tuning (5s default) and BL07's throttle-removal fix from the same day:
 
-**However, a live forced-disconnect-during-active-wardriving retest the same day found a *separate* reconnect stall** with a different root cause than BL07 or the Wi-Fi-coexistence theory: `wardriving_ble_interval_cb()`'s periodic BLE re-arm can collide with its own in-flight connect attempt, independent of Wi-Fi. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01 for full evidence — **the wardriving BLE reconnect stall (G36) is not fully resolved**; treat it as still open.
+- **G12** (Flipper never used the negotiated ATT MTU) and **BL07** (ESP32 wouldn't reconnect
+  without a FAP restart) — both **hardware-confirmed via live serial log**: MTU negotiates to
+  256, `hello_ack` arrives in 2 fragments instead of 6+, plain disconnect/reconnect completes
+  cleanly with session re-auth.
+- **G30** (wardriving log cross-thread race) — build-verified, all host tests pass; live
+  concurrent-load test still needed, tracked as [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H02.
+- **G19** (reconnect task churn) and **G21** (path buffer sizing) — build-verified, no
+  user-visible behavior change expected; nothing further to test.
+
+**Found during live testing, not caused by today's fixes:** a forced disconnect while wardriving
+was actively running (Wi-Fi+BLE sources both on) hit a *separate* reconnect stall —
+`wardriving_ble_interval_cb()`'s periodic BLE re-arm colliding with its own in-flight connect
+attempt. Tracked as [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01. **This means the wardriving
+BLE reconnect stall (G36) is not fully resolved** — the earlier "RESOLVED" note based on the
+BLE-only isolation test's 7/7 result explained *a* cause, not the only one. Treat G36 as open.
 
 ## Known backlog (other open items)
 
-Step 8 (hardened persistent state, pairing-record/capability-file atomicity) and Step 9 (full negative-security-test suite) remain future work. See [BACKLOG.md](BACKLOG.md) for the complete list of open items by priority.
+Step 8 (hardened persistent state, pairing-record/capability-file atomicity) and Step 9 (full
+negative-security-test suite) remain future work. See [BACKLOG.md](BACKLOG.md) for the complete
+list of open items by priority, and [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) for deeper
+structural issues (H01, H02) that need their own investigation/design pass before fixing.
 
 ## Working conventions worth remembering every session
 

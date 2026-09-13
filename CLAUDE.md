@@ -20,6 +20,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Building, flashing, and pairing the two devices as they work today — scoped to what's actually implemented and hardware-verified. |
 | [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria. |
 | [docs/BACKLOG.md](docs/BACKLOG.md) | The single centralized list of open, actionable items — defects, deferred product decisions, cost/efficiency work. Check before starting anything not already in the current roadmap step. |
+| [docs/HARDENING_BACKLOG.md](docs/HARDENING_BACKLOG.md) | Deeper structural/robustness issues found during live testing that need their own investigation/design pass before fixing — distinct from BACKLOG.md's ready-to-fix items. |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why pairing/transport/delivery choices were made, and their accepted tradeoffs. |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The v2 wire contract — CBOR shapes, crypto derivations, UUIDs. Source of truth for both firmwares. |
 | [docs/PAIRING.md](docs/PAIRING.md) | The reset-gated X25519 pairing ceremony, step by step. |
