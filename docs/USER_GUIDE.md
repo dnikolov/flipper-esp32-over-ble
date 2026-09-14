@@ -151,16 +151,19 @@ Once an authenticated session is active and the Flipper's status line shows the 
 advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Up**
 from the main screen to open the wardriving control/status screen (hardware-verified).
 
-**Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, the
-records/source line reads `Source: WiFi+BLE`, `Source: WiFi only`, or `Source: BLE only`
-while wardriving is stopped, and **Left**/**Right** toggle Wi-Fi/BLE membership for the next
-start (at least one source always stays selected — toggling off the last remaining one is a
-no-op). This line and the toggle are only shown when the board has both sources; a board with
-only one has nothing to pick and always uses it, matching the original behavior. The
-selection defaults to both, so pressing **OK** without touching Left/Right behaves exactly as
-before. There's still no interval-entry screen — the ESP32 always applies its own default
-capture cadence (the most thorough setting validated during this project's radio-coexistence
-testing) for whichever source(s) are requested.
+**Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, while
+wardriving is stopped the records/source line displays the current source configuration, and
+**Left**/**Right** cycle through five options in order (wrapping): `WiFi(2s)+BLE` (default),
+`WiFi(2s)+BLE(p)`, `WiFi(0s)+BLE`, `WiFi(5s)+BLE`, and `BLE only`. The numbers represent
+seconds between Wi-Fi scans; `(p)` denotes a passive BLE scan during wardriving. `BLE only`
+omits Wi-Fi and captures only BLE devices. When recording is stopped, the next **OK** press
+will start wardriving with the currently selected source configuration.
+
+Passive wardriving uses passive BLE scanning while connected, but active discovery is retained
+during reconnect scanning intervals (when the board temporarily disconnects to rescan). This
+line and toggle are shown only when the board advertises both sources; a board with only one
+source has no selection option and always uses it. Press **OK** without touching Left/Right to
+start with the default configuration (WiFi(2s)+BLE).
 
 **Starting and stopping:** Press **OK** to start wardriving with the currently selected
 source(s). Once running, pressing **OK** again sends a stop command, and the records/source

@@ -36,7 +36,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | --- | --- | --- |
 | G03 | ESP32 marks the session `AUTHENTICATED` on its own GATT write-complete, not on peer confirmation | Open — needs a product decision on the `capability_query`-caveat (see appendix) |
 | G06 | Neither firmware sends the spec-mandated `unsupported_version` error + close | Open |
-| G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Open — **deferred at explicit user request**; re-confirm before implementing (see "Deferred" below). Fresh evidence 2026-09-13: also reproduces on the reconnect handshake itself (wardriving-status-query-answer racing a backlog-drain send), causing a full disconnect loop — see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H03. |
+| G07 | Any `send_protected*` clobbers an in-flight wardriving backlog drain (generalizes past `start`) | Implemented 2026-09-14 with a bounded ESP32 protected-TX FIFO; hardware reconnect/wardriving retest pending. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H03. |
 | G09 | Flipper advances `session_seq_out` even when notify delivery is unknown | Open |
 | BL01 | Flipper's `handle_pair_init()` runs unconditionally on any incoming `pair_init` — no local user-gesture/authorization-state check, contradicting [PAIRING.md](PAIRING.md) step 3's "user selects Add ESP32 board" | Open — low severity, works in practice; needs design clarification |
 
@@ -60,6 +60,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
 | BL07 | ESP32 status LED does not turn green when Flipper connects during wardriving session and starts flushing ESP backlog | Open |
+| BL09 | Filter the paired Flipper's BLE address out of scan and wardriving results | Open — define whether filtering applies to dedicated scans, wardriving capture, or both |
 
 ## Codebase & agent cost-efficiency
 
@@ -129,8 +130,14 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
     at all (the GPS module reports HDOP, not a meters-based error estimate). Not folded into the
     GPS-capability addition since it requires a wardriving-record wire-format change on both
     firmwares.
-  - Board-side autostart wardriving, independent of the Flipper initiating the session (a
-    board-specific setting) — unscoped.
+  - **Per-board wardriving autostart setting** — add persistent board configuration so
+    wardriving can start autonomously after ESP32 boot, independent of the Flipper initiating
+    the session; define the Flipper settings UI and get/set wire surface, boot-time interaction
+    with GPS fix availability, and how an active capture is stopped or disabled. Unscoped.
+  - **Persistent GPS GNSS configuration setting** — expose GPS constellation selection (GPS,
+    GLONASS, BeiDou) and related receiver configuration through board settings; define the
+    Flipper settings UI, authenticated get/set wire surface, ESP32 persistence, and safe
+    one-time UBX provisioning without sending configuration commands on every boot. Unscoped.
   - Runtime-configurable GPS UART GPIO pins via a Flipper Settings screen — deliberately split
     out of the frozen design (see PLAN.md's "Scope boundary" note) because it needs a
     form/pin-entry widget this project doesn't have yet and a new get/set wire config surface.
@@ -194,11 +201,9 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   cycle works but causes a cosmetic LED/screen flicker. This is a wire-protocol change (both
   firmwares) needing its own design session — backlogged at the user's explicit request, not a
   quick patch.
-- **G07** (TX single-flight clobbers wardriving drain) — user previously deferred the
-  narrower `start`-only form; this entry generalizes it to `stop`/`capability_query` too, and
-  as of 2026-09-13 to the reconnect handshake itself (see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md)
-  H03 — it can now cause a full disconnect loop, not just a one-off clobbered send).
-  Re-confirm the deferral still stands before implementing.
+- **G07** (TX single-flight clobbers wardriving drain) — deferral lifted 2026-09-14; a bounded
+  ESP32 protected-TX FIFO now serializes backlog, handshake, capability, status, and error
+  records. Hardware reconnect/wardriving retest remains before closing H03.
 
 ## Accepted, not a bug — do not "fix"
 

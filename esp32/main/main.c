@@ -291,6 +291,8 @@ static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
    24 bits and does not itself enforce this cap (session.h) -- both directions of a single
    session must stay strictly below this value or the AES-GCM nonce repeats. */
 #define FEB_SESSION_SEQUENCE_MAX 0xFFFFFFu
+#define FEB_TX_PENDING_PROTECTED_COUNT 4u
+#define FEB_TX_PENDING_TYPE_MAX 32u
 
 static const char *const feb_features[] = {"wifi_scan", "ble_scan", "wardriving", "gps"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
@@ -327,6 +329,7 @@ static ble_scan_source_t ble_scan_active_source;
    scan/window is actually in flight). */
 static bool wardriving_wifi_active;
 static bool wardriving_ble_active;
+static bool wardriving_ble_passive;
 static uint32_t wardriving_wifi_interval_ms;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
@@ -437,6 +440,18 @@ static size_t tx_fragment_lens[FEB_TX_MAX_FRAGMENTS];
 static size_t tx_fragment_write_pos;
 static uint8_t tx_fragment_total;
 static uint8_t tx_fragment_next;
+typedef struct {
+    uint16_t conn_handle;
+    char type[FEB_TX_PENDING_TYPE_MAX];
+    size_t type_len;
+    uint8_t payload[FEB_CBOR_MAX_PAYLOAD];
+    size_t payload_len;
+    tx_done_action_t next_action;
+} pending_protected_tx_t;
+static pending_protected_tx_t pending_protected_tx[FEB_TX_PENDING_PROTECTED_COUNT];
+static uint8_t pending_protected_tx_head;
+static uint8_t pending_protected_tx_count;
+static bool tx_dispatching_completion;
 
 static int gap_event(struct ble_gap_event *event, void *arg);
 static void nimble_host_task(void *arg);
@@ -986,14 +1001,9 @@ static bool encode_and_queue_protected_record(const char *type, size_t type_len,
     return queue_encoded_record_for_tx(record_len);
 }
 
-/* Shared tail of every protected-record send: encode+queue, advance rt_tx_sequence, arm
-   `next_action` for write_complete() to run once every fragment of this record has gone out,
-   and kick off the first fragment. `next_action` is TX_DONE_NONE for a one-shot record
-   (capability_response, error) or TX_DONE_CONTINUE_WIFI_SCAN when another status batch is
-   already queued behind this one (docs/PLAN.md "Wi-Fi scan capability" step). */
-static bool queue_and_send_protected(uint16_t conn_handle, const char *type, size_t type_len,
-                                     const uint8_t *payload, size_t payload_len,
-                                     tx_done_action_t next_action)
+static bool start_protected_send(uint16_t conn_handle, const char *type, size_t type_len,
+                                 const uint8_t *payload, size_t payload_len,
+                                 tx_done_action_t next_action)
 {
     if (rt_tx_sequence >= FEB_SESSION_SEQUENCE_MAX) {
         ESP_LOGW(TAG, "protected tx sequence at cap; closing to force a new session");
@@ -1007,6 +1017,67 @@ static bool queue_and_send_protected(uint16_t conn_handle, const char *type, siz
     tx_done_action = next_action;
     send_next_tx_fragment(conn_handle);
     return true;
+}
+
+static bool enqueue_protected_send(uint16_t conn_handle, const char *type, size_t type_len,
+                                   const uint8_t *payload, size_t payload_len,
+                                   tx_done_action_t next_action)
+{
+    uint8_t index;
+    pending_protected_tx_t *pending;
+
+    if (type_len >= FEB_TX_PENDING_TYPE_MAX || payload_len > FEB_CBOR_MAX_PAYLOAD ||
+        pending_protected_tx_count >= FEB_TX_PENDING_PROTECTED_COUNT) {
+        ESP_LOGW(TAG, "protected tx queue full or request too large");
+        return false;
+    }
+    index = (uint8_t)((pending_protected_tx_head + pending_protected_tx_count) %
+                      FEB_TX_PENDING_PROTECTED_COUNT);
+    pending = &pending_protected_tx[index];
+    pending->conn_handle = conn_handle;
+    memcpy(pending->type, type, type_len);
+    pending->type[type_len] = '\0';
+    pending->type_len = type_len;
+    memcpy(pending->payload, payload, payload_len);
+    pending->payload_len = payload_len;
+    pending->next_action = next_action;
+    pending_protected_tx_count++;
+    return true;
+}
+
+static bool start_next_pending_protected_send(void)
+{
+    pending_protected_tx_t *pending;
+
+    if (pending_protected_tx_count == 0) {
+        return true;
+    }
+    pending = &pending_protected_tx[pending_protected_tx_head];
+    if (!start_protected_send(pending->conn_handle, pending->type, pending->type_len,
+                              pending->payload, pending->payload_len, pending->next_action)) {
+        return false;
+    }
+    pending_protected_tx_head = (uint8_t)((pending_protected_tx_head + 1) %
+                                          FEB_TX_PENDING_PROTECTED_COUNT);
+    pending_protected_tx_count--;
+    return true;
+}
+
+/* Shared tail of every protected-record send: encode+queue, advance rt_tx_sequence, arm
+   `next_action` for write_complete() to run once every fragment of this record has gone out,
+   and kick off the first fragment. `next_action` is TX_DONE_NONE for a one-shot record
+   (capability_response, error) or TX_DONE_CONTINUE_WIFI_SCAN when another status batch is
+   already queued behind this one (docs/PLAN.md "Wi-Fi scan capability" step). */
+static bool queue_and_send_protected(uint16_t conn_handle, const char *type, size_t type_len,
+                                     const uint8_t *payload, size_t payload_len,
+                                     tx_done_action_t next_action)
+{
+    if (tx_fragment_next < tx_fragment_total || tx_dispatching_completion ||
+        pending_protected_tx_count > 0) {
+        return enqueue_protected_send(conn_handle, type, type_len, payload, payload_len,
+                                      next_action);
+    }
+    return start_protected_send(conn_handle, type, type_len, payload, payload_len, next_action);
 }
 
 static bool send_protected(uint16_t conn_handle, const char *type, size_t type_len,
@@ -1508,26 +1579,6 @@ static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t
         return;
     }
 
-    if (tx_fragment_next < tx_fragment_total) {
-        /* queue_and_send_protected()/queue_encoded_record_for_tx() share one
-           single-in-flight tx_fragment_* state across every capability (see
-           wardriving_tx_in_flight's own comment above) and have no re-entrancy guard
-           of their own: sending here while a wardriving status("data") batch (or any
-           other protected record) is still mid-fragmentation would reset that shared
-           state out from under the send already in progress, corrupting or losing it
-           -- the likely root cause of a real hardware report where leaving the
-           Wardriving/GPS screen open (the only source of this periodic, otherwise
-           unthrottled `gps` poll, docs/PROTOCOL.md) while wardriving is actively
-           streaming reliably broke the connection. `gps` is documented as having "no
-           exclusivity/busy concept" on the wire, so silently drop this poll's reply
-           rather than teaching every queue_and_send_protected() caller a new failure
-           mode -- the Flipper's gps_poll_timer simply retries every
-           GPS_POLL_PERIOD_MS regardless. */
-        ESP_LOGW(TAG, "gps status query dropped: protected tx busy (request_id=%llu)",
-                 (unsigned long long)cmd->request_id);
-        return;
-    }
-
     loc_state = location_get_fix(&fix);
     status_payload.request_id = cmd->request_id;
     switch (loc_state) {
@@ -1892,13 +1943,11 @@ static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
         return;
     }
     ble_scan_raw_count = 0;
-    /* Active, not passive (was passive through 2026-09-10): this window is also the merged
-       reconnect-scan pass (docs/PLAN.md "Revised long-run reconnect policy") while wardriving's
-       BLE source owns discovery. A live forced-disconnect test found reconnect silently never
-       matching under a passive-only re-arm here -- root-caused and fixed 2026-09-11
-       (docs/LESSONS.md); the dedicated reconnect scan in start_scan() has always used active
-       scanning and does find peers reliably. */
-    params.passive = 0;
+     /* Passive capture is safe while the authenticated connection is present. During reconnect,
+         use active discovery so the Flipper's service can still be found (a passive-only re-arm
+         was shown to miss the reconnect match in live testing). */
+     params.passive = wardriving_ble_passive &&
+                            runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED;
     params.filter_duplicates = 0;
     params.itvl = 0;
     params.window = 0;
@@ -2151,7 +2200,7 @@ static bool wardriving_source_requested(const feb_wardriving_command_payload_t *
    `wardriving` bullet. Field-presence/bounds validation this codec's decoder deliberately
    leaves to the caller (see cbor_wardriving.h's top-of-file comment) is all done here:
    action-dependent presence of `sources`/`wifi_interval_ms`/`ble_window_ms`+`ble_interval_ms`,
-   source values restricted to "wifi"/"ble" with no duplicates, board-capability gating
+    source values restricted to "wifi"/"ble"/"ble_passive" with no duplicates, board-capability gating
    against feb_features[], and the interval bounds from docs/PLAN.md step 4.
 
    Interpretation note on "required" vs "default when omitted" (resolved 2026-09-09,
@@ -2181,6 +2230,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     bool is_status_query;
     bool want_wifi = false;
     bool want_ble = false;
+    bool want_ble_passive = false;
     size_t i;
 
     status = feb_cbor_decode_wardriving_command_payload(cmd->arguments_span, cmd->arguments_span_len, &payload);
@@ -2305,15 +2355,17 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
 
     want_wifi = wardriving_source_requested(&payload, "wifi");
     want_ble = wardriving_source_requested(&payload, "ble");
+    want_ble_passive = wardriving_source_requested(&payload, "ble_passive");
     {
-        size_t recognized_count = (want_wifi ? 1u : 0u) + (want_ble ? 1u : 0u);
+        size_t recognized_count = (want_wifi ? 1u : 0u) + (want_ble ? 1u : 0u) +
+                                  (want_ble_passive ? 1u : 0u);
 
-        /* Catches both an unrecognized source string and a duplicate entry ("wifi","wifi")
+        /* Catches both an unrecognized source string and duplicate entries
            in one comparison: source_count can only equal recognized_count if every entry is
-           exactly one of "wifi"/"ble" and neither appears twice. Neither rule is an explicit
+           exactly one of "wifi"/"ble"/"ble_passive" and neither appears twice. Neither rule is an explicit
            docs/PROTOCOL.md sentence for the duplicate case -- a judgment call, since a
            repeated source is structurally nonsensical the same way an unrecognized one is. */
-        if (payload.source_count != recognized_count) {
+        if (payload.source_count != recognized_count || (want_ble && want_ble_passive)) {
             if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
                 ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
@@ -2329,7 +2381,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
             if (strcmp(feb_features[i], "wifi_scan") == 0) have_wifi_scan = true;
             if (strcmp(feb_features[i], "ble_scan") == 0) have_ble_scan = true;
         }
-        if ((want_wifi && !have_wifi_scan) || (want_ble && !have_ble_scan)) {
+        if ((want_wifi && !have_wifi_scan) || ((want_ble || want_ble_passive) && !have_ble_scan)) {
             if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
                 ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
@@ -2342,7 +2394,7 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         wardriving_resolved_intervals_t resolved;
 
         req.want_wifi = want_wifi;
-        req.want_ble = want_ble;
+        req.want_ble = want_ble || want_ble_passive;
         req.has_wifi_interval_ms = payload.has_wifi_interval_ms;
         req.wifi_interval_ms = payload.wifi_interval_ms;
         req.has_ble_params = payload.has_ble_params;
@@ -2408,11 +2460,13 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         ble_scan_raw_count = 0;
         wardriving_ble_window_ms = (uint32_t)payload.ble_window_ms;
         wardriving_ble_interval_ms = (uint32_t)payload.ble_interval_ms;
+        wardriving_ble_passive = want_ble_passive;
 
         /* Active, not passive -- see wardriving_ble_interval_cb()'s comment: this window is
            also the merged reconnect-scan pass while wardriving's BLE source owns discovery,
            and a passive-only pass here was found to never catch the reconnect match. */
-        params.passive = 0;
+        params.passive = wardriving_ble_passive &&
+                 runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED;
         params.filter_duplicates = 0;
         params.itvl = 0;
         params.window = 0;
@@ -2790,6 +2844,7 @@ static int write_complete(uint16_t conn_handle,
                           struct ble_gatt_attr *attr, void *arg)
 {
     tx_done_action_t action;
+    bool pending_started;
 
     if (error->status != 0) {
         ESP_LOGE(TAG, "GATT write failed: %d", error->status);
@@ -2823,6 +2878,7 @@ static int write_complete(uint16_t conn_handle,
 
     action = tx_done_action;
     tx_done_action = TX_DONE_NONE;
+    tx_dispatching_completion = true;
     switch (action) {
     case TX_DONE_AWAIT_PAIR_REPLY:
         ESP_LOGI(TAG, "pair_init sent; awaiting pair_reply");
@@ -2874,6 +2930,11 @@ static int write_complete(uint16_t conn_handle,
     }
     default:
         break;
+    }
+    tx_dispatching_completion = false;
+    pending_started = start_next_pending_protected_send();
+    if (!pending_started) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
 }
@@ -2961,6 +3022,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         tx_done_action = TX_DONE_NONE;
         tx_fragment_total = 0;
         tx_fragment_next = 0;
+        pending_protected_tx_head = 0;
+        pending_protected_tx_count = 0;
+        tx_dispatching_completion = false;
         feb_reassembly_reset(&rx_reassembly);
         wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
                                              deliberately persist across connect/disconnect */
@@ -2992,6 +3056,9 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         tx_done_action = TX_DONE_NONE;
         tx_fragment_total = 0;
         tx_fragment_next = 0;
+        pending_protected_tx_head = 0;
+        pending_protected_tx_count = 0;
+        tx_dispatching_completion = false;
         feb_reassembly_reset(&rx_reassembly);
         pairing_attempt_zeroize();
         runtime_auth_zeroize();

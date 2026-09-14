@@ -318,10 +318,10 @@ envelope — `arguments` already exists as a map for exactly this kind of extens
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `action` | text string | `"start"` or `"stop"`. Any other value is `invalid_command`. |
-| `sources` | array of text strings | `["wifi"]`, `["ble"]`, or `["wifi", "ble"]`. Required when `action = "start"`; must be absent when `action = "stop"`. A source the board does not advertise is `invalid_command`. |
+| `sources` | array of text strings | `["wifi"]`, `["ble"]`, `["ble_passive"]`, `["wifi", "ble"]`, or `["wifi", "ble_passive"]`. Required when `action = "start"`; must be absent when `action = "stop"`. `ble_passive` selects observer-only BLE scanning. A source the board does not advertise is `invalid_command`. |
 | `wifi_interval_ms` | unsigned integer | Wi-Fi scan cadence in milliseconds. Required when `"wifi"` is in `sources`; absent otherwise. Bounds: see "Interval bounds and defaults" below. Out-of-bounds values are rejected `invalid_command`. |
-| `ble_window_ms` | unsigned integer | BLE observer scan window in milliseconds. Required together with `ble_interval_ms` when `"ble"` is in `sources`; absent otherwise. |
-| `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` is in `sources`; absent otherwise. |
+| `ble_window_ms` | unsigned integer | BLE observer scan window in milliseconds. Required together with `ble_interval_ms` when `"ble"` or `"ble_passive"` is in `sources`; absent otherwise. |
+| `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` or `"ble_passive"` is in `sources`; absent otherwise. |
 
 **Interval bounds and defaults.** Bounds are the interval/duty-cycle values validated in
 [PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is step 4's
