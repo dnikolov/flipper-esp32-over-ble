@@ -1190,7 +1190,7 @@ static uint8_t capability_query_ciphertext_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_
    send_wifi_scan_command() failed 100% of the time (hardware-verified 2026-09-07: OK-press
    never reached the ESP32) before that fix; sized with real margin now, not shaved to the
    byte. */
-#define FEB_CMD_PAYLOAD_MAX_LEN 96u
+#define FEB_CMD_PAYLOAD_MAX_LEN 160u
 static uint8_t cmd_payload_buf[FEB_CMD_PAYLOAD_MAX_LEN];
 static uint8_t cmd_ciphertext_buf[FEB_CMD_PAYLOAD_MAX_LEN];
 static uint8_t cmd_record_buf[FEB_MAX_RECORD_SIZE];
@@ -2441,11 +2441,11 @@ static bool send_gps_command(Esp32App* app) {
    values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see the
    shared cmd_payload_buf declaration's own comment above for why this project no longer
    shaves these to the byte, and why FEB_CMD_PAYLOAD_MAX_LEN is sized off this capability's
-   96-byte worst case). FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size
+    160-byte worst case). FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size
    this function's local `arguments_buf`; the command payload/ciphertext/record scratch is
    the shared cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with wifi_scan's
    command scratch above. */
-#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 96u
+#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 128u
 static uint64_t wardriving_next_request_id = 1;
 
 /* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
