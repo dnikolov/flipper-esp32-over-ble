@@ -9,10 +9,10 @@ size_t feb_wardriving_csv_format_header(char *out, size_t out_cap) {
     int written = snprintf(
         out,
         out_cap,
-        "WigleWifi-1.4,appRelease=1.0.0,model=ESP32-C6,release=1.0.0,"
+        "WigleWifi-1.6,appRelease=1.0.0,model=ESP32-C6,release=1.0.0,"
         "device=flipper-esp32-over-ble,display=none,board=f7,brand=flipper\n"
         "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,"
-        "AltitudeMeters,AccuracyMeters,Type\n");
+        "AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type\n");
     if(written < 0 || (size_t)written >= out_cap) {
         return 0;
     }
@@ -214,7 +214,7 @@ size_t feb_wardriving_csv_format_row(
     int written = snprintf(
         out,
         out_cap,
-        "%s,%s,%s,%.*s,%s,%s,%ld,%.7f,%.7f,0,0,%s\n",
+        "%s,%s,%s,%.*s,%s,%s,%ld,%.7f,%.7f,0,0,,,%s\n",
         mac,
         ssid_field,
         auth_field,

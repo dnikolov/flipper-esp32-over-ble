@@ -1418,12 +1418,12 @@ static void test_wardriving_csv_format_header(void) {
     size_t n = feb_wardriving_csv_format_header(out, sizeof(out));
     CHECK(n > 0, "CSV_HEADER: format succeeds");
     CHECK(
-        n >= 14 && memcmp(out, "WigleWifi-1.4,", 14) == 0,
-        "CSV_HEADER: metadata line starts with WigleWifi-1.4,");
+        n >= 14 && memcmp(out, "WigleWifi-1.6,", 14) == 0,
+        "CSV_HEADER: metadata line starts with WigleWifi-1.6,");
     CHECK(
         strstr(out, "MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,"
-                    "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type") != NULL,
-        "CSV_HEADER: contains the WigleWifi-1.4 column header line");
+                "CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type") != NULL,
+        "CSV_HEADER: contains the WigleWifi-1.6 column header line");
     CHECK(out[n - 1] == '\n', "CSV_HEADER: ends with a newline");
 
     /* Too-small out_cap fails cleanly rather than writing a truncated/corrupt header. */

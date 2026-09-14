@@ -10,10 +10,9 @@
    Furi-dependent and lives in flipper_esp32_over_ble.c instead, calling into this module only
    for the pure byte-formatting.
 
-   Format is WigleWifi-1.4 (MAC, SSID, AuthMode, FirstSeen, Channel, Frequency, RSSI,
-   CurrentLatitude, CurrentLongitude, AltitudeMeters, AccuracyMeters, Type) -- WigleWifi-1.6
-   additionally adds RCOIs/MfgrId, which this project genuinely has no data source for, so
-   there is no benefit to the newer version tag for those two. Frequency is different: it's a
+   Format is WigleWifi-1.6 (MAC, SSID, AuthMode, FirstSeen, Channel, Frequency, RSSI,
+   CurrentLatitude, CurrentLongitude, AltitudeMeters, AccuracyMeters, RCOIs, MfgrId, Type).
+   RCOIs/MfgrId are blank because this project genuinely has no data source for them. Frequency is different: it's a
    deterministic function of a Wi-Fi Channel (2.4GHz only, matching this board's single radio),
    not a field needing its own data source, so it's included here despite the older version
    tag -- a WiGLE parser reads the column-header row itself, not just the version tag, to know
@@ -36,7 +35,7 @@
    feb_wardriving_csv_format_row() -- both header lines together are ~237 bytes; a
    maximally-escaped row (a 64-byte all-quote-character SSID, the longest defensively-clamped
    auth string, and the widest lat/lon/rssi text) is ~244 bytes. Rounded up with margin. */
-#define FEB_WARDRIVING_CSV_HEADER_MAX_LEN 256u
+#define FEB_WARDRIVING_CSV_HEADER_MAX_LEN 320u
 #define FEB_WARDRIVING_CSV_ROW_MAX_LEN 256u
 /* Real content is always "YYYY-MM-DD HH:MM:SS" == 19 bytes + NUL, but the caller-owned
    buffer this sizes is built with snprintf("%04u-%02u-%02u %02u:%02u:%02u", ...) from a
