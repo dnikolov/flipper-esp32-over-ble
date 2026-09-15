@@ -230,6 +230,19 @@ built and hardware-verified 2026-09-06:
 This is entirely ESP32-side — the Flipper isn't involved and doesn't need to be nearby or even
 powered on.
 
+## Wardriving autostart and boot-button toggle
+
+Once wardriving has been started on the ESP32, the board persists its on/off state and source settings (which sources enabled, scan intervals) to NVS flash. On the next boot, if wardriving was running when powered off, it automatically resumes with the same configuration — no action required.
+
+You can also toggle wardriving on/off using the onboard **BOOT button** without a Flipper nearby:
+
+- **Press and release within 100 ms to 1 second** to toggle wardriving on/off using the last-used settings, or sensible defaults (both Wi-Fi and active BLE enabled) if wardriving has never run on this board.
+- **Presses under ~100 ms** are ignored — contact bounce and accidental taps don't trigger.
+- **Presses held over 1 second but before the 5-second factory-reset point** are also ignored — treated as an aborted reset, so releasing after the first second is safe.
+- The LED reflects wardriving's state (blinking/solid purple when active, blinking/solid blue when idle); there's no distinct signal for the button press itself.
+
+This is entirely ESP32-side — the Flipper isn't involved and doesn't need to be nearby or even powered on.
+
 ## Two things to know before you rely on this
 
 These two items were found during the 2026-09-05 hardware verification session in the

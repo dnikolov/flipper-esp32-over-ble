@@ -15,4 +15,10 @@ void feb_factory_reset_start(void);
    between NVS erase and restart cannot leave the old secret sitting in SRAM. */
 void feb_wipe_pairing_secrets(void);
 
+/* Defined in main.c: hands a boot-button short press off to the wardriving on/off toggle,
+   which only ever runs on the NimBLE host task -- this function itself just arms a
+   ble_npl_callout and is safe to call from factory_reset_task(). A no-op (logs a warning)
+   if called before the NimBLE host task has finished its own startup. */
+void feb_wardriving_request_button_toggle(void);
+
 #endif

@@ -19,6 +19,16 @@ static const char *TAG = "feb_factory_reset";
 #define FEB_FACTORY_RESET_HOLD_MS 5000u
 #define FEB_FACTORY_RESET_POLL_MS 50u
 #define FEB_FACTORY_RESET_BLINK_MS 200u
+/* A release is treated as a wardriving on/off toggle press only within this window: at
+   least two poll ticks (rejects a single-tick electrical-bounce read, which
+   `press_ms >= FEB_FACTORY_RESET_POLL_MS` alone can't -- one tick of "pressed" already
+   guarantees press_ms >= FEB_FACTORY_RESET_POLL_MS by construction, so that comparison
+   never actually rejected anything), and short enough that it can't be an aborted
+   factory-reset hold (a user releasing at, say, 4s to back out of the reset gesture must
+   not also silently toggle wardriving). Anything released between MAX_MS and
+   FEB_FACTORY_RESET_HOLD_MS is treated as "gesture aborted, no action" -- not a toggle. */
+#define FEB_WARDRIVING_TOGGLE_MIN_MS (2u * FEB_FACTORY_RESET_POLL_MS)
+#define FEB_WARDRIVING_TOGGLE_MAX_MS 1000u
 
 static void perform_factory_reset(void)
 {
@@ -70,10 +80,18 @@ static void factory_reset_task(void *arg)
                 feb_ws2812_set(led_on ? 32 : 0, 0, 0);
             }
         } else if (held) {
-            /* Early release: abort silently, no erase, hand the LED back to the real
-               connection-status state (docs/PLAN.md). */
+            /* Early release: abort the factory-reset gesture, no erase, hand the LED back
+               to the real connection-status state (docs/PLAN.md). Only a release inside
+               [FEB_WARDRIVING_TOGGLE_MIN_MS, FEB_WARDRIVING_TOGGLE_MAX_MS) is treated as a
+               deliberate short press that toggles wardriving; a bounce-length blip or a
+               long-but-aborted reset hold does nothing (see those constants' comment). */
+            uint32_t press_ms = now_ms - hold_start_ms;
+
             held = false;
             feb_status_led_factory_reset_end();
+            if (press_ms >= FEB_WARDRIVING_TOGGLE_MIN_MS && press_ms < FEB_WARDRIVING_TOGGLE_MAX_MS) {
+                feb_wardriving_request_button_toggle();
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(FEB_FACTORY_RESET_POLL_MS));

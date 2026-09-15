@@ -51,6 +51,8 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | BL06 | Flipper does not reconnect when coming back in range of ESP32 while on wardriving screen during wardriving | Open |
 | G36 | Wardriving BLE reconnect can stall permanently | **Partially explained, not fully resolved.** BLE-only isolation test (7/7 successful reconnects) confirmed Wi-Fi coexistence starvation is *a* cause. But a live retest 2026-09-13 (after removing BL07's throttle) found a stall with a *different* mechanism — `wardriving_ble_interval_cb()`'s periodic re-arm colliding with its own in-flight connect attempt, independent of Wi-Fi entirely. See [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01 for the full evidence and proposed fix. Do not treat this as closed. |
 | BL04 | Wardriving CSV dedup table resets on disconnect, but file lifetime is per-calendar-day — same-day reconnect can re-log an address already written earlier that day | Open — lower priority (correctness is preserved, just allows edge-case duplicate rows within a day); candidate fix is to seed dedup table from existing file on reopen. |
+| BL10 | Wardriving screen shows `Start (delayed)` regardless of whether the ESP32 currently has a GPS fix | Open |
+| BL11 | GPS fix indicator on wardriving screen does not reflect the ESP32's actual GPS status; avoid reintroducing polling on this screen without resolving the prior polling-related issues | Open |
 
 ## P2 — robustness / cost / defense-in-depth
 
@@ -59,7 +61,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G18 | Flipper X25519 donna static ladder scratch (~3-4 KB) never zeroized, resident for the app's lifetime | Open |
 | G23 | Flipper reassembly-complete buffer read after mutex release; `profile_start()` resets it unlocked | Open |
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
-| BL07 | ESP32 status LED does not turn green when Flipper connects during wardriving session and starts flushing ESP backlog | Open |
+| BL07 | ESP32 status LED turns off instead of green when the Flipper app is closed while wardriving continues, then reopened and reconnected while the ESP32 flushes its backlog | Open |
 | BL09 | Filter the paired Flipper's BLE address out of scan and wardriving results | Open — define whether filtering applies to dedicated scans, wardriving capture, or both |
 
 ## Codebase & agent cost-efficiency
