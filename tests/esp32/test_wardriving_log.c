@@ -206,6 +206,17 @@ static void test_start_interval_resolution(void)
     check(resolved.wifi_interval_ms == 15000u,
           "start intervals: explicit wifi_interval_ms value is used, not the default");
 
+    /* Zero is the explicit continuous Wi-Fi mode used by the Flipper's WiFi(0s)+BLE
+       selection. */
+    memset(&req, 0, sizeof(req));
+    req.want_wifi = true;
+    req.has_wifi_interval_ms = 1;
+    req.wifi_interval_ms = 0u;
+    check(wardriving_resolve_start_intervals(&req, &resolved),
+          "start intervals: explicit zero wifi_interval_ms -> accepted");
+    check(resolved.wifi_interval_ms == 0u,
+          "start intervals: explicit zero wifi_interval_ms is preserved");
+
     /* An explicit, in-bounds ble window/interval pair is used as-is. */
     memset(&req, 0, sizeof(req));
     req.want_ble = true;

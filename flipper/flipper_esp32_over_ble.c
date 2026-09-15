@@ -134,8 +134,9 @@ typedef enum {
 typedef enum {
     WardrivingSourceWifi2Ble = 0,
     WardrivingSourceWifi2BlePassive,
-    WardrivingSourceWifi0Ble,
     WardrivingSourceWifi5Ble,
+    WardrivingSourceWifiOnly,
+    WardrivingSourceWifi0Ble,
     WardrivingSourceBleOnly,
     WardrivingSourceModeCount,
 } WardrivingSourceMode;
@@ -2461,14 +2462,14 @@ static bool send_wardriving_start_command(Esp32App* app) {
 
     feb_wardriving_command_payload_t command_args;
     bool use_wifi = app->wardriving_source_mode != WardrivingSourceBleOnly;
-    bool use_ble = true;
+    bool use_ble = app->wardriving_source_mode != WardrivingSourceWifiOnly;
     bool ble_passive = app->wardriving_source_mode == WardrivingSourceWifi2BlePassive;
     uint32_t wifi_interval_ms = 2000;
 
-    if(app->wardriving_source_mode == WardrivingSourceWifi0Ble) {
-        wifi_interval_ms = 0;
-    } else if(app->wardriving_source_mode == WardrivingSourceWifi5Ble) {
+    if(app->wardriving_source_mode == WardrivingSourceWifi5Ble) {
         wifi_interval_ms = 5000;
+    } else if(app->wardriving_source_mode == WardrivingSourceWifi0Ble) {
+        wifi_interval_ms = 0;
     }
     memset(&command_args, 0, sizeof(command_args));
     command_args.action = "start";
@@ -2490,9 +2491,11 @@ static bool send_wardriving_start_command(Esp32App* app) {
         command_args.has_wifi_interval_ms = 1;
         command_args.wifi_interval_ms = wifi_interval_ms;
     }
-    command_args.has_ble_params = 1;
-    command_args.ble_window_ms = 100;
-    command_args.ble_interval_ms = 500;
+    command_args.has_ble_params = use_ble;
+    if(use_ble) {
+        command_args.ble_window_ms = 100;
+        command_args.ble_interval_ms = 500;
+    }
     if(source_count == 0) {
         FURI_LOG_W(TAG, "wardriving start: no source selected/available");
         return false;
@@ -3357,11 +3360,14 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
         case WardrivingSourceWifi2BlePassive:
             source_label = "WiFi(2s)+BLE(p)";
             break;
-        case WardrivingSourceWifi0Ble:
-            source_label = "WiFi(0s)+BLE";
-            break;
         case WardrivingSourceWifi5Ble:
             source_label = "WiFi(5s)+BLE";
+            break;
+        case WardrivingSourceWifiOnly:
+            source_label = "WiFi only (2s)";
+            break;
+        case WardrivingSourceWifi0Ble:
+            source_label = "WiFi(0s)+BLE";
             break;
         default:
             source_label = "BLE only";

@@ -2099,6 +2099,7 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
     size_t remaining_after;
     size_t result_len;
     size_t payload_len;
+    size_t pending_now;
 
     /* The previous batch's records are only safe to evict from the flash log once
        write_complete() has confirmed every one of its fragments actually went out --
@@ -2119,12 +2120,15 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
 
     memset(&result, 0, sizeof(result));
     include_count = 0;
+    pending_now = wardriving_log_pending_count();
     while (include_count < peeked_count) {
         size_t trial_len;
 
         trial = result;
         trial.records[trial.record_count] = peeked[include_count];
         trial.record_count++;
+        trial.backlog_remaining = (pending_now >= trial.record_count) ?
+                                  (pending_now - trial.record_count) : 0;
         trial_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &trial);
         if (trial_len == 0 || trial_len + FEB_WARDRIVING_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
             if (result.record_count == 0) {
@@ -2143,10 +2147,7 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
         include_count++;
     }
 
-    {
-        size_t pending_now = wardriving_log_pending_count();
-        remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
-    }
+    remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
     result.backlog_remaining = remaining_after;
     result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
 
@@ -2162,6 +2163,13 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
 
     payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
                                                  sizeof(pairing_payload_encode_buf), &status_payload);
+    if (result_len == 0) {
+        ESP_LOGE(TAG, "wardriving status(data) result encode failed (records=%u, peeked=%u)",
+                 (unsigned)result.record_count, (unsigned)peeked_count);
+    } else if (payload_len == 0) {
+        ESP_LOGE(TAG, "wardriving status(data) wrapper encode failed (result_len=%u)",
+                 (unsigned)result_len);
+    }
     /* Always chain through TX_DONE_CONTINUE_WARDRIVING, even when remaining_after == 0:
        write_complete() only runs tx_done_action once every fragment of *this* record has
        gone out, so this is what keeps wardriving_tx_in_flight/wardriving_pending_drain_count
@@ -2169,10 +2177,17 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
        fragment queued (2026-09-10 GATT-write-flood bug, see wardriving_tx_in_flight's
        comment). The re-entry this triggers finds nothing left pending and clears the flag
        itself when this really was the last batch -- see the peeked_count == 0 branch above. */
-    if (payload_len == 0 ||
-        !queue_and_send_protected(conn_handle, "status", strlen("status"),
+    if (payload_len == 0) {
+        ESP_LOGE(TAG, "failed to build wardriving status(data) record");
+        wardriving_tx_in_flight = false;
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    if (!queue_and_send_protected(conn_handle, "status", strlen("status"),
                                   pairing_payload_encode_buf, payload_len,
                                   TX_DONE_CONTINUE_WARDRIVING)) {
+        ESP_LOGE(TAG, "failed to queue wardriving status(data) record (payload_len=%u)",
+                 (unsigned)payload_len);
         ESP_LOGE(TAG, "failed to build wardriving status(data) record");
         wardriving_tx_in_flight = false;
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);

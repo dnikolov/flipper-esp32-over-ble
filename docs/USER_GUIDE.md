@@ -153,10 +153,12 @@ from the main screen to open the wardriving control/status screen (hardware-veri
 
 **Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, while
 wardriving is stopped the records/source line displays the current source configuration, and
-**Left**/**Right** cycle through five options in order (wrapping): `WiFi(2s)+BLE` (default),
-`WiFi(2s)+BLE(p)`, `WiFi(0s)+BLE`, `WiFi(5s)+BLE`, and `BLE only`. The numbers represent
+**Left**/**Right** cycle through six options in order (wrapping): `WiFi(2s)+BLE` (default),
+`WiFi(2s)+BLE(p)`, `WiFi(5s)+BLE`, `WiFi only (2s)`, `WiFi(0s)+BLE`, and `BLE only`. The numbers represent
 seconds between Wi-Fi scans; `(p)` denotes a passive BLE scan during wardriving. `BLE only`
-omits Wi-Fi and captures only BLE devices. When recording is stopped, the next **OK** press
+omits Wi-Fi and captures only BLE devices. `WiFi only (2s)` omits BLE and captures only Wi-Fi
+networks. `WiFi(0s)+BLE` immediately starts the next Wi-Fi scan after each scan completes,
+while retaining the configured BLE capture cadence. When recording is stopped, the next **OK** press
 will start wardriving with the currently selected source configuration.
 
 Passive wardriving uses passive BLE scanning while connected, but active discovery is retained
