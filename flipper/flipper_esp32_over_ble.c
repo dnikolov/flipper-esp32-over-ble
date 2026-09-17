@@ -2985,10 +2985,21 @@ static void publish_badusb_type_string(const char* text) {
    Returns false only if the USB personality switch itself failed (furi_hal_usb_set_config
    returning false) -- the caller shows an immediate failure rather than entering the
    "waiting for publish" state, since without HID the script's bootstrap was never typed. */
+/* Hardware-verified fix, 2026-09-18: a direct HID -> usb_if_prev switch never actually
+   re-enumerated as CDC/serial on the host -- the publish host script waited the full 20s
+   port-discovery timeout and never saw the Flipper come back. Unleashed's own BadUSB app
+   (applications/main/bad_usb/bad_usb_app.c's alloc/free, helpers/bad_usb_hid.c's init/deinit)
+   never switches directly between two non-NULL USB interfaces either way -- it always detaches
+   first (furi_hal_usb_set_config(NULL, NULL)) before attaching the next one. Matched that
+   shape here on both transitions, with a short settle delay for the detach to actually take
+   before the next attach. */
 static bool publish_trigger_badusb(void) {
     FuriHalUsbInterface* usb_if_prev = furi_hal_usb_get_config();
+    furi_hal_usb_set_config(NULL, NULL);
+    furi_delay_ms(200);
     if(!furi_hal_usb_set_config(&usb_hid, NULL)) {
         FURI_LOG_E(TAG, "Publish: failed to switch USB to HID");
+        furi_hal_usb_set_config(usb_if_prev, NULL);
         return false;
     }
     furi_delay_ms(2000);
@@ -3003,6 +3014,8 @@ static bool publish_trigger_badusb(void) {
     furi_delay_ms(300);
 
     furi_hal_hid_kb_release_all();
+    furi_hal_usb_set_config(NULL, NULL);
+    furi_delay_ms(200);
     if(!furi_hal_usb_set_config(usb_if_prev, NULL)) {
         FURI_LOG_E(TAG, "Publish: failed to restore previous USB config");
     }
