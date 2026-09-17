@@ -239,6 +239,14 @@ Instead:
   with an actually-failed upload is a real data-loss risk. Since wdgwars's own response already
   reports a `duplicates` count, a safe re-upload of a file that partially succeeded earlier is not
   wasteful.
+  - **Explicit user decision, 2026-09-18, confirmed against the live API:** `POST /api/upload-csv`
+    (v1) can itself respond `202` with `{"ok": true, "queued": true, "job_id": ..., "poll_url":
+    ...}` — the same async-queued shape the docs above describe for v2, observed in practice from
+    the v1 endpoint too. `ok: true` at `202` is treated as confirmed enough to archive, the same as
+    a `200`; the script does not poll `poll_url` to wait for the queued job to actually finish
+    before renaming. This trades a small chance of archiving a CSV whose queued import later fails
+    server-side for not needing a whole second polling sub-flow — accepted deliberately, not an
+    oversight.
 - **One attempt per publish action — no automatic retry loop.** If a re-attempt is ever needed
   (e.g. a transient failure), the user re-triggers publish later; the script doesn't sleep-and-retry
   unattended. This keeps the "script deletes itself and its data when done" cleanup step simple and

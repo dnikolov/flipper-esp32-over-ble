@@ -462,7 +462,13 @@ try {
     $parsed = $null
     try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
 
-    if ($result.StatusCode -eq 200 -and $parsed -and $parsed.ok -eq $true) {
+    # 202 is wdgwars.pl's async-queued acknowledgement (docs/WARDRIVING_PUBLISH.md's v2
+    # upload-job behavior) -- confirmed 2026-09-18 that even /api/upload-csv (v1) can return
+    # it under real conditions, not just the documented v2 endpoint. ok:true here means the
+    # server has accepted and queued the upload, which this project treats as confirmed
+    # enough to archive -- an explicit user decision over waiting on the job to finish via
+    # poll_url, which this script does not do.
+    if (($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) -and $parsed -and $parsed.ok -eq $true) {
         $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $archivePath = "$script:WardrivingDir/$timestamp.csv"
         Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
