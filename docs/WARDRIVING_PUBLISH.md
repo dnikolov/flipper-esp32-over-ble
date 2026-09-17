@@ -147,13 +147,19 @@ storage.py`) already implements and this project already relies on (see
 known paths with the `Storage` API it already uses for CSV writing; it registers no new CLI verb.
 This also resolves Open Item 3 below by elimination: there is no new command name to pick.
 
-**On-SD file layout**, all under `/ext/apps_data/flipper_esp32_over_ble/` (same directory the
-capability cache already lives in):
-- `wardriving_current.csv` — the live accumulating capture file (replaces the old
-  `wardriving_YYYYMMDD.csv` per-day naming).
-- `wdgwars_credentials.txt` — the keyed credential store described below.
+**On-SD file layout**, under `/ext/apps_data/flipper_esp32_over_ble/` (same directory the
+capability cache already lives in) — **corrected 2026-09-18**, after briefly flattening
+everything during initial implementation:
+- `wardriving/wardriving_current.csv` — the live accumulating capture file (replaces the old
+  `wardriving/wardriving_YYYYMMDD.csv` per-day naming), in the same subdirectory the older
+  per-day files already lived in. A successful publish archives it, in place, to
+  `wardriving/<timestamp>.csv` (see "Result handling" below) — archived captures live
+  alongside the current file, not in a separate archive location.
+- `wdgwars_credentials.txt` — the keyed credential store described below. Flat at the app data
+  root, not inside `wardriving/` — it's publish-flow plumbing, not wardriving data, and (unlike
+  the CSV) forward-looking for wigle.net too.
 - `wardriving_publish_result.txt` — written by the host script after each publish attempt; read
-  and displayed by the FAP's Publish screen.
+  and displayed by the FAP's Publish screen. Also flat, same reasoning as the credentials file.
 
 ### Host script implementation: pure PowerShell, no external dependency
 

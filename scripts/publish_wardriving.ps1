@@ -17,7 +17,11 @@ $ErrorActionPreference = "Stop"
 
 $script:CliPrompt = ">: "
 $script:CliEol = "`r`n"
-$script:CsvFlipperPath = "$AppDataPath/wardriving_current.csv"
+# The wardriving CSV (current + archived) lives in its own "wardriving" subdirectory
+# alongside the FAP's older per-calendar-day export files; the credentials and result files
+# are publish-flow plumbing, not wardriving data, and stay flat at the app data root.
+$script:WardrivingDir = "$AppDataPath/wardriving"
+$script:CsvFlipperPath = "$script:WardrivingDir/wardriving_current.csv"
 $script:CredentialsFlipperPath = "$AppDataPath/wdgwars_credentials.txt"
 $script:ResultFlipperPath = "$AppDataPath/wardriving_publish_result.txt"
 
@@ -408,7 +412,7 @@ try {
 
     if ($result.StatusCode -eq 200 -and $parsed -and $parsed.ok -eq $true) {
         $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-        $archivePath = "$AppDataPath/$timestamp.csv"
+        $archivePath = "$script:WardrivingDir/$timestamp.csv"
         Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
         Rename-FlipperFile -Cli $cli -OldPath $script:CsvFlipperPath -NewPath $archivePath
 

@@ -56,15 +56,21 @@
 #define CAPABILITY_DIR_NAME "capabilities"
 #define FEB_CAPABILITIES_PATH_MAX_LEN 160
 /* App data root (docs/WARDRIVING_PUBLISH.md "On-SD file layout"): resolved once, same
-   resolve-once-from-this-app's-own-thread pattern as resolve_pairings_dir_path()'s comment,
-   but with no subdirectory of its own -- the wardriving CSV, the publish-result file, and
-   (host-script-owned, never read/written by this FAP) the wdgwars credentials file all live
-   flat at /ext/apps_data/flipper_esp32_over_ble/, because the already-frozen host script
-   (scripts/publish_wardriving.ps1) hardcodes that flat layout and this FAP has to match it,
-   not the other way around. Was a "wardriving" subdirectory before Phase 6; flattened when
-   the publish flow's fixed on-SD paths were designed. */
-#define FEB_WARDRIVING_CSV_FILENAME "wardriving_current.csv"
+   resolve-once-from-this-app's-own-thread pattern as resolve_pairings_dir_path()'s comment.
+   The publish-result file and (host-script-owned, never read/written by this FAP) the
+   wdgwars credentials file live flat here -- both are publish-flow plumbing, not wardriving
+   data. The wardriving CSV itself (current + host-script-archived) lives one level down, in
+   its own "wardriving" subdirectory (see WARDRIVING_DIR_NAME below) alongside the older
+   per-calendar-day export files that predate Phase 6 -- corrected 2026-09-18 after Phase 6
+   briefly flattened it to match an earlier draft of the host script; the host script itself
+   was updated instead, since only the wardriving CSV needed a directory, not the two
+   publish-flow files. */
 #define FEB_WARDRIVING_PUBLISH_RESULT_FILENAME "wardriving_publish_result.txt"
+/* Own subdirectory of the app data root, holding only wardriving CSV exports -- current and
+   host-script-archived alike (docs/WARDRIVING_PUBLISH.md "Result handling"). Same
+   resolve-once-and-mkdir pattern as CAPABILITY_DIR_NAME/PAIRING_DIR_NAME above. */
+#define WARDRIVING_DIR_NAME "wardriving"
+#define FEB_WARDRIVING_CSV_FILENAME "wardriving_current.csv"
 #define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 160
 /* Compact on-screen capability line: "<board>: <features>". Real values today are short
    ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
@@ -549,6 +555,8 @@ static char capabilities_dir_path[FEB_CAPABILITIES_PATH_MAX_LEN];
 static bool capabilities_dir_ready;
 static char app_data_root_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
 static bool app_data_root_ready;
+static char wardriving_dir_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+static bool wardriving_dir_ready;
 
 static bool resolve_pairings_dir_path(Storage* storage) {
     FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(PAIRING_DIR_NAME));
@@ -643,13 +651,13 @@ static bool build_capability_path(
 }
 
 /* Same resolve-once-from-this-app's-own-thread rationale as resolve_pairings_dir_path()
-   above. Unlike the pairings/capabilities directories, this resolves the app data root
-   itself (no subdirectory, no mkdir needed beyond what
-   storage_common_resolve_path_and_ensure_app_directory() already guarantees) -- see
-   FEB_WARDRIVING_CSV_FILENAME's own comment for why this must stay flat.
-   APP_DATA_PATH("") is "/data/" (trailing slash, from the macro's own "/" + path
-   concatenation); trimmed back off after resolution so every build_app_data_path() call
-   below doesn't produce a doubled "//" before the filename. */
+   above. Resolves the app data root itself (no subdirectory, no mkdir needed beyond what
+   storage_common_resolve_path_and_ensure_app_directory() already guarantees) -- only the two
+   publish-flow plumbing files (publish-result, and the host-script-owned credentials file)
+   live flat here; the wardriving CSV itself lives one level down, see
+   resolve_wardriving_dir_path() below. APP_DATA_PATH("") is "/data/" (trailing slash, from
+   the macro's own "/" + path concatenation); trimmed back off after resolution so every
+   build_app_data_path() call below doesn't produce a doubled "//" before the filename. */
 static bool resolve_app_data_root_path(Storage* storage) {
     FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(""));
     storage_common_resolve_path_and_ensure_app_directory(storage, resolved);
@@ -668,9 +676,51 @@ static bool resolve_app_data_root_path(Storage* storage) {
     return ok;
 }
 
-/* Builds "<app data root>/<filename>" into `out` -- shared by the wardriving CSV and the
-   publish-result file, both flat at the app data root (see FEB_WARDRIVING_CSV_FILENAME's
-   comment). Returns false if the root wasn't resolved at init or the result would truncate. */
+/* Same resolve-once-and-mkdir shape as resolve_pairings_dir_path() -- this one owns the
+   wardriving CSV's own subdirectory (WARDRIVING_DIR_NAME), which holds both the live
+   wardriving_current.csv and, after a successful publish, the host script's timestamped
+   archives (docs/WARDRIVING_PUBLISH.md "Result handling"). Depends on app_data_root_path
+   already being resolved -- called after resolve_app_data_root_path() at app startup. */
+static bool resolve_wardriving_dir_path(Storage* storage) {
+    if(!app_data_root_ready) {
+        return false;
+    }
+    FuriString* resolved = furi_string_alloc_printf("%s/%s", app_data_root_path, WARDRIVING_DIR_NAME);
+    bool ok = furi_string_size(resolved) < sizeof(wardriving_dir_path);
+    if(ok) {
+        strncpy(wardriving_dir_path, furi_string_get_cstr(resolved), sizeof(wardriving_dir_path) - 1);
+        wardriving_dir_path[sizeof(wardriving_dir_path) - 1] = '\0';
+    } else {
+        FURI_LOG_E(TAG, "Resolved wardriving dir path too long to cache");
+    }
+    furi_string_free(resolved);
+    if(!ok) {
+        return false;
+    }
+
+    FS_Error mkdir_err = storage_common_mkdir(storage, wardriving_dir_path);
+    if(mkdir_err != FSE_OK && mkdir_err != FSE_EXIST) {
+        FURI_LOG_E(TAG, "mkdir wardriving dir failed: %d", mkdir_err);
+        return false;
+    }
+    return true;
+}
+
+/* Builds "<wardriving dir>/<filename>" -- used for the wardriving CSV only (current file
+   today; the host script's own renamed archives land in this same directory but this FAP
+   never builds those paths itself). Returns false if the directory wasn't resolved at init
+   or the result would truncate. */
+static bool build_wardriving_path(char* out, size_t out_cap, const char* filename) {
+    if(!wardriving_dir_ready) {
+        return false;
+    }
+    int written = snprintf(out, out_cap, "%s/%s", wardriving_dir_path, filename);
+    return written > 0 && (size_t)written < out_cap;
+}
+
+/* Builds "<app data root>/<filename>" into `out` -- used for the publish-flow plumbing files
+   (publish-result, and the host-script-owned credentials file), both flat at the app data
+   root. Returns false if the root wasn't resolved at init or the result would truncate. */
 static bool build_app_data_path(char* out, size_t out_cap, const char* filename) {
     if(!app_data_root_ready) {
         return false;
@@ -2004,7 +2054,7 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
     if(wardriving_csv_file) {
         return true;
     }
-    if(!build_app_data_path(
+    if(!build_wardriving_path(
            wardriving_csv_path, sizeof(wardriving_csv_path), FEB_WARDRIVING_CSV_FILENAME)) {
         FURI_LOG_E(TAG, "wardriving CSV: path build failed");
         return false;
@@ -4513,6 +4563,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     app_data_root_ready = resolve_app_data_root_path(app.storage);
     if(!app_data_root_ready) {
         FURI_LOG_E(TAG, "Failed to resolve app data root path");
+    }
+    wardriving_dir_ready = resolve_wardriving_dir_path(app.storage);
+    if(!wardriving_dir_ready) {
+        FURI_LOG_E(TAG, "Failed to resolve wardriving directory path");
     }
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
