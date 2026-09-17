@@ -94,10 +94,10 @@
 /* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
    section: this runs unattended, with no review step, so "whatever's on the default branch
    right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
-   wire format). Currently a placeholder set to this branch's HEAD at implementation time,
-   not yet the actual commit that adds/changes scripts/publish_wardriving.ps1 -- bump this to
-   the real commit once this branch is pushed. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "4cd6c7dd75cf0e49aea0b7856b93170d8d72e1d2"
+   wire format). This is the commit that actually adds scripts/publish_wardriving.ps1,
+   confirmed pushed to origin/wardriving-publish via `git ls-remote` -- bump it again if that
+   script's contract changes after this. */
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "f7cc99628acf7f8c08e1338cffb9d6816f024d7e"
 
 typedef enum {
     CharacteristicWrite,
