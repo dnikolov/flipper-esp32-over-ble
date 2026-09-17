@@ -137,6 +137,15 @@ function Read-FlipperUntil {
             if ($b -ge 0) { $Buffer.Value.Add([byte]$b) }
         } catch [TimeoutException] {
             continue
+        } catch [System.IO.IOException] {
+            # A known .NET SerialPort quirk over USB CDC: a ReadByte() timeout sometimes
+            # surfaces as "The I/O operation has been aborted because of either a thread exit
+            # or an application request" (IOException) instead of a clean TimeoutException.
+            # Reproduced 2026-09-18 against real hardware mid-transfer. Treated the same as an
+            # ordinary timeout -- this loop's own $deadline above still bounds the overall
+            # wait, so a genuinely dead connection still surfaces as a clear timeout error
+            # rather than looping forever.
+            continue
         }
     }
 }
@@ -160,7 +169,12 @@ function Read-FlipperBytes {
         try {
             $n = $Serial.Read($out, $filled, $Count - $filled)
             if ($n -gt 0) { $filled += $n }
-        } catch [TimeoutException] {
+        } catch {
+            # See Read-FlipperUntil's own comment -- a real timeout can surface as either
+            # TimeoutException or IOException from this same underlying SerialPort quirk.
+            if ($_.Exception -isnot [TimeoutException] -and $_.Exception -isnot [System.IO.IOException]) {
+                throw
+            }
             if ((Get-Date) -gt $deadline) {
                 throw "Timed out after ${TimeoutSec}s reading $Count bytes from Flipper (CLI hung)"
             }
@@ -211,6 +225,12 @@ function Get-FlipperErrorText {
 function Test-FlipperFileExists {
     param($Cli, [string]$Path)
     Send-FlipperLine -Serial $Cli.Serial -Line "storage stat `"$Path`"`r"
+    # The Flipper's CLI echoes the command line back before printing its actual response --
+    # this first read discards that echo (same two-read shape as
+    # scripts/flipper/storage.py's send_and_wait_eol()-then-read.until() pattern, e.g. its
+    # exist_file()). Missing this made every stat/remove/rename call see its own echoed
+    # command instead of the real response (root-caused 2026-09-18 against real hardware).
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null
     $line = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol
     Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt | Out-Null
     return ($line -match "File, size:")
@@ -220,6 +240,7 @@ function Receive-FlipperFile {
     param($Cli, [string]$FlipperPath, [string]$LocalPath, [int]$ChunkSize = 8192)
 
     Send-FlipperLine -Serial $Cli.Serial -Line "storage read_chunks `"$FlipperPath`" $ChunkSize`r"
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null # echo
     $sizeLine = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol
     if (Test-FlipperErrorLine $sizeLine) {
         Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt | Out-Null
@@ -247,6 +268,7 @@ function Receive-FlipperFile {
 function Remove-FlipperFile {
     param($Cli, [string]$Path)
     Send-FlipperLine -Serial $Cli.Serial -Line "storage remove `"$Path`"`r"
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null # echo
     $line = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol
     Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt | Out-Null
     if ((Test-FlipperErrorLine $line) -and (Get-FlipperErrorText $line) -ne "file/dir not exist") {
@@ -286,6 +308,7 @@ function Send-FlipperFile {
 function Rename-FlipperFile {
     param($Cli, [string]$OldPath, [string]$NewPath)
     Send-FlipperLine -Serial $Cli.Serial -Line "storage rename `"$OldPath`" `"$NewPath`"`r"
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null # echo
     $line = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol
     Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt | Out-Null
     if (Test-FlipperErrorLine $line) {

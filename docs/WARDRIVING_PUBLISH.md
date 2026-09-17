@@ -58,10 +58,14 @@ and the server-side parser is the whole point of using this method (no on-device
 - No official rate-limit is stated for the CSV endpoints specifically (only `/api/me` documents
   `120 req/min`). Treat the CSV endpoints as "don't hammer it, one attempt per publish action"
   rather than assuming a specific number.
-- **Needs verification during implementation:** the official docs don't spell out exact non-200
-  HTTP status codes/error bodies for the CSV endpoints (e.g. bad key, malformed CSV, oversized
-  file). Confirm actual behavior against a real account before finalizing the host script's error
-  handling — don't assume specific codes not actually documented here.
+- **Partially confirmed against the live API, 2026-09-18:** a missing/invalid `X-API-Key`
+  returns HTTP `401` with body `{"ok":false,"error":"Missing or invalid API key"}` — observed via
+  a real end-to-end run of `scripts/publish_wardriving.ps1` against `https://wdgwars.pl/api/
+  upload-csv` with a deliberately-wrong key. The host script's existing handling (treat any
+  non-`200`-plus-`ok:true` response as a generic failure, never rename the CSV) already covers
+  this correctly without needing a code change. Still unconfirmed: malformed-CSV and
+  oversized-file behavior, which need a real account and a real (or intentionally-broken) upload
+  to observe — don't assume specific codes for those without testing.
 
 ## Publish flow
 
