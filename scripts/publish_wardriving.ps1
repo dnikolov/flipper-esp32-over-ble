@@ -29,30 +29,49 @@ $script:ResultFlipperPath = "$AppDataPath/wardriving_publish_result.txt"
 # Low-level CLI-over-serial client
 # ---------------------------------------------------------------------------
 
+# Retries the whole port scan, not just a single port open, for up to $TimeoutSec --
+# immediately after BadUSB types the bootstrap, the Flipper is still switching its USB
+# personality back from HID to its normal CDC/serial mode, and Windows can take several
+# seconds to detach the HID device, load the CDC driver, and assign a COM port. A single
+# GetPortNames() snapshot taken right as the script starts can easily miss it entirely, since
+# the port doesn't exist yet at that instant, not just fail to open (real-world failure seen
+# 2026-09-18: the script started and failed in well under a second, before the Flipper had
+# finished re-enumerating).
 function Find-FlipperPort {
-    $candidates = [System.IO.Ports.SerialPort]::GetPortNames()
-    foreach ($name in $candidates) {
-        try {
-            $probe = New-Object System.IO.Ports.SerialPort $name, 115200
-            $probe.ReadTimeout = 1500
-            $probe.WriteTimeout = 1500
-            $probe.Open()
-            Start-Sleep -Milliseconds 300
-            $buffer = New-Object System.Text.StringBuilder
-            $isFlipper = $false
-            $deadline = (Get-Date).AddSeconds(2)
-            while ((Get-Date) -lt $deadline) {
-                try {
-                    $b = $probe.ReadByte()
-                    if ($b -ge 0) { [void]$buffer.Append([char]$b) }
-                    if ($buffer.ToString().Contains($script:CliPrompt)) { $isFlipper = $true; break }
-                } catch [TimeoutException] { break }
+    param([int]$TimeoutSec = 20)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $printedWaitMessage = $false
+    while ((Get-Date) -lt $deadline) {
+        $candidates = [System.IO.Ports.SerialPort]::GetPortNames()
+        foreach ($name in $candidates) {
+            try {
+                $probe = New-Object System.IO.Ports.SerialPort $name, 115200
+                $probe.ReadTimeout = 1500
+                $probe.WriteTimeout = 1500
+                $probe.Open()
+                Start-Sleep -Milliseconds 300
+                $buffer = New-Object System.Text.StringBuilder
+                $isFlipper = $false
+                $probeDeadline = (Get-Date).AddSeconds(2)
+                while ((Get-Date) -lt $probeDeadline) {
+                    try {
+                        $b = $probe.ReadByte()
+                        if ($b -ge 0) { [void]$buffer.Append([char]$b) }
+                        if ($buffer.ToString().Contains($script:CliPrompt)) { $isFlipper = $true; break }
+                    } catch [TimeoutException] { break }
+                }
+                $probe.Close()
+                if ($isFlipper) { return $name }
+            } catch {
+                continue
             }
-            $probe.Close()
-            if ($isFlipper) { return $name }
-        } catch {
-            continue
         }
+        if (-not $printedWaitMessage) {
+            Write-Host "Flipper not found yet -- waiting for it to finish switching back from BadUSB mode..."
+            $printedWaitMessage = $true
+        }
+        Start-Sleep -Milliseconds 500
     }
     return $null
 }
