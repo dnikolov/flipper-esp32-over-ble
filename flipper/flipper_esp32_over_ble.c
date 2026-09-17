@@ -1,7 +1,8 @@
 #include <furi.h>
 #include <furi_hal_bt.h>
 #include <furi_hal_random.h>
-#include <furi_hal_rtc.h>
+#include <furi_hal_usb.h>
+#include <furi_hal_usb_hid.h>
 #include <bt/bt_service/bt.h>
 #include <ble/ble.h>
 #include <ble_glue.h>
@@ -54,12 +55,16 @@
    "pairings", same atomic-write pattern, one file per board_id. */
 #define CAPABILITY_DIR_NAME "capabilities"
 #define FEB_CAPABILITIES_PATH_MAX_LEN 160
-/* wardriving WiGLE CSV export directory (docs/CAPABILITIES.md's wardriving bullet), own
-   subdirectory next to "pairings"/"capabilities", same resolve-once-from-this-app's-own-
-   thread pattern -- see resolve_pairings_dir_path()'s comment for why. Unlike those two,
-   files here are append-only exports, not atomically-replaced state, so there is no
-   "*.tmp"/rename pattern for them (see wardriving_csv_ensure_open()). */
-#define WARDRIVING_EXPORT_DIR_NAME "wardriving"
+/* App data root (docs/WARDRIVING_PUBLISH.md "On-SD file layout"): resolved once, same
+   resolve-once-from-this-app's-own-thread pattern as resolve_pairings_dir_path()'s comment,
+   but with no subdirectory of its own -- the wardriving CSV, the publish-result file, and
+   (host-script-owned, never read/written by this FAP) the wdgwars credentials file all live
+   flat at /ext/apps_data/flipper_esp32_over_ble/, because the already-frozen host script
+   (scripts/publish_wardriving.ps1) hardcodes that flat layout and this FAP has to match it,
+   not the other way around. Was a "wardriving" subdirectory before Phase 6; flattened when
+   the publish flow's fixed on-SD paths were designed. */
+#define FEB_WARDRIVING_CSV_FILENAME "wardriving_current.csv"
+#define FEB_WARDRIVING_PUBLISH_RESULT_FILENAME "wardriving_publish_result.txt"
 #define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 160
 /* Compact on-screen capability line: "<board>: <features>". Real values today are short
    ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
@@ -78,6 +83,21 @@
    specified in PROTOCOL.md, so this is a judgment call, not a re-derivation of a frozen
    number. */
 #define GPS_POLL_PERIOD_MS 2000
+/* Publish-result poll cadence/timeout (docs/WARDRIVING_PUBLISH.md "Result handling") -- the
+   host script's own network call can legitimately take a while, so the timeout is generous;
+   neither number is wire-format-pinned, just a judgment call bounding an otherwise-unbounded
+   wait for a file that might never appear (host script never ran, USB never got plugged in,
+   etc). */
+#define FEB_PUBLISH_POLL_PERIOD_MS 2000u
+#define FEB_PUBLISH_POLL_TIMEOUT_MS 180000u
+#define FEB_PUBLISH_RESULT_MAX_LEN 512u
+/* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
+   section: this runs unattended, with no review step, so "whatever's on the default branch
+   right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
+   wire format). Currently a placeholder set to this branch's HEAD at implementation time,
+   not yet the actual commit that adds/changes scripts/publish_wardriving.ps1 -- bump this to
+   the real commit once this branch is pushed. */
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "4cd6c7dd75cf0e49aea0b7856b93170d8d72e1d2"
 
 typedef enum {
     CharacteristicWrite,
@@ -113,6 +133,7 @@ typedef enum {
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
     AppScreenWardriving,
+    AppScreenPublish,
 } AppScreen;
 
 typedef enum {
@@ -122,8 +143,20 @@ typedef enum {
     HomeMenuSettings,
     HomeMenuAbout,
     HomeMenuLegacy,
+    HomeMenuPublish,
     HomeMenuCount,
 } HomeMenuItem;
+
+/* Publish-result outcome (docs/WARDRIVING_PUBLISH.md "Result handling"): mirrors the host
+   script's own `status=` values one-for-one, plus Timeout/None for states the wire format
+   itself has no word for (this Flipper gave up waiting / hasn't tried yet this screen visit). */
+typedef enum {
+    PublishOutcomeNone = 0,
+    PublishOutcomeOk,
+    PublishOutcomeFail,
+    PublishOutcomeNothingToPublish,
+    PublishOutcomeTimeout,
+} PublishOutcome;
 
 typedef enum {
     ScanMenuWifi = 0,
@@ -186,6 +219,10 @@ typedef enum {
        comments for why the send itself never happens directly on the timer thread. */
     AppEventGpsStatus,
     AppEventGpsPollTick,
+    /* No payload -- publish_poll_timer_callback() posts this purely to make the main thread
+       do the actual file-existence check (same reasoning as AppEventGpsPollTick's own
+       comment). */
+    AppEventPublishPollTick,
 } AppEventType;
 
 /* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
@@ -231,8 +268,8 @@ typedef struct {
                                         correction (do not reset the counter). */
     uint32_t wardriving_batch_count;
     uint64_t wardriving_backlog_remaining;
-    bool wardriving_last_is_ble;
-    char wardriving_last_summary[40];
+    char wardriving_last_wifi_summary[40];
+    char wardriving_last_ble_summary[40];
     char wardriving_error_message[48];
     bool capability_has_gps;
     /* AppEventGpsStatus fields; gps_lat_e7_offset..gps_utc_timestamp_s are only meaningful
@@ -286,8 +323,8 @@ typedef struct {
     bool wardriving_running;
     uint32_t wardriving_records_this_session;
     uint64_t wardriving_backlog_remaining;
-    bool wardriving_last_is_ble;
-    char wardriving_last_summary[40];
+    char wardriving_last_wifi_summary[40];
+    char wardriving_last_ble_summary[40];
     char wardriving_error_message[48];
      WardrivingSourceMode wardriving_source_mode;
     bool capability_has_gps;
@@ -304,6 +341,21 @@ typedef struct {
     uint64_t gps_hdop_e1;
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
+    /* Publish screen state (docs/WARDRIVING_PUBLISH.md) -- independent of any BLE session or
+       ESP32 pairing, since the whole point of this flow is publishing later, at a computer,
+       with no board present. publish_waiting is true only while polling for the host
+       script's result file; publish_outcome is PublishOutcomeNone until a poll or a trigger
+       failure sets it. */
+    bool publish_waiting;
+    uint32_t publish_poll_elapsed_ms;
+    PublishOutcome publish_outcome;
+    uint32_t publish_imported;
+    uint32_t publish_captured;
+    uint32_t publish_updated;
+    uint32_t publish_duplicates;
+    uint32_t publish_no_gps;
+    uint32_t publish_bad_rows;
+    char publish_fail_message[96];
 } Esp32App;
 
 typedef struct {
@@ -389,6 +441,12 @@ static uint8_t outgoing_message_id;
    while connected" (a poll tick with no active session is just a harmless no-op send
    attempt -- see send_gps_command()'s own profile/pairing_phase guard). */
 static FuriTimer* gps_poll_timer;
+
+/* Publish-result poll timer (docs/WARDRIVING_PUBLISH.md) -- allocated/freed alongside
+   gps_poll_timer above; started only while AppScreenPublish is showing "waiting for
+   publish..." and stopped the moment a result is read, a timeout is hit, or the user backs
+   out. Independent of any BLE session, unlike gps_poll_timer. */
+static FuriTimer* publish_poll_timer;
 
 static const FuriHalBleProfileTemplate profile_callbacks;
 
@@ -489,8 +547,8 @@ static char pairings_dir_path[FEB_PAIRINGS_PATH_MAX_LEN];
 static bool pairings_dir_ready;
 static char capabilities_dir_path[FEB_CAPABILITIES_PATH_MAX_LEN];
 static bool capabilities_dir_ready;
-static char wardriving_export_dir_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-static bool wardriving_export_dir_ready;
+static char app_data_root_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+static bool app_data_root_ready;
 
 static bool resolve_pairings_dir_path(Storage* storage) {
     FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(PAIRING_DIR_NAME));
@@ -585,34 +643,40 @@ static bool build_capability_path(
 }
 
 /* Same resolve-once-from-this-app's-own-thread rationale as resolve_pairings_dir_path()
-   above. Unlike the pairings/capabilities directories, this one holds append-only CSV export
-   files (wardriving_csv_ensure_open() below), not atomically-replaced per-board state -- no
-   board_id-keyed path builder is needed here, since export files are named by timestamp, not
-   by board. */
-static bool resolve_wardriving_export_dir_path(Storage* storage) {
-    FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(WARDRIVING_EXPORT_DIR_NAME));
+   above. Unlike the pairings/capabilities directories, this resolves the app data root
+   itself (no subdirectory, no mkdir needed beyond what
+   storage_common_resolve_path_and_ensure_app_directory() already guarantees) -- see
+   FEB_WARDRIVING_CSV_FILENAME's own comment for why this must stay flat.
+   APP_DATA_PATH("") is "/data/" (trailing slash, from the macro's own "/" + path
+   concatenation); trimmed back off after resolution so every build_app_data_path() call
+   below doesn't produce a doubled "//" before the filename. */
+static bool resolve_app_data_root_path(Storage* storage) {
+    FuriString* resolved = furi_string_alloc_set_str(APP_DATA_PATH(""));
     storage_common_resolve_path_and_ensure_app_directory(storage, resolved);
-    bool ok = furi_string_size(resolved) < sizeof(wardriving_export_dir_path);
+    size_t resolved_len = furi_string_size(resolved);
+    if(resolved_len > 0 && furi_string_get_char(resolved, resolved_len - 1) == '/') {
+        furi_string_left(resolved, resolved_len - 1);
+    }
+    bool ok = furi_string_size(resolved) < sizeof(app_data_root_path);
     if(ok) {
-        strncpy(
-            wardriving_export_dir_path,
-            furi_string_get_cstr(resolved),
-            sizeof(wardriving_export_dir_path) - 1);
-        wardriving_export_dir_path[sizeof(wardriving_export_dir_path) - 1] = '\0';
+        strncpy(app_data_root_path, furi_string_get_cstr(resolved), sizeof(app_data_root_path) - 1);
+        app_data_root_path[sizeof(app_data_root_path) - 1] = '\0';
     } else {
-        FURI_LOG_E(TAG, "Resolved wardriving export path too long to cache");
+        FURI_LOG_E(TAG, "Resolved app data root path too long to cache");
     }
     furi_string_free(resolved);
-    if(!ok) {
-        return false;
-    }
+    return ok;
+}
 
-    FS_Error mkdir_err = storage_common_mkdir(storage, wardriving_export_dir_path);
-    if(mkdir_err != FSE_OK && mkdir_err != FSE_EXIST) {
-        FURI_LOG_E(TAG, "mkdir wardriving export dir failed: %d", mkdir_err);
+/* Builds "<app data root>/<filename>" into `out` -- shared by the wardriving CSV and the
+   publish-result file, both flat at the app data root (see FEB_WARDRIVING_CSV_FILENAME's
+   comment). Returns false if the root wasn't resolved at init or the result would truncate. */
+static bool build_app_data_path(char* out, size_t out_cap, const char* filename) {
+    if(!app_data_root_ready) {
         return false;
     }
-    return true;
+    int written = snprintf(out, out_cap, "%s/%s", app_data_root_path, filename);
+    return written > 0 && (size_t)written < out_cap;
 }
 
 /* Atomic per-board persistence: temp-file write, exact-length verification,
@@ -1850,16 +1914,21 @@ static void post_wardriving_batch(
     Esp32App* app,
     uint32_t batch_count,
     uint64_t backlog_remaining,
-    bool last_is_ble,
-    const char* last_summary) {
+    const char* last_wifi_summary,
+    const char* last_ble_summary) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWardrivingBatch;
     event->wardriving_batch_count = batch_count;
     event->wardriving_backlog_remaining = backlog_remaining;
-    event->wardriving_last_is_ble = last_is_ble;
     strncpy(
-        event->wardriving_last_summary, last_summary, sizeof(event->wardriving_last_summary) - 1);
+        event->wardriving_last_wifi_summary,
+        last_wifi_summary,
+        sizeof(event->wardriving_last_wifi_summary) - 1);
+    strncpy(
+        event->wardriving_last_ble_summary,
+        last_ble_summary,
+        sizeof(event->wardriving_last_ble_summary) - 1);
     furi_message_queue_put(app->queue, event, 0);
 }
 
@@ -1924,29 +1993,19 @@ static void wardriving_csv_close(void) {
     wardriving_csv_reset_state();
 }
 
-/* Filename is timestamped at creation (docs/CAPABILITIES.md: "one timestamped file per flush
-   session"); FSOM_OPEN_APPEND creates-if-absent and seeks to EOF, matching this file's
-   append-only, not atomically-replaced, write pattern (contrast with pairing_storage_save()'s
-   temp-file/rename dance, which does not fit an incrementally-appended, potentially
-   hours-long export). */
+/* Fixed filename (docs/WARDRIVING_PUBLISH.md "Capture-side change"): one "current" file that
+   keeps accumulating across however many capture sessions happen between publishes, no
+   calendar-date rollover. FSOM_OPEN_APPEND creates-if-absent and seeks to EOF, matching this
+   file's append-only, not atomically-replaced, write pattern (contrast with
+   pairing_storage_save()'s temp-file/rename dance, which does not fit an incrementally-
+   appended, potentially hours-long export). Only the host script renames this file away,
+   and only after a confirmed successful publish -- this FAP never renames it during capture. */
 static bool wardriving_csv_ensure_open(Storage* storage) {
     if(wardriving_csv_file) {
         return true;
     }
-    if(!wardriving_export_dir_ready) {
-        return false;
-    }
-    DateTime now;
-    furi_hal_rtc_get_datetime(&now);
-    int written = snprintf(
-        wardriving_csv_path,
-        sizeof(wardriving_csv_path),
-        "%s/wardriving_%04u%02u%02u.csv",
-        wardriving_export_dir_path,
-        (unsigned)now.year,
-        (unsigned)now.month,
-        (unsigned)now.day);
-    if(written <= 0 || (size_t)written >= sizeof(wardriving_csv_path)) {
+    if(!build_app_data_path(
+           wardriving_csv_path, sizeof(wardriving_csv_path), FEB_WARDRIVING_CSV_FILENAME)) {
         FURI_LOG_E(TAG, "wardriving CSV: path build failed");
         return false;
     }
@@ -2092,9 +2151,10 @@ static void
         wardriving_flush_led_active = true;
     }
 
-    bool last_is_ble = false;
-    static char last_summary[40];
-    last_summary[0] = '\0';
+    static char last_wifi_summary[40];
+    static char last_ble_summary[40];
+    last_wifi_summary[0] = '\0';
+    last_ble_summary[0] = '\0';
     for(size_t i = 0; i < result->record_count; i++) {
         const feb_wardriving_record_t* record = &result->records[i];
         if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record)) {
@@ -2105,12 +2165,11 @@ static void
                 post_wardriving_error(app, "CSV export write failed");
             }
         }
-        last_is_ble = record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE;
-        if(last_is_ble) {
+        if(record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE) {
             const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
             snprintf(
-                last_summary,
-                sizeof(last_summary),
+                last_ble_summary,
+                sizeof(last_ble_summary),
                 "%02x:%02x:%02x:%02x:%02x:%02x",
                 ble->address[0],
                 ble->address[1],
@@ -2120,22 +2179,22 @@ static void
                 ble->address[5]);
         } else {
             const feb_wardriving_wifi_payload_t* wifi = &record->payload.wifi;
-            size_t n =
-                wifi->ssid_len > sizeof(last_summary) - 1 ? sizeof(last_summary) - 1 : wifi->ssid_len;
+            size_t n = wifi->ssid_len > sizeof(last_wifi_summary) - 1 ? sizeof(last_wifi_summary) - 1
+                                                                       : wifi->ssid_len;
             for(size_t j = 0; j < n; j++) {
                 uint8_t b = wifi->ssid[j];
-                last_summary[j] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+                last_wifi_summary[j] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
             }
-            last_summary[n] = '\0';
+            last_wifi_summary[n] = '\0';
             if(n == 0) {
-                strncpy(last_summary, "(hidden)", sizeof(last_summary) - 1);
-                last_summary[sizeof(last_summary) - 1] = '\0';
+                strncpy(last_wifi_summary, "(hidden)", sizeof(last_wifi_summary) - 1);
+                last_wifi_summary[sizeof(last_wifi_summary) - 1] = '\0';
             }
         }
     }
 
     post_wardriving_batch(
-        app, (uint32_t)result->record_count, result->backlog_remaining, last_is_ble, last_summary);
+        app, (uint32_t)result->record_count, result->backlog_remaining, last_wifi_summary, last_ble_summary);
 
     if(wardriving_flush_led_active && result->backlog_remaining == 0 && app->notifications) {
         notification_message(app->notifications, &sequence_set_only_blue_255);
@@ -2819,6 +2878,275 @@ static void gps_poll_timer_callback(void* context) {
     furi_message_queue_put(app->queue, &event, 0);
 }
 
+/* Same reasoning as gps_poll_timer_callback above -- separate static AppEvent, since this
+   also runs on the Furi timer-service thread and can be in flight concurrently with it. */
+static void publish_poll_timer_callback(void* context) {
+    Esp32App* app = context;
+    static AppEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = AppEventPublishPollTick;
+    furi_message_queue_put(app->queue, &event, 0);
+}
+
+/* The exact fetch-and-run line from docs/WARDRIVING_PUBLISH.md's "Launch" section --
+   string-literal concatenation with the pinned-commit macro, not a runtime snprintf, since
+   both pieces are compile-time constants. */
+static const char publish_bootstrap_command[] =
+    "iwr -Uri 'https://raw.githubusercontent.com/dnikolov/flipper-esp32-over-ble/"
+    WARDRIVING_PUBLISH_SCRIPT_COMMIT
+    "/scripts/publish_wardriving.ps1' -OutFile \"$env:TEMP\\publish_wardriving.ps1\"; & "
+    "\"$env:TEMP\\publish_wardriving.ps1\"";
+
+static void publish_badusb_press_release(uint16_t keycode) {
+    furi_hal_hid_kb_press(keycode);
+    furi_hal_hid_kb_release(keycode);
+}
+
+/* No per-character delay -- matches Unleashed's own ducky_string()'s default (0ms
+   stringdelay) fast path: press-then-release each character back to back, relying on the
+   USB polling interval for pacing rather than an explicit sleep. */
+static void publish_badusb_type_string(const char* text) {
+    for(size_t i = 0; text[i] != '\0'; i++) {
+        uint16_t keycode = HID_ASCII_TO_KEY(text[i]);
+        if(keycode != HID_KEYBOARD_NONE) {
+            publish_badusb_press_release(keycode);
+        }
+    }
+}
+
+/* Types the BadUSB bootstrap sequence via furi_hal_hid_kb_press/release directly, rather than
+   chain-launching Unleashed's own bundled BadUSB app through the Loader service
+   (docs/WARDRIVING_PUBLISH.md's Open Item 4). Investigated and rejected: loader_start()
+   requires loader->app.thread to be NULL first (loader_do_is_locked(),
+   applications/services/loader/loader.c) -- while this FAP is the running foreground app,
+   that thread pointer is *this app's own thread*, so any loader_start() call from in here
+   fails with LoaderStatusErrorAppStarted ("please close ... first"). loader_enqueue_launch()
+   does work without that restriction, but only fires *after* this app fully exits -- which
+   is incompatible with this screen's own requirement to stay resident and poll for the
+   publish result once BadUSB has run. Direct HID typing is therefore the only option that
+   keeps this app in the foreground throughout. Modeled on Unleashed's own
+   applications/main/bad_usb/resources/badusb/examples/Install_qFlipper_windows.txt (GUI r ->
+   powershell -> Enter opens a fresh, known-focused console before anything is typed into it,
+   which is what makes blind keystroke injection safe to do unattended here).
+
+   Runs synchronously on this app's own main thread (the input-dispatch loop in
+   flipper_esp32_over_ble_app() below), never on BleEventWorker, so the 1280-byte stack
+   budget does not apply to the few-hundred-byte publish_bootstrap_command buffer above.
+   Returns false only if the USB personality switch itself failed (furi_hal_usb_set_config
+   returning false) -- the caller shows an immediate failure rather than entering the
+   "waiting for publish" state, since without HID the script's bootstrap was never typed. */
+static bool publish_trigger_badusb(void) {
+    FuriHalUsbInterface* usb_if_prev = furi_hal_usb_get_config();
+    if(!furi_hal_usb_set_config(&usb_hid, NULL)) {
+        FURI_LOG_E(TAG, "Publish: failed to switch USB to HID");
+        return false;
+    }
+    furi_delay_ms(2000);
+
+    publish_badusb_press_release(HID_KEYBOARD_R | KEY_MOD_LEFT_GUI);
+    furi_delay_ms(500);
+    publish_badusb_type_string("powershell");
+    publish_badusb_press_release(HID_KEYBOARD_RETURN);
+    furi_delay_ms(1200);
+    publish_badusb_type_string(publish_bootstrap_command);
+    publish_badusb_press_release(HID_KEYBOARD_RETURN);
+    furi_delay_ms(300);
+
+    furi_hal_hid_kb_release_all();
+    if(!furi_hal_usb_set_config(usb_if_prev, NULL)) {
+        FURI_LOG_E(TAG, "Publish: failed to restore previous USB config");
+    }
+    return true;
+}
+
+static bool publish_str_eq(const char* str, size_t str_len, const char* literal) {
+    size_t literal_len = strlen(literal);
+    return str_len == literal_len && memcmp(str, literal, literal_len) == 0;
+}
+
+static uint32_t publish_parse_uint(const char* value, size_t value_len) {
+    uint32_t result = 0;
+    for(size_t i = 0; i < value_len; i++) {
+        char c = value[i];
+        if(c < '0' || c > '9') {
+            break;
+        }
+        result = result * 10u + (uint32_t)(c - '0');
+    }
+    return result;
+}
+
+/* Parses wardriving_publish_result.txt (flat `key=value` lines, docs/WARDRIVING_PUBLISH.md
+   "Result handling") -- the host script's own format, not CBOR, since this codebase has no
+   JSON decoder and the host script deliberately avoided needing one either. `buf` is
+   file-scope static (see its own declaration) since this whole call chain runs on this app's
+   main thread with no reentrancy, matching this file's usual static-buffer convention. */
+static void publish_parse_result(Esp32App* app, const char* buf, size_t len) {
+    app->publish_imported = 0;
+    app->publish_captured = 0;
+    app->publish_updated = 0;
+    app->publish_duplicates = 0;
+    app->publish_no_gps = 0;
+    app->publish_bad_rows = 0;
+    app->publish_fail_message[0] = '\0';
+
+    bool status_ok = false;
+    bool status_fail = false;
+    bool status_nothing = false;
+
+    size_t pos = 0;
+    while(pos < len) {
+        size_t line_start = pos;
+        while(pos < len && buf[pos] != '\n' && buf[pos] != '\r') {
+            pos++;
+        }
+        size_t line_len = pos - line_start;
+        while(pos < len && (buf[pos] == '\n' || buf[pos] == '\r')) {
+            pos++;
+        }
+        if(line_len == 0) {
+            continue;
+        }
+
+        const char* line = buf + line_start;
+        const char* eq = memchr(line, '=', line_len);
+        if(!eq) {
+            continue;
+        }
+        size_t key_len = (size_t)(eq - line);
+        const char* value = eq + 1;
+        size_t value_len = line_len - key_len - 1;
+
+        if(publish_str_eq(line, key_len, "status")) {
+            status_ok = publish_str_eq(value, value_len, "ok");
+            status_fail = publish_str_eq(value, value_len, "fail");
+            status_nothing = publish_str_eq(value, value_len, "nothing_to_publish");
+        } else if(publish_str_eq(line, key_len, "imported")) {
+            app->publish_imported = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "captured")) {
+            app->publish_captured = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "updated")) {
+            app->publish_updated = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "duplicates")) {
+            app->publish_duplicates = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "no_gps")) {
+            app->publish_no_gps = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "bad_rows")) {
+            app->publish_bad_rows = publish_parse_uint(value, value_len);
+        } else if(publish_str_eq(line, key_len, "message")) {
+            size_t copy_len = value_len < sizeof(app->publish_fail_message) - 1 ?
+                                   value_len :
+                                   sizeof(app->publish_fail_message) - 1;
+            memcpy(app->publish_fail_message, value, copy_len);
+            app->publish_fail_message[copy_len] = '\0';
+        }
+    }
+
+    if(status_ok) {
+        app->publish_outcome = PublishOutcomeOk;
+    } else if(status_nothing) {
+        app->publish_outcome = PublishOutcomeNothingToPublish;
+    } else {
+        app->publish_outcome = PublishOutcomeFail;
+        if(!status_fail || app->publish_fail_message[0] == '\0') {
+            strncpy(
+                app->publish_fail_message,
+                status_fail ? "Publish failed" : "Unrecognized result file",
+                sizeof(app->publish_fail_message) - 1);
+            app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        }
+    }
+}
+
+/* Returns true once this result is final (either parsed, or a real open failure) -- false
+   means "not ready yet, keep polling". A confirmed real race, not a hypothetical one: the
+   host script's `storage write_chunk` CLI command (applications/services/storage/
+   storage_cli.c's storage_cli_write_chunk()) opens with FSOM_OPEN_APPEND, which makes the
+   file exist at 0 bytes for the brief window between that open and the single
+   storage_file_write() call that follows it -- a poll landing in that window must not be
+   read as a final, unreadable-file failure. */
+static bool publish_try_read_result(Esp32App* app, const char* path) {
+    static char buf[FEB_PUBLISH_RESULT_MAX_LEN];
+    File* file = storage_file_alloc(app->storage);
+    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    size_t read_len = 0;
+    if(ok) {
+        uint64_t size = storage_file_size(file);
+        size_t cap = size > sizeof(buf) ? sizeof(buf) : (size_t)size;
+        read_len = storage_file_read(file, buf, cap);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+
+    if(!ok) {
+        app->publish_outcome = PublishOutcomeFail;
+        strncpy(
+            app->publish_fail_message,
+            "Result file unreadable",
+            sizeof(app->publish_fail_message) - 1);
+        app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        return true;
+    }
+    if(read_len == 0) {
+        return false;
+    }
+    publish_parse_result(app, buf, read_len);
+    return true;
+}
+
+/* Called from the main loop's AppEventPublishPollTick handler, only while AppScreenPublish is
+   showing "waiting for publish..." (see that handler's own guard). */
+static void publish_poll_check(Esp32App* app) {
+    static char result_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+    if(!build_app_data_path(
+           result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME)) {
+        return;
+    }
+    if(storage_file_exists(app->storage, result_path) &&
+       publish_try_read_result(app, result_path)) {
+        furi_timer_stop(publish_poll_timer);
+        app->publish_waiting = false;
+        return;
+    }
+    app->publish_poll_elapsed_ms += FEB_PUBLISH_POLL_PERIOD_MS;
+    if(app->publish_poll_elapsed_ms >= FEB_PUBLISH_POLL_TIMEOUT_MS) {
+        furi_timer_stop(publish_poll_timer);
+        app->publish_waiting = false;
+        app->publish_outcome = PublishOutcomeTimeout;
+    }
+}
+
+/* OK-press handler for the idle Publish screen (docs/WARDRIVING_PUBLISH.md "Publish flow"):
+   deletes any stale result file first (so a leftover result from a previous run can never be
+   mistaken for this run's), triggers BadUSB, then starts polling. A failed USB-personality
+   switch shows an immediate failure instead of entering the waiting state, since the
+   bootstrap was never typed in that case. */
+static void publish_start(Esp32App* app) {
+    app->publish_outcome = PublishOutcomeNone;
+    app->publish_fail_message[0] = '\0';
+
+    char result_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+    if(build_app_data_path(
+           result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME)) {
+        storage_common_remove(app->storage, result_path);
+    }
+
+    if(!publish_trigger_badusb()) {
+        app->publish_outcome = PublishOutcomeFail;
+        strncpy(
+            app->publish_fail_message,
+            "Could not switch USB to HID",
+            sizeof(app->publish_fail_message) - 1);
+        app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        return;
+    }
+
+    app->publish_waiting = true;
+    app->publish_poll_elapsed_ms = 0;
+    furi_timer_stop(publish_poll_timer);
+    furi_timer_start(publish_poll_timer, furi_ms_to_ticks(FEB_PUBLISH_POLL_PERIOD_MS));
+}
+
 static BleEventAckStatus profile_event_handler(void* event, void* context) {
     Esp32BleProfile* profile = context;
     hci_event_pckt* event_packet = (hci_event_pckt*)(((hci_uart_pckt*)event)->data);
@@ -3392,19 +3720,27 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     }
     canvas_draw_str(canvas, 2, 22, line);
 
-    if(app->wardriving_last_summary[0] != '\0') {
+    if(app->wardriving_last_wifi_summary[0] != '\0') {
         snprintf(
             line,
             sizeof(line),
-            "Last %s: %s",
-            app->wardriving_last_is_ble ? "BLE" : "WiFi",
-            app->wardriving_last_summary);
-        canvas_draw_str(canvas, 2, 33, line);
+            "Last WiFi: %s",
+            app->wardriving_last_wifi_summary);
+        canvas_draw_str(canvas, 2, 32, line);
+    }
+
+    if(app->wardriving_last_ble_summary[0] != '\0') {
+        snprintf(
+            line,
+            sizeof(line),
+            "Last BLE: %s",
+            app->wardriving_last_ble_summary);
+        canvas_draw_str(canvas, 2, 42, line);
     }
 
     if(app->wardriving_error_message[0] != '\0') {
         snprintf(line, sizeof(line), "! %s", app->wardriving_error_message);
-        canvas_draw_str(canvas, 2, 44, line);
+        canvas_draw_str(canvas, 2, 52, line);
     }
 
     const char* footer;
@@ -3463,6 +3799,10 @@ static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
     case HomeMenuSettings:
     case HomeMenuAbout:
     case HomeMenuLegacy:
+    /* Publish is BLE-session-independent (docs/WARDRIVING_PUBLISH.md) -- reachable regardless
+       of pairing/connection state, same as Settings/About/Legacy above, unlike
+       Wardriving/Scan/Gps which require an active session. */
+    case HomeMenuPublish:
         return true;
     default:
         return false;
@@ -3819,6 +4159,72 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, 52, line);
 }
 
+/* docs/WARDRIVING_PUBLISH.md "Publish flow" -- three distinct states, matching this app's own
+   "don't conflate states" UI convention: idle instructions, waiting-with-poll, and outcome
+   (one of PublishOutcome's four real values). Row y-coordinates match draw_gps_screen's own
+   dense 22/32/42/52 layout, no separate footer row. */
+static void draw_publish_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Publish");
+    canvas_set_font(canvas, FontSecondary);
+
+    if(app->publish_waiting) {
+        canvas_draw_str(canvas, 2, 22, "Waiting for publish");
+        canvas_draw_str(canvas, 2, 32, "result...");
+        canvas_draw_str(canvas, 2, 42, "(watch the PC console)");
+        canvas_draw_str(canvas, 2, 52, "Back: cancel");
+        return;
+    }
+
+    if(app->publish_outcome == PublishOutcomeNone) {
+        canvas_draw_str(canvas, 2, 22, "Connect Flipper to a");
+        canvas_draw_str(canvas, 2, 32, "Windows PC via USB,");
+        canvas_draw_str(canvas, 2, 42, "then press OK.");
+        canvas_draw_str(canvas, 2, 52, "Back: return");
+        return;
+    }
+
+    if(app->publish_outcome == PublishOutcomeOk) {
+        char line[32];
+        canvas_draw_str(canvas, 2, 22, "Publish OK");
+        snprintf(line, sizeof(line), "imp=%lu dup=%lu",
+                 (unsigned long)app->publish_imported, (unsigned long)app->publish_duplicates);
+        canvas_draw_str(canvas, 2, 32, line);
+        snprintf(line, sizeof(line), "cap=%lu upd=%lu",
+                 (unsigned long)app->publish_captured, (unsigned long)app->publish_updated);
+        canvas_draw_str(canvas, 2, 42, line);
+        snprintf(line, sizeof(line), "nogps=%lu bad=%lu",
+                 (unsigned long)app->publish_no_gps, (unsigned long)app->publish_bad_rows);
+        canvas_draw_str(canvas, 2, 52, line);
+        return;
+    }
+
+    if(app->publish_outcome == PublishOutcomeNothingToPublish) {
+        canvas_draw_str(canvas, 2, 22, "No new data");
+        canvas_draw_str(canvas, 2, 32, "to publish.");
+        canvas_draw_str(canvas, 2, 52, "Back: return");
+        return;
+    }
+
+    if(app->publish_outcome == PublishOutcomeTimeout) {
+        canvas_draw_str(canvas, 2, 22, "Timed out waiting");
+        canvas_draw_str(canvas, 2, 32, "for publish result.");
+        canvas_draw_str(canvas, 2, 52, "Back: return");
+        return;
+    }
+
+    /* PublishOutcomeFail: word-wrap the free-text message (host-script text or this app's
+       own short fixed string) with the same helper the Settings screen uses for its
+       board/features rows -- an empty label just leaves every row width-22 for the message. */
+    canvas_draw_str(canvas, 2, 22, "Publish failed:");
+    char rows[3][64];
+    size_t row_count = 0;
+    wrap_field_rows(rows, 3, "", app->publish_fail_message, &row_count);
+    for(size_t i = 0; i < row_count && i < 3; i++) {
+        canvas_draw_str(canvas, 2, (uint8_t)(32 + i * HOME_ROW_HEIGHT), rows[i]);
+    }
+}
+
 static void draw_scan_screen(Canvas* canvas, Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "Scan");
@@ -3867,6 +4273,7 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
         "Settings",
         "About",
         "Legacy",
+        "Publish",
     };
 
     uint8_t visible_rows = home_menu_visible_rows(app);
@@ -3943,6 +4350,10 @@ static void draw_callback(Canvas* canvas, void* context) {
         draw_wardriving_screen(canvas, app);
         return;
     }
+    if(app->screen == AppScreenPublish) {
+        draw_publish_screen(canvas, app);
+        return;
+    }
 
     home_menu_fix_selection(app);
     draw_home_screen(canvas, app);
@@ -3980,6 +4391,14 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
         app->screen = AppScreenHome;
     }
     furi_timer_stop(gps_poll_timer);
+    /* Publish is BLE-session-independent (it runs after the ESP32 is long gone, see
+       docs/WARDRIVING_PUBLISH.md), so this reset path should never fire while it's in
+       progress -- stopped here anyway, defensively, so a stray disconnect/reconnect can
+       never leave an abandoned poll timer ticking forever against a screen nothing is
+       reading from. Does not touch publish_outcome: return_home already forces the screen
+       away, and the Home-menu entry point resets it fresh on next entry. */
+    furi_timer_stop(publish_poll_timer);
+    app->publish_waiting = false;
     pending_command_kind = PendingCommandNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
@@ -3995,7 +4414,8 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     app->wardriving_running = false;
     app->wardriving_records_this_session = 0;
     app->wardriving_backlog_remaining = 0;
-    app->wardriving_last_summary[0] = '\0';
+    app->wardriving_last_wifi_summary[0] = '\0';
+    app->wardriving_last_ble_summary[0] = '\0';
     app->wardriving_error_message[0] = '\0';
     wardriving_flush_led_active = false;
     if(app->notifications) {
@@ -4090,9 +4510,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     if(!capabilities_dir_ready) {
         FURI_LOG_E(TAG, "Failed to resolve capabilities directory path");
     }
-    wardriving_export_dir_ready = resolve_wardriving_export_dir_path(app.storage);
-    if(!wardriving_export_dir_ready) {
-        FURI_LOG_E(TAG, "Failed to resolve wardriving export directory path");
+    app_data_root_ready = resolve_app_data_root_path(app.storage);
+    if(!app_data_root_ready) {
+        FURI_LOG_E(TAG, "Failed to resolve app data root path");
     }
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
@@ -4104,6 +4524,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     furi_check(reassembly_timeout_timer);
     gps_poll_timer = furi_timer_alloc(gps_poll_timer_callback, FuriTimerTypePeriodic, &app);
     furi_check(gps_poll_timer);
+    publish_poll_timer =
+        furi_timer_alloc(publish_poll_timer_callback, FuriTimerTypePeriodic, &app);
+    furi_check(publish_poll_timer);
 
     ViewPort* view_port = view_port_alloc();
     view_port_draw_callback_set(view_port, draw_callback, &app);
@@ -4253,19 +4676,26 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                    must NOT reset counts we may already be accumulating this connection). */
                 app.wardriving_records_this_session = 0;
                 app.wardriving_backlog_remaining = 0;
-                app.wardriving_last_summary[0] = '\0';
+                app.wardriving_last_wifi_summary[0] = '\0';
+                app.wardriving_last_ble_summary[0] = '\0';
             }
             app.wardriving_error_message[0] = '\0';
         } else if(event.type == AppEventWardrivingBatch) {
             app.wardriving_records_this_session += event.wardriving_batch_count;
             app.wardriving_backlog_remaining = event.wardriving_backlog_remaining;
-            if(event.wardriving_last_summary[0] != '\0') {
-                app.wardriving_last_is_ble = event.wardriving_last_is_ble;
+            if(event.wardriving_last_wifi_summary[0] != '\0') {
                 strncpy(
-                    app.wardriving_last_summary,
-                    event.wardriving_last_summary,
-                    sizeof(app.wardriving_last_summary) - 1);
-                app.wardriving_last_summary[sizeof(app.wardriving_last_summary) - 1] = '\0';
+                    app.wardriving_last_wifi_summary,
+                    event.wardriving_last_wifi_summary,
+                    sizeof(app.wardriving_last_wifi_summary) - 1);
+                app.wardriving_last_wifi_summary[sizeof(app.wardriving_last_wifi_summary) - 1] = '\0';
+            }
+            if(event.wardriving_last_ble_summary[0] != '\0') {
+                strncpy(
+                    app.wardriving_last_ble_summary,
+                    event.wardriving_last_ble_summary,
+                    sizeof(app.wardriving_last_ble_summary) - 1);
+                app.wardriving_last_ble_summary[sizeof(app.wardriving_last_ble_summary) - 1] = '\0';
             }
         } else if(event.type == AppEventWardrivingError) {
             strncpy(
@@ -4292,6 +4722,10 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                active. */
             if(app.screen == AppScreenGps && app.capability_has_gps) {
                 send_gps_command(&app);
+            }
+        } else if(event.type == AppEventPublishPollTick) {
+            if(app.screen == AppScreenPublish && app.publish_waiting) {
+                publish_poll_check(&app);
             }
         } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
             if(app.connection_lost) {
@@ -4364,6 +4798,15 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         break;
                     case HomeMenuLegacy:
                         app.screen = AppScreenLegacy;
+                        break;
+                    case HomeMenuPublish:
+                        app.screen = AppScreenPublish;
+                        /* Fresh state on every entry, not just app start -- a previous
+                           visit's outcome (or an abandoned wait) must not leak into this
+                           one. */
+                        app.publish_outcome = PublishOutcomeNone;
+                        app.publish_waiting = false;
+                        furi_timer_stop(publish_poll_timer);
                         break;
                     default:
                         break;
@@ -4496,6 +4939,18 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.wardriving_source_mode =
                         (app.wardriving_source_mode + 1) % WardrivingSourceModeCount;
                 }
+            } else if(app.screen == AppScreenPublish) {
+                if(event.input.key == InputKeyBack) {
+                    /* Discards any in-progress wait, matching this app's "Back never
+                       persists data" convention -- the result file (if the host script does
+                       eventually write one) is simply never read; nothing on the Flipper
+                       side is lost by cancelling. */
+                    furi_timer_stop(publish_poll_timer);
+                    app.publish_waiting = false;
+                    app.screen = AppScreenHome;
+                } else if(event.input.key == InputKeyOk && !app.publish_waiting) {
+                    publish_start(&app);
+                }
             } else if(app.screen == AppScreenLegacy) {
                 if(event.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
@@ -4547,6 +5002,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     furi_timer_stop(gps_poll_timer);
     furi_timer_free(gps_poll_timer);
     gps_poll_timer = NULL;
+    furi_timer_stop(publish_poll_timer);
+    furi_timer_free(publish_poll_timer);
+    publish_poll_timer = NULL;
     furi_mutex_free(reassembly_mutex);
     reassembly_mutex = NULL;
     gui_remove_view_port(gui, view_port);

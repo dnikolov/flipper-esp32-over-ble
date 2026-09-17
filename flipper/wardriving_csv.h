@@ -111,8 +111,8 @@ size_t feb_wardriving_csv_format_row(
    (esp32/main/wardriving_dedup.c) already treats these as two separate tables (256 Wi-Fi /
    512 BLE) for exactly this reason. Capacities kept at the same 1:2 ratio but scaled down
    (144 total vs the ESP32's 768) since this table only needs to catch duplicates within one
-   calendar-day CSV file's dedup window, not gate the whole capture pipeline the way the
-   ESP32's own table does. */
+   connection session's dedup window (see this header's own comment above on scope/reset
+   timing), not gate the whole capture pipeline the way the ESP32's own table does. */
 #define FEB_WARDRIVING_DEDUP_WIFI_CAPACITY 48u
 #define FEB_WARDRIVING_DEDUP_BLE_CAPACITY 96u
 #define FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB 6
