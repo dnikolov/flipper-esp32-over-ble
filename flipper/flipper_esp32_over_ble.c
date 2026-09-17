@@ -101,9 +101,9 @@
    section: this runs unattended, with no review step, so "whatever's on the default branch
    right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
    wire format). This is the commit where scripts/publish_wardriving.ps1 last changed (the
-   wardriving/ subdirectory fix), confirmed pushed to origin/wardriving-publish via
+   port-discovery retry fix), confirmed pushed to origin/wardriving-publish via
    `git ls-remote` -- bump it again if that script's contract changes after this. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "c398cca8509e6bb8ed1ff82d10ae9657b8af0d25"
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "baca619477b60fd0ffa6493e75b033947f6c9ad6"
 
 typedef enum {
     CharacteristicWrite,
