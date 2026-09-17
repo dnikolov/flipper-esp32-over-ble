@@ -100,11 +100,10 @@
 /* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
    section: this runs unattended, with no review step, so "whatever's on the default branch
    right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
-   wire format). This is the commit where scripts/publish_wardriving.ps1 last changed (the
-   CLI echo-handling and false-timeout IOException fixes), confirmed pushed to
-   origin/wardriving-publish via `git ls-remote` -- bump it again if that script's contract
-   changes after this. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "e19d80ba9dc89ff3926f031ae2873c31af2e5ebf"
+   wire format). This is the commit where scripts/publish_wardriving.ps1 last changed (treat
+   HTTP 202/queued as confirmed success), confirmed pushed to origin/wardriving-publish via
+   `git ls-remote` -- bump it again if that script's contract changes after this. */
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "37e59bfd4dc6add498d9567a5d9728da29a41d46"
 
 typedef enum {
     CharacteristicWrite,
