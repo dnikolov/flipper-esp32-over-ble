@@ -77,6 +77,8 @@ static void location_recompute_locked(void)
 
     if (gga_fix && rmc_valid) {
         location_current.utc_timestamp_s = nmea_rmc_to_unix_time(&location_last_rmc);
+        location_current.speed_e1_kmh =
+            (location_last_rmc.speed_knots_e1 * 1852u) / 1000u;
         location_state = FEB_LOCATION_FIX;
     } else {
         location_state = FEB_LOCATION_ACQUIRING;

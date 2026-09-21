@@ -942,7 +942,8 @@ BLE_SCAN_STATUS_COMPLETE_PAYLOAD = status_payload(BLE_SCAN_REQUEST_ID, "complete
 # capability-agnostic generic validation pass, not only this file's from-scratch encoder.
 # =====================================================================================
 
-def wardriving_command_start(sources, wifi_interval_ms=None, ble_window_ms=None, ble_interval_ms=None) -> bytes:
+def wardriving_command_start(sources, wifi_interval_ms=None, ble_window_ms=None, ble_interval_ms=None,
+                              wifi_swelling=None, country=None) -> bytes:
     fields = [("action", cbor_text("start"))]
     fields.append(("sources", cbor_array_header(len(sources)) + b"".join(cbor_text(s) for s in sources)))
     if wifi_interval_ms is not None:
@@ -951,6 +952,10 @@ def wardriving_command_start(sources, wifi_interval_ms=None, ble_window_ms=None,
         fields.append(("ble_window_ms", cbor_uint(ble_window_ms)))
     if ble_interval_ms is not None:
         fields.append(("ble_interval_ms", cbor_uint(ble_interval_ms)))
+    if wifi_swelling is not None:
+        fields.append(("wifi_swelling", cbor_text(wifi_swelling)))
+    if country is not None:
+        fields.append(("country", cbor_text(country)))
     out = cbor_map_header(len(fields))
     for k, v in fields:
         out += cbor_text(k) + v
@@ -1014,6 +1019,7 @@ def wardriving_status_result(records, backlog_remaining: int) -> bytes:
 WARDRIVING_START_REQUEST_ID = 501
 WARDRIVING_STOP_REQUEST_ID = 502
 WARDRIVING_DATA_REQUEST_ID = 0  # unsolicited backlog-drain sentinel per docs/PROTOCOL.md
+WARDRIVING_START_SWELLING_COUNTRY_REQUEST_ID = 503
 
 # ---- command.arguments vectors: a start with both sources and explicit intervals, a
 # plain stop, and a start missing wifi_interval_ms despite "wifi" being in sources (a
@@ -1024,10 +1030,20 @@ WARDRIVING_START_BOTH_SOURCES = wardriving_command_start(
 WARDRIVING_STOP_ARGS = wardriving_command_stop()
 WARDRIVING_START_MISSING_INTERVAL = wardriving_command_start(["wifi"])  # no wifi_interval_ms
 
+# ---- wifi_swelling/country vectors (docs/WARDRIVING_REDESIGN.md, added 2026-09-21): a
+# wifi-only start carrying both new fields, appended after ble_interval_ms per
+# docs/PROTOCOL.md's field order. WARDRIVING_START_MISSING_INTERVAL above already covers
+# the "wifi in sources but wifi_swelling/country absent" structurally-OK-but-caller-rejected
+# case (has_wifi_swelling/has_country both 0 there), so no separate vector is needed for it. ----
+WARDRIVING_START_SWELLING_COUNTRY = wardriving_command_start(
+    ["wifi"], wifi_interval_ms=5000, wifi_swelling="aggressive", country="BG")
+
 WARDRIVING_START_COMMAND_PAYLOAD = command_payload("wardriving", WARDRIVING_START_REQUEST_ID, WARDRIVING_START_BOTH_SOURCES)
 WARDRIVING_STOP_COMMAND_PAYLOAD = command_payload("wardriving", WARDRIVING_STOP_REQUEST_ID, WARDRIVING_STOP_ARGS)
 WARDRIVING_START_MISSING_INTERVAL_COMMAND_PAYLOAD = command_payload(
     "wardriving", WARDRIVING_START_REQUEST_ID, WARDRIVING_START_MISSING_INTERVAL)
+WARDRIVING_START_SWELLING_COUNTRY_COMMAND_PAYLOAD = command_payload(
+    "wardriving", WARDRIVING_START_SWELLING_COUNTRY_REQUEST_ID, WARDRIVING_START_SWELLING_COUNTRY)
 
 # ---- a genuinely codec-level-malformed arguments map: an unrecognized field name, which
 # feb_cbor_decode_wardriving_command_payload() must hard-reject (FEB_CBOR_ERR_UNEXPECTED_TYPE),
@@ -1080,14 +1096,16 @@ WARDRIVING_STATUS_STOPPED_PAYLOAD = raw(
 # =====================================================================================
 
 def gps_result(lat: float, lon: float, fix_quality: int, satellites: int, hdop_e1: int,
-               utc_timestamp_s: int, altitude_m: float) -> bytes:
+               utc_timestamp_s: int, altitude_m: float, speed_kmh: float) -> bytes:
     lat_e7_offset = int(round(lat * 1e7)) + 900000000
     lon_e7_offset = int(round(lon * 1e7)) + 1800000000
     altitude_dm_offset = int(round(altitude_m * 10)) + 1000000
+    speed_e1_kmh = int(round(speed_kmh * 10))
     assert 1 <= lat_e7_offset <= 1800000001
     assert 1 <= lon_e7_offset <= 3600000001
     assert 0 <= altitude_dm_offset <= 2000000
-    out = cbor_map_header(7)
+    assert speed_e1_kmh >= 0
+    out = cbor_map_header(8)
     out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
     out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
     out += cbor_text("fix_quality") + cbor_uint(fix_quality)
@@ -1095,6 +1113,7 @@ def gps_result(lat: float, lon: float, fix_quality: int, satellites: int, hdop_e
     out += cbor_text("hdop_e1") + cbor_uint(hdop_e1)
     out += cbor_text("utc_timestamp_s") + cbor_uint(utc_timestamp_s)
     out += cbor_text("altitude_dm_offset") + cbor_uint(altitude_dm_offset)
+    out += cbor_text("speed_e1_kmh") + cbor_uint(speed_e1_kmh)
     return out
 
 
@@ -1104,7 +1123,7 @@ GPS_COMMAND_PAYLOAD = command_payload("gps", GPS_REQUEST_ID, cbor_map_header(0))
 GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
     "gps", GPS_REQUEST_ID, cbor_map_header(1) + cbor_text("foo") + cbor_uint(1))
 
-GPS_RESULT_FIX = gps_result(42.3601, -71.0589, 1, 9, 20, 1757667010, 52.9)
+GPS_RESULT_FIX = gps_result(42.3601, -71.0589, 1, 9, 20, 1757667010, 52.9, 45.6)
 
 GPS_STATUS_NO_SIGNAL_PAYLOAD = raw(
     cbor_map_header(2), cbor_text("request_id"), cbor_uint(GPS_REQUEST_ID),
@@ -1423,6 +1442,13 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD", WARDRIVING_BAD_FIELD_COMMAND_PAYLOAD))
     f.write("\n")
 
+    f.write("/* wifi_swelling/country vectors (docs/WARDRIVING_REDESIGN.md, added 2026-09-21):\n")
+    f.write("   a wifi-only start carrying both new fields, appended after ble_interval_ms. */\n")
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_ARGS", WARDRIVING_START_SWELLING_COUNTRY))
+    f.write(c_bytes("FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_COMMAND_PAYLOAD",
+                     WARDRIVING_START_SWELLING_COUNTRY_COMMAND_PAYLOAD))
+    f.write("\n")
+
     f.write("/* <wardriving-record> vectors: one wifi-sourced record, one ble-sourced record\n")
     f.write("   with a name, one ble-sourced record with no name (optional-field omission). */\n")
     f.write(c_bytes("FEB_VEC_WARDRIVING_RECORD_WIFI", WARDRIVING_RECORD_WIFI))
@@ -1455,7 +1481,8 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD", GPS_COMMAND_BAD_ARGUMENTS_PAYLOAD))
     f.write("\n")
 
-    f.write("/* status.result vector: one fix (all seven fields). */\n")
+    f.write("/* status.result vector: one fix (all eight fields, speed_e1_kmh appended\n")
+    f.write("   2026-09-21 per docs/WARDRIVING_REDESIGN.md). */\n")
     f.write(c_bytes("FEB_VEC_GPS_RESULT_FIX", GPS_RESULT_FIX))
     f.write("\n")
 

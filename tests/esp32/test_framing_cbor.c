@@ -616,6 +616,33 @@ static void test_wardriving_command_payload(void)
     }
     check(status == FEB_CBOR_ERR_UNEXPECTED_TYPE,
           "wardriving command (unrecognized field name): hard-rejected by the codec itself");
+
+    /* start, wifi only, with wifi_swelling/country (docs/WARDRIVING_REDESIGN.md, added
+       2026-09-21) -- appended after ble_interval_ms per docs/PROTOCOL.md's field order. */
+    status = feb_cbor_decode_command_payload(FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_COMMAND_PAYLOAD,
+                                              FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK) && cmd.request_id == 503;
+    if (ok) {
+        status = feb_cbor_decode_wardriving_command_payload(cmd.arguments_span, cmd.arguments_span_len, &wc);
+        ok = (status == FEB_CBOR_OK);
+        ok = ok && wc.has_sources && wc.source_count == 1;
+        ok = ok && wc.source_lens[0] == strlen("wifi") && memcmp(wc.sources[0], "wifi", wc.source_lens[0]) == 0;
+        ok = ok && wc.has_wifi_interval_ms && wc.wifi_interval_ms == 5000;
+        ok = ok && !wc.has_ble_params;
+        ok = ok && wc.has_wifi_swelling && wc.wifi_swelling_len == strlen("aggressive") &&
+             memcmp(wc.wifi_swelling, "aggressive", wc.wifi_swelling_len) == 0;
+        ok = ok && wc.has_country && wc.country_len == strlen("BG") &&
+             memcmp(wc.country, "BG", wc.country_len) == 0;
+    }
+    check(ok, "wardriving command (start, wifi only): decodes wifi_swelling/country");
+    if (ok) {
+        encoded_len = feb_cbor_encode_wardriving_command_payload(encode_buf, sizeof(encode_buf), &wc);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_ARGS,
+                       FEB_VEC_WARDRIVING_START_SWELLING_COUNTRY_ARGS_LEN),
+              "wardriving command (start, wifi only, wifi_swelling/country): encode round-trip byte-identical");
+    } else {
+        check(0, "wardriving command (start, wifi only, wifi_swelling/country): encode round-trip byte-identical");
+    }
 }
 
 static void test_wardriving_record_roundtrip(void)
@@ -785,10 +812,10 @@ static void test_gps_status_payload(void)
         status = feb_cbor_decode_gps_result_payload(st.result_span, st.result_span_len, &result);
         ok = (status == FEB_CBOR_OK) && result.fix_quality == 1 && result.satellites == 9 &&
              result.hdop_e1 == 20 && result.utc_timestamp_s == 1757667010 &&
-             result.altitude_dm_offset == 1000529;
+             result.altitude_dm_offset == 1000529 && result.speed_e1_kmh == 456;
     }
     check(ok, "gps status (fix): result decodes fix_quality/satellites/hdop_e1/utc_timestamp_s/"
-              "altitude_dm_offset");
+              "altitude_dm_offset/speed_e1_kmh");
 
     if (ok) {
         encoded_len = feb_cbor_encode_gps_result_payload(encode_buf, sizeof(encode_buf), &result);

@@ -149,56 +149,33 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 
 Once an authenticated session is active and the Flipper's status line shows the board
 advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Up**
-from the main screen to open the wardriving control/status screen (hardware-verified).
+from the main screen to open the wardriving screen. **Note: This feature is build-verified as of
+2026-09-21 but has not yet been tested on physical hardware.**
 
-**Choosing sources:** If the connected board advertises both `wifi_scan` and `ble_scan`, while
-wardriving is stopped the records/source line displays the current source configuration, and
-**Left**/**Right** cycle through six options in order (wrapping): `WiFi(2s)+BLE` (default),
-`WiFi(2s)+BLE(p)`, `WiFi(5s)+BLE`, `WiFi only (2s)`, `WiFi(0s)+BLE`, and `BLE only`. The numbers represent
-seconds between Wi-Fi scans; `(p)` denotes a passive BLE scan during wardriving. `BLE only`
-omits Wi-Fi and captures only BLE devices. `WiFi only (2s)` omits BLE and captures only Wi-Fi
-networks. `WiFi(0s)+BLE` immediately starts the next Wi-Fi scan after each scan completes,
-while retaining the configured BLE capture cadence. When recording is stopped, the next **OK** press
-will start wardriving with the currently selected source configuration.
+The wardriving screen has two layouts depending on whether recording is currently running:
 
-Passive wardriving uses passive BLE scanning while connected, but active discovery is retained
-during reconnect scanning intervals (when the board temporarily disconnects to rescan). This
-line and toggle are shown only when the board advertises both sources; a board with only one
-source has no selection option and always uses it. Press **OK** without touching Left/Right to
-start with the default configuration (WiFi(2s)+BLE).
+**Stopped screen** — a scrollable settings list (shown when wardriving is not running). Use **Up**/**Down** to move the highlighted row, and **Left**/**Right** to change that row's value. Each setting persists across app restarts. The available rows depend on what radios the connected board supports:
 
-**Starting and stopping:** Press **OK** to start wardriving with the currently selected
-source(s). Once running, pressing **OK** again sends a stop command, and the records/source
-line switches back to showing the records/backlog count (see below) — the source toggle only
-applies, and is only shown, while stopped. **Back** always returns to the main screen without
-stopping the capture — wardriving runs autonomously on the ESP32 regardless of whether this
-screen is open or the Flipper is even connected, so leaving the screen is pure navigation, not
-an implicit stop.
+| Row | Values | Shown when |
+| --- | --- | --- |
+| Mode | WiFi+BLE / WiFi / BLE | board advertises both `wifi_scan` and `ble_scan` |
+| WiFi Swelling | Normal / Aggressive / Speed-based | board advertises `wifi_scan` |
+| WiFi Cooldown | 5s / 2s / 0s | board advertises `wifi_scan` |
+| BLE Mode | Active / Passive | board advertises `ble_scan` |
+| Country | BG / RoW | board advertises `wifi_scan` |
 
-While stopped, the footer's start hint reads `OK: start` when the board currently reports a real
-GPS fix, or `OK: start (delayed)` otherwise (no fix yet, still acquiring, or no GPS status polled
-yet this session) — this is a label only, matching the same button press either way; wardriving
-is never blocked on having a fix (see "Location data" below).
+The WiFi Swelling setting controls the scan dwell time per channel: Normal uses the ESP32's default (fastest), Aggressive uses 85ms per channel for denser capture at the cost of slower scanning, and Speed-based automatically switches to Aggressive when the board's GPS reports movement faster than ~10 km/h (and back to Normal below ~8 km/h). The WiFi Cooldown values (5s/2s/0s) set the time between successive Wi-Fi scans. Country controls the WiFi regulatory region: BG sets Bulgaria's regulatory domain specifically (unlocking channels 1-13, active scan only), while RoW (Rest of World) keeps the safe worldwide default of channels 1-11 only — pick BG only if the board is actually operating in Bulgaria, not generically "in Europe." **Note: Passive BLE scanning (BLE Mode: Passive) is currently known to be broken in this firmware and omits BLE devices entirely rather than scanning passively — this is a known limitation, not a selection between two working modes.**
 
-**GPS fix indicator:** while this screen is open, the Flipper polls the board's `gps` status
-every 2 seconds and shows it appended to the records/source line as `GPS:Fix`, `GPS:Acq`
-(acquiring), `GPS:No sig` (no signal), or `GPS:?` (not polled yet this session). Only shown if
-the connected board advertises the `gps` capability.
+Press **OK** to start wardriving with the current settings. The footer shows `OK: start` when the board reports a real GPS fix, or `OK: start (delayed)` while still acquiring a fix — the label differs but the button press works either way (wardriving is never blocked on having a fix).
 
-**Screen contents:**
-- **Header** — `Wardriving: unknown`, `Wardriving: RUNNING`, or `Wardriving: stopped`. The
-  `unknown` state appears right after connecting: the wire protocol has no "is it currently
-  running?" query, so until this Flipper either starts/stops it itself or gets a `busy`/
-  `not_running` response correcting a guess, it genuinely doesn't know the ESP32's current
-  state — this is deliberate, not a bug, and OK will always try to start it from `unknown`.
-- **Records/backlog line** — a running count of records received this connected session, plus
-  either `Backlog: N` (still draining previously-buffered results from the ESP32's flash log)
-  or `Live` (caught up). While wardriving is stopped and the board advertises both sources,
-  this line instead shows the source selection (see "Choosing sources" above).
-- **Last result line** — the most recently received record's kind (WiFi/BLE) and a short
-  summary (SSID or BLE address).
-- **Error line** — appears only when something needs attention (e.g. the board reports it's
-  already running, or a CSV write failed).
+**Running screen** — shown when wardriving is actively recording. Displays:
+- **Header** — `Wardriving: RUNNING`.
+- **Records/backlog line** — a running count of records received this connected session, plus either `Backlog: N` (still draining previously-buffered results from the ESP32's flash log) or `Live` (caught up).
+- **Last result line** — the most recently received record's kind (WiFi/BLE) and a short summary (SSID or BLE address).
+- **GPS fix indicator** — the Flipper polls the board's `gps` status every 2 seconds and shows it appended as `GPS:Fix`, `GPS:Acq` (acquiring), `GPS:No sig` (no signal), or `GPS:?` (not polled yet this session). Only shown if the board advertises the `gps` capability.
+- **Error line** — appears only when something needs attention (e.g. the board reports it's already running, or a CSV write failed).
+
+Press **OK** to stop wardriving; press **Back** to return to the main screen without stopping the capture (wardriving runs autonomously on the ESP32, so leaving the screen is pure navigation, not an implicit stop).
 
 **Backlog drain:** Whenever the Flipper connects and authenticates, the ESP32 automatically
 sends any wardriving records it has buffered since the last connection — this happens whether
@@ -230,16 +207,43 @@ built and hardware-verified 2026-09-06:
 This is entirely ESP32-side — the Flipper isn't involved and doesn't need to be nearby or even
 powered on.
 
+## Home menu behavior with wardriving
+
+When you connect to a board that advertises the `wardriving` capability, the Home menu's cursor automatically jumps to the Wardriving option as soon as the session becomes active, even if you were viewing a different menu item (like Settings or About). This is a convenience feature to make wardriving easily accessible — if you want to stay on a different menu item, you can navigate away as normal. Additionally, in the Home menu, the Publish option now appears immediately after Wardriving in the menu order, making the publish flow easier to access after a wardriving session.
+
+## GPS screen
+
+Once an authenticated session is active and the Flipper's status line shows the board
+advertises `gps` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Down**
+from the main screen to view live GPS data read from the board. The screen displays:
+
+- **Latitude/Longitude** — the board's current position as reported by the GPS receiver.
+- **Altitude and Speed** — altitude in meters and ground speed in km/h (shown as `--` when there is no GPS fix yet).
+- **Fix state and time** — whether the board currently has a real GPS fix, along with the last-known UTC time.
+
+This screen updates in real time while the board has an active GPS fix. Speed data is particularly useful when wardriving with Speed-based WiFi Swelling enabled — the same speed value determines whether the scan dwell time switches to aggressive 85ms per-channel tuning.
+
 ## Wardriving autostart and boot-button toggle
 
-Once wardriving has been started on the ESP32, the board persists its on/off state and source settings (which sources enabled, scan intervals) to NVS flash. On the next boot, if wardriving was running when powered off, it automatically resumes with the same configuration — no action required.
+Once wardriving has been started on the ESP32, the board persists its on/off state to NVS flash. On the next boot, if wardriving was running when powered off, it automatically resumes — no action required.
 
 You can also toggle wardriving on/off using the onboard **BOOT button** without a Flipper nearby:
 
-- **Press and release within 100 ms to 1 second** to toggle wardriving on/off using the last-used settings, or sensible defaults (both Wi-Fi and active BLE enabled) if wardriving has never run on this board.
+- **Press and release within 100 ms to 1 second** to toggle wardriving on/off using the
+  ESP32's own last-used source/cooldown settings (or sensible defaults — both Wi-Fi and active
+  BLE enabled, 5s cooldown — if wardriving has never run on this board).
 - **Presses under ~100 ms** are ignored — contact bounce and accidental taps don't trigger.
 - **Presses held over 1 second but before the 5-second factory-reset point** are also ignored — treated as an aborted reset, so releasing after the first second is safe.
 - The LED reflects wardriving's state (blinking/solid purple when active, blinking/solid blue when idle); there's no distinct signal for the button press itself.
+
+**Important:** WiFi Swelling and Country (the two brand-new settings on the Flipper's Wardriving
+Stopped screen) are only ever applied when you start wardriving via the Flipper's OK press —
+starting via the BOOT button or boot autostart always uses Normal/RoW regardless of what's
+saved on the Flipper, since the ESP32 doesn't persist these two settings itself. Mode, WiFi
+Cooldown, and BLE Mode, by contrast, use whatever the ESP32 last had running (unchanged
+behavior from before this feature) — they just won't necessarily match what's currently shown
+on the Flipper's settings list if you've changed it there since the ESP32 last started
+wardriving on its own. This is a known simplification, not a bug.
 
 This is entirely ESP32-side — the Flipper isn't involved and doesn't need to be nearby or even powered on.
 

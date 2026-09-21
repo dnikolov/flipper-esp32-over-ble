@@ -110,6 +110,13 @@ above, for what actually ships today)
 
 #### Wardriving
 
+**Superseded 2026-09-21 by [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)** (Phase 7,
+implemented and build-verified, hardware-verification pending) — that doc is now the actual
+shipped design for this screen (Stopped/Running split, a persisted multi-row settings list,
+WiFi scan-dwell/country-code control, GPS speed). The text below describes what shipped in the
+original Phase 3a pass and is stale for Wardriving specifically; it is left as-is for history
+rather than rewritten in place.
+
 Unchanged from today's screen: source toggle (Wi-Fi/BLE/both, shown only while stopped and
 only when the board supports both), Start/Stop, live record count, backlog-drain count, Back.
 

@@ -8,10 +8,13 @@
    ---- `gps`-specific `status.result` map (docs/PROTOCOL.md "`gps` command and status
    payloads") ----
    Field order: lat_e7_offset, lon_e7_offset, fix_quality, satellites, hdop_e1,
-   utc_timestamp_s, altitude_dm_offset -- matches PROTOCOL.md's table exactly. `altitude_dm_offset`
-   was appended after the original six fields (added 2026-09-12, same design session) rather
-   than inserted next to lat/lon_e7_offset, since this codec's field order is meaningful (the
-   decoder below rejects out-of-order keys) and appending is the minimal, additive change.
+   utc_timestamp_s, altitude_dm_offset, speed_e1_kmh -- matches PROTOCOL.md's table exactly.
+   `altitude_dm_offset` was appended after the original six fields (added 2026-09-12, same
+   design session) rather than inserted next to lat/lon_e7_offset, since this codec's field
+   order is meaningful (the decoder below rejects out-of-order keys) and appending is the
+   minimal, additive change. `speed_e1_kmh` was appended after `altitude_dm_offset` the same
+   way (added 2026-09-21, docs/WARDRIVING_REDESIGN.md) -- ground speed in km/h * 10,
+   truncated, derived from the most recent valid RMC's speed-over-ground field.
    `lat_e7_offset`/`lon_e7_offset` use the exact same offset-encoding as <wardriving-record>'s
    fields (cbor_wardriving.h); callers convert to/from a real signed value themselves.
    `altitude_dm_offset` uses its own offset (see FEB_GPS_ALTITUDE_DM_OFFSET below) since
@@ -41,6 +44,7 @@ typedef struct {
     uint64_t hdop_e1;
     uint64_t utc_timestamp_s;
     uint64_t altitude_dm_offset;
+    uint64_t speed_e1_kmh;
 } feb_gps_result_payload_t;
 
 size_t feb_cbor_encode_gps_result_payload(uint8_t *out, size_t out_cap, const feb_gps_result_payload_t *payload);

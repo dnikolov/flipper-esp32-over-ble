@@ -53,6 +53,22 @@ this firmware's real feature list. **Still untested: an actual paired `wifi_scan
 round-trip against the Flipper**, and this board's Wi-Fi+BLE radio coexistence generally (step 5
 was skipped). Full detail: `docs/PROJECT_HISTORY.md`'s 2026-09-16/2026-09-17 entries.
 
+**Phase 7 (Wardriving screen redesign) implemented and build-verified 2026-09-21, hardware-verification pending.** Design: [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md). The
+Wardriving screen is now split into Stopped/Running (`AppScreenWardrivingStopped`/
+`AppScreenWardrivingRunning`), with a new persisted (`wardriving_settings.txt`) settings list on
+the Stopped screen: radio mode, WiFi scan-dwell "swelling" (Normal/Aggressive-85ms/Speed-based,
+the last self-switching on the ESP32 from its own parsed GPS speed), WiFi cooldown, BLE
+active/passive, and a new WiFi regulatory country-code toggle (`BG`/`RoW`). `HomeMenuPublish`
+now sits right after `HomeMenuWardriving`, and the Home cursor force-jumps to Wardriving the
+moment a wardriving-capable session goes active. The GPS screen now shows real speed (from a
+newly-parsed `RMC` speed-over-ground field). `esp32/`, `heltec/`, and the Flipper FAP all build
+clean; both host-native codec suites pass in full; `tools/check_shared_headers.py` is clean. Two
+open gaps, both recorded in [BACKLOG.md](BACKLOG.md)/that design doc: ESP32-side
+`wifi_swelling`/`country` aren't persisted across the button-toggle/boot-autostart wardriving
+paths (only a Flipper `start` command carries them), and the GPS screen's speed landed in the
+existing Alt row's placeholder rather than a dedicated row (no screen space left). No hardware
+testing done yet.
+
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete and hardware-verified.** Steps 1-7 are implemented and fully verified on real devices (ESP32-C6-DevKitC-1-N4 + Flipper Zero).
 
 **Phase 3a (Flipper UI menu redesign) is complete and hardware-verified.** The Home screen is menu-driven (`HomeMenuItem`: Wardriving/Scan/GPS/Settings/About/Legacy; Up/Down move, OK selects), with Wardriving/Scan/GPS hidden unless a session is active and the board's capability registry supports them, and Settings/About/Legacy always visible. A `connection_lost` flag keeps the active screen in place on disconnect/session-fatal and shows a banner instead of snapping back to Home. All screens (Home, Scan, GPS, Wardriving, Settings, About) have been hardware-tested and work as designed.

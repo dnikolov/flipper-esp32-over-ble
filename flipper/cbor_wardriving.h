@@ -10,26 +10,36 @@
    status payloads") ----
 
    `command.arguments` field order: action, sources, wifi_interval_ms, ble_window_ms,
-   ble_interval_ms -- matches PROTOCOL.md exactly. `sources`/`wifi_interval_ms`/
-   `ble_window_ms`+`ble_interval_ms` are present only for `action = "start"`, and their
-   presence is derived purely from the map's own field count at this layer (0, 1, 2, or 3
-   trailing fields after action+sources) -- this codec does NOT itself validate `action`'s
-   or `sources`' element values against "start"/"stop"/"wifi"/"ble" (that is a dispatch-layer
-   concern, same split as feb_wifi_scan_ap_t's phy/auth not being validated here). Internal
-   representation choice: `sources` is captured as a small array of caller-owned text
-   pointers (FEB_WARDRIVING_MAX_SOURCES == 2, the only two defined values today), not as
-   pre-resolved has_wifi_source/has_ble_source booleans -- dispatch-layer code inspects the
-   captured strings itself. `ble_window_ms`/`ble_interval_ms` are always required together
-   per PROTOCOL.md, so a single has_ble_params flag makes the invalid "one present, one
-   absent" state unrepresentable, rather than relying on the decoder to separately guard
-   against it (converged with the ESP32 side on this point 2026-09-08; ESP32 previously used
-   two separate flags). */
+   ble_interval_ms, wifi_swelling, country -- matches PROTOCOL.md exactly (`wifi_swelling`/
+   `country` appended 2026-09-21, docs/WARDRIVING_REDESIGN.md, per this protocol's
+   append-only convention). `sources`/`wifi_interval_ms`/`ble_window_ms`+`ble_interval_ms`/
+   `wifi_swelling`/`country` are present only for `action = "start"`, and their presence is
+   derived purely from the map's own field count at this layer (0, 2, 3, or 5 trailing
+   fields after action+sources -- the surviving combinations once `wifi_swelling`/`country`
+   always co-occur with `wifi_interval_ms`, per PROTOCOL.md's "required when wifi is in
+   sources" rule; 1 and 4 trailing fields are therefore not decodable shapes) -- this codec
+   does NOT itself validate `action`'s or `sources`' element values against
+   "start"/"stop"/"wifi"/"ble", nor `wifi_swelling`'s/`country`'s own text against their
+   enumerated wire values (that is a dispatch-layer concern, same split as
+   feb_wifi_scan_ap_t's phy/auth not being validated here) -- the two new fields report
+   presence via has_wifi_swelling/has_country independently of has_wifi_interval_ms/
+   has_ble_params, even though the caller-side "required iff wifi in sources" rule ties them
+   together in practice. Internal representation choice: `sources` is captured as a small
+   array of caller-owned text pointers (FEB_WARDRIVING_MAX_SOURCES == 2, the only two
+   defined values today), not as pre-resolved has_wifi_source/has_ble_source booleans --
+   dispatch-layer code inspects the captured strings itself. `ble_window_ms`/
+   `ble_interval_ms` are always required together per PROTOCOL.md, so a single
+   has_ble_params flag makes the invalid "one present, one absent" state unrepresentable,
+   rather than relying on the decoder to separately guard against it (converged with the
+   ESP32 side on this point 2026-09-08; ESP32 previously used two separate flags). */
 #ifndef FEB_CBOR_WARDRIVING_H
 #define FEB_CBOR_WARDRIVING_H
 
 #define FEB_WARDRIVING_MAX_SOURCES 2u
 #define FEB_WARDRIVING_ACTION_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_SOURCE_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
+#define FEB_WARDRIVING_SWELLING_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
+#define FEB_WARDRIVING_COUNTRY_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_WIFI_SSID_MAX_LEN FEB_WIFI_SCAN_SSID_MAX_LEN
 #define FEB_WARDRIVING_BLE_ADDRESS_LEN FEB_BLE_SCAN_ADDRESS_LEN
 #define FEB_WARDRIVING_BLE_NAME_MAX_LEN FEB_BLE_SCAN_NAME_MAX_LEN
@@ -47,6 +57,12 @@ typedef struct {
     uint64_t ble_interval_ms;
     int has_ble_params; /* ble_window_ms/ble_interval_ms are always present or absent
                             together per PROTOCOL.md */
+    const char *wifi_swelling;
+    size_t wifi_swelling_len;
+    int has_wifi_swelling;
+    const char *country;
+    size_t country_len;
+    int has_country;
 } feb_wardriving_command_payload_t;
 
 size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, const feb_wardriving_command_payload_t *payload);

@@ -42,6 +42,11 @@ int main(void)
     /* A VTG sentence (not parsed for data, but a valid NMEA sentence -- used to prove
        nmea_checksum_valid() is type-agnostic). */
     static const char vtg[] = "$GNVTG,0.00,T,,M,0.00,N,0.00,K,A*23";
+    /* Same as rmc_fix above but with a nonzero speed-over-ground field (12.3 knots, field
+       index 6) -- not in the captured log (which happened to read 0.00 knots stationary),
+       but structurally identical otherwise; checksum computed (not hand-derived) since XOR
+       of "12.3" happens to equal XOR of "0.00", so it's unchanged from rmc_fix's *72. */
+    static const char rmc_speed[] = "$GNRMC,091010.000,A,4242.30373,N,02742.79804,E,12.3,0.00,120926,,,A*72";
 
     nmea_gga_t gga;
     nmea_rmc_t rmc;
@@ -65,8 +70,13 @@ int main(void)
     ok = ok && rmc.status_active && rmc.hour == 9 && rmc.minute == 10 && rmc.second == 10;
     ok = ok && rmc.day == 12 && rmc.month == 9 && rmc.year_2digit == 26;
     check(ok, "RMC fix: parses status/time/date");
+    check(rmc.speed_knots_e1 == 0, "RMC fix: 0.00 knots parses to speed_knots_e1 0");
     /* 2026-09-12 09:10:10 UTC. */
     check(nmea_rmc_to_unix_time(&rmc) == 1789204210ULL, "RMC fix: unix time matches hand-computed value");
+
+    ok = nmea_parse_rmc(rmc_speed, strlen(rmc_speed), &rmc);
+    ok = ok && rmc.speed_knots_e1 == 123;
+    check(ok, "RMC with speed: 12.3 knots parses to speed_knots_e1 123");
 
     ok = nmea_parse_gga(gga_no_fix, strlen(gga_no_fix), &gga);
     ok = ok && gga.fix_quality == 0 && gga.lat_e7 == 0 && gga.lon_e7 == 0 && gga.altitude_dm == 0;

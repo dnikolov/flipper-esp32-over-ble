@@ -334,6 +334,27 @@ static bool wardriving_ble_passive;
 static uint32_t wardriving_wifi_interval_ms;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
+
+/* WiFi per-channel scan dwell-time ("swelling") control and regulatory country code
+   (docs/WARDRIVING_REDESIGN.md, added 2026-09-21) -- set once at wardriving_start_internal()
+   and read back by wardriving_wifi_interval_cb() on every re-arm. */
+typedef enum {
+    WARDRIVING_SWELLING_NORMAL = 0,
+    WARDRIVING_SWELLING_AGGRESSIVE = 1,
+    WARDRIVING_SWELLING_SPEED_BASED = 2,
+} wardriving_swelling_mode_t;
+
+typedef enum {
+    WARDRIVING_COUNTRY_ROW = 0,
+    WARDRIVING_COUNTRY_BG = 1,
+} wardriving_country_t;
+
+static wardriving_swelling_mode_t wardriving_wifi_swelling;
+/* Only meaningful while wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED --
+   tracks whether the aggressive 85ms dwell is currently selected, updated from a fresh
+   location_get_fix() read on every wardriving_wifi_interval_cb() re-arm (2 km/h hysteresis
+   band, see that function). Reset to false (normal) at every wardriving_start_internal(). */
+static bool wardriving_swelling_aggressive_active;
 static struct ble_npl_callout wardriving_wifi_interval_co;
 static struct ble_npl_callout wardriving_ble_interval_co;
 /* Last-saved on/off + Wi-Fi/BLE settings (wardriving_persist.h), loaded once at boot and
@@ -532,11 +553,14 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
 static void wardriving_send_next_batch(uint16_t conn_handle);
 static void wardriving_maybe_kick_send(uint16_t conn_handle);
 static void wardriving_self_stop(const char *error_code);
+static void wardriving_apply_wifi_swelling(wifi_scan_config_t *scan_cfg);
 static void wardriving_wifi_interval_cb(struct ble_npl_event *ev);
 static void wardriving_ble_interval_cb(struct ble_npl_event *ev);
 static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_ble_passive,
                                       uint32_t wifi_interval_ms, uint32_t ble_window_ms,
-                                      uint32_t ble_interval_ms);
+                                      uint32_t ble_interval_ms,
+                                      wardriving_swelling_mode_t wifi_swelling,
+                                      wardriving_country_t country);
 static void wardriving_stop_internal(void);
 static void wardriving_button_toggle_cb(struct ble_npl_event *ev);
 
@@ -1608,7 +1632,22 @@ static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t
     feb_location_t fix;
     feb_location_state_t loc_state;
     feb_status_payload_t status_payload = {0};
-    uint8_t result_buf[128];
+    /* map(1) + lat_e7_offset key(1+13)+value(up to 5, values to ~1.8e9) +
+       lon_e7_offset key(1+13)+value(5, up to ~3.6e9) + fix_quality key(1+11)+value(~1-2) +
+       satellites key(1+10)+value(~1-2) + hdop_e1 key(1+7)+value(~1-2) + utc_timestamp_s
+       key(1+15)+value(5, real Unix timestamps need the full 4-byte uint32 form) +
+       altitude_dm_offset key(1+18)+value(5, offset keeps this > 65535) + speed_e1_kmh
+       key(1+12)+value(~1-3) == ~133 bytes worst case with real (large) field values -- found
+       (2026-09-21, hardware-verified) to exceed the previous 128-byte sizing in practice, not
+       just in a theoretical worst case: real lat/lon/timestamp/altitude values are large
+       enough to need their full uint encoding on every genuine fix, so
+       feb_cbor_encode_gps_result_payload() failed on every single `gps` status reply once a
+       real fix existed, silently downgrading every reply to an `internal_error` (result_len
+       == 0 below) -- the GPS screen never actually decoded a bad payload, it just never
+       received a `status` reply at all. Sized with real margin now, not shaved to the byte,
+       matching this file's `cmd_payload_buf`/`FEB_CMD_PAYLOAD_MAX_LEN` precedent for the same
+       failure class on the Flipper side. */
+    uint8_t result_buf[192];
     size_t payload_len;
 
     if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
@@ -1641,6 +1680,7 @@ static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t
         result.hdop_e1 = fix.hdop_e1;
         result.utc_timestamp_s = fix.utc_timestamp_s;
         result.altitude_dm_offset = (uint64_t)((int64_t)fix.altitude_dm + FEB_GPS_ALTITUDE_DM_OFFSET);
+        result.speed_e1_kmh = fix.speed_e1_kmh;
 
         result_len = feb_cbor_encode_gps_result_payload(result_buf, sizeof(result_buf), &result);
         if (result_len == 0) {
@@ -1953,7 +1993,15 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
    wardriving_wifi_interval_ms (0 = immediate/continuous) -- runs on the NimBLE host task
    (wardriving_wifi_interval_co's queue), consistent with handle_wardriving_command() and
    handle_wifi_scan_command() both already calling esp_wifi_scan_start() from that same
-   task. */
+   task.
+
+   docs/WARDRIVING_REDESIGN.md (2026-09-21): when wardriving_wifi_swelling is
+   WARDRIVING_SWELLING_SPEED_BASED, this is also where the next scan's dwell mode is
+   decided -- a fresh location_get_fix() read (never cached, per location.h) compared
+   against a 2 km/h hysteresis band (>=10.0 km/h switches to aggressive, <8.0 km/h switches
+   back to normal; a no-fix/unknown state leaves wardriving_swelling_aggressive_active
+   unchanged). wardriving_apply_wifi_swelling() then reads that flag (or the fixed
+   normal/aggressive mode) to set scan_cfg's dwell before this scan starts. */
 static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 {
     wifi_scan_config_t scan_cfg;
@@ -1963,7 +2011,20 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
     if (!wardriving_wifi_active) {
         return;
     }
+    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
+        feb_location_t fix;
+        feb_location_state_t loc_state = location_get_fix(&fix);
+
+        if (loc_state == FEB_LOCATION_FIX) {
+            if (fix.speed_e1_kmh >= 100u) {
+                wardriving_swelling_aggressive_active = true;
+            } else if (fix.speed_e1_kmh < 80u) {
+                wardriving_swelling_aggressive_active = false;
+            }
+        }
+    }
     memset(&scan_cfg, 0, sizeof(scan_cfg));
+    wardriving_apply_wifi_swelling(&scan_cfg);
     err = esp_wifi_scan_start(&scan_cfg, false);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wardriving: re-trigger esp_wifi_scan_start failed: %s", esp_err_to_name(err));
@@ -2053,6 +2114,26 @@ static void wardriving_stop_internal(void)
     wardriving_sync_status_led();
 }
 
+/* Sets scan_cfg->scan_time.active.min/max per the currently-stored WiFi swelling mode
+   (docs/WARDRIVING_REDESIGN.md, added 2026-09-21). "normal": scan_cfg is left as the caller
+   zeroed it (today's default). "aggressive": fixed 85ms active dwell per channel.
+   "speed_based": mirrors "aggressive" while wardriving_swelling_aggressive_active is true,
+   "normal" otherwise -- the caller (wardriving_wifi_interval_cb()) is responsible for
+   refreshing that flag from a fresh GPS read before calling this; wardriving_start_internal()
+   always calls this right after resetting the flag to false (speed_based starts at normal
+   dwell per the design doc). */
+static void wardriving_apply_wifi_swelling(wifi_scan_config_t *scan_cfg)
+{
+    bool aggressive = (wardriving_wifi_swelling == WARDRIVING_SWELLING_AGGRESSIVE) ||
+                      (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED &&
+                       wardriving_swelling_aggressive_active);
+
+    if (aggressive) {
+        scan_cfg->scan_time.active.min = 85;
+        scan_cfg->scan_time.active.max = 85;
+    }
+}
+
 /* Shared start path for every wardriving start trigger (explicit `start` command, boot
    autostart, boot-button toggle-on). Assumes the caller already validated/resolved
    whatever's specific to its own trigger (wire-format checks for a command, none needed
@@ -2062,7 +2143,9 @@ static void wardriving_stop_internal(void)
    extracted from. Runs on the NimBLE host task only. */
 static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_ble_passive,
                                       uint32_t wifi_interval_ms, uint32_t ble_window_ms,
-                                      uint32_t ble_interval_ms)
+                                      uint32_t ble_interval_ms,
+                                      wardriving_swelling_mode_t wifi_swelling,
+                                      wardriving_country_t country)
 {
     if (wardriving_wifi_active || wardriving_ble_active) {
         return false;
@@ -2074,11 +2157,28 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
     if (want_wifi) {
         wifi_scan_config_t scan_cfg;
         esp_err_t err;
+        esp_err_t country_err;
 
         memset(&scan_cfg, 0, sizeof(scan_cfg));
         wifi_scan_in_progress = true;
         wifi_scan_active_source = WIFI_SCAN_SOURCE_WARDRIVING;
         wardriving_wifi_interval_ms = wifi_interval_ms;
+        wardriving_wifi_swelling = wifi_swelling;
+        wardriving_swelling_aggressive_active = false;
+
+        /* Applied once, here, at start -- not re-applied on every WiFi re-arm (a
+           radio-global setting per docs/WARDRIVING_REDESIGN.md), so any later manual
+           wifi_scan observes whatever country wardriving last set. Best-effort: a failure
+           here doesn't abort wardriving start, since the radio already has a usable
+           (world-safe) default country from ESP-IDF's own init. */
+        country_err = esp_wifi_set_country_code(
+            country == WARDRIVING_COUNTRY_BG ? "BG" : "01", false);
+        if (country_err != ESP_OK) {
+            ESP_LOGW(TAG, "wardriving: esp_wifi_set_country_code failed: %s",
+                     esp_err_to_name(country_err));
+        }
+
+        wardriving_apply_wifi_swelling(&scan_cfg);
         err = esp_wifi_scan_start(&scan_cfg, false);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "wardriving: esp_wifi_scan_start failed: %s", esp_err_to_name(err));
@@ -2202,7 +2302,12 @@ static void wardriving_button_toggle_cb(struct ble_npl_event *ev)
                                       wardriving_persisted.want_ble_passive,
                                       wardriving_persisted.wifi_interval_ms,
                                       wardriving_persisted.ble_window_ms,
-                                      wardriving_persisted.ble_interval_ms)) {
+                                      wardriving_persisted.ble_interval_ms,
+                                      /* wardriving_persist.h does not persist swelling/country
+                                         (docs/WARDRIVING_REDESIGN.md's own persistence is
+                                         Flipper-side only) -- boot-button toggle-on falls
+                                         back to today's unconfigured-radio defaults. */
+                                      WARDRIVING_SWELLING_NORMAL, WARDRIVING_COUNTRY_ROW)) {
             wardriving_persisted.enabled = true;
             wardriving_persist_save(&wardriving_persisted);
             ESP_LOGI(TAG, "wardriving started via boot-button toggle (wifi=%d ble=%d ble_passive=%d)",
@@ -2433,6 +2538,8 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     bool want_wifi = false;
     bool want_ble = false;
     bool want_ble_passive = false;
+    wardriving_swelling_mode_t wifi_swelling = WARDRIVING_SWELLING_NORMAL;
+    wardriving_country_t country = WARDRIVING_COUNTRY_ROW;
     size_t i;
 
     status = feb_cbor_decode_wardriving_command_payload(cmd->arguments_span, cmd->arguments_span_len, &payload);
@@ -2455,7 +2562,8 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     }
 
     if (is_status_query) {
-        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params) {
+        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params ||
+            payload.has_wifi_swelling || payload.has_country) {
             if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
                 ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
@@ -2482,7 +2590,8 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     }
 
     if (is_stop) {
-        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params) {
+        if (payload.has_sources || payload.has_wifi_interval_ms || payload.has_ble_params ||
+            payload.has_wifi_swelling || payload.has_country) {
             if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
                 ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             }
@@ -2568,6 +2677,59 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
         }
     }
 
+    /* docs/WARDRIVING_REDESIGN.md (2026-09-21): wifi_swelling/country are required exactly
+       when "wifi" is in sources, absent otherwise -- unlike wifi_interval_ms (which has a
+       defined default substituted on omission, per wardriving_validate.h), these two have
+       no defined default, so a missing value while want_wifi is a real invalid_command, not
+       an omission to resolve. */
+    if (want_wifi) {
+        bool wifi_swelling_ok = false;
+        bool country_ok = false;
+
+        if (!payload.has_wifi_swelling || !payload.has_country) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+
+        if (payload.wifi_swelling_len == strlen("normal") &&
+            memcmp(payload.wifi_swelling, "normal", payload.wifi_swelling_len) == 0) {
+            wifi_swelling = WARDRIVING_SWELLING_NORMAL;
+            wifi_swelling_ok = true;
+        } else if (payload.wifi_swelling_len == strlen("aggressive") &&
+                  memcmp(payload.wifi_swelling, "aggressive", payload.wifi_swelling_len) == 0) {
+            wifi_swelling = WARDRIVING_SWELLING_AGGRESSIVE;
+            wifi_swelling_ok = true;
+        } else if (payload.wifi_swelling_len == strlen("speed_based") &&
+                  memcmp(payload.wifi_swelling, "speed_based", payload.wifi_swelling_len) == 0) {
+            wifi_swelling = WARDRIVING_SWELLING_SPEED_BASED;
+            wifi_swelling_ok = true;
+        }
+
+        if (payload.country_len == strlen("BG") &&
+            memcmp(payload.country, "BG", payload.country_len) == 0) {
+            country = WARDRIVING_COUNTRY_BG;
+            country_ok = true;
+        } else if (payload.country_len == strlen("RoW") &&
+                  memcmp(payload.country, "RoW", payload.country_len) == 0) {
+            country = WARDRIVING_COUNTRY_ROW;
+            country_ok = true;
+        }
+
+        if (!wifi_swelling_ok || !country_ok) {
+            if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+                ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+            }
+            return;
+        }
+    } else if (payload.has_wifi_swelling || payload.has_country) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"), 1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
     {
         wardriving_start_request_t req = {0};
         wardriving_resolved_intervals_t resolved;
@@ -2612,7 +2774,8 @@ static void handle_wardriving_command(uint16_t conn_handle, const feb_command_pa
     if (!wardriving_start_internal(want_wifi, want_ble, want_ble_passive,
                                    (uint32_t)payload.wifi_interval_ms,
                                    (uint32_t)payload.ble_window_ms,
-                                   (uint32_t)payload.ble_interval_ms)) {
+                                   (uint32_t)payload.ble_interval_ms,
+                                   wifi_swelling, country)) {
         if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"), 1, cmd->request_id)) {
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
@@ -3586,7 +3749,11 @@ static void host_synced(void)
                                            wardriving_persisted.want_ble_passive,
                                            wardriving_persisted.wifi_interval_ms,
                                            wardriving_persisted.ble_window_ms,
-                                           wardriving_persisted.ble_interval_ms)) {
+                                           wardriving_persisted.ble_interval_ms,
+                                           /* Not persisted (see boot-button toggle's matching
+                                              comment above) -- autostart falls back to
+                                              today's unconfigured-radio defaults. */
+                                           WARDRIVING_SWELLING_NORMAL, WARDRIVING_COUNTRY_ROW)) {
                 /* Does NOT clear/persist enabled -- same rationale as wardriving_self_stop():
                    a failed radio start is not the user turning wardriving off, so the
                    saved intent survives for the next boot attempt. */

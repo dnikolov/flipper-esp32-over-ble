@@ -28,6 +28,9 @@ typedef struct {
     uint32_t hdop_e1;       /* GGA HDOP * 10, truncated */
     int32_t altitude_dm;    /* GGA MSL altitude * 10, truncated, sign preserved */
     uint64_t utc_timestamp_s; /* Unix epoch seconds from the most recent valid RMC */
+    uint32_t speed_e1_kmh;  /* ground speed, km/h * 10, truncated, from the most recent valid
+                               RMC's speed-over-ground (knots) * 1.852 -- integer-only:
+                               (speed_knots_e1 * 1852) / 1000. Same gating as utc_timestamp_s. */
 } feb_location_t;
 
 /* Opens the GPS UART (UART1, RX=GPIO18, TX=GPIO19, 9600 8N1, no flow control -- compile-time

@@ -7,10 +7,11 @@
    contract (NMEA sentences never cross the BLE wire; only the derived fix values in
    location.h/cbor_gps.h do).
 
-   Only GGA (fix quality/satellite count/HDOP/lat-lon/altitude) and RMC (date+time, used for
-   utc_timestamp_s) are parsed -- see docs/PLAN.md's design decision 2 for why ZDA was
-   rejected and VTG is not parsed. RMC's speed/course fields exist on the wire but are
-   intentionally never extracted here (backlogged, not in this design's scope). */
+   Only GGA (fix quality/satellite count/HDOP/lat-lon/altitude) and RMC (date+time, status,
+   and speed-over-ground, used for utc_timestamp_s and speed_e1_kmh) are parsed -- see
+   docs/PLAN.md's design decision 2 for why ZDA was rejected and VTG is not parsed. RMC's
+   course field exists on the wire but is intentionally never extracted here (backlogged, not
+   in this design's scope; see docs/WARDRIVING_REDESIGN.md for the speed field's addition). */
 #ifndef FEB_NMEA_PARSER_H
 #define FEB_NMEA_PARSER_H
 
@@ -47,12 +48,16 @@ typedef struct {
     uint8_t day, month;
     uint8_t year_2digit; /* add 2000 -- GPS did not exist before 2000, and this project's
                             operating dates are decades past that */
+    uint32_t speed_knots_e1; /* speed over ground, knots * 10, truncated -- e.g. 2.3 -> 23;
+                                0 when the field is empty (matches parse_x10_field's existing
+                                empty-field convention, same as GGA's hdop_e1) */
 } nmea_rmc_t;
 
 /* Parses one RMC sentence. Returns false for a checksum failure, a non-RMC sentence, or a
    malformed status/time/date field -- true otherwise (including status_active == false,
-   "void" fix). Speed/course fields are structurally present on the wire but never extracted
-   here (docs/PLAN.md's scope boundary). */
+   "void" fix). RMC's course field is structurally present on the wire but never extracted
+   here (docs/PLAN.md's scope boundary); speed-over-ground (field index 6) is parsed into
+   speed_knots_e1. */
 bool nmea_parse_rmc(const char *line, size_t line_len, nmea_rmc_t *out);
 
 /* Unix epoch seconds for an RMC sentence's date+time fields, treated as UTC (NMEA's own

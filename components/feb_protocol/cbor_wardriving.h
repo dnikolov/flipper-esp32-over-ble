@@ -12,10 +12,12 @@
    (docs/PROTOCOL.md "`wardriving` command and status payloads") ----
 
    `command.arguments` for wardriving: `feb_wardriving_command_payload_t`. Field order:
-   action, sources, wifi_interval_ms, ble_window_ms, ble_interval_ms. Only `action` is
+   action, sources, wifi_interval_ms, ble_window_ms, ble_interval_ms, wifi_swelling, country
+   (wifi_swelling/country added 2026-09-21, docs/WARDRIVING_REDESIGN.md). Only `action` is
    unconditionally required by this decoder; PROTOCOL.md's action-dependent presence rules
    ("sources required for start, absent for stop"; "wifi_interval_ms required when \"wifi\"
-   in sources", etc.) are NOT enforced here -- same split established by wifi_scan's
+   in sources"; "wifi_swelling/country required when \"wifi\" in sources", etc.) are NOT
+   enforced here -- same split established by wifi_scan's
    command payload (see feb_cbor_decode_command_payload's non-empty-arguments test in
    tests/esp32/test_framing_cbor.c): this decoder validates each *present* field's own
    shape/type and the fixed field order, and reports which fields were present via
@@ -54,6 +56,8 @@
 #define FEB_WARDRIVING_ACTION_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_SOURCE_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_MAX_SOURCES 2u
+#define FEB_WARDRIVING_SWELLING_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
+#define FEB_WARDRIVING_COUNTRY_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 
 typedef struct {
     const char *action;
@@ -71,6 +75,14 @@ typedef struct {
     uint64_t ble_interval_ms;
     int has_ble_params; /* ble_window_ms/ble_interval_ms are always present or absent
                             together per docs/PROTOCOL.md */
+
+    const char *wifi_swelling; /* "normal" | "aggressive" | "speed_based" */
+    size_t wifi_swelling_len;
+    int has_wifi_swelling;
+
+    const char *country; /* "BG" | "RoW" */
+    size_t country_len;
+    int has_country;
 } feb_wardriving_command_payload_t;
 
 size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, const feb_wardriving_command_payload_t *payload);

@@ -288,6 +288,11 @@ bool nmea_parse_rmc(const char *line, size_t line_len, nmea_rmc_t *out)
     out->month = (uint8_t)((f[2] - '0') * 10 + (f[3] - '0'));
     out->year_2digit = (uint8_t)((f[4] - '0') * 10 + (f[5] - '0'));
 
+    out->speed_knots_e1 = 0;
+    if (nmea_field(line, line_len, 6, &f, &flen)) { /* speed over ground, knots */
+        out->speed_knots_e1 = parse_x10_field(f, flen);
+    }
+
     return true;
 }
 

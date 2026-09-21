@@ -290,6 +290,7 @@ polling only while visible.
 | `hdop_e1` | unsigned integer | `GGA`'s HDOP, scaled by 10 and truncated to an integer (this protocol's fields are never negative or floating-point) — e.g. HDOP `2.3` encodes as `23`. |
 | `utc_timestamp_s` | unsigned integer | Unix epoch seconds derived from the most recent valid `RMC` date+time — same derivation as `wardriving`'s new record field below. |
 | `altitude_dm_offset` | unsigned integer | `GGA`'s MSL altitude (field 9), scaled by 10 (decimeters) and offset to stay positive: `(int32_t)(altitude_m * 10) + 1000000`. Unlike `lat_e7_offset`/`lon_e7_offset`, altitude has no natural bounded range — `1,000,000` (±100,000.0 m) is a generous symmetric bound comfortably beyond the u-blox NEO-6 module's documented ±operational altitude limit (50,000 m). Recovered as `(altitude_dm_offset - 1000000) / 10.0`. Appended after `utc_timestamp_s` (added 2026-09-12, same design session as the rest of this table) rather than inserted next to `lat_e7_offset`/`lon_e7_offset` — this map's field order is meaningful (both codecs reject out-of-order keys), so appending is the minimal, additive change. |
+| `speed_e1_kmh` | unsigned integer | Ground speed in km/h, scaled by 10 and truncated (same scaling convention as `hdop_e1`) — e.g. `12.3` km/h encodes as `123`. Derived from the most recent valid `RMC` sentence's speed-over-ground field (knots) × 1.852. Appended after `altitude_dm_offset` (added 2026-09-21, [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md) — same append-only rule as above). |
 
 **Busy/error handling.** `gps` has no exclusivity/busy concept — the UART read is a passive
 background task independent of the Wi-Fi/BLE radio the other capabilities contend over, so a
@@ -312,8 +313,9 @@ inside `arguments` distinguishing start from stop, rather than two capability st
 envelope — `arguments` already exists as a map for exactly this kind of extension.
 
 `arguments` field order: `action`, `sources`, `wifi_interval_ms`, `ble_window_ms`,
-`ble_interval_ms`. `sources` and the interval fields are present only when `action = "start"`;
-`arguments = { "action": "stop" }` (that field alone) when stopping.
+`ble_interval_ms`, `wifi_swelling`, `country`. `sources` and the interval/swelling/country
+fields are present only when `action = "start"`; `arguments = { "action": "stop" }` (that field
+alone) when stopping.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -322,6 +324,8 @@ envelope — `arguments` already exists as a map for exactly this kind of extens
 | `wifi_interval_ms` | unsigned integer | Wi-Fi scan cadence in milliseconds. Required when `"wifi"` is in `sources`; absent otherwise. Bounds: see "Interval bounds and defaults" below. Out-of-bounds values are rejected `invalid_command`. |
 | `ble_window_ms` | unsigned integer | BLE observer scan window in milliseconds. Required together with `ble_interval_ms` when `"ble"` or `"ble_passive"` is in `sources`; absent otherwise. |
 | `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` or `"ble_passive"` is in `sources`; absent otherwise. |
+| `wifi_swelling` | text string | `"normal"` \| `"aggressive"` \| `"speed_based"` — WiFi per-channel scan dwell-time control (added 2026-09-21, [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)). Required when `"wifi"` is in `sources`; must be absent otherwise. Any other value is `invalid_command`. See that doc for full semantics (`"aggressive"` = 85ms active dwell per channel; `"speed_based"` = the ESP32 self-switches between normal/aggressive from its own GPS speed reading, no further wire traffic needed). |
+| `country` | text string | `"BG"` \| `"RoW"` — WiFi regulatory country code (added 2026-09-21, same doc). Required when `"wifi"` is in `sources`; must be absent otherwise. Any other value is `invalid_command`. `"RoW"` maps to `esp_wifi_set_country_code("01", false)` (today's implicit default: channels 1-11); `"BG"` maps to `esp_wifi_set_country_code("BG", false)` (channels 1-13, active-only). Applied once at wardriving start, not per scan cycle — a global radio setting, so a later manual `wifi_scan` observes whatever `country` wardriving last set. |
 
 **Interval bounds and defaults.** Bounds are the interval/duty-cycle values validated in
 [PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is step 4's

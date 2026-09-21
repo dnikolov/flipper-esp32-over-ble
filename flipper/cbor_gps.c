@@ -14,7 +14,7 @@ size_t feb_cbor_encode_gps_result_payload(
     }
     size_t pos = 0;
     size_t n;
-    n = feb_cbor_encode_map_header(out, out_cap, 7);
+    n = feb_cbor_encode_map_header(out, out_cap, 8);
     if(n == 0) return 0;
     pos += n;
     n = feb_cbor_encode_text(out + pos, out_cap - pos, "lat_e7_offset", sizeof("lat_e7_offset") - 1);
@@ -61,6 +61,12 @@ size_t feb_cbor_encode_gps_result_payload(
     n = feb_cbor_encode_uint(out + pos, out_cap - pos, payload->altitude_dm_offset);
     if(n == 0) return 0;
     pos += n;
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "speed_e1_kmh", sizeof("speed_e1_kmh") - 1);
+    if(n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, payload->speed_e1_kmh);
+    if(n == 0) return 0;
+    pos += n;
     return pos;
 }
 
@@ -78,15 +84,15 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(
     if(pos == 0) {
         return status;
     }
-    if(count < 7) {
+    if(count < 8) {
         return FEB_CBOR_ERR_MISSING_FIELD;
     }
-    if(count > 7) {
+    if(count > 8) {
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
 
-    const uint8_t* seen_ptrs[7];
-    size_t seen_lens[7];
+    const uint8_t* seen_ptrs[8];
+    size_t seen_lens[8];
     size_t n;
 
     n = feb_cbor_i_decode_expected_key(
@@ -142,6 +148,14 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(
     if(n == 0) return status;
     pos += n;
     n = feb_cbor_decode_uint(in + pos, in_len - pos, &payload->altitude_dm_offset, &status);
+    if(n == 0) return status;
+    pos += n;
+
+    n = feb_cbor_i_decode_expected_key(
+        in + pos, in_len - pos, "speed_e1_kmh", seen_ptrs, seen_lens, 7, &status);
+    if(n == 0) return status;
+    pos += n;
+    n = feb_cbor_decode_uint(in + pos, in_len - pos, &payload->speed_e1_kmh, &status);
     if(n == 0) return status;
     pos += n;
 

@@ -2194,6 +2194,97 @@ board was left running the `gps_probe` throwaway image, not the real capability-
 from the entry above — it needs the real `heltec/` firmware reflashed before any further
 `wifi_scan`/`ble_scan` testing.
 
+## 2026-09-21: Phase 7 — Wardriving screen redesign (Stopped/Running split, WiFi Swelling, country code, GPS speed)
+
+Design and implementation in one pass, reached via direct discussion with the user rather than
+a grill-me session, then frozen into [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)
+before any code was written. Full frozen wire shapes and rationale live in that doc and in
+[docs/PROTOCOL.md](PROTOCOL.md) (`wifi_swelling`/`country` on `wardriving`'s `start`,
+`speed_e1_kmh` on `gps`'s `result`) — not restated here.
+
+**Implementation split across two parallel subagents** (`esp32-developer` for
+`components/feb_protocol/`, `esp32/main/`; `flipper-developer` for `flipper/`,
+`flipper_esp32_over_ble.c`), both launched with `isolation: "worktree"`. This surfaced a real
+tooling gotcha worth remembering: **a fresh worktree is cut from committed `HEAD`, not from the
+working tree's uncommitted state.** This branch (`wardriving-publish`) had 14 commits' worth of
+uncommitted work at the time (the `components/feb_protocol/` shared-component extraction, plus
+this same session's own freshly-written, uncommitted design docs) — both agents' worktrees
+initially had neither. Both caught it themselves before writing any code (the `esp32-developer`
+one by noticing `components/feb_protocol/` simply didn't exist where its task said it would) and
+self-resolved by fast-forward-merging their worktree branch onto `wardriving-publish`'s tip
+(clean, since neither worktree had diverging commits) and copying in the two uncommitted design
+docs via `Read` on the main checkout's absolute paths. The `flipper-developer` agent ended up
+doing its actual implementation work directly against the main checkout's paths rather than its
+worktree; the `esp32-developer` agent's changes landed in its worktree and had to be copied back
+into the main checkout by hand (plain file copies — the two agents' file sets were disjoint, so
+no merge conflicts) before a real build could be run. **Lesson for next time**: don't use
+`isolation: "worktree"` for parallel agents on a branch that itself carries meaningful
+uncommitted state — either commit first, or run without isolation.
+
+**A second, smaller tooling snag**: the `esp32-developer` worktree's sandboxing refused
+`powershell`/`cmd` entirely (blocking `idf.py build` and the MSVC host-test scripts), and a
+pure-Python `idf_tools.py --export` workaround also failed, because ESP-IDF's own tooling
+hard-refuses to run under Git-Bash/MSYS (`if 'MSYSTEM' in os.environ: fatal(...)`) and this
+harness's spawned Win32 children observe `MSYSTEM=MINGW64` regardless of `unset` in the parent
+bash session. The agent did a careful static review instead (brace/paren balance, manual
+declaration-order re-read — caught one real forward-declaration bug this way) and flagged
+everything as build-pending. All real builds/tests below were run afterward, outside worktree
+isolation, once the ESP32-side changes were copied into the main checkout.
+
+**Build/test results, all green**: `esp32/` (`idf.py build`), `heltec/` (`idf.py build`,
+confirming the shared-component change stays compatible even though Heltec doesn't implement
+`wardriving`), `tests/esp32/build.ps1` (all checks pass), `tests/flipper/build.ps1` (430/430,
+after `tools/build_flipper.ps1`'s FAP build — 133,068 bytes), and `python
+tools/check_shared_headers.py` (one real mismatch caught and fixed: the ESP32 side defined
+`FEB_WARDRIVING_SWELLING_MAX_LEN`/`FEB_WARDRIVING_COUNTRY_MAX_LEN` macros the Flipper mirror
+didn't have; added to `flipper/cbor_wardriving.h` to match). The known
+`vswhere.exe`/`vcvars64.bat` PATH issue (`docs/BACKLOG.md`) resurfaced and was worked around by
+prepending the VS Installer directory to `$env:PATH` for the build session, not by editing
+either `build.ps1` script.
+
+Two real gaps surfaced during implementation and recorded in
+[docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)'s "Open items" and
+[docs/BACKLOG.md](BACKLOG.md): ESP32-side `wifi_swelling`/`country` are not persisted across the
+button-toggle/boot-autostart wardriving-start paths (only a Flipper `start` command carries
+them), and the GPS screen's new Speed value was fit into the existing Alt row's placeholder
+rather than a dedicated row (the screen's fixed 4-row layout had no space left).
+
+No hardware testing performed — build/host-test-verified only, per this project's hardware-safety
+rules.
+
+## 2026-09-21: Phase 7 hardware testing — two silent buffer-sizing bugs found and fixed
+
+Both boards were flashed and two real symptoms reported during live use: WiFi+BLE wardriving
+silently failed to start (WiFi-only worked), and the GPS screen never showed a fix or
+coordinates despite a real fix existing. Extensive static review of the encode/decode/dispatch
+code on both sides found nothing wrong — because nothing was. Root-caused instead via live
+serial/CLI log capture from both boards during physical reproduction
+(`esp32-monitoring`/`flipper-monitoring` agents), broadening the log search past
+capability-name keywords once a narrow "gps"-only grep came up empty.
+
+Both were the same failure class: a fixed-size buffer sized for this redesign's *old* worst
+case, not rechecked once its own new fields (`wifi_swelling`/`country`/`speed_e1_kmh`) grew
+that worst case past it. Both failed completely silently at the point of overflow — the
+`feb_cbor_encode_*` call just returned 0, and the caller's existing `if (len == 0)` fallback
+sent a generic `internal_error`/nothing at all, with no signal pointing at "buffer too small."
+
+1. **`flipper/flipper_esp32_over_ble.c`'s `cmd_payload_buf`/`FEB_CMD_PAYLOAD_MAX_LEN`** (every
+   capability's shared outgoing command envelope, 160 bytes) wasn't rechecked when wardriving's
+   own arguments sub-buffer grew to accommodate `wifi_swelling`/`country` — WiFi-only's smaller
+   arguments still fit, masking the bug until BLE's own fields were added to the mix. Bumped to
+   224.
+2. **`esp32/main/main.c`'s `handle_gps_command()`'s `result_buf`** (128 bytes) wasn't bumped when
+   `speed_e1_kmh` was added to the `gps` result — and the true worst case (~133 bytes) isn't a
+   rare edge case here: real lat/lon/timestamp/altitude values need the full 5-byte CBOR uint
+   form, so encoding failed on every single reply once a real fix existed, silently downgrading
+   every `gps` status reply to an `internal_error` the Flipper had no route for (by design, `gps`
+   has no `PendingCommandKind` entry) — so it was dropped with no `gps`-specific trace anywhere.
+   Bumped to 192.
+
+Both fixes rebuilt, reflashed to the physical boards, and confirmed working by the user
+afterward. Full root-cause writeup: [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)'s
+"Hardware-testing fixes" section.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

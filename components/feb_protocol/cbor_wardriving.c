@@ -21,6 +21,8 @@ size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, 
     }
     if (payload->has_wifi_interval_ms) count++;
     if (payload->has_ble_params) count += 2;
+    if (payload->has_wifi_swelling) count++;
+    if (payload->has_country) count++;
 
     n = feb_cbor_encode_map_header(out + pos, out_cap - pos, count);
     if (n == 0) return 0;
@@ -72,17 +74,36 @@ size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, 
         pos += n;
     }
 
+    if (payload->has_wifi_swelling) {
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, "wifi_swelling", FEB_CBOR_I_KLEN("wifi_swelling"));
+        if (n == 0) return 0;
+        pos += n;
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->wifi_swelling, payload->wifi_swelling_len);
+        if (n == 0) return 0;
+        pos += n;
+    }
+
+    if (payload->has_country) {
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, "country", FEB_CBOR_I_KLEN("country"));
+        if (n == 0) return 0;
+        pos += n;
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->country, payload->country_len);
+        if (n == 0) return 0;
+        pos += n;
+    }
+
     return pos;
 }
 
 feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, size_t in_len, feb_wardriving_command_payload_t *payload)
 {
-    static const char *const names[5] = {"action", "sources", "wifi_interval_ms", "ble_window_ms", "ble_interval_ms"};
+    static const char *const names[7] = {"action", "sources", "wifi_interval_ms", "ble_window_ms",
+                                          "ble_interval_ms", "wifi_swelling", "country"};
     size_t count;
     size_t pos;
     size_t i;
     size_t next_min = 0;
-    int seen[5] = {0, 0, 0, 0, 0};
+    int seen[7] = {0, 0, 0, 0, 0, 0, 0};
     feb_cbor_status_t status;
     size_t consumed;
 
@@ -93,12 +114,14 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, 
     payload->source_count = 0;
     payload->has_wifi_interval_ms = 0;
     payload->has_ble_params = 0;
+    payload->has_wifi_swelling = 0;
+    payload->has_country = 0;
 
     consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
     if (consumed == 0) {
         return status;
     }
-    if (count > 5) {
+    if (count > 7) {
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
     if (count == 0) {
@@ -122,7 +145,7 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, 
         pos += key_consumed;
 
         found = -1;
-        for (j = 0; j < 5; j++) {
+        for (j = 0; j < 7; j++) {
             if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
                 found = (int)j;
                 break;
@@ -203,6 +226,32 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(const uint8_t *in, 
 
             if (n == 0) return status;
             payload->ble_interval_ms = value;
+            pos += n;
+            break;
+        }
+        case 5: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_WARDRIVING_SWELLING_MAX_LEN, &status);
+
+            if (n == 0) return status;
+            payload->wifi_swelling = data;
+            payload->wifi_swelling_len = len;
+            payload->has_wifi_swelling = 1;
+            pos += n;
+            break;
+        }
+        case 6: {
+            const char *data;
+            size_t len;
+            size_t n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len,
+                                             FEB_WARDRIVING_COUNTRY_MAX_LEN, &status);
+
+            if (n == 0) return status;
+            payload->country = data;
+            payload->country_len = len;
+            payload->has_country = 1;
             pos += n;
             break;
         }

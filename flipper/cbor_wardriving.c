@@ -19,6 +19,8 @@ size_t feb_cbor_encode_wardriving_command_payload(
     if(payload->has_sources) count++;
     if(payload->has_wifi_interval_ms) count++;
     if(payload->has_ble_params) count += 2u;
+    if(payload->has_wifi_swelling) count++;
+    if(payload->has_country) count++;
 
     size_t pos = 0;
     size_t n;
@@ -69,6 +71,24 @@ size_t feb_cbor_encode_wardriving_command_payload(
         if(n == 0) return 0;
         pos += n;
     }
+    if(payload->has_wifi_swelling) {
+        n = feb_cbor_encode_text(
+            out + pos, out_cap - pos, "wifi_swelling", sizeof("wifi_swelling") - 1);
+        if(n == 0) return 0;
+        pos += n;
+        n = feb_cbor_encode_text(
+            out + pos, out_cap - pos, payload->wifi_swelling, payload->wifi_swelling_len);
+        if(n == 0) return 0;
+        pos += n;
+    }
+    if(payload->has_country) {
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, "country", sizeof("country") - 1);
+        if(n == 0) return 0;
+        pos += n;
+        n = feb_cbor_encode_text(out + pos, out_cap - pos, payload->country, payload->country_len);
+        if(n == 0) return 0;
+        pos += n;
+    }
     return pos;
 }
 
@@ -89,12 +109,12 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(
     if(count < 1) {
         return FEB_CBOR_ERR_MISSING_FIELD;
     }
-    if(count > 5) {
+    if(count > 7) {
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
 
-    const uint8_t* seen_ptrs[5];
-    size_t seen_lens[5];
+    const uint8_t* seen_ptrs[7];
+    size_t seen_lens[7];
     size_t n;
 
     n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "action", seen_ptrs, seen_lens, 0, &status);
@@ -128,12 +148,17 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(
     payload->source_count = source_count;
     payload->has_sources = 1;
 
+    /* Valid trailing-field counts after action+sources, given wifi_interval_ms/wifi_swelling/
+       country always co-occur (all three "required iff wifi in sources") and ble_window_ms/
+       ble_interval_ms always co-occur (both "required iff ble(_passive) in sources"): 0
+       (neither block), 2 (ble block only), 3 (wifi block only), 5 (both blocks). 1 and 4 are
+       not decodable shapes under this rule -- see this file's header comment. */
     size_t remaining = count - 2;
-    if(remaining > 3) {
+    if(remaining != 0 && remaining != 2 && remaining != 3 && remaining != 5) {
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
 
-    if(remaining == 1 || remaining == 3) {
+    if(remaining == 3 || remaining == 5) {
         n = feb_cbor_i_decode_expected_key(
             in + pos, in_len - pos, "wifi_interval_ms", seen_ptrs, seen_lens, 2, &status);
         if(n == 0) return status;
@@ -143,8 +168,8 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(
         pos += n;
         payload->has_wifi_interval_ms = 1;
     }
-    if(remaining == 2 || remaining == 3) {
-        size_t idx = (remaining == 3) ? 3 : 2;
+    if(remaining == 2 || remaining == 5) {
+        size_t idx = (remaining == 5) ? 3 : 2;
         n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "ble_window_ms", seen_ptrs, seen_lens, idx, &status);
         if(n == 0) return status;
         pos += n;
@@ -159,6 +184,30 @@ feb_cbor_status_t feb_cbor_decode_wardriving_command_payload(
         if(n == 0) return status;
         pos += n;
         payload->has_ble_params = 1;
+    }
+    if(remaining == 3 || remaining == 5) {
+        size_t idx = (remaining == 5) ? 5 : 3;
+        n = feb_cbor_i_decode_expected_key(
+            in + pos, in_len - pos, "wifi_swelling", seen_ptrs, seen_lens, idx, &status);
+        if(n == 0) return status;
+        pos += n;
+        n = feb_cbor_decode_text(
+            in + pos, in_len - pos, &payload->wifi_swelling, &payload->wifi_swelling_len,
+            FEB_CBOR_MAX_TEXT_LEN, &status);
+        if(n == 0) return status;
+        pos += n;
+        payload->has_wifi_swelling = 1;
+
+        n = feb_cbor_i_decode_expected_key(
+            in + pos, in_len - pos, "country", seen_ptrs, seen_lens, idx + 1, &status);
+        if(n == 0) return status;
+        pos += n;
+        n = feb_cbor_decode_text(
+            in + pos, in_len - pos, &payload->country, &payload->country_len,
+            FEB_CBOR_MAX_TEXT_LEN, &status);
+        if(n == 0) return status;
+        pos += n;
+        payload->has_country = 1;
     }
 
     if(pos != in_len) {

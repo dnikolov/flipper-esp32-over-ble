@@ -72,6 +72,14 @@
 #define WARDRIVING_DIR_NAME "wardriving"
 #define FEB_WARDRIVING_CSV_FILENAME "wardriving_current.csv"
 #define FEB_WARDRIVING_EXPORT_PATH_MAX_LEN 160
+/* Wardriving Stopped-screen settings (docs/WARDRIVING_REDESIGN.md "Persistence") -- flat
+   `key=value` lines at the app data root, same file-shape convention as the publish-flow
+   plumbing files above; global, not per-board (design doc decision 5). Real worst case is
+   5 lines of "<=15-char key>=<=11-char value>\n" (~30 bytes each) plus margin -- sized with
+   real margin, not shaved to the byte, matching this project's usual buffer-sizing
+   convention. */
+#define FEB_WARDRIVING_SETTINGS_FILENAME "wardriving_settings.txt"
+#define FEB_WARDRIVING_SETTINGS_MAX_LEN 256u
 /* Compact on-screen capability line: "<board>: <features>". Real values today are short
    ("esp32-c6-devkit", "wifi_scan"); sized with modest margin, not FEB_CBOR_MAX_TEXT_LEN's
    full 64 bytes -- a real scrollable capability view is backlogged for when `features`
@@ -138,18 +146,24 @@ typedef enum {
     AppScreenLegacy,
     AppScreenWifiScanResults,
     AppScreenBleScanResults,
-    AppScreenWardriving,
+    /* docs/WARDRIVING_REDESIGN.md (2026-09-21): the single AppScreenWardriving is replaced
+       by this Stopped/Running split -- see draw_wardriving_stopped_screen()/
+       draw_wardriving_running_screen()'s own comments. */
+    AppScreenWardrivingStopped,
+    AppScreenWardrivingRunning,
     AppScreenPublish,
 } AppScreen;
 
 typedef enum {
     HomeMenuWardriving = 0,
+    /* Publish moved to immediately after Wardriving (docs/WARDRIVING_REDESIGN.md, 2026-09-21;
+       previously last in this list). */
+    HomeMenuPublish,
     HomeMenuScan,
     HomeMenuGps,
     HomeMenuSettings,
     HomeMenuAbout,
     HomeMenuLegacy,
-    HomeMenuPublish,
     HomeMenuCount,
 } HomeMenuItem;
 
@@ -170,15 +184,109 @@ typedef enum {
     ScanMenuCount,
 } ScanMenuItem;
 
+/* docs/WARDRIVING_REDESIGN.md (2026-09-21): the old single 6-value WardrivingSourceMode
+   enum is replaced by five independent settings, one row each on the new Stopped screen
+   (see draw_wardriving_stopped_screen()), persisted in wardriving_settings.txt
+   (wardriving_settings_load()/wardriving_settings_save()). Rows are capability-gated only,
+   not re-gated by each other's current value (design doc rationale #4) -- e.g. Mode=BLE
+   does not hide the WiFi Swelling row. */
 typedef enum {
-    WardrivingSourceWifi2Ble = 0,
-    WardrivingSourceWifi2BlePassive,
-    WardrivingSourceWifi5Ble,
-    WardrivingSourceWifiOnly,
-    WardrivingSourceWifi0Ble,
-    WardrivingSourceBleOnly,
-    WardrivingSourceModeCount,
-} WardrivingSourceMode;
+    WardrivingModeWifiBle = 0,
+    WardrivingModeWifi,
+    WardrivingModeBle,
+    WardrivingModeCount,
+} WardrivingMode;
+
+typedef enum {
+    WardrivingSwellingNormal = 0,
+    WardrivingSwellingAggressive,
+    WardrivingSwellingSpeedBased,
+    WardrivingSwellingCount,
+} WardrivingSwelling;
+
+typedef enum {
+    WardrivingBleModeActive = 0,
+    WardrivingBleModePassive,
+    WardrivingBleModeCount,
+} WardrivingBleMode;
+
+typedef enum {
+    WardrivingCountryBg = 0,
+    WardrivingCountryRoW,
+    WardrivingCountryCount,
+} WardrivingCountry;
+
+/* wardriving_cooldown_ms (Esp32App) is not an enum -- it stores the wire's own
+   wifi_interval_ms value directly (one of these three), matching the design doc's field
+   naming. wardriving_cooldown_values/_labels below back the Left/Right cycling and the
+   on-screen "5s"/"2s"/"0s" labels; index found by linear search since the persisted/wire
+   value, not an index, is the field's own representation. */
+static const uint32_t wardriving_cooldown_values[3] = {5000u, 2000u, 0u};
+static const char* const wardriving_cooldown_labels[3] = {"5s", "2s", "0s"};
+
+static const char* wardriving_mode_label(WardrivingMode mode) {
+    switch(mode) {
+    case WardrivingModeWifi:
+        return "WiFi";
+    case WardrivingModeBle:
+        return "BLE";
+    default:
+        return "WiFi+BLE";
+    }
+}
+
+/* Persisted token only -- WardrivingMode has no wire field of its own, it only decides
+   which of wifi/ble land in the `sources` array (see send_wardriving_start_command()). */
+static const char* wardriving_mode_token(WardrivingMode mode) {
+    switch(mode) {
+    case WardrivingModeWifi:
+        return "wifi";
+    case WardrivingModeBle:
+        return "ble";
+    default:
+        return "wifi_ble";
+    }
+}
+
+static const char* wardriving_swelling_label(WardrivingSwelling swelling) {
+    switch(swelling) {
+    case WardrivingSwellingAggressive:
+        return "Aggressive";
+    case WardrivingSwellingSpeedBased:
+        return "Speed-based";
+    default:
+        return "Normal";
+    }
+}
+
+/* Doubles as the persisted token -- both reuse docs/PROTOCOL.md's own `wifi_swelling` wire
+   strings ("normal"/"aggressive"/"speed_based") rather than a separate vocabulary. */
+static const char* wardriving_swelling_wire_value(WardrivingSwelling swelling) {
+    switch(swelling) {
+    case WardrivingSwellingAggressive:
+        return "aggressive";
+    case WardrivingSwellingSpeedBased:
+        return "speed_based";
+    default:
+        return "normal";
+    }
+}
+
+static const char* wardriving_ble_mode_label(WardrivingBleMode mode) {
+    return mode == WardrivingBleModePassive ? "Passive" : "Active";
+}
+
+/* Persisted token only -- WardrivingBleMode has no wire field of its own, it only picks
+   between the existing "ble"/"ble_passive" `sources` strings. */
+static const char* wardriving_ble_mode_token(WardrivingBleMode mode) {
+    return mode == WardrivingBleModePassive ? "passive" : "active";
+}
+
+/* Doubles as the persisted token -- both reuse docs/PROTOCOL.md's own `country` wire
+   strings ("BG"/"RoW"). */
+static const char* wardriving_country_wire_value(WardrivingCountry country) {
+    return country == WardrivingCountryBg ? "BG" : "RoW";
+}
 
 /* `gps` capability status (docs/PROTOCOL.md "`gps` command and status payloads", frozen
    2026-09-12): the wire's three states, `no_signal`/`acquiring`/`fix`. Distinct from
@@ -288,6 +396,7 @@ typedef struct {
     uint64_t gps_hdop_e1;
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
+    uint64_t gps_speed_e1_kmh;
 } AppEvent;
 
 typedef struct {
@@ -332,7 +441,20 @@ typedef struct {
     char wardriving_last_wifi_summary[40];
     char wardriving_last_ble_summary[40];
     char wardriving_error_message[48];
-     WardrivingSourceMode wardriving_source_mode;
+    /* Stopped-screen settings (docs/WARDRIVING_REDESIGN.md) -- defaults set in
+       flipper_esp32_over_ble_app() match the old WardrivingSourceMode default
+       (WardrivingSourceWifi2Ble): WiFi+BLE, Normal, 2000ms, Active, RoW. Persisted in
+       wardriving_settings.txt (wardriving_settings_load()/_save()), global not per-board
+       (design doc decision 5). wardriving_settings_row is the Stopped screen's own
+       Up/Down-selected row index, not persisted (resets to 0 each screen visit, same as
+       every other screen's own transient scroll/cursor state in this file). */
+    WardrivingMode wardriving_mode;
+    WardrivingSwelling wardriving_swelling;
+    uint32_t wardriving_cooldown_ms;
+    WardrivingBleMode wardriving_ble_mode;
+    WardrivingCountry wardriving_country;
+    size_t wardriving_settings_row;
+    size_t wardriving_settings_scroll_offset;
     bool capability_has_gps;
     /* gps_status_known false means this session has never received a `gps` status reply yet
        (docs/LESSONS.md "UI must derive from real state") -- distinct from any particular
@@ -347,6 +469,7 @@ typedef struct {
     uint64_t gps_hdop_e1;
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
+    uint64_t gps_speed_e1_kmh;
     /* Publish screen state (docs/WARDRIVING_PUBLISH.md) -- independent of any BLE session or
        ESP32 pairing, since the whole point of this flow is publishing later, at a computer,
        with no board present. publish_waiting is true only while polling for the host
@@ -512,6 +635,43 @@ static bool send_pairing_record(Esp32BleProfile* profile, const uint8_t* record,
 static int text_matches(const char* data, size_t len, const char* literal) {
     size_t literal_len = strlen(literal);
     return len == literal_len && memcmp(data, literal, literal_len) == 0;
+}
+
+/* wardriving_settings.txt token parsers (docs/WARDRIVING_REDESIGN.md "Persistence") -- an
+   unrecognized/missing token falls back to that field's own default (see
+   wardriving_settings_load()), never a hard parse failure, since a stale or hand-edited file
+   should degrade gracefully rather than block the app. */
+static WardrivingMode wardriving_mode_from_token(const char* token, size_t len) {
+    if(text_matches(token, len, "wifi")) return WardrivingModeWifi;
+    if(text_matches(token, len, "ble")) return WardrivingModeBle;
+    return WardrivingModeWifiBle;
+}
+
+static WardrivingSwelling wardriving_swelling_from_token(const char* token, size_t len) {
+    if(text_matches(token, len, "aggressive")) return WardrivingSwellingAggressive;
+    if(text_matches(token, len, "speed_based")) return WardrivingSwellingSpeedBased;
+    return WardrivingSwellingNormal;
+}
+
+static WardrivingBleMode wardriving_ble_mode_from_token(const char* token, size_t len) {
+    return text_matches(token, len, "passive") ? WardrivingBleModePassive : WardrivingBleModeActive;
+}
+
+static WardrivingCountry wardriving_country_from_token(const char* token, size_t len) {
+    return text_matches(token, len, "BG") ? WardrivingCountryBg : WardrivingCountryRoW;
+}
+
+static uint32_t wardriving_cooldown_ms_from_token(const char* token, size_t len) {
+    uint32_t value = 0;
+    for(size_t i = 0; i < len; i++) {
+        char c = token[i];
+        if(c < '0' || c > '9') break;
+        value = value * 10u + (uint32_t)(c - '0');
+    }
+    for(size_t i = 0; i < 3; i++) {
+        if(wardriving_cooldown_values[i] == value) return value;
+    }
+    return 2000u;
 }
 
 static bool board_id_is_valid(const char* board_id, size_t len) {
@@ -905,6 +1065,137 @@ static bool capability_storage_load(
     return ok;
 }
 
+/* Sets app's five wardriving settings fields to today's defaults (docs/WARDRIVING_REDESIGN.md
+   "Persistence": "Default to today's old defaults if the file doesn't exist yet" -- matches
+   the pre-redesign WardrivingSourceMode default, WardrivingSourceWifi2Ble: WiFi+BLE source,
+   normal dwell, 2000ms cooldown, active BLE, world-safe (RoW) country). Called before
+   attempting to load the persisted file, so a missing/corrupt/partially-readable file always
+   leaves every field at a sane value rather than zero-initialized garbage. */
+static void wardriving_settings_set_defaults(Esp32App* app) {
+    app->wardriving_mode = WardrivingModeWifiBle;
+    app->wardriving_swelling = WardrivingSwellingNormal;
+    app->wardriving_cooldown_ms = 2000u;
+    app->wardriving_ble_mode = WardrivingBleModeActive;
+    app->wardriving_country = WardrivingCountryRoW;
+}
+
+/* Loads wardriving_settings.txt (flat `key=value` lines, same shape/parse style as
+   publish_parse_result() below -- this codec has no JSON decoder). Missing file, unreadable
+   file, or any unrecognized/absent individual key all degrade to that field's own default
+   (set by wardriving_settings_set_defaults() first) rather than a hard failure -- a stale or
+   hand-edited file should never block the app from starting. */
+static void wardriving_settings_load(Esp32App* app) {
+    wardriving_settings_set_defaults(app);
+
+    static char path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+    if(!build_app_data_path(path, sizeof(path), FEB_WARDRIVING_SETTINGS_FILENAME)) {
+        return;
+    }
+    File* file = storage_file_alloc(app->storage);
+    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    static char buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
+    size_t read_len = 0;
+    if(ok) {
+        uint64_t size = storage_file_size(file);
+        size_t cap = size > sizeof(buf) ? sizeof(buf) : (size_t)size;
+        read_len = storage_file_read(file, buf, cap);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    if(!ok || read_len == 0) {
+        return;
+    }
+
+    size_t pos = 0;
+    while(pos < read_len) {
+        size_t line_start = pos;
+        while(pos < read_len && buf[pos] != '\n' && buf[pos] != '\r') {
+            pos++;
+        }
+        size_t line_len = pos - line_start;
+        while(pos < read_len && (buf[pos] == '\n' || buf[pos] == '\r')) {
+            pos++;
+        }
+        if(line_len == 0) {
+            continue;
+        }
+        const char* line = buf + line_start;
+        const char* eq = memchr(line, '=', line_len);
+        if(!eq) {
+            continue;
+        }
+        size_t key_len = (size_t)(eq - line);
+        const char* value = eq + 1;
+        size_t value_len = line_len - key_len - 1;
+
+        if(text_matches(line, key_len, "mode")) {
+            app->wardriving_mode = wardriving_mode_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "wifi_swelling")) {
+            app->wardriving_swelling = wardriving_swelling_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "wifi_cooldown_ms")) {
+            app->wardriving_cooldown_ms = wardriving_cooldown_ms_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "ble_mode")) {
+            app->wardriving_ble_mode = wardriving_ble_mode_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "country")) {
+            app->wardriving_country = wardriving_country_from_token(value, value_len);
+        }
+    }
+}
+
+/* Rewrites wardriving_settings.txt in full (docs/WARDRIVING_REDESIGN.md "Persistence":
+   "rewritten immediately on every row-value change") -- one small file, no batching needed.
+   Same atomic temp-file/verified-write/storage_file_sync()/close/rename sequence as
+   pairing_storage_save()/capability_storage_save() above. Logs (not silently drops) a
+   failure, matching this file's "wrap silent-failure storage APIs in positive confirmation"
+   convention -- a failed save here just means the next app launch falls back to defaults,
+   not a security-relevant loss. */
+static void wardriving_settings_save(const Esp32App* app) {
+    static char final_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+    static char tmp_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+    if(!build_app_data_path(final_path, sizeof(final_path), FEB_WARDRIVING_SETTINGS_FILENAME) ||
+       !build_app_data_path(tmp_path, sizeof(tmp_path), FEB_WARDRIVING_SETTINGS_FILENAME ".tmp")) {
+        FURI_LOG_E(TAG, "wardriving_settings_save: path build failed");
+        return;
+    }
+
+    static char buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
+    int written = snprintf(
+        buf,
+        sizeof(buf),
+        "mode=%s\nwifi_swelling=%s\nwifi_cooldown_ms=%lu\nble_mode=%s\ncountry=%s\n",
+        wardriving_mode_token(app->wardriving_mode),
+        wardriving_swelling_wire_value(app->wardriving_swelling),
+        (unsigned long)app->wardriving_cooldown_ms,
+        wardriving_ble_mode_token(app->wardriving_ble_mode),
+        wardriving_country_wire_value(app->wardriving_country));
+    if(written <= 0 || (size_t)written >= sizeof(buf)) {
+        FURI_LOG_E(TAG, "wardriving_settings_save: buffer too small");
+        return;
+    }
+    size_t buf_len = (size_t)written;
+
+    File* file = storage_file_alloc(app->storage);
+    bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    if(ok) {
+        size_t out_written = storage_file_write(file, buf, buf_len);
+        ok = (out_written == buf_len) && storage_file_sync(file);
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    if(!ok) {
+        FURI_LOG_E(TAG, "wardriving_settings_save: write failed");
+        storage_common_remove(app->storage, tmp_path);
+        return;
+    }
+
+    storage_common_remove(app->storage, final_path);
+    FS_Error rename_err = storage_common_rename(app->storage, tmp_path, final_path);
+    if(rename_err != FSE_OK) {
+        FURI_LOG_E(TAG, "wardriving_settings_save: rename failed: %d", rename_err);
+        storage_common_remove(app->storage, tmp_path);
+    }
+}
+
 /* docs/PLAN.md step 7 grew AppEvent past this file's ~100-byte static-storage threshold
    (added capability_board/capability_features) -- event is static, not stack-local, to
    keep it off the 1280-byte BleEventWorker stack (this function is reachable from
@@ -1293,19 +1584,24 @@ static uint8_t capability_query_ciphertext_buf[FEB_CAPABILITY_QUERY_PAYLOAD_MAX_
    pending_command_kind's own one-command-in-flight convention (see its declaration below)
    already establishes only one of these can be in progress at a time -- the same
    single-in-flight reasoning this file already applies to shared_ble_event above, just on
-   the main thread instead of BleEventWorker. Sized to 96 bytes, the largest of the four
-   capabilities' worst-case payload encodings (wardriving's `{action:"start",
-   sources:[...]}` -- see its own send_wardriving_start_command() comment further below for
-   the byte count); wifi_scan/ble_scan/gps's smaller ~45-53-byte worst case (map(1) +
-   "capability" key(1+10) + value(1+9) + "request_id" key(1+10) + uint value(1-9) +
-   "arguments" key(1+9) + empty-map value(1)) fits with margin to spare. The original
-   per-capability 32u sizing only counted value bytes, forgetting the CBOR map *key* text
-   strings entirely -- feb_cbor_encode_command_payload() silently returned 0 (out_cap
-   exhausted partway through encoding "request_id"'s key) on every single call, so
-   send_wifi_scan_command() failed 100% of the time (hardware-verified 2026-09-07: OK-press
-   never reached the ESP32) before that fix; sized with real margin now, not shaved to the
-   byte. */
-#define FEB_CMD_PAYLOAD_MAX_LEN 160u
+   the main thread instead of BleEventWorker. Must fit the full *wrapped* command envelope
+   (map(1) + "capability" key(1+10) + "wardriving" value(1+10) + "request_id" key(1+10) +
+   uint value(1-9) + "arguments" key(1+9) + the arguments map embedded inline, not as a
+   separate bstr) for every capability, not just each capability's own arguments sub-buffer
+   -- wardriving's arguments alone (`FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN`, its own send_
+   wardriving_start_command() comment further below) grew to ~150 bytes worst case
+   (wifi_swelling/country added 2026-09-21, docs/WARDRIVING_REDESIGN.md) atop ~30-53 bytes of
+   this envelope's own overhead == ~180-203 bytes total for a WiFi+BLE wardriving start,
+   found (2026-09-21, hardware-verified) to exceed this buffer's previous 160u sizing:
+   send_wardriving_start_command()'s outer feb_cbor_encode_command_payload() call silently
+   returned 0 (out_cap exhausted) for the WiFi+BLE case specifically (WiFi-only's smaller
+   arguments still fit, masking the bug until BLE was added to the mix) -- the same failure
+   class, and the same "buffer sized for one capability's old worst case, not rechecked once
+   another capability's own sub-buffer grew" root cause, as the original 2026-09-07 wifi_scan
+   sizing bug this comment used to describe alone (send_wifi_scan_command() failed 100% of
+   the time, OK-press never reached the ESP32, before that fix). Sized with real margin now,
+   not shaved to the byte. */
+#define FEB_CMD_PAYLOAD_MAX_LEN 224u
 static uint8_t cmd_payload_buf[FEB_CMD_PAYLOAD_MAX_LEN];
 static uint8_t cmd_ciphertext_buf[FEB_CMD_PAYLOAD_MAX_LEN];
 static uint8_t cmd_record_buf[FEB_MAX_RECORD_SIZE];
@@ -1897,6 +2193,7 @@ static void post_gps_status(
         event->gps_hdop_e1 = result->hdop_e1;
         event->gps_utc_timestamp_s = result->utc_timestamp_s;
         event->gps_altitude_dm_offset = result->altitude_dm_offset;
+        event->gps_speed_e1_kmh = result->speed_e1_kmh;
     }
     furi_message_queue_put(app->queue, event, 0);
 }
@@ -2568,49 +2865,59 @@ static bool send_gps_command(Esp32App* app) {
 }
 
 /* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
-   values ("wifi"=1+4,"ble"=1+3) == ~40 bytes worst case; sized with real margin (see the
-   shared cmd_payload_buf declaration's own comment above for why this project no longer
-   shaves these to the byte, and why FEB_CMD_PAYLOAD_MAX_LEN is sized off this capability's
-    160-byte worst case). FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size
-   this function's local `arguments_buf`; the command payload/ciphertext/record scratch is
-   the shared cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with wifi_scan's
-   command scratch above. */
-#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 128u
+   values ("wifi"=1+4,"ble_passive"=1+11) + "wifi_interval_ms"key(1+16)+uint(5) +
+   "ble_window_ms"key(1+13)+uint(5) + "ble_interval_ms"key(1+16)+uint(5) +
+   "wifi_swelling"key(1+13)+"speed_based"value(1+11) + "country"key(1+7)+"RoW"value(1+3) ==
+   ~150 bytes worst case (wifi_swelling/country added 2026-09-21,
+   docs/WARDRIVING_REDESIGN.md); sized with real margin (see the shared cmd_payload_buf
+   declaration's own comment above for why this project no longer shaves these to the byte).
+   FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size this function's
+   local `arguments_buf`; the command payload/ciphertext/record scratch is the shared
+   cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with wifi_scan's command
+   scratch above. */
+#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 192u
 static uint64_t wardriving_next_request_id = 1;
 
 /* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
-    payloads") for the selected source mode. The interval fields are explicit so the UI's
-    source choices remain stable when the ESP32 defaults change. `ble_passive` requests an
-    observer-only BLE scan; the ESP32 temporarily uses active discovery while disconnected so
-    wardriving can still find the Flipper and reconnect. */
+    payloads") built from the Stopped screen's five independent settings fields (docs/
+    WARDRIVING_REDESIGN.md, 2026-09-21, replacing the old single WardrivingSourceMode enum).
+    `use_wifi`/`use_ble` intersect the user's Mode choice with what the board actually
+    advertises, same as the old code did with its own want/capability split -- a board that
+    only advertises one radio is never blocked by a stale Mode value, since that row is
+    hidden (not editable) on such a board anyway. `ble_passive` requests an observer-only BLE
+    scan; the ESP32 temporarily uses active discovery while disconnected so wardriving can
+    still find the Flipper and reconnect. */
 static bool send_wardriving_start_command(Esp32App* app) {
     if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
         return false;
     }
     Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
 
-    feb_wardriving_command_payload_t command_args;
-    bool use_wifi = app->wardriving_source_mode != WardrivingSourceBleOnly;
-    bool use_ble = app->wardriving_source_mode != WardrivingSourceWifiOnly;
-    bool ble_passive = app->wardriving_source_mode == WardrivingSourceWifi2BlePassive;
-    uint32_t wifi_interval_ms = 2000;
+    /* static, not stack-local: this struct grew to ~96 bytes once wifi_swelling/country
+       were added (2026-09-21), crossing this file's own "sizeable buffer on a BLE-thread-
+       reachable path must be static" rule of thumb (docs/LESSONS.md) -- send_wardriving_
+       status_query() below shares this same struct type and IS reached from BleEventWorker
+       (handle_client_auth() -> send_wardriving_status_query()), so all three wardriving
+       command-builder functions use the same static convention for consistency, even though
+       this particular function (start) is only ever called from the main app thread today. */
+    static feb_wardriving_command_payload_t command_args;
+    bool want_wifi = app->wardriving_mode != WardrivingModeBle;
+    bool want_ble = app->wardriving_mode != WardrivingModeWifi;
+    bool use_wifi = app->capability_has_wifi_scan && want_wifi;
+    bool use_ble = app->capability_has_ble_scan && want_ble;
+    bool ble_passive = app->wardriving_ble_mode == WardrivingBleModePassive;
 
-    if(app->wardriving_source_mode == WardrivingSourceWifi5Ble) {
-        wifi_interval_ms = 5000;
-    } else if(app->wardriving_source_mode == WardrivingSourceWifi0Ble) {
-        wifi_interval_ms = 0;
-    }
     memset(&command_args, 0, sizeof(command_args));
     command_args.action = "start";
     command_args.action_len = sizeof("start") - 1;
     command_args.has_sources = 1;
     size_t source_count = 0;
-    if(app->capability_has_wifi_scan && use_wifi) {
+    if(use_wifi) {
         command_args.sources[source_count] = "wifi";
         command_args.source_lens[source_count] = sizeof("wifi") - 1;
         source_count++;
     }
-    if(app->capability_has_ble_scan && use_ble) {
+    if(use_ble) {
         command_args.sources[source_count] = ble_passive ? "ble_passive" : "ble";
         command_args.source_lens[source_count] = ble_passive ? sizeof("ble_passive") - 1 : sizeof("ble") - 1;
         source_count++;
@@ -2618,7 +2925,13 @@ static bool send_wardriving_start_command(Esp32App* app) {
     command_args.source_count = source_count;
     if(use_wifi) {
         command_args.has_wifi_interval_ms = 1;
-        command_args.wifi_interval_ms = wifi_interval_ms;
+        command_args.wifi_interval_ms = app->wardriving_cooldown_ms;
+        command_args.has_wifi_swelling = 1;
+        command_args.wifi_swelling = wardriving_swelling_wire_value(app->wardriving_swelling);
+        command_args.wifi_swelling_len = strlen(command_args.wifi_swelling);
+        command_args.has_country = 1;
+        command_args.country = wardriving_country_wire_value(app->wardriving_country);
+        command_args.country_len = strlen(command_args.country);
     }
     command_args.has_ble_params = use_ble;
     if(use_ble) {
@@ -2700,7 +3013,10 @@ static bool send_wardriving_status_query(Esp32App* app) {
     }
     Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
 
-    feb_wardriving_command_payload_t command_args;
+    /* static, not stack-local -- see send_wardriving_start_command()'s own comment on this
+       same struct type; this call site is the one that's actually BleEventWorker-reachable
+       (handle_client_auth() -> send_wardriving_status_query()). */
+    static feb_wardriving_command_payload_t command_args;
     memset(&command_args, 0, sizeof(command_args));
     command_args.action = "status";
     command_args.action_len = sizeof("status") - 1;
@@ -2772,7 +3088,9 @@ static bool send_wardriving_stop_command(Esp32App* app) {
     }
     Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
 
-    feb_wardriving_command_payload_t command_args;
+    /* static, not stack-local -- see send_wardriving_start_command()'s own comment on this
+       same struct type. */
+    static feb_wardriving_command_payload_t command_args;
     memset(&command_args, 0, sizeof(command_args));
     command_args.action = "stop";
     command_args.action_len = sizeof("stop") - 1;
@@ -3705,26 +4023,17 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, BLE_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
-/* wardriving control/status screen (docs/CAPABILITIES.md's wardriving bullet) -- a third
-    fixed-layout screen alongside the main screen and the two scan-results views, not a
-    scrollable list. Left/Right cycle the source/cadence choice for the next `start` when the
-    board advertises both wifi_scan and ble_scan (see WardrivingSourceMode); there is still no
-    interval-entry UI (docs/PLAN.md).
-   wardriving_running_known is deliberately displayed as its own distinct "unknown" state
-   (docs/LESSONS.md "UI must derive from real state") rather than defaulting to "stopped" --
-   this Flipper genuinely has no evidence either way until a "started"/"stopped" ack or a
-   busy/not_running error arrives this session (see Esp32App's own field comment). */
-static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
+/* Wardriving running screen (docs/WARDRIVING_REDESIGN.md, 2026-09-21) -- unchanged content
+   from the pre-redesign single screen's own running-state rendering: state text, Recs/
+   Backlog-or-Live line, GPS fix suffix, and the existing single last-WiFi/last-BLE lines (no
+   history list -- design doc decision 3). Reached only when wardriving_running_known &&
+   wardriving_running (see the Home-menu OK-press handler and the AppEventWardrivingRunState
+   handler, both of which route navigation using exactly that condition), so this function
+   does not re-derive an "unknown" state of its own -- draw_wardriving_stopped_screen() below
+   owns that case, since it's the screen a fresh/unconfirmed session actually lands on. */
+static void draw_wardriving_running_screen(Canvas* canvas, const Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
-    const char* state_text;
-    if(!app->wardriving_running_known) {
-        state_text = "Wardriving: unknown";
-    } else if(app->wardriving_running) {
-        state_text = "Wardriving: RUNNING";
-    } else {
-        state_text = "Wardriving: stopped";
-    }
-    canvas_draw_str(canvas, 2, 11, state_text);
+    canvas_draw_str(canvas, 2, 11, "Wardriving: RUNNING");
     canvas_set_font(canvas, FontSecondary);
 
     /* Sized with margin over the two longest fields (wardriving_last_summary and
@@ -3733,15 +4042,11 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
        project's docs/LESSONS.md for why a value that "can't really" overflow at runtime
        still needs a buffer GCC can prove is large enough. */
     char line[80];
-    bool wardriving_is_running = app->wardriving_running_known && app->wardriving_running;
-    bool both_sources_advertised = app->capability_has_wifi_scan && app->capability_has_ble_scan;
 
     /* `gps` fix indicator (docs/PLAN.md "Real GPS driver...", decision 6): three-state, not
        binary -- "?" (never polled/no gps capability), "No sig"/"Acq"/"Fix" once polled at
-       least once this session. Squeezed onto this row (rather than a dedicated new one)
-       since every other row on this fixed-layout screen is already conditionally occupied --
-       see this function's own row budget below. Blank entirely when the board doesn't
-       advertise `gps` at all, matching this file's existing capability-gating convention. */
+       least once this session. Blank entirely when the board doesn't advertise `gps` at all,
+       matching this file's existing capability-gating convention. */
     char gps_suffix[16];
     gps_suffix[0] = '\0';
     if(app->capability_has_gps) {
@@ -3758,34 +4063,7 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
         snprintf(gps_suffix, sizeof(gps_suffix), "  GPS:%s", gps_label);
     }
 
-    /* While stopped and both sources are advertised, this line shows what the next `start`
-       will request (toggled via Left/Right below) instead of the Recs/Backlog line -- picking
-       a source is only actionable before OK is pressed, so it takes the slot back once
-       running. Single-source boards have nothing to pick, so they always see Recs/Backlog. */
-    if(!wardriving_is_running && both_sources_advertised) {
-        const char* source_label;
-        switch(app->wardriving_source_mode) {
-        case WardrivingSourceWifi2Ble:
-            source_label = "WiFi(2s)+BLE";
-            break;
-        case WardrivingSourceWifi2BlePassive:
-            source_label = "WiFi(2s)+BLE(p)";
-            break;
-        case WardrivingSourceWifi5Ble:
-            source_label = "WiFi(5s)+BLE";
-            break;
-        case WardrivingSourceWifiOnly:
-            source_label = "WiFi only (2s)";
-            break;
-        case WardrivingSourceWifi0Ble:
-            source_label = "WiFi(0s)+BLE";
-            break;
-        default:
-            source_label = "BLE only";
-            break;
-        }
-        snprintf(line, sizeof(line), "Source: %s%s", source_label, gps_suffix);
-    } else if(app->wardriving_backlog_remaining > 0) {
+    if(app->wardriving_backlog_remaining > 0) {
         snprintf(
             line,
             sizeof(line),
@@ -3804,20 +4082,12 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, 22, line);
 
     if(app->wardriving_last_wifi_summary[0] != '\0') {
-        snprintf(
-            line,
-            sizeof(line),
-            "Last WiFi: %s",
-            app->wardriving_last_wifi_summary);
+        snprintf(line, sizeof(line), "Last WiFi: %s", app->wardriving_last_wifi_summary);
         canvas_draw_str(canvas, 2, 32, line);
     }
 
     if(app->wardriving_last_ble_summary[0] != '\0') {
-        snprintf(
-            line,
-            sizeof(line),
-            "Last BLE: %s",
-            app->wardriving_last_ble_summary);
+        snprintf(line, sizeof(line), "Last BLE: %s", app->wardriving_last_ble_summary);
         canvas_draw_str(canvas, 2, 42, line);
     }
 
@@ -3826,29 +4096,237 @@ static void draw_wardriving_screen(Canvas* canvas, const Esp32App* app) {
         canvas_draw_str(canvas, 2, 52, line);
     }
 
-    const char* footer;
-    char footer_buf[40];
-    if(wardriving_is_running) {
-        footer = "OK: stop  Back: exit";
-    } else {
-        /* Start action's label only (docs/PLAN.md decision 6) -- the action itself is
-           unchanged either way (send_wardriving_start_command() is called regardless), and
-           this never disables/greys out OK. Only ever "(delayed)" when the board actually
-           advertises `gps` (see gps_suffix's own comment above); a board with no gps
-           capability keeps the original plain "start" wording unconditionally, since there is
-           no signal to reason about and CAPABILITIES.md's own framing already treats a board
-           with no real GPS driver as equivalent to an always-fixed stub. */
-        bool gps_delayed =
-            app->capability_has_gps && !(app->gps_status_known && app->gps_state == GpsFixStateFix);
-        const char* start_label = gps_delayed ? "start (delayed)" : "start";
-        if(both_sources_advertised) {
-            snprintf(footer_buf, sizeof(footer_buf), "OK:%s L/R:src Back:exit", start_label);
-        } else {
-            snprintf(footer_buf, sizeof(footer_buf), "OK: %s  Back: exit", start_label);
-        }
-        footer = footer_buf;
+    canvas_draw_str(canvas, 2, 56, "OK: stop  Back: exit");
+}
+
+/* Stopped-screen settings rows (docs/WARDRIVING_REDESIGN.md) -- capability-gated only, not
+   re-gated by each other's current value (design doc rationale #4): e.g. the WiFi Swelling
+   row stays visible even while Mode=BLE is selected. Declared here, not with the
+   WardrivingMode/etc. value enums up top, since this row-index concept is purely an artifact
+   of this one screen's own rendering/input. */
+typedef enum {
+    WardrivingSettingsRowMode = 0,
+    WardrivingSettingsRowSwelling,
+    WardrivingSettingsRowCooldown,
+    WardrivingSettingsRowBleMode,
+    WardrivingSettingsRowCountry,
+    WardrivingSettingsRowCount,
+} WardrivingSettingsRow;
+
+#define WARDRIVING_SETTINGS_VISIBLE_ROWS 4
+
+static bool wardriving_settings_row_visible(const Esp32App* app, WardrivingSettingsRow row) {
+    switch(row) {
+    case WardrivingSettingsRowMode:
+        return app->capability_has_wifi_scan && app->capability_has_ble_scan;
+    case WardrivingSettingsRowBleMode:
+        return app->capability_has_ble_scan;
+    case WardrivingSettingsRowSwelling:
+    case WardrivingSettingsRowCooldown:
+    case WardrivingSettingsRowCountry:
+        return app->capability_has_wifi_scan;
+    default:
+        return false;
     }
-    canvas_draw_str(canvas, 2, 56, footer);
+}
+
+/* Same "scroll follows selection" idiom as home_menu_scroll_into_view() above. */
+static void wardriving_settings_scroll_into_view(Esp32App* app) {
+    int total = 0;
+    int rank = -1;
+    for(int i = 0; i < WardrivingSettingsRowCount; i++) {
+        if(!wardriving_settings_row_visible(app, (WardrivingSettingsRow)i)) continue;
+        if((size_t)i == app->wardriving_settings_row) rank = total;
+        total++;
+    }
+    if(rank < 0) return;
+
+    size_t max_offset = (size_t)total > WARDRIVING_SETTINGS_VISIBLE_ROWS ?
+                             (size_t)total - WARDRIVING_SETTINGS_VISIBLE_ROWS :
+                             0;
+    if(app->wardriving_settings_scroll_offset > max_offset) {
+        app->wardriving_settings_scroll_offset = max_offset;
+    }
+    if((size_t)rank < app->wardriving_settings_scroll_offset) {
+        app->wardriving_settings_scroll_offset = (size_t)rank;
+    } else if((size_t)rank >= app->wardriving_settings_scroll_offset + WARDRIVING_SETTINGS_VISIBLE_ROWS) {
+        app->wardriving_settings_scroll_offset = (size_t)rank - WARDRIVING_SETTINGS_VISIBLE_ROWS + 1;
+    }
+}
+
+/* Same "clamp selection to a currently-visible item" idiom as home_menu_fix_selection() --
+   called every draw, defensively, in case a capability set shrinks (a reconnect to a
+   different board) while this screen happens to be open. */
+static void wardriving_settings_fix_selection(Esp32App* app) {
+    if(!wardriving_settings_row_visible(app, (WardrivingSettingsRow)app->wardriving_settings_row)) {
+        for(int i = 0; i < WardrivingSettingsRowCount; i++) {
+            if(wardriving_settings_row_visible(app, (WardrivingSettingsRow)i)) {
+                app->wardriving_settings_row = (size_t)i;
+                break;
+            }
+        }
+    }
+    wardriving_settings_scroll_into_view(app);
+}
+
+/* Same "step to the next visible item, wrap around" idiom as home_menu_step() -- relies on
+   at least one row always being visible, which holds here since this screen is only
+   reachable when capability_has_wardriving is true, and this capability implies at least one
+   of wifi_scan/ble_scan is also advertised (docs/CAPABILITIES.md; send_wardriving_start_
+   command()'s own source_count==0 guard depends on the same assumption). */
+static void wardriving_settings_step(Esp32App* app, int delta) {
+    int idx = (int)app->wardriving_settings_row;
+    int count = WardrivingSettingsRowCount;
+    while(true) {
+        idx += delta;
+        if(idx < 0) idx = count - 1;
+        if(idx >= count) idx = 0;
+        if(wardriving_settings_row_visible(app, (WardrivingSettingsRow)idx)) {
+            app->wardriving_settings_row = (size_t)idx;
+            break;
+        }
+    }
+    wardriving_settings_scroll_into_view(app);
+}
+
+/* Left/Right on the Stopped screen's highlighted row -- cycles that row's own value with
+   wraparound and persists the whole settings file immediately (docs/WARDRIVING_REDESIGN.md
+   "Persistence": "rewritten immediately on every row-value change"). wardriving_cooldown_ms
+   is not an enum (see its own Esp32App field comment), so it cycles through
+   wardriving_cooldown_values[] by linear search instead of a modulo increment. */
+static void wardriving_settings_cycle_row(Esp32App* app, int delta) {
+    switch((WardrivingSettingsRow)app->wardriving_settings_row) {
+    case WardrivingSettingsRowMode:
+        app->wardriving_mode = (WardrivingMode)(
+            ((int)app->wardriving_mode + delta + WardrivingModeCount) % WardrivingModeCount);
+        break;
+    case WardrivingSettingsRowSwelling:
+        app->wardriving_swelling = (WardrivingSwelling)(
+            ((int)app->wardriving_swelling + delta + WardrivingSwellingCount) %
+            WardrivingSwellingCount);
+        break;
+    case WardrivingSettingsRowCooldown: {
+        int idx = 1; /* falls back to 2000ms's index if the current value is somehow stale */
+        for(int i = 0; i < 3; i++) {
+            if(wardriving_cooldown_values[i] == app->wardriving_cooldown_ms) {
+                idx = i;
+                break;
+            }
+        }
+        idx = (idx + delta + 3) % 3;
+        app->wardriving_cooldown_ms = wardriving_cooldown_values[idx];
+        break;
+    }
+    case WardrivingSettingsRowBleMode:
+        app->wardriving_ble_mode = (WardrivingBleMode)(
+            ((int)app->wardriving_ble_mode + delta + WardrivingBleModeCount) %
+            WardrivingBleModeCount);
+        break;
+    case WardrivingSettingsRowCountry:
+        app->wardriving_country = (WardrivingCountry)(
+            ((int)app->wardriving_country + delta + WardrivingCountryCount) %
+            WardrivingCountryCount);
+        break;
+    default:
+        return;
+    }
+    wardriving_settings_save(app);
+}
+
+static void wardriving_settings_row_text(
+    const Esp32App* app,
+    WardrivingSettingsRow row,
+    char* label,
+    size_t label_cap,
+    char* value,
+    size_t value_cap) {
+    switch(row) {
+    case WardrivingSettingsRowMode:
+        snprintf(label, label_cap, "Mode");
+        snprintf(value, value_cap, "%s", wardriving_mode_label(app->wardriving_mode));
+        break;
+    case WardrivingSettingsRowSwelling:
+        snprintf(label, label_cap, "WiFi Swelling");
+        snprintf(value, value_cap, "%s", wardriving_swelling_label(app->wardriving_swelling));
+        break;
+    case WardrivingSettingsRowCooldown: {
+        int idx = 1;
+        for(int i = 0; i < 3; i++) {
+            if(wardriving_cooldown_values[i] == app->wardriving_cooldown_ms) {
+                idx = i;
+                break;
+            }
+        }
+        snprintf(label, label_cap, "WiFi Cooldown");
+        snprintf(value, value_cap, "%s", wardriving_cooldown_labels[idx]);
+        break;
+    }
+    case WardrivingSettingsRowBleMode:
+        snprintf(label, label_cap, "BLE Mode");
+        snprintf(value, value_cap, "%s", wardriving_ble_mode_label(app->wardriving_ble_mode));
+        break;
+    case WardrivingSettingsRowCountry:
+        snprintf(label, label_cap, "Country");
+        snprintf(value, value_cap, "%s", wardriving_country_wire_value(app->wardriving_country));
+        break;
+    default:
+        label[0] = '\0';
+        value[0] = '\0';
+        break;
+    }
+}
+
+/* Wardriving stopped screen (docs/WARDRIVING_REDESIGN.md, 2026-09-21) -- replaces the old
+   single screen's "Source: ..." Left/Right-cycled line with a real scrollable settings list,
+   same 22/32/42/52 4-row window as draw_wifi_scan_results()/draw_ble_scan_results(). Shown
+   whenever wardriving_running_known is false (this Flipper has no evidence either way yet,
+   same "unknown" state the pre-redesign screen carried -- docs/LESSONS.md "UI must derive
+   from real state") or the board is confirmed stopped; confirmed-running always lives on
+   draw_wardriving_running_screen() instead (see that function's own comment). */
+static void draw_wardriving_stopped_screen(Canvas* canvas, Esp32App* app) {
+    wardriving_settings_fix_selection(app);
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(
+        canvas, 2, 11, app->wardriving_running_known ? "Wardriving: stopped" : "Wardriving: unknown");
+    canvas_set_font(canvas, FontSecondary);
+
+    int rank = 0;
+    for(int i = 0; i < WardrivingSettingsRowCount; i++) {
+        if(!wardriving_settings_row_visible(app, (WardrivingSettingsRow)i)) continue;
+        if((size_t)rank >= app->wardriving_settings_scroll_offset &&
+           (size_t)rank < app->wardriving_settings_scroll_offset + WARDRIVING_SETTINGS_VISIBLE_ROWS) {
+            char label[20];
+            char value[20];
+            wardriving_settings_row_text(
+                app, (WardrivingSettingsRow)i, label, sizeof(label), value, sizeof(value));
+            /* Sized for -Werror=format-truncation's static worst case: "> "(2) + label(<=19)
+               + ": "(2) + value(<=19) + NUL == 43, with margin -- see docs/LESSONS.md for why
+               a value that "can't really" overflow at runtime still needs a buffer GCC can
+               prove is large enough. */
+            char line[48];
+            snprintf(
+                line,
+                sizeof(line),
+                "%s%s: %s",
+                (size_t)i == app->wardriving_settings_row ? "> " : "  ",
+                label,
+                value);
+            uint8_t y = (uint8_t)(22 + (rank - (int)app->wardriving_settings_scroll_offset) * 10);
+            canvas_draw_str(canvas, 2, y, line);
+        }
+        rank++;
+    }
+
+    /* Same "start"/"start (delayed)" footer label logic as before the redesign (docs/PLAN.md
+       decision 6) -- unchanged: the action itself is always send_wardriving_start_command()
+       regardless of gps_delayed, this never disables/greys out OK. */
+    bool gps_delayed =
+        app->capability_has_gps && !(app->gps_status_known && app->gps_state == GpsFixStateFix);
+    const char* start_label = gps_delayed ? "start (delayed)" : "start";
+    char footer_buf[40];
+    snprintf(footer_buf, sizeof(footer_buf), "OK:%s L/R:val Back:exit", start_label);
+    canvas_draw_str(canvas, 2, 56, footer_buf);
 }
 
 /* Home screen layout: same proven 10px-pitch / y=62-footer convention as the
@@ -4231,13 +4709,17 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
 
     /* Same offset-recovery convention as the Lat/Lon row above (cbor_gps.h's
        FEB_GPS_ALTITUDE_DM_OFFSET), decimeters -> meters with one decimal place retained.
-       Speed/heading parsing from RMC is still backlogged (docs/BACKLOG.md) -- always `--`. */
+       Speed (docs/WARDRIVING_REDESIGN.md, 2026-09-21) shares this same row -- the screen's
+       fixed 22/32/42/52 row budget has no spare row, and this line already reserved a
+       "Speed: --" placeholder for exactly this field; heading parsing from RMC remains
+       backlogged (docs/BACKLOG.md). */
     if(has_fix) {
         double altitude_m =
             ((double)(int64_t)app->gps_altitude_dm_offset - (double)1000000) / (double)10;
-        snprintf(line, sizeof(line), "Alt: %.1fm  Speed: --", altitude_m);
+        double speed_kmh = (double)app->gps_speed_e1_kmh / (double)10;
+        snprintf(line, sizeof(line), "Alt: %.1fm  Spd: %.1f km/h", altitude_m, speed_kmh);
     } else {
-        snprintf(line, sizeof(line), "Alt: --  Speed: --");
+        snprintf(line, sizeof(line), "Alt: --  Spd: --");
     }
     canvas_draw_str(canvas, 2, 52, line);
 }
@@ -4351,12 +4833,12 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
 
     static const char* labels[HomeMenuCount] = {
         "Wardriving",
+        "Publish",
         "Scan",
         "GPS",
         "Settings",
         "About",
         "Legacy",
-        "Publish",
     };
 
     uint8_t visible_rows = home_menu_visible_rows(app);
@@ -4429,8 +4911,12 @@ static void draw_callback(Canvas* canvas, void* context) {
         draw_ble_scan_results(canvas, app);
         return;
     }
-    if(app->screen == AppScreenWardriving) {
-        draw_wardriving_screen(canvas, app);
+    if(app->screen == AppScreenWardrivingStopped) {
+        draw_wardriving_stopped_screen(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenWardrivingRunning) {
+        draw_wardriving_running_screen(canvas, app);
         return;
     }
     if(app->screen == AppScreenPublish) {
@@ -4500,6 +4986,10 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     app->wardriving_last_wifi_summary[0] = '\0';
     app->wardriving_last_ble_summary[0] = '\0';
     app->wardriving_error_message[0] = '\0';
+    /* UI cursor/scroll only (the five settings fields themselves are persisted, global
+       config -- docs/WARDRIVING_REDESIGN.md "Persistence" -- and must NOT be reset here). */
+    app->wardriving_settings_row = 0;
+    app->wardriving_settings_scroll_offset = 0;
     wardriving_flush_led_active = false;
     if(app->notifications) {
         notification_message(app->notifications, &sequence_blink_stop);
@@ -4573,7 +5063,6 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         .pairing_phase = PairingPhaseNone,
         .has_saved_pairing = false,
         .connection_lost = false,
-        .wardriving_source_mode = WardrivingSourceWifi2Ble,
     };
     app.bt = furi_record_open(RECORD_BT);
     app.storage = furi_record_open(RECORD_STORAGE);
@@ -4601,6 +5090,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     if(!wardriving_dir_ready) {
         FURI_LOG_E(TAG, "Failed to resolve wardriving directory path");
     }
+    wardriving_settings_load(&app);
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
 
@@ -4712,6 +5202,16 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.capability_has_ble_scan = event.capability_has_ble_scan;
             app.capability_has_wardriving = event.capability_has_wardriving;
             app.capability_has_gps = event.capability_has_gps;
+            /* Force-jump to Wardriving on connect (docs/WARDRIVING_REDESIGN.md, decision 6):
+               the moment a session's capability info arrives and the board advertises
+               wardriving, the Home cursor is forced here unconditionally, even if the user
+               was sitting on Settings/About/Publish/Legacy at that moment -- in addition to,
+               not instead of, home_menu_fix_selection()'s own clamp-to-first-visible-item
+               safety net that already runs on every Home draw. */
+            if(event.capability_has_wardriving) {
+                app.home_menu_index = HomeMenuWardriving;
+                home_menu_scroll_into_view(&app);
+            }
         } else if(event.type == AppEventWifiScanAp) {
             if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
                 WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
@@ -4769,6 +5269,16 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.wardriving_last_ble_summary[0] = '\0';
             }
             app.wardriving_error_message[0] = '\0';
+            /* A running/stopped state change while already on one of the two Wardriving
+               screens switches to the other (docs/WARDRIVING_REDESIGN.md) -- same re-render
+               on this event the pre-redesign single screen already did, just expressed as a
+               screen swap now that the two states are separate screens. */
+            if(app.screen == AppScreenWardrivingStopped || app.screen == AppScreenWardrivingRunning) {
+                app.screen = app.wardriving_running ? AppScreenWardrivingRunning :
+                                                       AppScreenWardrivingStopped;
+                app.wardriving_settings_row = 0;
+                app.wardriving_settings_scroll_offset = 0;
+            }
         } else if(event.type == AppEventWardrivingBatch) {
             app.wardriving_records_this_session += event.wardriving_batch_count;
             app.wardriving_backlog_remaining = event.wardriving_backlog_remaining;
@@ -4803,6 +5313,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.gps_hdop_e1 = event.gps_hdop_e1;
                 app.gps_utc_timestamp_s = event.gps_utc_timestamp_s;
                 app.gps_altitude_dm_offset = event.gps_altitude_dm_offset;
+                app.gps_speed_e1_kmh = event.gps_speed_e1_kmh;
             }
         } else if(event.type == AppEventGpsPollTick) {
             /* GPS polling must not run while the Wardriving screen is open: the Wardriving
@@ -4833,12 +5344,23 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 } else if(event.input.key == InputKeyOk) {
                     switch(app.home_menu_index) {
                     case HomeMenuWardriving:
-                        app.screen = AppScreenWardriving;
+                        /* Navigating in from Home always lands on whichever screen matches
+                           this Flipper's current knowledge of run state (docs/
+                           WARDRIVING_REDESIGN.md) -- wardriving_running_known false (no
+                           evidence yet this session) routes to Stopped, same as a
+                           confirmed-stopped board; AppEventWardrivingRunState's own handler
+                           switches screens if the pending status query below turns out to
+                           report "running". */
+                        app.screen = (app.wardriving_running_known && app.wardriving_running) ?
+                                         AppScreenWardrivingRunning :
+                                         AppScreenWardrivingStopped;
+                        app.wardriving_settings_row = 0;
+                        app.wardriving_settings_scroll_offset = 0;
                         if(app.pairing_phase == PairingPhaseSessionActive &&
                            app.capability_has_wardriving && !app.wardriving_running_known) {
                             send_wardriving_status_query(&app);
                         }
-                        /* Do not keep the GPS timer running while the Wardriving screen is
+                        /* Do not keep the GPS timer running while either Wardriving screen is
                            open. That poll stream is the source of the disconnects seen while a
                            capture is already live. */
                         furi_timer_stop(gps_poll_timer);
@@ -4998,7 +5520,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.ble_scan_error_message[0] = '\0';
                     app.ble_scan_in_progress = send_ble_scan_command(&app);
                 }
-            } else if(app.screen == AppScreenWardriving) {
+            } else if(app.screen == AppScreenWardrivingRunning) {
                 if(event.input.key == InputKeyBack) {
                     /* Unlike wifi_scan/ble_scan's Back, this does NOT stop wardriving --
                        capture runs autonomously server-side regardless of whether this
@@ -5009,24 +5531,26 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
                 } else if(event.input.key == InputKeyOk) {
-                    if(app.wardriving_running_known && app.wardriving_running) {
-                        send_wardriving_stop_command(&app);
-                    } else {
-                        send_wardriving_start_command(&app);
-                    }
-                } else if(
-                    event.input.key == InputKeyLeft && app.capability_has_wifi_scan &&
-                    app.capability_has_ble_scan &&
-                    !(app.wardriving_running_known && app.wardriving_running)) {
-                    app.wardriving_source_mode = (app.wardriving_source_mode == 0) ?
-                                                       (WardrivingSourceModeCount - 1) :
-                                                       (app.wardriving_source_mode - 1);
-                } else if(
-                    event.input.key == InputKeyRight && app.capability_has_wifi_scan &&
-                    app.capability_has_ble_scan &&
-                    !(app.wardriving_running_known && app.wardriving_running)) {
-                    app.wardriving_source_mode =
-                        (app.wardriving_source_mode + 1) % WardrivingSourceModeCount;
+                    send_wardriving_stop_command(&app);
+                }
+            } else if(app.screen == AppScreenWardrivingStopped) {
+                if(event.input.key == InputKeyBack) {
+                    /* Same "pure navigation, nothing to discard" reasoning as the Running
+                       screen's own Back above -- settings-row edits are already persisted
+                       to disk immediately on change (wardriving_settings_cycle_row()), not
+                       held as unconfirmed in-progress state. */
+                    app.screen = AppScreenHome;
+                    furi_timer_stop(gps_poll_timer);
+                } else if(event.input.key == InputKeyOk) {
+                    send_wardriving_start_command(&app);
+                } else if(event.input.key == InputKeyUp) {
+                    wardriving_settings_step(&app, -1);
+                } else if(event.input.key == InputKeyDown) {
+                    wardriving_settings_step(&app, 1);
+                } else if(event.input.key == InputKeyLeft) {
+                    wardriving_settings_cycle_row(&app, -1);
+                } else if(event.input.key == InputKeyRight) {
+                    wardriving_settings_cycle_row(&app, 1);
                 }
             } else if(app.screen == AppScreenPublish) {
                 if(event.input.key == InputKeyBack) {

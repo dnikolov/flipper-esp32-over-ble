@@ -755,8 +755,16 @@ static void test_wardriving_command_payload_codec(void) {
         payload.ble_window_ms = 30;
         payload.ble_interval_ms = 30;
         payload.has_ble_params = 1;
+        /* wifi_swelling/country: required alongside wifi_interval_ms whenever "wifi" is in
+           sources (docs/PROTOCOL.md, docs/WARDRIVING_REDESIGN.md, 2026-09-21). */
+        payload.wifi_swelling = "aggressive";
+        payload.wifi_swelling_len = strlen(payload.wifi_swelling);
+        payload.has_wifi_swelling = 1;
+        payload.country = "BG";
+        payload.country_len = strlen(payload.country);
+        payload.has_country = 1;
 
-        uint8_t out[128];
+        uint8_t out[192];
         size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
         CHECK(out_len > 0, "WARDRIVING_CMD_START_BOTH: encode succeeds");
 
@@ -771,8 +779,15 @@ static void test_wardriving_command_payload_codec(void) {
         CHECK(
             decoded.has_ble_params == 1 && decoded.ble_window_ms == 30 && decoded.ble_interval_ms == 30,
             "WARDRIVING_CMD_START_BOTH: ble params == 30/30");
+        CHECK(
+            decoded.has_wifi_swelling == 1 &&
+                memcmp(decoded.wifi_swelling, "aggressive", decoded.wifi_swelling_len) == 0,
+            "WARDRIVING_CMD_START_BOTH: wifi_swelling == \"aggressive\"");
+        CHECK(
+            decoded.has_country == 1 && memcmp(decoded.country, "BG", decoded.country_len) == 0,
+            "WARDRIVING_CMD_START_BOTH: country == \"BG\"");
 
-        uint8_t reencoded[128];
+        uint8_t reencoded[192];
         size_t reencoded_len = feb_cbor_encode_wardriving_command_payload(reencoded, sizeof(reencoded), &decoded);
         CHECK(bytes_equal(reencoded, reencoded_len, out, out_len), "WARDRIVING_CMD_START_BOTH: re-encode byte-identical");
     }
@@ -789,6 +804,12 @@ static void test_wardriving_command_payload_codec(void) {
         payload.has_sources = 1;
         payload.wifi_interval_ms = 30000;
         payload.has_wifi_interval_ms = 1;
+        payload.wifi_swelling = "normal";
+        payload.wifi_swelling_len = strlen(payload.wifi_swelling);
+        payload.has_wifi_swelling = 1;
+        payload.country = "RoW";
+        payload.country_len = strlen(payload.country);
+        payload.has_country = 1;
 
         uint8_t out[128];
         size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
@@ -800,6 +821,13 @@ static void test_wardriving_command_payload_codec(void) {
         CHECK(decoded.source_count == 1, "WARDRIVING_CMD_START_WIFI_ONLY: 1 source");
         CHECK(decoded.has_wifi_interval_ms == 1 && decoded.wifi_interval_ms == 30000, "WARDRIVING_CMD_START_WIFI_ONLY: wifi_interval_ms == 30000");
         CHECK(decoded.has_ble_params == 0, "WARDRIVING_CMD_START_WIFI_ONLY: no ble params");
+        CHECK(
+            decoded.has_wifi_swelling == 1 &&
+                memcmp(decoded.wifi_swelling, "normal", decoded.wifi_swelling_len) == 0,
+            "WARDRIVING_CMD_START_WIFI_ONLY: wifi_swelling == \"normal\"");
+        CHECK(
+            decoded.has_country == 1 && memcmp(decoded.country, "RoW", decoded.country_len) == 0,
+            "WARDRIVING_CMD_START_WIFI_ONLY: country == \"RoW\"");
     }
 
     /* start, ble source only */
@@ -1304,10 +1332,11 @@ static void test_gps_status_result_payload_codec(void) {
     payload.hdop_e1 = 23;
     payload.utc_timestamp_s = 1700000000;
     payload.altitude_dm_offset = 1000123;
+    payload.speed_e1_kmh = 123; /* 12.3 km/h, docs/WARDRIVING_REDESIGN.md, 2026-09-21 */
 
     /* per-field round trip */
     {
-        uint8_t out[128];
+        uint8_t out[160]; /* 8 fields incl. speed_e1_kmh (2026-09-21) needs ~133 bytes worst case */
         size_t out_len = feb_cbor_encode_gps_result_payload(out, sizeof(out), &payload);
         CHECK(out_len > 0, "GPS_RESULT: encode succeeds");
 
@@ -1322,6 +1351,7 @@ static void test_gps_status_result_payload_codec(void) {
         CHECK(decoded.utc_timestamp_s == 1700000000, "GPS_RESULT: utc_timestamp_s matches");
         CHECK(
             decoded.altitude_dm_offset == 1000123, "GPS_RESULT: altitude_dm_offset matches");
+        CHECK(decoded.speed_e1_kmh == 123, "GPS_RESULT: speed_e1_kmh matches");
     }
 
     /* Full status(state="fix") envelope round trip -- confirms the result span
@@ -1329,7 +1359,7 @@ static void test_gps_status_result_payload_codec(void) {
        feb_cbor_decode_gps_result_payload(), same pattern as
        WARDRIVING_STATUS_DATA above (this shape is flat, well within FEB_CBOR_MAX_NESTING). */
     {
-        uint8_t result_out[128];
+        uint8_t result_out[160]; /* same margin as GPS_RESULT's own out[] above */
         size_t result_out_len =
             feb_cbor_encode_gps_result_payload(result_out, sizeof(result_out), &payload);
         CHECK(result_out_len > 0, "GPS_STATUS_FIX: result encode succeeds");

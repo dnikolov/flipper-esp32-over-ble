@@ -128,9 +128,10 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
     design uses "any non-zero fix quality," no threshold).
   - Research into improving on-board GPS accuracy (antenna choice, SBAS/WAAS config, update
     rate, etc.) — raised during the design session, not investigated yet.
-  - Real speed/heading on the GPS screen, from `RMC`'s speed/course fields — the frozen design
-    already parses `RMC` for date/time, so this is now a smaller follow-on (read two fields
-    already being parsed) than it would otherwise be, but is still not part of the frozen scope.
+  - Real speed on the GPS screen: **done 2026-09-21**, see
+    [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md) (`speed_e1_kmh`, parsed from `RMC`'s
+    speed-over-ground field). Real heading, from `RMC`'s course field, remains open — not part
+    of that pass.
   - `wardriving_csv.c`'s WigleWifi-1.4 `AltitudeMeters`/`AccuracyMeters` columns are still
     hardcoded `"0,0"` — GGA `altitude_dm` exists in `feb_location_t` and the `gps` capability's
     own `altitude_dm_offset` result field, but wardriving records carry no altitude field of
@@ -150,19 +151,12 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
     out of the frozen design (see PLAN.md's "Scope boundary" note) because it needs a
     form/pin-entry widget this project doesn't have yet and a new get/set wire config surface.
     Defaults stay compile-time constants for now.
-  - **Per-channel Wi-Fi scan dwell time configurable via the Flipper Settings screen**
-    (2026-09-21) — `esp_wifi_scan_start()`'s `scan_time.active.min/max`/`scan_time.passive`
-    fields (see the dwell-time-tuning item above) are currently left zeroed/default and are not
-    exposed on the wire at all: unlike `wardriving`'s `wifi_interval_ms`/`ble_window_ms`/
-    `ble_interval_ms` (already real, overridable `start`-command fields per PROTOCOL.md, just
-    unused by the Flipper UI), there is no `PROTOCOL.md` field for dwell time today — this needs
-    new wire surface on both firmwares, not just a Flipper UI for an existing one. Same blocker
-    as the two settings items above: the Flipper Settings screen is still a deliberate
-    placeholder rendering static "TBD" text (`docs/UI_REDESIGN.md` decision #6), so this has no
-    UI to land in yet either. Also depends on the regulatory-country-code item above for
-    correctness — the active/passive channel split (and therefore which dwell fields even apply
-    to which channels) changes with the configured country code, so decide/implement that first
-    or alongside this, not after. Unscoped beyond this.
+  - Per-channel Wi-Fi scan dwell time ("WiFi Swelling") configurable from the Flipper UI: **done
+    2026-09-21**, see [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md) — landed on the new
+    Wardriving Stopped screen's settings list rather than the still-placeholder Settings screen,
+    with the regulatory country-code item below implemented alongside it as that doc's own
+    scoping decision required. Scoped to wardriving's own WiFi scan calls only, not the manual
+    `wifi_scan` capability — see that doc's "Scope boundaries."
 - Non-ASCII SSID rendering is untested on real hardware (host-native codec tests cover the
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
@@ -173,6 +167,8 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s actual five-mode BLE-active/passive live-view design
   (reusing Wardriving's capture engine without persistence). Needs its own implementation pass
   once the runtime BLE active/passive toggle above exists.
+- **ESP32-side `wifi_swelling`/`country` (Phase 7, [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)) are not persisted across the button-toggle or boot-autostart wardriving-start paths** — only a Flipper-sent `start` command carries them; autostart/button-toggle always run at Normal/RoW. See that doc's "Open items" for full detail. Not scoped for this pass.
+- **`docs/USER_GUIDE.md` still describes every screen's entry point as a direct Left/Right/Up/Down button press "from the main screen"** (wifi_scan/ble_scan/wardriving/gps sections all read this way) — this predates the Phase 3a Home-menu redesign and was never updated to describe menu-based navigation (`HomeMenuWardriving`/`HomeMenuScan`/etc., OK to select). Noticed 2026-09-21 while syncing the guide for Phase 7; left alone as out-of-scope for that pass since it spans sections unrelated to wardriving specifically. Needs its own doc-wide pass.
 - Decide whether `AppScreenLegacy`/`HomeMenuLegacy` (a compatibility screen preserving the old
   direct-button-shortcut flow, found during the Phase 3a implementation but never part of
   [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s original design) is kept long-term or removed once
@@ -215,25 +211,13 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   intervals; measure: (1) BLE reconnect latency if connection drops, (2) backlog drain reliability,
   (3) WiFi capture density (networks/minute), (4) subjective coverage quality. Document tradeoffs
   and settle on production default accordingly.
-- **Set an explicit Wi-Fi regulatory country code instead of relying on ESP-IDF's implicit
-  default** (2026-09-21) — `esp32/main/main.c` never calls `esp_wifi_set_country()` /
-  `esp_wifi_set_country_code()`, so the board runs under ESP-IDF v5.5.2's default `{.cc="01"
-  (world safe mode), .schan=1, .nchan=11, .policy=WIFI_COUNTRY_POLICY_AUTO}`
-  (`esp_wifi.h:814`). This caps the scan channel range at **1-11** — channels 12-13 are not
-  scanned at all today, actively or passively, contrary to the above item's "13-channel sweep"
-  framing, which should be re-verified against this project's actual default rather than the
-  generic 2-channel-more assumption it currently cites. `"BG"` is an explicitly supported code
-  (`esp_wifi.h:1545-1548`), and the bundled regulatory data confirms Bulgaria permits the full
-  2.4 GHz band unrestricted: `country BG: DFS-ETSI, (2400 - 2483.5 @ 40), (100 mW)`
-  (`esp_wifi_regulatory.txt:294-297`) — channels 1-13, no active/passive distinction, unlike the
-  US FCC domain the above item's 85ms-active/255ms-passive split implicitly assumes. Calling
-  `esp_wifi_set_country_code("BG", false)` once at Wi-Fi init would both correctly match the
-  board's actual operating jurisdiction and unlock channels 12-13 for scanning (with plain
-  active-scan dwell timing, same as 1-11 — no passive carve-out needed under BG's rules).
-  Confirm the board's actual deployment country before implementing (not necessarily always
-  Bulgaria), then implement together with — not before — the dwell-time tuning above, since
-  both touch the same `wifi_scan_config_t` setup and the channel count changes the dwell-time
-  math.
+- Set an explicit Wi-Fi regulatory country code instead of relying on ESP-IDF's implicit
+  default: **done 2026-09-21**, see [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md) — a
+  `BG`/`RoW` toggle on the new Wardriving Stopped screen calls `esp_wifi_set_country_code()`
+  once at wardriving start (`"BG"` unlocks channels 12-13, active-only; `"RoW"` keeps today's
+  implicit `"01"` world-safe-mode default, channels 1-11). Applied once per wardriving start,
+  not at boot — a later manual `wifi_scan` observes whatever `country` wardriving last set,
+  since it's a global radio setting (documented, not solved, in that doc's "Scope boundaries").
 
 ## Deferred by explicit product decision — confirm with the user before touching
 

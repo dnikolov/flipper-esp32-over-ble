@@ -12,7 +12,7 @@ size_t feb_cbor_encode_gps_result_payload(uint8_t *out, size_t out_cap, const fe
         return 0;
     }
 
-    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 7);
+    n = feb_cbor_encode_map_header(out + pos, out_cap - pos, 8);
     if (n == 0) return 0;
     pos += n;
 
@@ -65,19 +65,26 @@ size_t feb_cbor_encode_gps_result_payload(uint8_t *out, size_t out_cap, const fe
     if (n == 0) return 0;
     pos += n;
 
+    n = feb_cbor_encode_text(out + pos, out_cap - pos, "speed_e1_kmh", FEB_CBOR_I_KLEN("speed_e1_kmh"));
+    if (n == 0) return 0;
+    pos += n;
+    n = feb_cbor_encode_uint(out + pos, out_cap - pos, payload->speed_e1_kmh);
+    if (n == 0) return 0;
+    pos += n;
+
     return pos;
 }
 
 feb_cbor_status_t feb_cbor_decode_gps_result_payload(const uint8_t *in, size_t in_len, feb_gps_result_payload_t *payload)
 {
-    static const char *const names[7] = {"lat_e7_offset", "lon_e7_offset", "fix_quality",
+    static const char *const names[8] = {"lat_e7_offset", "lon_e7_offset", "fix_quality",
                                           "satellites", "hdop_e1", "utc_timestamp_s",
-                                          "altitude_dm_offset"};
+                                          "altitude_dm_offset", "speed_e1_kmh"};
     size_t count;
     size_t pos;
     size_t i;
     size_t next_min = 0;
-    int seen[7] = {0, 0, 0, 0, 0, 0, 0};
+    int seen[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     feb_cbor_status_t status;
     size_t consumed;
 
@@ -89,7 +96,7 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(const uint8_t *in, size_t i
     if (consumed == 0) {
         return status;
     }
-    if (count > 7) {
+    if (count > 8) {
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
     pos = consumed;
@@ -112,7 +119,7 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(const uint8_t *in, size_t i
         pos += key_consumed;
 
         found = -1;
-        for (j = 0; j < 7; j++) {
+        for (j = 0; j < 8; j++) {
             if (key_len == strlen(names[j]) && memcmp(key_data, names[j], key_len) == 0) {
                 found = (int)j;
                 break;
@@ -143,6 +150,7 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(const uint8_t *in, size_t i
         case 4: payload->hdop_e1 = value; break;
         case 5: payload->utc_timestamp_s = value; break;
         case 6: payload->altitude_dm_offset = value; break;
+        case 7: payload->speed_e1_kmh = value; break;
         default: break;
         }
 
@@ -150,7 +158,7 @@ feb_cbor_status_t feb_cbor_decode_gps_result_payload(const uint8_t *in, size_t i
         next_min = field_index + 1;
     }
 
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 8; i++) {
         if (!seen[i]) {
             return FEB_CBOR_ERR_MISSING_FIELD;
         }
