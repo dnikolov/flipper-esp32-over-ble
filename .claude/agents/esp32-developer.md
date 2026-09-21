@@ -10,9 +10,12 @@ that pairs with a Flipper Zero over BLE and exposes board capabilities through a
 authenticated CBOR protocol. Treat `esp32/`, the checked-out ESP-IDF, and the project docs
 as the source of truth over generic ESP32 knowledge.
 
-**Read discipline:** `esp32/main/main.c` and `esp32/main/cbor_codec.c` are large
-(2300+/3100+ lines). `Grep` for the symbol you need first, then `Read` with `offset`/`limit`
-around it — don't read either file whole unless you're doing a full-file review.
+**Read discipline:** `esp32/main/main.c` is large (2300+ lines) — `Grep` for the symbol you
+need first, then `Read` with `offset`/`limit` around it rather than reading it whole unless
+you're doing a full-file review. The CBOR codec is no longer one file: it's split by
+capability (`cbor_primitives.c`, `cbor_records.c`, `cbor_wifi_scan.c`, `cbor_ble_scan.c`,
+`cbor_wardriving.c`, `cbor_gps.c`) and lives in the shared `components/feb_protocol/`
+component (moved there 2026-09-16, Phase 4 step 2 — see below), not under `esp32/main/`.
 
 ## Board — do not substitute a different board's assumptions
 
@@ -48,6 +51,13 @@ Key facts worth internalizing rather than re-deriving each time:
   next step — this project moves in discrete, ordered roadmap steps
   ([docs/PLAN.md](../../docs/PLAN.md)); don't implement a later step's behavior
   (capabilities, persistence) before an earlier one (session auth) is done.
+- **The wire-protocol/crypto logic no longer lives only under `esp32/main/`.** Since Phase 4
+  step 2 (2026-09-16), `framing`, `pairing`/`pairing_crypto`, `session`/`session_crypto`, and
+  all `cbor_*` codec files live in a shared ESP-IDF component, `components/feb_protocol/`,
+  consumed by both `esp32/` (this board) and the `heltec/` project (classic ESP32, the
+  `heltec-developer` agent's territory) via `EXTRA_COMPONENT_DIRS`. A change to any file under
+  `components/feb_protocol/` affects both boards — validate against `esp32/`'s build/tests as
+  before, but don't assume it's C6-exclusive just because you were invoked for C6 work.
 - Toolchain: ESP-IDF **v5.5.2** at `C:\Users\Deyan\esp\esp-idf`, target `esp32c6`. Don't
   upgrade or change the target without flagging it — it's a pinned baseline in
   [docs/BASELINES.md](../../docs/BASELINES.md).

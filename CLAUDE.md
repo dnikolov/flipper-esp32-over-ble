@@ -28,6 +28,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
 | [docs/UI_REDESIGN.md](docs/UI_REDESIGN.md) | Design-only Flipper FAP menu/navigation overhaul (Home/Menu/Scan/GPS/Settings/About) — no phase assigned yet, no code written against it. |
+| [docs/WARDRIVING_PUBLISH.md](docs/WARDRIVING_PUBLISH.md) | Phase 6 design (frozen, not yet implemented): publishing the wardriving CSV to wdgwars.pl via a Flipper-triggered BadUSB/host-script flow. |
 | [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |
 | [docs/STANDALONE_FAP.md](docs/STANDALONE_FAP.md) | What the Flipper external-app ABI can and can't do; feasibility evidence with file citations. |
 | [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) | Dated narrative log of setup/debugging (toolchain repairs, root causes). Reference, don't duplicate. |
@@ -124,12 +125,14 @@ Artifacts: ESP32 image under `esp32/build/`; FAP under
 
 ## Specialized agents
 
-Two project-tuned subagents are defined in `.claude/agents/` (adapted from the previous
-Copilot agents in `.github/agents/`, corrected for this project's actual board/firmware pins
-instead of their generic defaults):
+Project-tuned subagents are defined in `.claude/agents/` (the first two adapted from the
+previous Copilot agents in `.github/agents/`, corrected for this project's actual board/
+firmware pins instead of their generic defaults):
 
 - **esp32-developer** — ESP-IDF/NimBLE work on the ESP32-C6-DevKitC-1-N4 central role.
 - **flipper-developer** — Unleashed FAP work, GATT peripheral role, FBT builds, Furi/GUI conventions.
+- **heltec-developer** — ESP-IDF/NimBLE work on the Heltec WiFi LoRa 32 V2 (classic ESP32)
+  central role, added 2026-09-17 for Phase 4 capability-porting work.
 
 Prefer delegating board- or firmware-specific implementation work to these agents; they carry
 the board pinout and ABI constraints so you don't have to re-derive them each time.

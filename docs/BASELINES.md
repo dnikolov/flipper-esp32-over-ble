@@ -11,15 +11,27 @@ This file records the pinned inputs for phase 1. The baseline images must be bui
 - Project: `esp32/`
 - ESP-IDF v5.5.2 includes NimBLE central-mode support, mbedTLS X25519/HKDF-SHA-256/HMAC-SHA-256/AES-256-GCM, and encrypted-NVS support — standard components of this and prior ESP-IDF releases, confirmed rather than assumed from the fact that the version happened to already be installed. (Runtime sessions use AES-256-GCM, not AES-128-GCM as originally specified — see `docs/PLAN.md` step 6.)
 
-## Heltec WiFi LoRa 32 V2 (future, not yet started)
+## Heltec WiFi LoRa 32 V2 (Phase 4, in progress since 2026-09-16)
 
-Planned as a second ESP32 target board for display and LoRa capabilities (see `docs/PLAN.md` step 7 capability roadmap). This is a different chip family from the pinned C6 baseline above, not a peripheral addition to it:
+Second ESP32 target board for display and LoRa capabilities (see `docs/PLAN.md` step 7 capability roadmap). This is a different chip family from the pinned C6 baseline above, not a peripheral addition to it:
 
 - Classic ESP32 (dual-core Xtensa), not the C6's RISC-V.
 - SX1276 LoRa radio and SSD1306 OLED display onboard.
 - No native USB — requires a USB-UART bridge chip to flash, unlike the C6's native USB-Serial/JTAG.
 
-Not yet pinned to a specific board revision or ESP-IDF target config. Do not carry forward C6 pin mappings to this board — see `docs/hardware/esp32-c6-devkitc-1/README.md`, which already documents this distinction.
+**Board bring-up confirmed read-only 2026-09-16** (Phase 4 step 1):
+
+- Board revision: silkscreen reads **"WiFi LoRa 32 V2"** (not V2.1).
+- Chip: ESP32-D0WDQ6, revision v1.0.
+- Flash: **8 MB** (Winbond), detected read-only with `esptool flash_id` — matches the V2/V2.1 8MB expectation in the hardware doc below, rules out the older V1's 4MB.
+- MAC: `a4:cf:12:03:ba:58`.
+- USB-UART bridge: Silicon Labs CP210x, enumerated as COM10 (not stable across sessions/reboots — reconfirm before hardware work, same caveat as the C6's COM9/Flipper's COM8).
+- Toolchain: the classic `esp32` (Xtensa) toolchain was not installed prior to this (this project had only ever installed `esp32c6`'s RISC-V toolchain); installed via `idf_tools.py install --targets=esp32`. `idf-env.json` now lists both `esp32` and `esp32c6` as selected targets.
+- An unmodified `hello_world` example built and flashed cleanly for the `esp32` target, confirmed booting over serial.
+
+Do not carry forward C6 pin mappings to this board — see `docs/hardware/esp32-c6-devkitc-1/README.md`, which already documents this distinction.
+
+Full hardware reference (pinout, board-revision ambiguity, per-vendor-documentation caveats): [docs/hardware/heltec-wifi-lora-32-v2/README.md](hardware/heltec-wifi-lora-32-v2/README.md). Phase 4 design and step-by-step status (architecture decision confirmed, gate-override decision, step tracking): `docs/PLAN.md`'s "Phase 4: Heltec WiFi LoRa 32 V2 board support" section.
 
 ## Flipper
 

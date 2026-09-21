@@ -1,5 +1,10 @@
 # Backlog
 
+**2026-09-16: Phase 4 (Heltec board support) started despite this backlog not being cleared** —
+an explicit user decision overriding `docs/PLAN.md`'s "does not start until Phase 3 backlog is
+cleared" gate (see `docs/PLAN.md`'s Phase 4 section). Everything below stays fully deferred, not
+interleaved with Phase 4 work, per that same decision.
+
 The single, centralized list of every open, actionable item that isn't part of the current
 roadmap step's own scope: code defects, robustness gaps, deferred product decisions, and
 cost/efficiency work. This is the "check before starting related work" list for anything not
@@ -63,6 +68,7 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 | G25 | 256-byte stack buffer in the ESP32's NimBLE notify-RX path (same class as 4 prior stack-overflow bugs) | Open |
 | BL07 | ESP32 status LED turns off instead of green when the Flipper app is closed while wardriving continues, then reopened and reconnected while the ESP32 flushes its backlog | Open |
 | BL09 | Filter the paired Flipper's BLE address out of scan and wardriving results | Open — define whether filtering applies to dedicated scans, wardriving capture, or both |
+| BL12 | Wardriving flash-log capacity (`esp32/partitions.csv`'s "wardrive" partition, ~14,000-21,000 records depending on average record size) can be reached within about a day of unattended autostart capture, with no wire-visible warning as the backlog approaches capacity — a real risk now that autostart (`4cd6c7d`, 2026-09-16) makes multi-day unattended runs realistic rather than requiring a Flipper to have started the session | Open — surfaced 2026-09-16 by a real 16,838-record backlog that needed a manual ESP32 reboot to drain (see [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H01); candidate fixes: report `backlog_remaining` against capacity so the Flipper can warn near-full, or size the partition against a longer target duration |
 
 ## Codebase & agent cost-efficiency
 
@@ -144,6 +150,19 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
     out of the frozen design (see PLAN.md's "Scope boundary" note) because it needs a
     form/pin-entry widget this project doesn't have yet and a new get/set wire config surface.
     Defaults stay compile-time constants for now.
+  - **Per-channel Wi-Fi scan dwell time configurable via the Flipper Settings screen**
+    (2026-09-21) — `esp_wifi_scan_start()`'s `scan_time.active.min/max`/`scan_time.passive`
+    fields (see the dwell-time-tuning item above) are currently left zeroed/default and are not
+    exposed on the wire at all: unlike `wardriving`'s `wifi_interval_ms`/`ble_window_ms`/
+    `ble_interval_ms` (already real, overridable `start`-command fields per PROTOCOL.md, just
+    unused by the Flipper UI), there is no `PROTOCOL.md` field for dwell time today — this needs
+    new wire surface on both firmwares, not just a Flipper UI for an existing one. Same blocker
+    as the two settings items above: the Flipper Settings screen is still a deliberate
+    placeholder rendering static "TBD" text (`docs/UI_REDESIGN.md` decision #6), so this has no
+    UI to land in yet either. Also depends on the regulatory-country-code item above for
+    correctness — the active/passive channel split (and therefore which dwell fields even apply
+    to which channels) changes with the configured country code, so decide/implement that first
+    or alongside this, not after. Unscoped beyond this.
 - Non-ASCII SSID rendering is untested on real hardware (host-native codec tests cover the
   encoding; no such network was available during `wifi_scan` verification). Not a blocker.
 - Adopt a real `ViewDispatcher`/scene-manager architecture on the Flipper FAP instead of the
@@ -196,6 +215,25 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   intervals; measure: (1) BLE reconnect latency if connection drops, (2) backlog drain reliability,
   (3) WiFi capture density (networks/minute), (4) subjective coverage quality. Document tradeoffs
   and settle on production default accordingly.
+- **Set an explicit Wi-Fi regulatory country code instead of relying on ESP-IDF's implicit
+  default** (2026-09-21) — `esp32/main/main.c` never calls `esp_wifi_set_country()` /
+  `esp_wifi_set_country_code()`, so the board runs under ESP-IDF v5.5.2's default `{.cc="01"
+  (world safe mode), .schan=1, .nchan=11, .policy=WIFI_COUNTRY_POLICY_AUTO}`
+  (`esp_wifi.h:814`). This caps the scan channel range at **1-11** — channels 12-13 are not
+  scanned at all today, actively or passively, contrary to the above item's "13-channel sweep"
+  framing, which should be re-verified against this project's actual default rather than the
+  generic 2-channel-more assumption it currently cites. `"BG"` is an explicitly supported code
+  (`esp_wifi.h:1545-1548`), and the bundled regulatory data confirms Bulgaria permits the full
+  2.4 GHz band unrestricted: `country BG: DFS-ETSI, (2400 - 2483.5 @ 40), (100 mW)`
+  (`esp_wifi_regulatory.txt:294-297`) — channels 1-13, no active/passive distinction, unlike the
+  US FCC domain the above item's 85ms-active/255ms-passive split implicitly assumes. Calling
+  `esp_wifi_set_country_code("BG", false)` once at Wi-Fi init would both correctly match the
+  board's actual operating jurisdiction and unlock channels 12-13 for scanning (with plain
+  active-scan dwell timing, same as 1-11 — no passive carve-out needed under BG's rules).
+  Confirm the board's actual deployment country before implementing (not necessarily always
+  Bulgaria), then implement together with — not before — the dwell-time tuning above, since
+  both touch the same `wifi_scan_config_t` setup and the channel count changes the dwell-time
+  math.
 
 ## Deferred by explicit product decision — confirm with the user before touching
 

@@ -70,6 +70,31 @@ believed to fully explain. That theory may still be a contributing factor in oth
 this file doesn't rule it out, it just proves at least one independent failure mode exists that
 has nothing to do with Wi-Fi at all.
 
+**Confirmed in the field, 2026-09-16:** a real unattended overnight/1-day wardriving run (with
+autostart, see `docs/BACKLOG.md`'s "Add wardriving autostart and boot-button toggle") built up a
+16,838-record backlog that did not drain on its own even with the Flipper back in range --
+consistent with this bug's "permanently fight each other" description, not the milder
+"sometimes clean, sometimes not" case. **A full ESP32 reboot (reset button) recovered it and the
+drain proceeded normally afterward.** This is the practical workaround until a real fix lands:
+if a backlog is not draining after the Flipper is confirmed in range and connected, reboot the
+ESP32 rather than waiting further.
+
+Note this happened despite `wardriving_ble_interval_cb()` already having a partial mitigation in
+place (`esp32/main/main.c`, added in the 2026-09-16 autostart commit `4cd6c7d`): it backs off and
+retries the same window instead of erroring out when `ble_gap_disc()` returns `BLE_HS_EBUSY`
+(GAP master busy, e.g. a connect attempt in flight). That guard prevents the *immediate*
+`wardriving_self_stop("internal_error")` teardown this function would otherwise hit, but does not
+implement H01's actual proposed fix (a flag that skips *re-arming discovery* while a connect is
+in flight) -- so the underlying race this section describes is still open. This field case is
+evidence the `EBUSY` backoff alone is not sufficient to prevent the stall; the "connect attempt
+in flight" guard proposed above is still the needed fix, not just a nice-to-have.
+
+**Follow-up needed:** capture a live serial log (`tools/build_esp32.ps1 -CaptureBootLog` or an
+`idf.py monitor` session) the next time this reproduces, before rebooting, to confirm this is
+still the same H01 mechanism and not a new one, and to check whether the wardriving flash log's
+capacity was also a factor (see the new BACKLOG.md item on flash-log capacity vs. multi-day
+autostart accumulation, added the same day).
+
 ## H02 — Live concurrent-load test for the G30 wardriving-log race fix
 
 **Status:** fix implemented and build-verified 2026-09-13 (see `docs/BACKLOG.md` G30), not yet

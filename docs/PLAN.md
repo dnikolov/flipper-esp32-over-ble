@@ -8,8 +8,9 @@ This plan implements the trusted-environment BLE pairing decision in [DECISIONS.
 - **Phase 2 (✅ done):** core BLE transport, record framing, trusted-environment pairing, and authenticated runtime sessions on the ESP32-C6 — steps 1-7 implemented and hardware-verified.
 - **Phase 3a (✅ done, hardware-verified 2026-09-13):** Flipper UI menu redesign — Home/menu shell with capability-aware routing, reconnect-stays-put behavior, GPS/Settings/About screens all working end-to-end. (Note: ViewDispatcher/scene-manager architecture prerequisite was skipped; built directly on existing ViewPort/AppEvent-queue pattern and works reliably. Five-mode BLE-active/passive Scan screen remains backlogged, pending runtime toggle.)
 - **Phase 3 (✅ done, hardware-verified 2026-09-13):** Production-ready wardriving on the ESP32-C6. Includes `wifi_scan`, `ble_scan`, `wardriving` with real GPS driver, hardened flash log, per-record timestamps, WiGLE CSV export, LED indicators, and BLE active scanning. Field-usable unattended for hours, survives power loss, backlog drains reliably.
-- **Phase 4 (scheduled later):** Heltec WiFi LoRa 32 V2 board support — a second target (classic ESP32/Xtensa) adding display and LoRa. Does not start until Phase 3 backlog is cleared.
+- **Phase 4 (in progress, started 2026-09-16):** Heltec WiFi LoRa 32 V2 board support — a second target (classic ESP32/Xtensa) adding display and LoRa. **Gate overridden by explicit user decision 2026-09-16** — Phase 3's backlog is not cleared and stays fully deferred, not interleaved with Phase 4 work; see the Phase 4 section below for the override rationale and current step status.
 - **Phase 5 (scheduled later):** Zigbee/Thread and `gpio_control` — later-phase capabilities pending Phase 3/4 completion.
+- **Phase 6 (design frozen 2026-09-17, not yet started):** wardriving log publishing to wdgwars.pl via a Flipper-triggered BadUSB/host-script flow. **Explicit user decision 2026-09-17: proceeds in parallel with Phase 4**, not gated on Phase 4 or Phase 5 completion — same kind of gate override Phase 4 itself carries for the Phase 3 backlog. Full design: [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md).
 
 For the full dated narrative of how each phase/step was designed, implemented, and debugged, see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For current state, see [docs/SESSION_MEMORY.md](SESSION_MEMORY.md); for the open backlog, see [docs/BACKLOG.md](BACKLOG.md).
 
@@ -408,6 +409,211 @@ verification of the complete feature not yet started.**
     still `--`. Found and fixed a pre-existing capability-gating bug along the way:
     `HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
     `capability_has_gps`.
+
+## Phase 4: Heltec WiFi LoRa 32 V2 board support
+
+**Status: in progress, started 2026-09-16.** Phase 3's backlog was **not** cleared when this
+phase started — `docs/BACKLOG.md` still had open P0 items (G03, G06, G07, G09, BL01) and P1
+items (G08, G10, BL05, BL06, G36, BL04, BL10, BL11, BL12), and `docs/HARDENING_BACKLOG.md` had
+H01–H04 open. **The user explicitly overrode this phase's own gate ("does not start until
+Phase 3 backlog is cleared") on 2026-09-16**, via a grill-me design session, choosing to start
+Phase 4 now rather than clear the backlog first. Backlog items stay fully deferred, not
+interleaved with Phase 4 work — see `docs/BACKLOG.md`'s note. The step breakdown below,
+originally written as a frozen plan for a future session, is now the actual in-progress step
+list.
+
+**No physical Heltec board has been acquired.** Hardware facts are recorded in
+[docs/hardware/heltec-wifi-lora-32-v2/README.md](hardware/heltec-wifi-lora-32-v2/README.md),
+sourced from Heltec's/Espressif's published documentation and clearly marked
+per-vendor-documentation-only, not locally verified — mirroring the precision discipline of
+[docs/hardware/esp32-c6-devkitc-1/README.md](hardware/esp32-c6-devkitc-1/README.md). See
+`docs/BASELINES.md`'s Heltec stub for the pinned-baseline framing of this board.
+
+### Architecture decision: shared component (confirmed 2026-09-16)
+
+Today's `esp32/` is a single ESP-IDF project hardcoded to `CONFIG_IDF_TARGET="esp32c6"` in
+`sdkconfig.defaults`. A Heltec target needs `esp32` (classic Xtensa), a different target —
+ESP-IDF does not support two targets from one `sdkconfig`/build tree. Two ways to structure
+this:
+
+- **(a) Second top-level project (`heltec/`) sharing protocol/crypto logic with `esp32/` via
+  an ESP-IDF shared component directory** (`EXTRA_COMPONENT_DIRS`) — `framing.c`, `pairing.c`,
+  `pairing_crypto.c`, `session.c`, `session_crypto.c`, and the `cbor_*.c` codec files move into
+  a shared component consumed by both `esp32/` and `heltec/`, each with its own board-specific
+  `main.c`/capability handlers/`sdkconfig.defaults`/target. `docs/PROTOCOL.md` stays implemented
+  exactly once across both ESP32-family boards.
+- **(b) Two fully independent project trees**, each separately implementing the protocol —
+  duplicates every line of framing/crypto/codec logic, with the drift risk that already
+  motivates this project's "keep the two firmwares in lockstep" convention (`CLAUDE.md`) —
+  except now across **three** independent implementations (Flipper, C6, Heltec) instead of two.
+
+**Recommendation: (a).** The shared-component approach is a build-system detail (ESP-IDF's
+`EXTRA_COMPONENT_DIRS` is designed exactly for this — one component consumed by multiple
+project trees/targets), not a rewrite, and it's the only option consistent with this project's
+own stated convention that a wire-format/crypto change "is not done until both sides implement
+it identically." Duplicating the protocol logic into a third tree triples the surface area for
+exactly the convergence bugs `docs/LESSONS.md` already documents recurring between two
+implementations.
+
+**Confirmed 2026-09-16 (grill-me session): (a), shared component.** This was flagged per
+`CLAUDE.md`'s own rule ("Changing any of these [baselines] is a project decision... confirm
+with the user before proceeding"), and the user picked (a) over (b) or a third structure. Step
+2 below (project scaffolding) is unblocked.
+
+### Step breakdown
+
+Mirrors how Phase 1–3 steps are written above (numbered steps, each with a "Done when" line).
+Step 1 is done (2026-09-16); steps 2–6 have not started.
+
+**1. Board acquisition + baseline bring-up.**
+- Acquire a physical unit and confirm its exact revision (V2 vs V2.1 vs V1/V3+) against its
+  silkscreen/label — see the hardware doc's "Board revision ambiguity" section.
+- Verify flash size via `esptool flash_id` — **read-only**, `--before default_reset --after
+  no_reset` per this project's `esptool` read-only convention (see `docs/LESSONS.md`); do not
+  flash/erase/write without explicit user request.
+- Build an unmodified `esp32` target baseline (plain ESP-IDF example or a minimal skeleton) for
+  this specific chip, independent of any project code, the same way Phase 1 did for the C6.
+
+**Done when:** board revision confirmed, flash size measured read-only, an unmodified `esp32`
+target baseline builds and boots on the physical unit. ✅ **Met 2026-09-16** — board confirmed
+from its own silkscreen as "WiFi LoRa 32 V2" (not V2.1), chip ESP32-D0WDQ6 rev v1.0, MAC
+`a4:cf:12:03:ba:58`, 8MB Winbond flash measured via read-only `esptool flash_id`
+(`--before default_reset --after no_reset`, no erase/write) on COM10 (Silicon Labs CP210x
+bridge) — matches the hardware doc's V2/V2.1 8MB expectation and rules out V1's 4MB. The
+classic-`esp32` (Xtensa) toolchain was not yet installed (this project had only ever installed
+`esp32c6`'s RISC-V toolchain); installed via `idf_tools.py install --targets=esp32`. An
+unmodified `hello_world` example (built in a throwaway temp directory, not committed to this
+repo) built and flashed cleanly; serial output confirmed a clean boot (`Hello world!`, correct
+chip/flash identification, no crash/reset loop beyond the example's own restart countdown).
+
+**2. Project scaffolding**, per whichever architecture the user confirms above. If (a): create
+the shared component directory, move the listed files into it with no behavior change, wire
+`EXTRA_COMPONENT_DIRS` into both `esp32/`'s and the new `heltec/`'s `CMakeLists.txt`, and
+confirm `esp32/`'s existing build and all its host-native tests are unaffected by the move
+before adding any Heltec-specific code.
+
+**Done when:** both `esp32/` (unchanged behavior) and a new empty `heltec/` skeleton build
+against the shared component, with `esp32/`'s existing test suite still passing. ✅ **Met
+2026-09-16.** Shared component created at `components/feb_protocol/` (13 file pairs moved via
+`git mv`, no logic changes: `framing`, `pairing`/`pairing_crypto`, `session`/`session_crypto`,
+all `cbor_*` codec files, `cbor_codec.h`/`cbor_internal.h`; `REQUIRES mbedtls` only — none of
+the moved files touch ESP-IDF/FreeRTOS headers). `EXTRA_COMPONENT_DIRS` wired into both
+`esp32/CMakeLists.txt` and the new `heltec/CMakeLists.txt`. New `heltec/` project targets
+`esp32` (classic Xtensa) with a trivial `main.c` that includes `framing.h` and calls
+`feb_fragment_capacity()` to prove the link, nothing more. `esp32/`'s `idf.py build` and all
+five `tests/esp32/*.ps1` host-native suites pass unchanged (three scripts repointed to the new
+shared-component path); `heltec/`'s `idf.py build` passes against the default (uncorrected)
+2MB flash-size assumption — the real 8MB partition sizing is out of this step's scope.
+`tools/check_shared_headers.py` repointed to the new paths and passing. Full detail:
+`docs/PROJECT_HISTORY.md`.
+
+**3. Port/reuse the BLE transport + pairing + session crypto layer onto classic ESP32.**
+Nothing here is assumed working without re-verification:
+- **NimBLE central-mode support on classic ESP32** — confirm it's available and behaves the
+  same as on the C6 (central role, GATT client, notification subscription); classic ESP32 ships
+  a different combo Wi-Fi/BT radio than the C6's single 2.4 GHz Wi-Fi6+BLE5+802.15.4 radio, so
+  none of Phase 3/step 4's coexistence bounds transfer — this needs its own coexistence
+  validation pass (see the radio note below), not an assumption that the C6's numbers apply.
+- **mbedTLS primitive availability** — confirm X25519, HKDF-SHA-256, HMAC-SHA-256, and
+  AES-256-GCM are equally available on the `esp32` target. mbedTLS itself isn't chip-specific,
+  so this should be true, but per this project's "confirm, don't assume" discipline (see
+  `docs/BASELINES.md`'s C6 entry, which explicitly confirmed rather than assumed the same list),
+  it must be checked against this target's actual sdkconfig/component availability, not inferred
+  from the C6 having it.
+- Re-implement the ESP32-side halves of `docs/PROTOCOL.md`/`docs/PAIRING.md` against the shared
+  component from step 2, byte-for-byte identical wire behavior to the C6 build.
+
+**Done when:** the Heltec build passes the same shared host-native codec/crypto test vectors as
+the C6 build, and a real pairing + authenticated session round-trip is hardware-verified against
+a Flipper, independent of any capability beyond the base protocol. ✅ **Met 2026-09-16.**
+`heltec/main/main.c` has the full transport/pairing/session-auth port (base protocol only);
+`heltec`'s `idf.py build` and `esp32`'s own build + all host-native test suites pass. Flashed to
+the physical Heltec board (COM10): fresh-boot pairing ceremony against the Flipper completed
+(X25519 exchange, `pair_confirm`, secret persisted, `pair_complete`), and a subsequent reset
+completed the runtime `hello`/`hello_ack`/`client_auth` round-trip using the stored secret with
+no pairing window reopened. Full detail: `docs/PROJECT_HISTORY.md`'s 2026-09-16 entry.
+
+**4. `board_id` / multi-board-pairing implications.** Today's `board_id` format is
+`esp32c6-<12 lowercase hex chars>`, derived from the factory MAC (see step 5/7 above and
+`docs/PROTOCOL.md`). A Heltec board needs its own distinguishable prefix (e.g.
+`heltec-<12 lowercase hex chars>`) so the Flipper's per-`board_id` pairing-record files
+(`pairings/<board_id>.dat`) and capability caches keep boards distinct. This is a small but real
+shared-contract detail, not a wire-format change — `board_id` is already opaque,
+charset-validated text per step 5, so a new prefix value requires no protocol/CBOR shape change,
+just an ESP32-side constant and confirmation that the Flipper's existing charset validation
+accepts it unchanged.
+
+**Done when:** a Heltec board and a C6 board can be paired to the same Flipper simultaneously
+(subject to the existing "one BLE connection at a time" limitation — see "Multi-board pairing"
+under step 7 above), each keeping its own pairing record and capability cache with no filename
+collision. ✅ **Met 2026-09-16.** No code change was needed: `heltec/main/main.c` already derives
+`board_id` as `heltec-<12 lowercase hex chars>` (distinct from the C6's `esp32c6-` prefix), and
+the Flipper's pairing/capability storage (`build_pairing_path`/`build_capability_path` in
+`flipper/flipper_esp32_over_ble.c`) was already fully generic on `board_id`/`board_id_len` with
+no fixed-prefix/length assumption. Verified by inspecting the Flipper's SD card (`scripts/
+storage.py list /ext/apps_data/flipper_esp32_over_ble`, read-only): `pairings/
+esp32c6-acebe6fffeda.dat` and `pairings/heltec-a4cf1203ba58.dat` coexist (32 bytes each), as do
+`capabilities/esp32c6-acebe6fffeda.dat` (82 bytes, real capability list) and `capabilities/
+heltec-a4cf1203ba58.dat` (55 bytes, zero-feature base protocol) — no collision.
+
+**5. Radio/coexistence note.** Unlike the C6 (one 2.4 GHz radio shared by Wi-Fi, BLE, and
+802.15.4), the Heltec's LoRa radio is a separate SPI-attached chip (SX1276/SX1278) on its own
+antenna and sub-GHz frequency band — it does not compete with the classic ESP32's Wi-Fi/BLE
+radio the way `wifi_scan`/`ble_scan`/`wardriving` compete for the C6's single radio today. That
+said, the classic ESP32's Wi-Fi+BT combo radio still needs its own from-scratch coexistence
+validation (mirroring Phase 3/step 4's methodology) before `wifi_scan`/`ble_scan`/`wardriving`
+are trusted on this board — it is a different SoC with a different radio implementation; none
+of the C6's measured bounds are assumed to transfer.
+
+**Done when:** an equivalent of step 4's coexistence sweep (Wi-Fi scan + active BLE connection +
+BLE observer scan running together) passes on the Heltec board, with its own recorded interval
+bounds — not borrowed from the C6's. **Skipped by explicit user decision, 2026-09-16** — not
+done, not attempted. No coexistence bounds exist for this board's Wi-Fi+BT combo radio. Whoever
+later ports `wifi_scan`/`ble_scan`/`wardriving` onto the Heltec (no such step is currently
+written into this Phase 4 plan) must not assume the C6's bounds transfer and must do this
+validation first, or as part of that work.
+
+**6. `display`/`lora` capability design — explicitly out of scope for this document.** Sensible
+scope for a `lora` capability (recon/sniff only vs. TX capability, frequency/region regulatory
+constraints, antenna-presence assumptions) and a `display` capability (what it renders, whether
+it's push or poll, ESP32-local vs. Flipper-driven) cannot be responsibly designed without the
+physical board in hand and steps 1–5 done first. This needs its own dedicated grill-me design
+pass, the same way `gps` got one before implementation (see the "Real GPS driver..." section
+above) — do not design or implement `display`/`lora` wire formats as a side effect of this
+phase's earlier steps.
+
+**7. `wifi_scan`/`ble_scan` capability porting** (added 2026-09-17, by explicit user request —
+not originally written into this Phase 4 plan). Unlike `display`/`lora`, these two capabilities
+are already fully specified (`docs/PROTOCOL.md`, `docs/CAPABILITIES.md`) and implemented on the
+C6 — this is a straight port of already-agreed wire behavior onto a second board, not new
+capability design. `wardriving` and `gps` are explicitly excluded from this step: `wardriving`
+needs the coexistence-interval bounds that step 5 above skipped, and `gps` needs physical UART
+wiring not yet documented for this board (see `docs/hardware/heltec-wifi-lora-32-v2/README.md`).
+
+**Done when:** `heltec/main/main.c` reports `wifi_scan`/`ble_scan` in its capability response
+and both commands work end-to-end against a real Flipper, exercised concurrently with the
+active BLE connection (unlike step 5's skipped sweep, a manual one-shot scan is a bounded,
+low-risk action, but this board's Wi-Fi+BT combo radio has never been hardware-tested running a
+scan while BLE-connected — that gap must be closed by an actual test, not assumed away).
+✅ **Build-verified 2026-09-17** — both capabilities ported from `esp32/main/main.c`'s reference
+implementation into `heltec/main/main.c` (reusing the shared, unmodified
+`components/feb_protocol/cbor_wifi_scan.c`/`cbor_ble_scan.c` codecs), `feb_features[]` now
+`{"wifi_scan", "ble_scan"}`, `idf.py build` passes for both `heltec/` and `esp32/`. **Hardware
+verification still pending** — see `docs/PROJECT_HISTORY.md`'s 2026-09-17 entry for the full
+change narrative. Flashed to the physical board (COM10) 2026-09-17; boot log confirmed healthy
+(Wi-Fi STA init, NimBLE scan start, no crash). The Flipper's stale cached capability record
+(`capabilities/heltec-a4cf1203ba58.dat`, zero features from the step-3 test) was deleted the
+same day, so the next session's `capability_query` will reach this firmware's real feature
+list — an actual paired `wifi_scan`/`ble_scan` round-trip against the Flipper is still
+untested.
+
+### Cross-references
+
+- Board/pin facts: [docs/hardware/heltec-wifi-lora-32-v2/README.md](hardware/heltec-wifi-lora-32-v2/README.md).
+- Baseline framing: `docs/BASELINES.md`'s Heltec stub section.
+- Capability roadmap placement: `docs/CAPABILITIES.md`'s closing note on `display`/`lora`.
+- Do not carry forward C6 pin mappings or radio-coexistence bounds to this board, or vice versa
+  — both hardware docs state this caution independently.
 
 ## Backlog
 

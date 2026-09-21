@@ -26,18 +26,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 HEADER_PAIRS = [
-    ("esp32/main/cbor_codec.h", "flipper/cbor_codec.h"),
-    ("esp32/main/cbor_primitives.h", "flipper/cbor_primitives.h"),
-    ("esp32/main/cbor_records.h", "flipper/cbor_records.h"),
-    ("esp32/main/cbor_wifi_scan.h", "flipper/cbor_wifi_scan.h"),
-    ("esp32/main/cbor_ble_scan.h", "flipper/cbor_ble_scan.h"),
-    ("esp32/main/cbor_wardriving.h", "flipper/cbor_wardriving.h"),
-    ("esp32/main/cbor_gps.h", "flipper/cbor_gps.h"),
-    ("esp32/main/framing.h", "flipper/framing.h"),
-    ("esp32/main/pairing.h", "flipper/pairing.h"),
-    ("esp32/main/pairing_crypto.h", "flipper/pairing_crypto.h"),
-    ("esp32/main/session.h", "flipper/session.h"),
-    ("esp32/main/session_crypto.h", "flipper/session_crypto.h"),
+    ("components/feb_protocol/cbor_codec.h", "flipper/cbor_codec.h"),
+    ("components/feb_protocol/cbor_primitives.h", "flipper/cbor_primitives.h"),
+    ("components/feb_protocol/cbor_records.h", "flipper/cbor_records.h"),
+    ("components/feb_protocol/cbor_wifi_scan.h", "flipper/cbor_wifi_scan.h"),
+    ("components/feb_protocol/cbor_ble_scan.h", "flipper/cbor_ble_scan.h"),
+    ("components/feb_protocol/cbor_wardriving.h", "flipper/cbor_wardriving.h"),
+    ("components/feb_protocol/cbor_gps.h", "flipper/cbor_gps.h"),
+    ("components/feb_protocol/framing.h", "flipper/framing.h"),
+    ("components/feb_protocol/pairing.h", "flipper/pairing.h"),
+    ("components/feb_protocol/pairing_crypto.h", "flipper/pairing_crypto.h"),
+    ("components/feb_protocol/session.h", "flipper/session.h"),
+    ("components/feb_protocol/session_crypto.h", "flipper/session_crypto.h"),
 ]
 
 

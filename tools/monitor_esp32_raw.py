@@ -33,6 +33,7 @@ def monitor(port: str, baud: int, timeout: float, retry_delay: float, log_dir: P
         print(f"LOG={log_path}", flush=True)
 
         while True:
+            ser = None
             try:
                 ser = serial.Serial(port, baud, timeout=timeout)
                 print(f"OPEN={ser.name}", flush=True)
@@ -45,8 +46,13 @@ def monitor(port: str, baud: int, timeout: float, retry_delay: float, log_dir: P
                     record = f"[{timestamp}] {text}"
                     log_file.write(record)
                     log_file.flush()
-                    sys.stdout.write(record)
-                    sys.stdout.flush()
+                    try:
+                        sys.stdout.write(record)
+                        sys.stdout.flush()
+                    except UnicodeEncodeError:
+                        # console codepage (e.g. Windows cp1252) can't render every
+                        # decoded byte -- the log file already has the real bytes.
+                        pass
             except serial.SerialException as exc:
                 print(f"WAIT={exc}", flush=True)
                 time.sleep(retry_delay)
@@ -56,6 +62,9 @@ def monitor(port: str, baud: int, timeout: float, retry_delay: float, log_dir: P
             except Exception as exc:  # pragma: no cover - defensive fallback
                 print(f"ERR={type(exc).__name__}: {exc}", flush=True)
                 time.sleep(retry_delay)
+            finally:
+                if ser is not None and ser.is_open:
+                    ser.close()
 
 
 def parse_args() -> argparse.Namespace:

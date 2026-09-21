@@ -1881,6 +1881,319 @@ clean (`tools/build_flipper.ps1`), no hardware flashed.
 
 **Still open:** `wifi_scan_aps`/`ble_scan_devices` (~4.2 KB) — see HARDENING_BACKLOG.md H04.
 
+## 2026-09-16: Phase 4 Step 2 — shared `feb_protocol` component, `heltec/` scaffolding
+
+Implemented the shared-component architecture confirmed earlier the same day (see
+[PLAN.md](PLAN.md)'s Phase 4 section for the (a)-vs-(b) decision). Moved 13 file pairs from
+`esp32/main/` to a new component, `components/feb_protocol/` — `framing`,
+`pairing`/`pairing_crypto`, `session`/`session_crypto`, all six `cbor_*` codec files
+(`cbor_primitives`, `cbor_records`, `cbor_wifi_scan`, `cbor_ble_scan`, `cbor_wardriving`,
+`cbor_gps`), plus the header-only `cbor_codec.h`/`cbor_internal.h` — via `git mv` (history
+preserved as renames), with zero logic changes. Everything board-specific or capability-handler-
+level (`main.c`, `factory_reset`, `status_led`, `location`/`nmea_parser`, all `wardriving_*`)
+stayed in `esp32/main/`. Confirmed none of the moved files include any ESP-IDF/FreeRTOS header —
+only `<stdint.h>`/`<stddef.h>`/`<string.h>` and `mbedtls/*` — so the new component's
+`CMakeLists.txt` only needs `REQUIRES mbedtls`, not the long list `esp32/main/CMakeLists.txt`
+carries for its own board-specific code.
+
+`EXTRA_COMPONENT_DIRS` (pointing at `components/`) was added to both `esp32/CMakeLists.txt` and
+a new `heltec/CMakeLists.txt` (same shape, different `project()` name). `heltec/sdkconfig.defaults`
+sets only `CONFIG_IDF_TARGET="esp32"` (classic Xtensa) — no partition/flash-size config yet, since
+that depends on work later in this phase. `heltec/main/main.c` is a deliberately trivial
+proof-of-link skeleton: `#include "framing.h"`, one call to `feb_fragment_capacity(247)` logged via
+`ESP_LOGI`, nothing else — real BLE/pairing/session porting is step 3, not this step.
+
+Three `tests/esp32/*.ps1` host-native test scripts (`build.ps1`, `build_pairing.ps1`,
+`build_session.ps1`) hardcoded `esp32/main/<file>.c` paths for files that just moved; repointed
+to a new `$sharedDir` variable under `components/feb_protocol`. `build_wardriving.ps1`/
+`build_location.ps1` needed no change (their sources never moved). `tools/check_shared_headers.py`
+also hardcoded the old `esp32/main/*.h` paths for the same 12 headers — repointed all 12 entries,
+otherwise the script would have started failing with `FileNotFoundError` immediately after this
+move.
+
+**Verified, not just built:** `esp32/`'s full `idf.py build` (target `esp32c6`) — clean, binary
+size/shape unchanged, `feb_protocol` now appears as its own linked static component
+(`libfeb_protocol.a`). `heltec/`'s `idf.py build` (target `esp32`) — clean, against the default
+(uncorrected) flash-size assumption. All five `tests/esp32/*.ps1` scripts pass. `python
+tools/check_shared_headers.py` passes against the new paths (macro/prototype level only, per its
+own stated limitation — this was a pure path move, not a shape edit, so no additional struct-body
+comparison was needed).
+
+**Left for a later pass, flagged but not fixed in this step (out of scope — only the five named
+test scripts were touched):**
+- `tests/README.md`, and prose in `docs/PROJECT_HISTORY.md`/dated findings files under `docs/`,
+  still reference the old `esp32/main/framing.c`-style paths for files that moved — narrative
+  drift, not build-breaking.
+- `.claude/agents/esp32-developer.md`'s read-discipline note referencing a single large
+  `esp32/main/cbor_codec.c` (2300+/3100+ lines) is stale twice over: the codec was already split
+  into per-capability files before this move (see the 2026-09-08 split entry above), and those
+  split files now live under `components/feb_protocol/`, not `esp32/main/`. Corrected the same
+  session this entry was written — see the agent file itself.
+
+**Tooling note:** running `idf.py` via PowerShell from this session's Bash tool required
+`Remove-Item Env:\MSYSTEM` before sourcing `export.ps1` — the underlying Git-Bash shell leaks
+`MSYSTEM=MINGW64` into child `powershell.exe` processes, which ESP-IDF's Python dependency check
+rejects outright ("MSys/Mingw is not supported"). Not a project bug, just an artifact of this
+tool's shell nesting; worth remembering for future sessions invoking `idf.py` the same way.
+
+## 2026-09-16: Phase 4 step 3 — BLE transport/pairing/session-auth ported onto Heltec (classic ESP32)
+
+Ported `esp32/main/main.c`'s NimBLE-central transport, pairing ceremony, and runtime
+session-auth state machine onto `heltec/main/main.c`, reusing `components/feb_protocol/`
+unchanged. Deliberately narrow scope per `docs/PLAN.md`'s step 3: no capability beyond the
+base protocol — `handle_capability_query()` reports an empty feature list (`feature_count = 0`,
+no `wifi_scan`/`ble_scan`/`wardriving`/`gps`), and `handle_command()` answers
+`unsupported_capability` for every request rather than dispatching. `compute_board_id()` uses
+a `heltec-` prefix (vs. the C6's `esp32c6-`), and `FEB_BOARD_MODEL` is
+`"heltec-wifi-lora-32-v2"`.
+
+**Confirmed, not assumed** (per the Plan's explicit "confirm, don't assume" discipline):
+- NimBLE central-mode Kconfig (`CONFIG_BT_NIMBLE_ENABLED`/`CONFIG_BT_NIMBLE_ROLE_CENTRAL`) builds
+  cleanly against `CONFIG_IDF_TARGET="esp32"` — no target-specific NimBLE port issue found.
+- mbedTLS X25519 (`CONFIG_MBEDTLS_ECP_DP_CURVE25519_ENABLED`), HKDF-SHA-256
+  (`CONFIG_MBEDTLS_HKDF_C`), and AES-256-GCM (`CONFIG_MBEDTLS_GCM_C`) all built and linked
+  against the classic-`esp32` target's mbedTLS config with no changes needed beyond what
+  `esp32/sdkconfig.defaults` already sets — confirmed by grepping the generated
+  `heltec/sdkconfig` after a from-scratch regenerate (deleted stale `sdkconfig`/`build/`
+  before rebuilding, per the sdkconfig-defaults-not-retroactive lesson).
+- Both confirmations were via an actual `idf.py build` success, not inference from the C6
+  build.
+
+New board-specific modules (not shared, since the C6's equivalents are ESP-IDF-peripheral-
+specific): `heltec/main/status_led.c`/`.h` drives the board's plain GPIO25 LED (not a WS2812)
+with blink-cadence-encoded state instead of the C6's RMT/WS2812 color encoding — slow blink
+while connecting, solid while authenticated, fast blink while flushing; no wardriving-active
+color variant since wardriving isn't ported. `heltec/main/factory_reset.c`/`.h` ports the
+BOOT-hold-to-erase-NVS gesture onto this board's GPIO0 PRG button (vs. the C6's GPIO9), with
+the C6's short-press wardriving-toggle behavior dropped entirely (no wardriving capability to
+toggle).
+
+`heltec/sdkconfig.defaults` mirrors `esp32/sdkconfig.defaults`'s NimBLE/mbedTLS lines, but sets
+`CONFIG_ESPTOOLPY_FLASHSIZE_8MB` (this board's confirmed flash size, vs. the C6's 4 MB) and
+does not add a custom partition table — no wardriving flash log exists on this board yet, so
+the ESP-IDF default single-factory-app table (sized well under 8 MB either way) is sufficient
+for now; also omits `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` since classic ESP32 has no native-USB
+console path (console goes over the CP2102 UART bridge by default).
+
+Build verification only, matching the step's explicit hardware gating: `heltec`'s `idf.py
+build` passes; `esp32`'s `idf.py build` and all five `tests/esp32/*.ps1` host-native suites
+(`build.ps1`, `build_pairing.ps1`, `build_session.ps1`, `build_location.ps1`,
+`build_wardriving.ps1`) still pass unchanged, confirming the shared component wasn't touched.
+**Not done:** a real pairing + authenticated session round-trip against a physical Flipper —
+Plan step 3's full "done when" bar — since that requires flashing the physical Heltec board,
+explicitly out of scope for this pass per the hardware-safety rule (no flash without explicit
+user ask).
+
+## 2026-09-16: Phase 4 step 3 — hardware-verified against a physical Flipper
+
+With explicit user go-ahead, flashed `heltec/build/flipper_heltec_over_ble.bin` to the physical
+board (COM10, Silicon Labs CP210x) and ran the two remaining "done when" checks live:
+
+- **Fresh-boot pairing ceremony:** no stored `pairing_secret` found, board opened a 120s pairing
+  window and logged `board_id=heltec-a4cf1203ba58`. Scanned, connected to the Flipper (already
+  running the FAP on its "Add ESP32 board" screen), negotiated a 256-byte ATT MTU, discovered
+  the v2 pairing service/characteristics, subscribed to notifications, and completed the full
+  X25519 exchange: `pair_init` → `pair_reply` (reassembled from 3 fragments) → `pair_confirm` →
+  `pairing_secret persisted` → `pair_complete`. Connection closed cleanly afterward and the
+  board logged `pairing attempt consumed; staying idle until next reset`, matching
+  [PAIRING.md](PAIRING.md)'s one-attempt-per-window design.
+- **Runtime session-auth round-trip:** triggered a second board reset (`esptool ... chip_id`
+  with `--after hard_reset`). Boot log showed `stored pairing_secret found; attempting runtime
+  auth (no pairing window opened)` — confirming the reset-gating logic correctly distinguishes
+  "no secret yet" from "secret exists." Reconnected to the same Flipper session and completed
+  `hello` → `hello_ack` (2 fragments) → `client_auth` → `client_auth sent; runtime session
+  authenticated`.
+
+Both checks used the shared `feb_protocol` component and the ported transport/pairing/session
+code exactly as committed in the step-3 build-verification pass above — no code changes were
+needed to make the hardware pass. This closes Plan step 3's "done when" bar in full; Phase 4
+moves on to step 4 (board_id/multi-board pairing-file implications) next.
+
+**Tooling note:** `tools/monitor_esp32_raw.py`'s live stdout echo could crash on Windows
+(`UnicodeEncodeError` from the console's cp1252 codepage choking on a `�` replacement
+character from a decoded stray byte), and the script had no `finally: ser.close()`, so a crash
+left its own process holding the port open and unable to reopen it on retry. Worked around live
+with a throwaway capture script, then fixed properly in the same session: the stdout write is
+now wrapped in a try/except, and a `finally: ser.close()` guarantees the port is released on any
+exception path.
+
+## 2026-09-16: Phase 4 step 4 — `board_id`/multi-board-pairing implications verified, no code change needed
+
+Checked Plan step 4's "done when" bar (a Heltec and a C6 board both paired to the same Flipper
+at once, distinct pairing/capability files, no collision) against the code already written
+during steps 2/3/5/7, before assuming any new implementation was required:
+
+- `heltec/main/main.c`'s `compute_board_id()` already derives `heltec-<12 lowercase hex chars>`
+  from the factory MAC (distinct from the C6's `esp32c6-<12 hex chars>` in `esp32/main/main.c`)
+  — confirmed live in the step-3 hardware log (`board_id=heltec-a4cf1203ba58`), not just read
+  from source.
+- The Flipper's pairing/capability storage (`build_pairing_path`/`build_capability_path` in
+  `flipper/flipper_esp32_over_ble.c`) builds each file's name from `board_id`/`board_id_len`
+  directly (`"%s/%.*s%s"`), with no fixed-prefix or fixed-length assumption anywhere in the
+  path-building, charset-validation (`board_id_is_valid`), or `FEB_PAIRING_BOARD_ID_MAX_LEN`
+  (32-byte cap, checked by length only) logic — this was already fully generic from when it was
+  built for the C6 alone.
+
+So there was nothing to implement — only to verify. With the user's Flipper reconnected (COM8),
+inspected its SD card read-only (`scripts/storage.py -p COM8 list
+/ext/apps_data/flipper_esp32_over_ble`, from the pinned Unleashed checkout) and found both
+boards' records already coexisting from prior testing, with no filename collision:
+
+| File | Size |
+| --- | --- |
+| `pairings/esp32c6-acebe6fffeda.dat` | 32 bytes |
+| `pairings/heltec-a4cf1203ba58.dat` | 32 bytes |
+| `capabilities/esp32c6-acebe6fffeda.dat` | 82 bytes (C6's real capability list) |
+| `capabilities/heltec-a4cf1203ba58.dat` | 55 bytes (Heltec's zero-feature base-protocol response) |
+
+This closes Plan step 4 in full. Step 5 (Heltec's own from-scratch radio-coexistence sweep,
+mirroring Phase 3/step 4's methodology) is next, and needs the physical Heltec board running a
+live Wi-Fi+BLE workload rather than a static code/storage check.
+
+## 2026-09-16: Phase 4 step 5 (radio/coexistence sweep) skipped by explicit user decision
+
+Started porting the C6's throwaway `esp32/coex_test/` sweep harness to a new `heltec/coex_test/`
+project targeting classic ESP32 (via the esp32-developer agent), to mirror Phase 3/step 4's
+5-point Wi-Fi+BLE coexistence methodology on this board. Partway through the build the user said
+to skip this test altogether; the in-progress agent was stopped and the partially-built
+`heltec/coex_test/` directory (source files plus a mid-build `build/` tree) was deleted rather
+than left half-finished.
+
+Step 5 is therefore explicitly **not done and not attempted** — see `docs/PLAN.md`'s step 5 for
+the recorded consequence: no coexistence bounds exist for the Heltec's Wi-Fi+BT combo radio, and
+none of the C6's measured bounds may be assumed to transfer. No future step in this Phase 4 plan
+currently covers porting `wifi_scan`/`ble_scan`/`wardriving` onto the Heltec; whoever takes that
+on will need to do this validation first, or as part of that work.
+
+## 2026-09-17: Phase 4 step 7 — `wifi_scan`/`ble_scan` capability porting (build-verified)
+
+Immediately after step 5 was skipped, the user asked to start capability porting for the Heltec
+anyway. Scoped deliberately narrow: only `wifi_scan` and `ble_scan` (already fully specified,
+already implemented on the C6 — a straight port, not new capability design), explicitly
+excluding `wardriving` (blocked on step 5's skipped coexistence data) and `gps` (no documented
+wiring on this board) and leaving `display`/`lora` untouched (its own out-of-scope design pass
+per step 6).
+
+No `heltec-developer` subagent existed yet — the only prior agent, `esp32-developer`, is
+explicitly scoped to the C6 and warns against Heltec assumptions. Wrote
+`.claude/agents/heltec-developer.md` (mirroring `esp32-developer.md`'s structure, with this
+board's confirmed hardware facts from `docs/BASELINES.md`/the hardware README, the skipped-
+coexistence caveat, and the stale-capability-cache gotcha below) before delegating the port —
+new agent types only become selectable next session, so this pass ran the work through the
+general-purpose agent pointed at that file as its persona/instructions.
+
+Changes, all in `heltec/main/main.c` and `heltec/main/CMakeLists.txt` (verified by grepping the
+result, not just trusting the agent's report):
+
+- `feb_features[]` changed from empty to `{"wifi_scan", "ble_scan"}`; `handle_capability_query()`
+  now reports both.
+- `handle_command()` now dispatches `wifi_scan`/`ble_scan` to new `handle_wifi_scan_command()`/
+  `handle_ble_scan_command()`; every other command name (including `wardriving`/`gps`, which the
+  Flipper shouldn't send since it won't see them advertised) still falls through to
+  `unsupported_capability`.
+- Ported unchanged from `esp32/main/main.c`: the manual-scan-only paths of
+  `wifi_scan_done_cb`/`wifi_scan_send_next_batch`/`handle_wifi_scan_command`,
+  `ble_scan_catalog_advertisement`/`ble_scan_send_next_batch`/`ble_scan_window_close_cb`/
+  `handle_ble_scan_command`, and `start_wifi_subsystem()` (esp_netif/event-loop/esp_wifi
+  STA-mode bring-up). The C6 interleaves these with `wardriving`'s reuse of the same busy-flag/
+  callout plumbing (`wifi_scan_active_source`/`ble_scan_active_source` and branches inside the
+  done-callbacks); since wardriving doesn't exist on this board, those branches were omitted
+  entirely rather than ported as dead code — every busy-flag on the Heltec is unconditionally
+  the manual-scan source.
+- `components/feb_protocol/cbor_wifi_scan.{c,h}`/`cbor_ble_scan.{c,h}` were reused as-is,
+  unmodified — confirmed via `git status`/`git diff --stat` showing nothing changed under
+  `components/feb_protocol/`, so the C6 build needed no re-verification of that layer, only a
+  rebuild to confirm nothing regressed.
+- `heltec/main/CMakeLists.txt`: added `esp_wifi esp_netif esp_event` to `REQUIRES`.
+- No target-conditional code was needed anywhere — NimBLE discovery, `esp_wifi_scan_*`, and the
+  CBOR codec calls behave identically across `esp32c6` and classic `esp32` in this pinned IDF
+  v5.5.2.
+
+**Build verification (independently re-run, not just the agent's claim):** `heltec/idf.py build`
+— clean, binary `0xf0d00`/`0x100000` bytes (6% free); `esp32/idf.py build` — clean, no
+regression. `components/feb_protocol/` was untouched, so the shared host-native test suites
+weren't re-run — nothing under them could have changed.
+
+**Radio-coexistence gap, explicitly not closed by this step:** the ported code behaves
+identically to the C6's (always-on Wi-Fi STA, scan only on command — a bounded one-shot, not a
+continuous loop), but this board's Wi-Fi 4 + BT Classic/BLE 4.2 combo radio has never been
+tested running a manual scan concurrently with the active BLE connection to the Flipper. A
+comment was added at `start_wifi_subsystem()` stating this gap. This needs a real hardware test
+before the capability can be called validated, not just built.
+
+**Not yet done — blocking a real hardware test:** the Flipper's cached capability record for
+`heltec-a4cf1203ba58` still says zero features (written during step 3's hardware test, before
+this port existed). Per `docs/CAPABILITIES.md`'s cache lifecycle (`capability_query` sent once
+per `board_id`, cached permanently, only refreshed by unpair+re-pair), that stale answer will
+keep being served until it's invalidated — either delete
+`capabilities/heltec-a4cf1203ba58.dat` on the Flipper's SD card (`storage.py`, PowerShell not
+Git Bash) or do a full unpair+re-pair. Not done in this pass; flagged for whoever runs the
+hardware test next.
+
+## 2026-09-17: Heltec flashed with the new capabilities; stale Flipper cache cleared
+
+Two explicit user-requested follow-ups to the port above:
+
+- **Flashed** the new build to the physical Heltec (`idf.py -p COM10 flash`, after reconfirming
+  the port live — it briefly showed as a Windows "phantom" device, `CM_PROB_PHANTOM`, from a
+  prior session's stale registry entry, until the board was physically reconnected). A short
+  read-only raw-serial capture (`tools/monitor_esp32_raw.py --port COM10`) confirmed a healthy
+  boot: Wi-Fi STA subsystem now initializes (new — the previous base-protocol-only build never
+  touched Wi-Fi), NimBLE comes up and starts scanning for the Flipper's v2 service, no crash.
+- **Cleared the stale Flipper-side capability cache**: reconfirmed the Flipper's port (COM8),
+  then `python scripts/storage.py -p COM8 remove
+  /ext/apps_data/flipper_esp32_over_ble/capabilities/heltec-a4cf1203ba58.dat` from the pinned
+  Unleashed checkout (PowerShell, not Git Bash — same MSYS path-mangling caveat as every other
+  `storage.py` use in this project). Verified via `storage.py list` on the same directory
+  afterward: only `esp32c6-acebe6fffeda.dat` remains.
+
+Net effect: the next time this board authenticates with the Flipper, it will send a fresh
+`capability_query` and the Flipper will see the real `wifi_scan`/`ble_scan` feature list instead
+of the stale zero-feature answer. **Still not done: an actual paired `wifi_scan`/`ble_scan`
+command round-trip against the Flipper has not been exercised**, and this board's Wi-Fi+BLE
+radio coexistence remains untested in general (step 5 was skipped) — flashing and cache-clearing
+only removed the blockers to running that test, they are not the test itself.
+
+## 2026-09-17: unidentified GPS module wired to GPIO36, confirmed working via throwaway firmware
+
+The user wired an unlabeled/unidentified ("electronic scrap") GPS module's TX line to GPIO36 —
+an input-only, no-pull-resistor, not-5V-tolerant pin on classic ESP32 — and asked for a
+throwaway-firmware test of whether it produces anything readable. Module identity, exact
+chipset, and logic-level safety were not verified beforehand (the user knew nothing about the
+module); this is documented as a known unknown, not a confirmed-safe wiring.
+
+Built a standalone one-off project, `heltec/gps_probe/` (own `CMakeLists.txt`/
+`sdkconfig.defaults`/`partitions.csv`, mirroring the throwaway-project pattern already used for
+`esp32/coex_test/` — not wired into `heltec/main/`, `feb_protocol`, or any capability). It
+configures UART1 with RX-only on GPIO36 (TX/RTS/CTS left `UART_PIN_NO_CHANGE`, since GPIO36 has
+no output driver), cycles through 9600/4800/19200/38400/57600/115200 baud at 8-second dwell
+each forever, and per baud logs a printable-byte-percentage/first-16-bytes-hex summary plus any
+line that looks like a plausible `$`-prefixed, comma-delimited NMEA sentence.
+
+Built clean, flashed to the physical board (COM10; hit the same transient "phantom device"
+false report as step 3's port work until reconfirmed via `Get-PnpDevice`, and separately hit a
+"port busy" flash failure caused by a leftover `monitor_esp32_raw.py` process from the earlier
+boot-log check that hadn't actually been killed — a background-job cleanup gap, fixed by
+`Stop-Process` and, for the later capture, by using `timeout -s KILL` in the foreground instead
+of backgrounding-and-killing). A 60-second raw capture confirmed **9600 baud is correct**:
+100% printable bytes, ~56-57 valid sentences per 8s window, the full standard set
+(`GPGGA`/`GPGLL`/`GPGSA`/`GPGSV`/`GPRMC`/`GPVTG`/`GPZDA`), including live fix/no-fix transitions
+(`GPGGA` quality alternating 1↔0, satellite count 0-4) consistent with a real module doing a
+genuine acquisition cycle, not a dead or miswired board. All other tested bauds produced
+garbage, as expected once the correct one was found.
+
+Recorded in `docs/hardware/heltec-wifi-lora-32-v2/README.md` (new GPIO36 pin-table row and
+narrative note) and `.claude/agents/heltec-developer.md` (updated the now-stale "no GPS module
+wired" line). This removes the wiring blocker previously noted against a `gps` capability port
+for this board, but **no real driver integration exists** — this was a UART-sanity check only,
+using throwaway code, not the C6's `nmea_parser.c`/`location.c` pattern. The `heltec/gps_probe/`
+directory and its build output were deleted after the test, matching this project's convention
+of not leaving throwaway hardware-test harnesses lying around once their answer is captured in
+docs (same as `esp32/coex_test/`'s handling in the skipped-coexistence-sweep entry above). The
+board was left running the `gps_probe` throwaway image, not the real capability-porting build
+from the entry above — it needs the real `heltec/` firmware reflashed before any further
+`wifi_scan`/`ble_scan` testing.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

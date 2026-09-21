@@ -25,7 +25,7 @@ if(-not (Test-Path $vcvarsall)) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
-$esp32Dir = Join-Path $repoRoot "esp32\main"
+$sharedDir = Join-Path $repoRoot "components\feb_protocol"
 $vectorsDir = Join-Path $repoRoot "tests\vectors"
 $outDir = Join-Path $scriptDir "build"
 
@@ -46,15 +46,15 @@ if(-not (Test-Path $outDir)) {
 
 $sources = @(
     (Join-Path $scriptDir "test_session.c"),
-    (Join-Path $esp32Dir "session_crypto.c"),
-    (Join-Path $esp32Dir "session.c"),
-    (Join-Path $esp32Dir "pairing_crypto.c"),
-    (Join-Path $esp32Dir "pairing.c"),
-    (Join-Path $esp32Dir "cbor_primitives.c"),
-    (Join-Path $esp32Dir "cbor_records.c"),
-    (Join-Path $esp32Dir "cbor_wifi_scan.c"),
-    (Join-Path $esp32Dir "cbor_ble_scan.c"),
-    (Join-Path $esp32Dir "cbor_wardriving.c"),
+    (Join-Path $sharedDir "session_crypto.c"),
+    (Join-Path $sharedDir "session.c"),
+    (Join-Path $sharedDir "pairing_crypto.c"),
+    (Join-Path $sharedDir "pairing.c"),
+    (Join-Path $sharedDir "cbor_primitives.c"),
+    (Join-Path $sharedDir "cbor_records.c"),
+    (Join-Path $sharedDir "cbor_wifi_scan.c"),
+    (Join-Path $sharedDir "cbor_ble_scan.c"),
+    (Join-Path $sharedDir "cbor_wardriving.c"),
     (Join-Path $mbedtlsLibrary "sha256.c"),
     (Join-Path $mbedtlsLibrary "md.c"),
     (Join-Path $mbedtlsLibrary "hkdf.c"),
@@ -67,7 +67,7 @@ $sources = @(
     (Join-Path $mbedtlsLibrary "aes.c")
 ) -join " "
 
-$includeDirs = "/I `"$esp32Dir`" /I `"$vectorsDir`" /I `"$scriptDir`" /I `"$mbedtlsInclude`" /I `"$mbedtlsLibrary`""
+$includeDirs = "/I `"$sharedDir`" /I `"$vectorsDir`" /I `"$scriptDir`" /I `"$mbedtlsInclude`" /I `"$mbedtlsLibrary`""
 $defines = "/DMBEDTLS_CONFIG_FILE=`"\`"mbedtls_test_config.h\`"`""
 $exePath = Join-Path $outDir "test_session.exe"
 

@@ -1,0 +1,1 @@
+idf_component_register(SRCS "main.c" "factory_reset.c" "status_led.c" INCLUDE_DIRS "." REQUIRES feb_protocol bt esp_timer mbedtls nvs_flash esp_hw_support esp_driver_gpio esp_wifi esp_netif esp_event)

@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -26,8 +27,9 @@
 #define CHUNK_SIZE 128
 
 static const char *TAG = "nmea";
+static const char *TTFF_TAG = "ttff";
 
-static bool read_ubx_cfg_gnss(uint8_t *payload, size_t payload_cap, size_t *payload_len)
+static bool read_ubx_cfg_gnss(uint8_t *payload, size_t payload_cap, size_t *payload_len, uint32_t timeout_ms)
 {
     static const uint8_t poll_frame[] = {0xB5, 0x62, 0x06, 0x3E, 0x00, 0x00, 0x44, 0x88};
     uint8_t frame[128];
@@ -35,7 +37,10 @@ static bool read_ubx_cfg_gnss(uint8_t *payload, size_t payload_cap, size_t *payl
     uint32_t started_ms;
 
     uart_flush(UART_PORT);
-    ESP_ERROR_CHECK(uart_write_bytes(UART_PORT, poll_frame, sizeof(poll_frame)));
+    if (uart_write_bytes(UART_PORT, poll_frame, sizeof(poll_frame)) != (int)sizeof(poll_frame)) {
+        ESP_LOGE(TTFF_TAG, "uart_write_bytes failed to send CFG-GNSS poll frame");
+        return false;
+    }
     ESP_ERROR_CHECK(uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(1000)));
     started_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
@@ -68,11 +73,11 @@ static bool read_ubx_cfg_gnss(uint8_t *payload, size_t payload_cap, size_t *payl
             continue;
         }
         {
-            uint16_t payload_len = (uint16_t)frame[4] | ((uint16_t)frame[5] << 8);
-            if (frame_len < (size_t)payload_len + 8u) {
+            uint16_t frame_payload_len = (uint16_t)frame[4] | ((uint16_t)frame[5] << 8);
+            if (frame_len < (size_t)frame_payload_len + 8u) {
                 continue;
             }
-            if (frame_len == (size_t)payload_len + 8u && frame[2] == 0x06 &&
+            if (frame_len == (size_t)frame_payload_len + 8u && frame[2] == 0x06 &&
                 frame[3] == 0x3E) {
                 uint8_t ck_a = 0;
                 uint8_t ck_b = 0;
@@ -83,8 +88,8 @@ static bool read_ubx_cfg_gnss(uint8_t *payload, size_t payload_cap, size_t *payl
                     ck_b = (uint8_t)(ck_b + ck_a);
                 }
                 if (ck_a == frame[frame_len - 2] && ck_b == frame[frame_len - 1]) {
-                    memcpy(payload, &frame[6], payload_len);
-                    *payload_len = payload_len;
+                    memcpy(payload, &frame[6], frame_payload_len);
+                    *payload_len = frame_payload_len;
                     return true;
                 }
             }
@@ -101,7 +106,7 @@ static void inspect_gnss(void)
     size_t offset;
 
     ESP_LOGI(TAG, "reading current GPS CFG-GNSS; no settings will be changed");
-    if (!read_ubx_cfg_gnss(payload, sizeof(payload), &payload_len)) {
+    if (!read_ubx_cfg_gnss(payload, sizeof(payload), &payload_len, 1000)) {
         ESP_LOGE(TAG, "GPS did not return CFG-GNSS");
         return;
     }
@@ -122,8 +127,116 @@ static void inspect_gnss(void)
     }
 }
 
+static bool nmea_hex_nibble(char c, uint8_t *out)
+{
+    if (c >= '0' && c <= '9') {
+        *out = (uint8_t)(c - '0');
+        return true;
+    }
+    if (c >= 'A' && c <= 'F') {
+        *out = (uint8_t)(c - 'A' + 10);
+        return true;
+    }
+    if (c >= 'a' && c <= 'f') {
+        *out = (uint8_t)(c - 'a' + 10);
+        return true;
+    }
+    return false;
+}
+
+static bool nmea_checksum_ok(const char *sentence)
+{
+    const char *star = strchr(sentence, '*');
+    uint8_t hi;
+    uint8_t lo;
+    uint8_t sum = 0;
+    const char *p;
+
+    if (!star || star == sentence || star[1] == '\0' || star[2] == '\0') {
+        return false;
+    }
+    if (!nmea_hex_nibble(star[1], &hi) || !nmea_hex_nibble(star[2], &lo)) {
+        return false;
+    }
+    for (p = sentence + 1; p < star; p++) {
+        sum ^= (uint8_t)*p;
+    }
+    return sum == (uint8_t)((hi << 4) | lo);
+}
+
+static bool nmea_field(const char *sentence, int index, char *out, size_t out_cap)
+{
+    const char *p = sentence;
+    const char *end;
+    size_t field_len;
+    int cur = 0;
+
+    while (cur < index) {
+        p = strchr(p, ',');
+        if (!p) {
+            return false;
+        }
+        p++;
+        cur++;
+    }
+    end = p;
+    while (*end != '\0' && *end != ',' && *end != '*') {
+        end++;
+    }
+    field_len = (size_t)(end - p);
+    if (field_len >= out_cap) {
+        field_len = out_cap - 1;
+    }
+    memcpy(out, p, field_len);
+    out[field_len] = '\0';
+    return true;
+}
+
+static void check_ttff(const char *sentence, int64_t t0, bool *fix_logged)
+{
+    char sentence_id[8];
+    char quality_str[8];
+    char sats_str[8];
+    char hdop_str[16];
+    size_t id_len;
+    int quality;
+
+    if (*fix_logged || !nmea_checksum_ok(sentence)) {
+        return;
+    }
+    if (!nmea_field(sentence, 0, sentence_id, sizeof(sentence_id))) {
+        return;
+    }
+    id_len = strlen(sentence_id);
+    if (id_len < 3 || strcmp(sentence_id + id_len - 3, "GGA") != 0) {
+        return;
+    }
+    if (!nmea_field(sentence, 6, quality_str, sizeof(quality_str)) || quality_str[0] == '\0') {
+        return;
+    }
+    quality = atoi(quality_str);
+    if (quality <= 0) {
+        return;
+    }
+    if (!nmea_field(sentence, 7, sats_str, sizeof(sats_str)) || sats_str[0] == '\0') {
+        strcpy(sats_str, "0");
+    }
+    if (!nmea_field(sentence, 8, hdop_str, sizeof(hdop_str)) || hdop_str[0] == '\0') {
+        strcpy(hdop_str, "?");
+    }
+    uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    ESP_LOGI(TTFF_TAG, "first fix at t+%lums sats=%u hdop=%s", (unsigned long)elapsed_ms,
+             (unsigned int)atoi(sats_str), hdop_str);
+    *fix_logged = true;
+}
+
 void app_main(void)
 {
+    int64_t t0 = esp_timer_get_time();
+    bool fix_logged = false;
+
+    ESP_LOGI(TTFF_TAG, "t0 anchor captured; TTFF timer started");
+
     uart_config_t cfg = {
         .baud_rate = BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -155,6 +268,7 @@ void app_main(void)
                     line[line_len] = '\0';
                     if (line[0] == '$') {
                         ESP_LOGI(TAG, "%s", line);
+                        check_ttff(line, t0, &fix_logged);
                     }
                     line_len = 0;
                 }

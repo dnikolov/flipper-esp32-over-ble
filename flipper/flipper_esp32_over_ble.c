@@ -1990,11 +1990,10 @@ static void post_wardriving_error(Esp32App* app, const char* message) {
     furi_message_queue_put(app->queue, event, 0);
 }
 
-/* CSV export file state -- BLE-thread-only (handle_wardriving_status(), further below, runs
-   synchronously inside profile_event_handler, the same single-threaded-BLE-dispatch
-   assumption every other BLE-callback-only static in this file already relies on; nothing
-   outside that call chain touches these, so -- unlike `reassembly` above, which really is
-   touched from two threads -- no mutex is needed here). One export file spans one
+/* CSV export file state -- primarily touched from handle_wardriving_status(), further below,
+   which runs synchronously inside profile_event_handler on BleEventWorker, but also from
+   wardriving_csv_close() via reset_scan_ui_state_impl() on the app's main thread (see
+   wardriving_state_mutex below, which serializes the two). One export file spans one
    authenticated BLE session: opened lazily on the first wardriving record this session sees
    (whether from an unsolicited backlog drain or a live capture after an explicit start), kept
    open and appended to for the rest of the session regardless of any stop/restart within it,
@@ -2010,15 +2009,23 @@ static File* wardriving_csv_file;
 static char wardriving_csv_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
 static uint32_t wardriving_csv_records_since_sync;
 static bool wardriving_csv_write_failed;
+/* wardriving_csv_file/wardriving_csv_records_since_sync/wardriving_csv_write_failed/
+   wardriving_dedup_table (below) are touched from two threads despite the "BLE-thread-only"
+   framing above: handle_wardriving_status() on BleEventWorker, but also wardriving_csv_close()
+   via reset_scan_ui_state_impl(), which runs on the app's own main thread (stop_service() at
+   app exit/BtStatusUnavailable, and the AppEventSessionFatal/Back-key handlers). Same shape as
+   reassembly_mutex above -- real cross-thread access, not just single-threaded BLE dispatch --
+   so it needs the same real mutex. */
+static FuriMutex* wardriving_state_mutex;
 /* wardriving_flush_led_active (the solid-green-while-flushing / solid-blue-when-idle LED
    indicator for an active wardriving backlog flush, docs/PROTOCOL.md's backlog_remaining
    semantics) is declared earlier in this file, next to session_reset_state() which must
    clear it -- see handle_wardriving_status()'s "data" branch, further below, for both
    transition points. */
 
-/* Same BLE-thread-only, single-owner lifetime as the fields above (see wardriving_csv_file's
-   own declaration comment) -- see wardriving_csv.h's feb_wardriving_dedup_should_write() for
-   the policy this table drives. */
+/* Same file-lifetime scope and same wardriving_state_mutex protection as the fields above
+   (see wardriving_csv_file's own declaration comment) -- see wardriving_csv.h's
+   feb_wardriving_dedup_should_write() for the policy this table drives. */
 static feb_wardriving_dedup_table_t wardriving_dedup_table;
 
 /* storage_file_sync() every Nth record rather than every record (durability against a mid-
@@ -2027,6 +2034,8 @@ static feb_wardriving_dedup_table_t wardriving_dedup_table;
    existing message-queue depth, no other significance. */
 #define FEB_WARDRIVING_CSV_SYNC_EVERY_N_RECORDS 8u
 
+/* Caller must hold wardriving_state_mutex -- its only caller, wardriving_csv_close() below,
+   already does. */
 static void wardriving_csv_reset_state(void) {
     wardriving_csv_records_since_sync = 0;
     wardriving_csv_write_failed = false;
@@ -2034,6 +2043,7 @@ static void wardriving_csv_reset_state(void) {
 }
 
 static void wardriving_csv_close(void) {
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
     if(wardriving_csv_file) {
         storage_file_sync(wardriving_csv_file);
         storage_file_close(wardriving_csv_file);
@@ -2041,6 +2051,7 @@ static void wardriving_csv_close(void) {
         wardriving_csv_file = NULL;
     }
     wardriving_csv_reset_state();
+    furi_mutex_release(wardriving_state_mutex);
 }
 
 /* Fixed filename (docs/WARDRIVING_PUBLISH.md "Capture-side change"): one "current" file that
@@ -2164,9 +2175,11 @@ static void
     }
     if(text_matches(status_payload.state, status_payload.state_len, "stopped")) {
         pending_command_kind = PendingCommandNone;
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
         if(wardriving_csv_file) {
             storage_file_sync(wardriving_csv_file);
         }
+        furi_mutex_release(wardriving_state_mutex);
         post_wardriving_run_state(app, false, false);
         return;
     }
@@ -2207,13 +2220,20 @@ static void
     last_ble_summary[0] = '\0';
     for(size_t i = 0; i < result->record_count; i++) {
         const feb_wardriving_record_t* record = &result->records[i];
-        if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record)) {
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+        bool should_write = feb_wardriving_dedup_should_write(&wardriving_dedup_table, record);
+        bool write_failed_now = false;
+        if(should_write) {
             if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
                 wardriving_csv_write_failed = true;
-                FURI_LOG_E(
-                    TAG, "wardriving CSV: write failed, no further records written this session");
-                post_wardriving_error(app, "CSV export write failed");
+                write_failed_now = true;
             }
+        }
+        furi_mutex_release(wardriving_state_mutex);
+        if(write_failed_now) {
+            FURI_LOG_E(
+                TAG, "wardriving CSV: write failed, no further records written this session");
+            post_wardriving_error(app, "CSV export write failed");
         }
         if(record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE) {
             const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
@@ -4586,6 +4606,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
 
     reassembly_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(reassembly_mutex);
+    wardriving_state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(wardriving_state_mutex);
     reassembly_timeout_timer = furi_timer_alloc(
         reassembly_timeout_timer_callback, FuriTimerTypePeriodic, NULL);
     furi_check(reassembly_timeout_timer);
@@ -5074,6 +5096,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     publish_poll_timer = NULL;
     furi_mutex_free(reassembly_mutex);
     reassembly_mutex = NULL;
+    furi_mutex_free(wardriving_state_mutex);
+    wardriving_state_mutex = NULL;
     gui_remove_view_port(gui, view_port);
     view_port_free(view_port);
     furi_record_close(RECORD_GUI);

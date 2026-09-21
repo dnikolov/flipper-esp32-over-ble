@@ -23,7 +23,7 @@ if(-not (Test-Path $vcvarsall)) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
-$esp32Dir = Join-Path $repoRoot "esp32\main"
+$sharedDir = Join-Path $repoRoot "components\feb_protocol"
 $vectorsDir = Join-Path $repoRoot "tests\vectors"
 $outDir = Join-Path $scriptDir "build"
 
@@ -33,16 +33,16 @@ if(-not (Test-Path $outDir)) {
 
 $sources = @(
     (Join-Path $scriptDir "test_framing_cbor.c"),
-    (Join-Path $esp32Dir "framing.c"),
-    (Join-Path $esp32Dir "cbor_primitives.c"),
-    (Join-Path $esp32Dir "cbor_records.c"),
-    (Join-Path $esp32Dir "cbor_wifi_scan.c"),
-    (Join-Path $esp32Dir "cbor_ble_scan.c"),
-    (Join-Path $esp32Dir "cbor_wardriving.c"),
-    (Join-Path $esp32Dir "cbor_gps.c")
+    (Join-Path $sharedDir "framing.c"),
+    (Join-Path $sharedDir "cbor_primitives.c"),
+    (Join-Path $sharedDir "cbor_records.c"),
+    (Join-Path $sharedDir "cbor_wifi_scan.c"),
+    (Join-Path $sharedDir "cbor_ble_scan.c"),
+    (Join-Path $sharedDir "cbor_wardriving.c"),
+    (Join-Path $sharedDir "cbor_gps.c")
 ) -join " "
 
-$includeDirs = "/I `"$esp32Dir`" /I `"$vectorsDir`""
+$includeDirs = "/I `"$sharedDir`" /I `"$vectorsDir`""
 $exePath = Join-Path $outDir "test_framing_cbor.exe"
 
 $cmd = "call `"$vcvarsall`" >nul && cl.exe /nologo /W4 /std:c11 $includeDirs /Fe:`"$exePath`" /Fo:`"$outDir\\`" $sources"

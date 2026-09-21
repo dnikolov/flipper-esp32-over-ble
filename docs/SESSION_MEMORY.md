@@ -6,7 +6,52 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-13, commit 6481400)
+## Current state (as of 2026-09-16)
+
+**Phase 4 (Heltec WiFi LoRa 32 V2 board support) started 2026-09-16**, via an explicit
+user decision to override `docs/PLAN.md`'s "does not start until Phase 3 backlog is cleared"
+gate (Phase 3's backlog is not cleared — see [BACKLOG.md](BACKLOG.md); it stays fully deferred,
+not interleaved with Phase 4). The shared-component architecture ((a) in `docs/PLAN.md`'s Phase
+4 section) was confirmed over duplicating the protocol into a third tree. Step 1 (board
+acquisition + baseline bring-up) is done: board confirmed as "WiFi LoRa 32 V2" silkscreen,
+ESP32-D0WDQ6 rev v1.0, 8MB flash, MAC `a4:cf:12:03:ba:58`, on COM10 (Silicon Labs CP210x); the
+missing classic-`esp32` Xtensa toolchain was installed and an unmodified `hello_world` baseline
+built/flashed/booted cleanly. **Step 2 (project scaffolding) is also done** (2026-09-16): the
+protocol/crypto files (`framing`, `pairing`/`pairing_crypto`, `session`/`session_crypto`, all
+`cbor_*` codec files) moved into a new shared component (`components/feb_protocol/`), wired via
+`EXTRA_COMPONENT_DIRS` into both `esp32/` and a new `heltec/` skeleton project (target `esp32`,
+classic Xtensa); `esp32/`'s build and all host-native tests pass unchanged, and `heltec/`'s
+`idf.py build` passes against a trivial proof-of-link `main.c`. See `docs/PLAN.md`'s "Phase 4:
+Heltec WiFi LoRa 32 V2 board support" section for full detail and `docs/BASELINES.md`'s Heltec
+entry for the pinned facts. **Step 3 (port BLE transport + pairing + session crypto onto classic
+ESP32) is build-verified 2026-09-16, hardware-verification still pending.** `heltec/main/main.c`
+now has the full NimBLE-central transport, pairing ceremony, and runtime session-auth state
+machine (base protocol only — `handle_capability_query()` reports zero features,
+`handle_command()` always answers `unsupported_capability`; no wifi_scan/ble_scan/wardriving/gps
+ported). NimBLE central mode and mbedTLS X25519/HKDF/GCM all confirmed buildable against the
+classic-`esp32` target (not assumed from the C6). New board-specific `status_led.c` (plain
+GPIO25, blink-cadence-encoded state) and `factory_reset.c` (GPIO0 BOOT/PRG button, no
+wardriving-toggle) modules. `heltec`'s `idf.py build` passes; `esp32`'s build and all five
+host-native test suites pass unchanged. **Step 3 is now fully done, hardware-verified
+2026-09-16:** flashed to the physical Heltec board, pairing ceremony and the runtime
+`hello`/`hello_ack`/`client_auth` round-trip both completed successfully against the Flipper.
+**Step 4 (`board_id`/multi-board-pairing implications) is also done, verified 2026-09-16:**
+no code change was needed (the Heltec's `heltec-` `board_id` prefix and the Flipper's storage
+code were already collision-safe); confirmed by inspecting the Flipper's SD card, which holds
+distinct `esp32c6-*`/`heltec-*` pairing and capability files side by side. **Step 5 (radio/
+coexistence sweep) was explicitly skipped by user decision 2026-09-16** — not attempted; see
+`docs/PLAN.md`'s step 5 for the consequence (no validated coexistence bounds exist for this
+board). **Step 7 (`wifi_scan`/`ble_scan` capability porting, added 2026-09-17 by explicit user
+request) is build-verified, hardware-verification still pending:** both capabilities ported
+from the C6's reference implementation into `heltec/main/main.c`; `heltec`'s `idf.py build` and
+`esp32`'s own build both independently reconfirmed clean. A new `heltec-developer` subagent was
+added (`.claude/agents/heltec-developer.md`) since this was the first substantial Heltec-only
+firmware task. **Flashed to the physical board 2026-09-17** (COM10); boot log confirmed healthy.
+The Flipper's stale cached capability record (`capabilities/heltec-a4cf1203ba58.dat`, zero
+features from the step-3 test) has been **deleted**, so the next `capability_query` will reach
+this firmware's real feature list. **Still untested: an actual paired `wifi_scan`/`ble_scan`
+round-trip against the Flipper**, and this board's Wi-Fi+BLE radio coexistence generally (step 5
+was skipped). Full detail: `docs/PROJECT_HISTORY.md`'s 2026-09-16/2026-09-17 entries.
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete and hardware-verified.** Steps 1-7 are implemented and fully verified on real devices (ESP32-C6-DevKitC-1-N4 + Flipper Zero).
 
