@@ -2194,6 +2194,61 @@ board was left running the `gps_probe` throwaway image, not the real capability-
 from the entry above — it needs the real `heltec/` firmware reflashed before any further
 `wifi_scan`/`ble_scan` testing.
 
+## 2026-09-17 to 2026-09-18: Phase 6 (wardriving-publish) implemented and hardware-verified end to end
+
+Full design in [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md) (frozen 2026-09-17) implemented
+the same evening (`f7cc996`) and hardware-debugged over the following day, proceeding in parallel
+with Phase 4 per the explicit gate-override decision. Initial implementation: the wardriving CSV
+lifecycle changed from per-calendar-day files to a single accumulating `wardriving_current.csv`,
+archived only on confirmed publish success; a new Flipper Publish screen (idle/waiting/outcome),
+reachable independent of any BLE session; a BadUSB-driven trigger that types a bootstrap directly
+via `furi_hal_hid_kb_*` (no Loader chain-launch, since the Loader can't launch another app while
+this one stays resident to poll for the result); and `scripts/publish_wardriving.ps1`, a pure
+PowerShell reimplementation of the Flipper's `storage` CLI protocol (no Python dependency) that
+pulls the CSV, uploads it to wdgwars.pl, and writes the outcome back to the Flipper's SD card.
+Landed build-verified only — BadUSB timing, the USB personality switch, and the publish poll/race
+handling were explicitly flagged as untested.
+
+Five real hardware bugs then surfaced and were fixed, each confirmed against the physical Flipper:
+
+- **MPU fault entering the Wardriving screen** (`b398777`): Phase 6's new `publish_*` fields plus
+  a WiFi/BLE summary-field split grew `Esp32App` by ~170 bytes, enough to overflow the FBT default
+  2048-byte main-thread stack on the one screen whose render path nests a CBOR status query
+  deepest. Fixed by raising `application.fam`'s `stack_size` to 4096.
+- **CSV location regression** (`c398cca`): the initial implementation flattened
+  `wardriving_current.csv` to the app data root, diverging from the frozen design's `wardriving/`
+  subdirectory. Moved back; credentials/result files correctly stay flat (publish-flow plumbing,
+  not wardriving data).
+- **Flipper COM port not found after BadUSB** (`baca619`, then `5702d4c` as the real root cause):
+  `Find-FlipperPort` took a single port-list snapshot before the Flipper had re-enumerated from
+  HID back to CDC/serial, so a retry loop was added first — but the actual cause was that .NET's
+  `SerialPort` defaults `DtrEnable` to `false`, and the Flipper's CLI-over-VCP only starts its
+  shell once DTR goes active (`cli_vcp.c`). `scripts/storage.py` never hit this because pyserial
+  asserts DTR by default. Both fixes were kept: the retry loop is still correct defensive
+  behavior, and `187b375` additionally matched Unleashed's own BadUSB app by fully detaching USB
+  (config `NULL`) before switching personality, rather than switching directly between two
+  interfaces — confirmed not the actual cause via Device Manager, kept anyway as the proven
+  reference pattern.
+- **Every publish run reported "nothing to publish" even with a real CSV present** (`e19d80b`):
+  four of the five `storage` CLI wrapper functions read only the first EOL-terminated line as the
+  response, but the Flipper's CLI shell always echoes the command line back first — they were
+  reading their own echo. Fixed to match `Send-FlipperFile`'s already-correct two-read pattern.
+  The same commit fixed a .NET `SerialPort` quirk where a `ReadByte()`/`Read()` timeout can
+  surface as `IOException` instead of `TimeoutException`, now handled identically to an ordinary
+  timeout.
+- **Confirmed against the live wdgwars.pl API, not assumed:** a bad API key returns HTTP `401`
+  with `{"ok":false,"error":"..."}`, already handled correctly by the existing generic-failure
+  path. Separately (`37e59bf`), a real end-to-end run against the live API returned `202` with
+  `{"ok":true,"queued":true,"job_id":...,"poll_url":...}` from the v1 endpoint (the docs had only
+  described this shape for v2) — explicit user decision to treat `ok:true` at `202` as confirmed
+  enough to archive, without polling `poll_url` first.
+
+`WARDRIVING_PUBLISH_SCRIPT_COMMIT` (the pinned commit the BadUSB bootstrap fetches) was repinned
+after each script-affecting fix (`083b545`, `0ac2caa`, `3d46c40`, `824213a`). **Phase 6 is now
+implemented and hardware-verified end to end**, including a real successful publish against the
+live wdgwars.pl API. See [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md) for the frozen design
+and its now-resolved open items.
+
 ## 2026-09-21: Phase 7 — Wardriving screen redesign (Stopped/Running split, WiFi Swelling, country code, GPS speed)
 
 Design and implementation in one pass, reached via direct discussion with the user rather than

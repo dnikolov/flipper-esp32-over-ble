@@ -6,7 +6,7 @@ Flipper Zero <-> ESP32-C6 over BLE. See [CLAUDE.md](../CLAUDE.md) for the projec
 [docs/BASELINES.md](BASELINES.md) for pinned board/firmware/toolchain versions — not repeated
 here.
 
-## Current state (as of 2026-09-16)
+## Current state (as of 2026-09-21)
 
 **Phase 4 (Heltec WiFi LoRa 32 V2 board support) started 2026-09-16**, via an explicit
 user decision to override `docs/PLAN.md`'s "does not start until Phase 3 backlog is cleared"
@@ -68,6 +68,15 @@ open gaps, both recorded in [BACKLOG.md](BACKLOG.md)/that design doc: ESP32-side
 paths (only a Flipper `start` command carries them), and the GPS screen's speed landed in the
 existing Alt row's placeholder rather than a dedicated row (no screen space left). No hardware
 testing done yet.
+
+**Phase 6 (wardriving-publish) is complete and hardware-verified end-to-end, 2026-09-18.** The
+Flipper publishes its wardriving CSV to wdgwars.pl via a BadUSB-triggered host PowerShell script
+(`scripts/publish_wardriving.ps1`), with no ESP32 needed at publish time. A real publish against
+the live wdgwars.pl API succeeded, after five hardware bugs found and fixed during testing (a
+stack-size MPU fault on the Wardriving screen, a CSV-path regression, DTR/port-discovery timing on
+the host script's serial reconnect, and CLI response-echo handling). Design, decisions, and
+implementation-status notes: [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md). Full narrative:
+`docs/PROJECT_HISTORY.md`'s 2026-09-17/2026-09-18 Phase 6 entry.
 
 **Phase 2 (core BLE transport through authenticated runtime sessions) is complete and hardware-verified.** Steps 1-7 are implemented and fully verified on real devices (ESP32-C6-DevKitC-1-N4 + Flipper Zero).
 

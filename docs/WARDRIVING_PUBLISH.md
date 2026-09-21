@@ -1,4 +1,4 @@
-# Wardriving Log Publishing (Phase 6 — frozen design, not yet implemented)
+# Wardriving Log Publishing (Phase 6 — implemented and hardware-verified end-to-end 2026-09-18)
 
 Reached via a grill-me design session with the user, 2026-09-17. Lets the Flipper publish its
 captured wardriving CSV to [wdgwars.pl](https://wdgwars.pl) directly from a Windows host computer,
@@ -9,8 +9,13 @@ wigle.net support is an acknowledged future extension, not built now (see "wigle
 This is its own roadmap phase (Phase 6 in `docs/PLAN.md`), proceeding **in parallel with Phase 4**
 (Heltec board support) by explicit user decision — not gated on Phase 4 or Phase 5 completing.
 
-**Status: design only.** Two things below are marked "needs verification during implementation"
-rather than confirmed — this doc is frozen intent, not a "done when" bar met.
+**Status: implemented and hardware-verified end-to-end 2026-09-18**, including a real successful
+publish against the live wdgwars.pl API. This doc still records the frozen design and the
+decisions behind it; see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s "Phase 6" entry for the
+implementation pass and the five hardware bugs found and fixed along the way (stack-size MPU
+fault, a CSV-path regression, DTR/port-discovery timing, CLI echo handling). Inline notes below
+marked "corrected"/"confirmed" reflect what implementation actually found, layered onto the
+original design text.
 
 ## Why not just use the ESP32's Wi-Fi?
 
@@ -276,14 +281,17 @@ Phase 4 (Heltec) rather than waiting for Phase 4/5 to complete — an explicit u
 in `docs/PLAN.md` with the same kind of override note Phase 4 itself carries for its own
 Phase-3-backlog gate.
 
-## Open items before implementation can start
+## Open items (resolved during implementation, kept for the design record)
 
 1. ~~Design the actual wire format for the CLI-registered command~~ **Resolved 2026-09-17**: no
    custom command needed — reuses the built-in `storage` CLI verbs; see "Data transfer" above.
-2. Confirm wdgwars.pl's actual non-200 error behavior for the CSV endpoints against a real account
-   before finalizing the host script's error handling. **Still open** — no live account access
-   during this design/implementation pass; the host script treats any non-`ok:true` JSON body or
-   non-200 status as a generic failure rather than branching on assumed codes.
+2. ~~Confirm wdgwars.pl's actual non-200 error behavior for the CSV endpoints against a real
+   account~~ **Resolved 2026-09-18**, confirmed against the live API during hardware testing: a
+   bad API key returns HTTP `401` with `{"ok":false,"error":"..."}`, already handled correctly by
+   the existing generic-failure path (any non-`ok:true`/non-2xx response). A real successful
+   upload returned `202` with `{"ok":true,"queued":true,...}` from the v1 endpoint (see "Result
+   handling" above for the `202`-as-success decision this prompted). Malformed-CSV and
+   oversized-file behavior specifically were still not exercised — not a blocker, just untested.
 3. ~~Decide the exact on-Flipper CLI command name/namespace~~ **Resolved by elimination
    2026-09-17**: no new CLI command is registered at all, so there's no name to pick or collide.
 4. ~~Whether the Flipper types the BadUSB DuckyScript sequence via raw HID output driven

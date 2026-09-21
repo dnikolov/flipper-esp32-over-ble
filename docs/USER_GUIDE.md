@@ -149,8 +149,7 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 
 Once an authenticated session is active and the Flipper's status line shows the board
 advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Up**
-from the main screen to open the wardriving screen. **Note: This feature is build-verified as of
-2026-09-21 but has not yet been tested on physical hardware.**
+from the main screen to open the wardriving screen. This feature is hardware-verified as of 2026-09-21.
 
 The wardriving screen has two layouts depending on whether recording is currently running:
 
@@ -185,6 +184,22 @@ records are captured and exported the same as live results (see below).
 **Location data:** a real UART/NMEA GPS driver and per-record fix-dependency are implemented and hardware-verified. Any record captured while the board's location driver is not reporting a real fix (`GGA` fix quality > 0 and `RMC` status `A`) is discarded rather than logged or sent — losing a fix mid-capture pauses logging until it returns, without stopping the capture itself. `start`/`stop` are never gated on having a fix (see "Starting and stopping" above). See [CAPABILITIES.md](CAPABILITIES.md) for the full design.
 
 **SD card export:** every wardriving record (both backlog-drained and live) is appended, incrementally and in WiGLE CSV format, to a single file, `/ext/apps_data/flipper_esp32_over_ble/wardriving/wardriving_current.csv`, on the Flipper's SD card. Unlike the older per-calendar-day naming, this one file keeps accumulating across however many sessions/days happen between publishes (see [WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)) — it's only renamed away, to a timestamped archive in that same `wardriving/` directory, by the publish flow's host script, after a confirmed successful upload. Records are written to the file as they arrive rather than held in memory, so a capture session can run for hours without growing the app's RAM usage. Each record's exported `FirstSeen` timestamp is a real UTC wall-clock time derived from the board's GPS fix at capture time (`YYYY-MM-DD hh:mm:ss`, matching WiGLE's format, hardware-verified).
+
+## Publishing wardriving data
+
+The Flipper's accumulated wardriving CSV (`wardriving_current.csv` on its SD card) can be published to **wdgwars.pl**, a wardriving-data aggregation site. Publishing happens entirely from a Windows PC with internet access — no ESP32 board is required at publish time, so the board stays out in the field with no connectivity during actual wardriving runs.
+
+**How to start:** From the Flipper's Home menu, select **Publish** (it appears right after **Wardriving** in the menu). This does not require an active BLE session with the ESP32; it is a Flipper+PC-only flow.
+
+**What happens:** When you select Publish, the Flipper's screen shows idle/waiting/outcome states. The Flipper switches its USB personality to a BadUSB HID keyboard and types a short keystroke sequence (`Win+R` → `powershell` → Enter) to open a fresh PowerShell window on the connected Windows PC. A bootstrap command in that window fetches and runs a publish script (from this project's repo, pinned to a specific commit) that reads your wardriving CSV from the Flipper over its CLI-over-USB-serial channel, prompts once for a wdgwars.pl API key if you haven't already saved one (paste your 64-character hex key from your wdgwars.pl account's API Keys page), uploads the CSV to wdgwars.pl, and reports the outcome back to the Flipper's screen. The Flipper shows the result: success with import/duplicate/capture counts, or a failure message.
+
+**Requirements:** Windows only (no macOS/Linux support in this version); the Flipper must be connected to the PC via USB; the PC needs internet access.
+
+**Credentials and portability:** The upload key is stored in plain text on the Flipper's SD card (same risk class as the pairing secret — the Flipper is not treated as a hardware-backed secret vault). Once entered on one Windows machine, it persists on the device and travels with it; you won't need to re-enter it on a different PC later.
+
+**Upload verification:** The CSV is only renamed to a timestamped archive (freeing `wardriving_current.csv` to accumulate fresh data again) after a confirmed successful upload. A failed or ambiguous publish leaves the CSV untouched so no data is lost — you can simply try publishing again later.
+
+**Known friction:** Windows Defender or SmartScreen may flag the downloaded-and-run publish script as suspicious the first time — this is expected and not a sign of a problem, since you control exactly which pinned commit is fetched and run.
 
 ## Factory-resetting the ESP32 without a PC
 
