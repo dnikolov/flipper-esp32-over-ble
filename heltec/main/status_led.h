@@ -9,8 +9,11 @@
    single on/off GPIO, so states are distinguished by blink cadence rather than color: slow
    blink while scanning/connected-but-unauthenticated, solid on once the runtime session is
    authenticated, fast blink while a wardriving-style backlog batch is actively flushing.
-   There is no wardriving-active color variant (wardriving isn't ported on this board -- see
-   docs/PLAN.md Phase 4 step 3). factory_reset.c suppresses this module's own redraws for the
+   Unlike the C6 (which renders CONNECTING/CONNECTED as purple instead of blue while a
+   wardriving capture session is active, via color), this plain LED has no color to spend on
+   that distinction -- CONNECTING blinks twice as fast instead while wardriving is active (see
+   feb_status_led_set_wardriving_active()); CONNECTED (solid) and FLUSHING (already its own
+   fast blink) are unaffected. factory_reset.c suppresses this module's own redraws for the
    duration of its BOOT-hold gesture via _begin()/_end(), then this module restores whatever
    the real connection state was on a cancelled gesture. */
 typedef enum {
@@ -26,6 +29,13 @@ void feb_status_led_init(void);
 /* Records the new connection-status state and, unless a factory-reset gesture is currently
    suppressing redraws, applies it to the LED immediately. */
 void feb_status_led_set(feb_status_led_state_t state);
+
+/* Records whether a wardriving capture session is currently active. Unlike the C6 (which
+   renders this as a blue-vs-purple color change), this board's plain on/off LED can only
+   double the CONNECTING blink rate while active -- CONNECTED (solid on) and FLUSHING (already
+   its own fast blink) are unaffected. Exists so main.c's wardriving_sync_status_led() (ported
+   unchanged from esp32/main/main.c) has the same call site available on both boards. */
+void feb_status_led_set_wardriving_active(bool active);
 
 /* Periodic tick (expected roughly every FEB_REASSEMBLY_CHECK_INTERVAL_MS, piggybacked on
    reassembly_timeout_cb()): advances the CONNECTING/FLUSHING blink cadence. No-op for

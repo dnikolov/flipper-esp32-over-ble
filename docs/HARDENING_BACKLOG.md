@@ -261,3 +261,485 @@ by 15412 bytes (~34%, confirmed via `arm-none-eabi-size`); item 1 above is the n
 launch failures are still observed after that -- the actual OOM-frequency improvement on real
 hardware still needs to be observed in the field, this session's verification was build+static
 only (no flashing).
+
+**2026-09-24: investigated the sharper "especially on second launch" symptom -- no genuine
+heap leak found; one real redundancy found and fixed; `.bss` re-measured (grew back somewhat
+since the 2026-09-13 fix, as expected from new features added since).**
+
+**Re-measured `.bss`** via `arm-none-eabi-size`/`arm-none-eabi-nm` against a fresh build:
+29400 (2026-09-13 baseline) -> 32636 bytes before this session's fix, i.e. it had grown back
++3236 bytes from GPS/publish capabilities added since (their own new static event/path/buffer
+fields) -- confirms the file's own warning that `.bss` "needs re-auditing on every growth, not
+just when first written."
+
+**Exit/cleanup path traced end-to-end, found correctly paired -- no leak located in this
+FAP's own code:**
+- Every `storage_file_alloc()` site (9 call sites) has a matching `storage_file_close()` +
+  `storage_file_free()` on every path, including early-return/error paths (checked all 9
+  individually: `pairing_storage_save/load`, `any_saved_pairing_exists`,
+  `capability_storage_save/load`, `wardriving_settings_load/save`,
+  `wardriving_csv_ensure_open`, `publish_try_read_result`).
+- The one `malloc()` site in the whole file (`profile_start()`'s
+  `malloc(sizeof(Esp32BleProfile))`) is freed on both its own error path and in `profile_stop()`.
+- `stop_service()` (called both on explicit Back-exit and on `BtStatusUnavailable`, matching
+  this file's own established rule) calls `bt_profile_restore_default()`, which -- traced into
+  the pinned Unleashed checkout's `bt_api.c`/`bt.c`/`furi_hal_bt.c` -- always routes through
+  `furi_hal_bt_reinit()`, which calls `current_profile->config->stop(current_profile)`
+  (our `profile_stop()`) before restoring the default Serial profile. `profile_stop()` in turn
+  unregisters the GATT event handler, calls `ble_gatt_characteristic_delete()` for all 6
+  characteristics, `ble_gatt_service_delete()`, and `free(profile)` -- symmetric with
+  `profile_start()`. `ble_gatt_characteristic_init()`/`_delete()` (`targets/f7/ble_glue/
+  furi_ble/gatt.c`) each also malloc/free their own heap copy of the characteristic descriptor
+  per characteristic -- also symmetric, not a leak, given clean teardown.
+- No app-spawned `FuriThread`s to leak (grepped, none found -- this app is single-thread +
+  BLE/timer/GUI callbacks only).
+- The one GATT characteristic using the `FlipperGattCharacteristicDataCallback` path
+  (`notify_data_callback`) always returns `release_data = false`; no `descriptor_params` are
+  used anywhere -- rules out the other realistic per-characteristic leak shape (a callback that
+  mallocs data for the GATT stack to send and forgets to signal ownership correctly).
+- The publish flow's BadUSB USB-personality switch (`publish_trigger_badusb()`) is a stack-local
+  pointer swap (`furi_hal_usb_set_config`), not a heap allocation; runs on the main thread only.
+
+**Conclusion on the "especially second launch" mechanism:** given the above, this is not
+explained by a code-level leak in this FAP or in the firmware's normal profile-teardown path.
+The much more likely mechanism -- consistent with, not contradicting, H04's own existing
+fragmentation framing above -- is heap **fragmentation** carried over from the first launch's
+own churn: `bt_profile_restore_default()` does a full BLE-core reinit and re-starts the
+default Serial profile (which re-adds its own GATT characteristics/heap copies), and the app's
+own Storage/GUI/notification activity during the first run leaves the allocator's free-list
+differently shaped than it was at boot, even with every individual allocation correctly freed.
+A launch immediately after that first run's churn is competing for a contiguous block against a
+*more fragmented* heap than a first launch fresh off a reboot would. **This remains an
+unconfirmed hypothesis** -- this session had no hardware access; confirming it would need
+instrumenting `memmgr_heap_get_max_free_block()` before/after a first and second launch on real
+hardware (not done this session, flagged for whoever picks this up next).
+
+**Fixed this session (mechanical, safe, zero behavior change):**
+`gps_poll_timer_callback` and `publish_poll_timer_callback` each kept their own separate
+`static AppEvent event` on the stated rationale that they "run on the Furi timer-service thread
+... concurrently" -- but both in fact run on the *same single* FreeRTOS Timer Service task
+(`configTIMER_TASK_STACK_DEPTH`), which processes one expired-timer callback at a time from its
+own queue, so the two can never be in flight concurrently with *each other* (only with
+BleEventWorker/Bt/GuiSrv, which they don't share a buffer with anyway). Merged into one shared
+`timer_service_event`, same single-in-flight rationale as `shared_ble_event`. `.bss`: 32636 ->
+32068 (-568 bytes). Build-verified via `fbt.cmd fap_flipper_esp32_over_ble`
+(`flipper_esp32_over_ble.fap`, 133052 bytes); not hardware-tested.
+
+**Deferred item (`wifi_scan_aps`/`ble_scan_devices` merge) -- traced as this file asked,
+still not safe to do:** confirmed both arrays are already main-thread-owned (written only from
+the main loop's `AppEventWifiScanAp`/`AppEventBleScanDevice` handlers, never directly from
+BleEventWorker) and that `Left`/`Right` scan triggers are gated to the Home screen only, so a
+second scan can't be started without first returning Home (which calls
+`reset_scan_ui_state()`, itself zeroing both counts and `pending_command_kind` together). *But*
+the `AppEventWifiScanAp`/`AppEventBleScanDevice` handlers themselves write into their array
+unconditionally, with no `pending_command_kind`/screen check -- so a wifi_scan record already
+in flight (queued by BleEventWorker before the user backs out) can still land after the user has
+returned Home and started a *different* capability's scan. Today this is harmless only because
+the two arrays are separate (a late wifi_scan write lands in `wifi_scan_aps`, not wherever
+`ble_scan_devices` is being displayed). A union/shared-array merge would reintroduce exactly the
+cross-capability corruption risk this file already flagged -- unsafe without first adding an
+explicit `pending_command_kind` (or a scan-generation counter) check inside both event handlers
+themselves, which is its own change with its own risk of dropping a still-legitimately-in-flight
+record if the check is too strict. Left deferred, per this file's own "do this one last, if at
+all" -- not attempted this session.
+
+**2026-09-24: investigated a new user-reported correlation -- "crashes on launch more often
+when plugged into USB, especially when a PC-side tool (qFlipper/a terminal/`scripts/storage.py`)
+has the port actively open." Confirmed a plausible, source-level direct mechanism, not just a
+coincidental correlation. Read-only investigation; no hardware access, no code change.**
+
+Traced the pinned Unleashed checkout's USB CDC/CLI stack
+(`applications/services/cli/cli_vcp.c`, `lib/toolbox/cli/shell/cli_shell.c`,
+`lib/toolbox/pipe.c`, `targets/f7/furi_hal/furi_hal_usb_cdc.c`, `furi/core/thread.c`):
+
+- **USB plugged in, no host tool has the port open:** `cdc_init()`
+  (`furi_hal_usb_cdc.c`) mallocs two small USB string descriptors (product/serial name, each
+  `strlen * 2 + 2` bytes, well under 100 bytes combined) whenever the CDC interface is the
+  active USB personality -- which it is by default whenever USB is plugged in and no other
+  app/profile has taken over the USB personality. Real, but small.
+- **A PC-side tool actively has the port open (DTR asserted):** this is the qualifier the user
+  singled out, and it maps directly onto a specific, much larger, code path.
+  `cli_vcp_cdc_ctrl_line_callback` fires `CliVcpInternalEventConnected` when the CDC control line
+  state's DTR bit goes active -- i.e. exactly when a terminal, qFlipper, or this project's own
+  `scripts/storage.py` (drives the same VCP/RPC session over the port) opens the serial
+  connection, not merely when USB power/charging is present. That event handler
+  (`cli_vcp_internal_event_happened`, `cli_vcp.c`) allocates a `pipe_alloc(192, 1)` bidirectional
+  stream-buffer pair (~500 bytes: 2x `FuriStreamBuffer`, one `PipeShared`, two `PipeSide`
+  structs) and then calls `cli_shell_alloc()`, which allocates the `CliShell` struct plus a
+  `FuriThread` via `furi_thread_alloc_ex("CliShell", CLI_SHELL_STACK_SIZE, ...)`.
+  **`CLI_SHELL_STACK_SIZE` is 4096 bytes** (`lib/toolbox/cli/shell/cli_shell.h`), and critically
+  `furi_thread_alloc_ex`/`furi_thread_set_stack_size` allocates that stack with a plain
+  `malloc(stack_size)` from the ordinary system heap (`furi/core/thread.c` ~line 309) -- **not**
+  a separate pool/arena (contrast `furi_thread_alloc_service`, which uses
+  `memmgr_alloc_from_pool` instead, for the firmware's own always-on service threads). Once the
+  shell thread actually starts (`cli_shell_init`, `cli_shell.c`), it further allocates its own
+  `FuriEventLoop`, an `FuriEventFlag`, a storage pubsub subscription, and
+  `CliShellLine`/`CliShellCompletions`/`CliAnsiParser` state plus a command-history `FuriString`
+  -- individually small (tens to low hundreds of bytes each) but additive on top of the 4 KB
+  stack.
+- **All of this is held resident, not transient, for the entire time the host keeps the port
+  open** -- freed only on `CliVcpInternalEventDisconnected` (DTR dropped / port closed), which
+  calls `cli_shell_join()` + `cli_shell_free()` + `pipe_free()`. This directly matches the "per
+  command" vs. "for the whole session" distinction this investigation was asked to resolve: it's
+  the latter -- a PC tool merely having the port open (idle, no commands in flight) is enough to
+  keep the ~4-5 KB resident.
+
+**Mechanism confirmed as plausible and directly relevant to H04's existing framing:** this
+~4-5 KB resident allocation (dominated by the 4096-byte `CliShell` thread stack, a plain
+heap `malloc`) directly reduces both total free heap and -- matching H04's own already-confirmed
+mechanism above -- the single largest contiguous free block available for the FAP loader's
+`memmgr_heap_get_max_free_block()` check at launch. Against this app's own largest section
+(`.text`, ~56.8 KB as of the last measurement in this file), a few-KB hole taken out of the heap
+by a live CLI session is a meaningful bite out of an already-tight margin, not a rounding error.
+This is a genuinely different, additive mechanism from the "fragmentation carried over from a
+prior app run" hypothesis logged earlier in this entry -- both can be true simultaneously (a live
+CLI session narrows the margin directly; prior-run fragmentation shapes the free-list this
+session's allocation then has to fit inside).
+
+**This app's own code was checked for any USB/CLI interaction and found clean:** the only
+USB touchpoint in `flipper/flipper_esp32_over_ble.c` is the publish flow's
+`furi_hal_usb_set_config` HID-personality swap for BadUSB (`publish_trigger_badusb`), which runs
+at runtime during an explicit user-triggered publish, not at launch, and does not allocate or
+otherwise interact with anything CLI/VCP-shaped. No storage-mutex contention path was found
+either (this app's own `storage_file_alloc` sites are unrelated to the CLI shell's storage
+pubsub subscription, which only reacts to mount/unmount events, not per-file access).
+
+**No code-level mitigation exists in this app for the dominant mechanism** -- the 4096-byte
+`CliShell` stack is firmware behavior in the pinned Unleashed checkout, entirely outside this
+FAP's control; there is nothing to change in `flipper/flipper_esp32_over_ble.c` to prevent or
+shrink it. No code change made this session.
+
+**Practical user-facing workaround (until/unless upstream firmware changes):** close any
+PC-side terminal, qFlipper window, or in-progress `scripts/storage.py` session (let it finish and
+release the port) before launching this FAP, especially when retrying right after a previous
+OOM/reboot. When reliability matters more than USB power, prefer launching on battery with USB
+fully unplugged rather than just idle-but-connected.
+
+**Diagnostic option identified, not implemented:** `furi_hal_cdc_get_ctrl_line_state(0)` (check
+the `CdcCtrlLineDTR` bit) and `furi_hal_usb_get_config()` are both exported APIs
+(`targets/f7/api_symbols.csv`) this app could call at its own init to detect "USB CDC active +
+DTR asserted" and log it alongside a heap-margin measurement (e.g.
+`memmgr_heap_get_max_free_block()`). This would only characterize a *successful* launch's
+conditions, though -- a launch that fails via the loader's own OOM path never reaches this app's
+init code to log anything, so it can confirm correlation across successive successful launches
+(useful evidence for the still-unconfirmed "second launch is worse" fragmentation hypothesis
+above) but can't directly instrument the failure event itself. Not implemented this session
+(no hardware access to validate it works as expected, and out of scope for a read-only
+investigation pass) -- flagged as a possible follow-up.
+
+**2026-09-24 addendum: real hardware repro came in, sharper than anything above -- a
+monotonic 1st-launch-fast / 2nd-launch-slower / 3rd-launch-**whole-device-reboot** pattern
+within one boot session, no reboot between attempts. The 3rd-launch reboot's on-screen
+message was `furi_check_failed`, not an OOM/loader-rejection message -- correcting the
+"probably the loader's contiguous-block check" framing this file had been assuming.
+`furi_check_failed` is a Furi assertion (`furi_check()` macro) tripping somewhere, a distinct
+failure class from the ELF loader's `memmgr_heap_get_max_free_block()` rejection this file's
+existing entries are about. This matches the already-open `docs/BACKLOG.md` BL05
+(`furi_check_failed` on relaunch), whose title says "after wardriving" -- the user's repro
+didn't call out wardriving, so BL05's trigger condition may be broader than its current title;
+not yet confirmed with the user either way.**
+
+**Traced the firmware's own crash-reporting path (pinned Unleashed checkout,
+`furi/core/check.c`, `targets/f7/furi_hal/furi_hal_rtc.c`/`.h`,
+`applications/services/desktop/scenes/desktop_scene_fault.c`, `desktop.c`) to see what
+evidence already exists for a `furi_check_failed` reboot, before writing new instrumentation
+for it:**
+
+- `__furi_crash_implementation()` (`check.c`) runs on every `furi_check`/`furi_assert`/
+  `furi_crash` trip: it logs the message, full `r0`-`r11`/`lr` register dump, stack watermark,
+  and heap total/free/watermark over `furi_log_puts` (serial only -- lost if nothing is
+  monitoring the port), then -- in a release (`FURI_NDEBUG`) build with no debugger attached,
+  which is this project's normal case -- calls `furi_hal_rtc_set_fault_data(ptr)` with the
+  message pointer (falling back to a literal `"Check serial logs"` pointer if the message
+  isn't a valid internal-flash address) before `furi_hal_power_reset()`. This is a real,
+  already-exported (`furi_hal_rtc_set_fault_data`/`furi_hal_rtc_get_fault_data`,
+  `targets/f7/api_symbols.csv`) crash-log-across-reboot mechanism, backed by an RTC backup
+  register (survives the reset).
+- **The firmware already surfaces this to the user, unprompted, with zero code from this
+  project:** `desktop.c` checks `furi_hal_rtc_get_fault_data()` at its own startup scene logic
+  and, if non-zero, jumps straight to `DesktopSceneFault`
+  (`desktop_scene_fault.c`), which shows a `"Flipper crashed\nand was rebooted"` popup with
+  the stored message as body text, and clears the register (`furi_hal_rtc_set_fault_data(0)`)
+  only when the user dismisses it. **Practical ask for whoever reproduces this next: read and
+  report the exact text of that popup** -- it's already on the Flipper's own screen, before
+  any new instrumentation is needed.
+- **Two real limits on how useful that popup's text will be, both confirmed by reading the
+  macro expansion (`furi/core/check.h`):** (1) the common `furi_check(condition)` call form
+  (no explicit message argument) passes a sentinel flag, not a string, and `check.c`
+  substitutes the generic literal `"furi_check failed"` -- zero localizing information, and
+  this is the common form used throughout the firmware and in this app's own code (grepped:
+  every `furi_check(...)` call site in `flipper_esp32_over_ble.c` is this argument-less form).
+  (2) even for a `furi_check(condition, "some message")` call *with* an explicit message, the
+  popup only shows it correctly if that string lives in **internal MCU flash**
+  (`check.c`'s own range check, `FLASH_BASE`..`FLASH_BASE+FLASH_SIZE`) -- true for a string
+  literal inside the main firmware image, but **not** true for a string literal inside this
+  FAP's own compiled `.rodata`, since an external FAP's ELF sections are loaded into
+  heap-allocated RAM at runtime, not linked into internal flash. A `furi_check(..., "message")`
+  call inside this app's *own* code would have its message pointer rejected by that same range
+  check and silently replaced with `"Check serial logs"` -- so even if this project starts
+  passing explicit messages to its own `furi_check()` calls, the on-device popup still
+  wouldn't show them; only a live serial capture at the moment of the crash would.
+- **Net effect:** the RTC fault-data/popup mechanism is a genuinely useful confirmation
+  signal (crash class, and that a crash occurred at all) but is very unlikely to localize
+  *which* check failed or where, for either the common argument-less form or (if this app's
+  own code is the culprit) any explicit-message form either. The highest-value next artifact
+  for actually localizing this is a **live serial log spanning the crash** (`idf.py`-style
+  monitor equivalent for the Flipper -- an active `idf.py monitor`-alike CDC session, or
+  `tools/build_flipper.ps1`'s existing serial tooling) captured *during* a repro of the 3rd
+  relaunch, since `__furi_crash_implementation()` logs the register dump and heap stats over
+  serial unconditionally, before the RTC-register/reboot path -- richer than anything the RTC
+  register alone can carry. Not attempted this session (would require live hardware access
+  during an in-progress crash, coordinated with the user).
+
+**A concrete, unifying candidate mechanism, not yet confirmed:** grepped every `furi_check(...)`
+call site in `flipper_esp32_over_ble.c` (all 8 are the argument-less form, see above) --
+five of them are alloc-result guards run during app init, in this order:
+`furi_check(reassembly_mutex)`, `furi_check(wardriving_state_mutex)`,
+`furi_check(reassembly_timeout_timer)`, `furi_check(gps_poll_timer)`,
+`furi_check(publish_poll_timer)` (each immediately after its own `furi_mutex_alloc()`/
+`furi_timer_alloc()` call). Any of these returning `NULL` -- plausible under exactly the kind
+of heap fragmentation this file's fragmentation hypothesis already describes, even with total
+free bytes nominally sufficient -- would trip `furi_check_failed` immediately, with no OOM
+message, no loader involvement at all (this code runs *after* the loader already successfully
+placed the FAP's own sections). **This would mean the fragmentation/OOM hypothesis and the
+`furi_check_failed` hypothesis are not necessarily competing explanations for two different
+symptoms -- fragmentation could be the common root cause of both, manifesting as a loader
+rejection on some launches and a small runtime allocation's `furi_check()` trip on others,
+depending on exactly which allocation loses the fragmentation race that particular time.**
+Not confirmed -- would need either a live serial capture showing the crash happened at one of
+these specific call sites, or (cheaper, already covered by this session's instrumentation
+below) a heap-margin trend across launches consistent with the margin getting tight enough to
+plausibly explain a small `furi_mutex_alloc`/`furi_timer_alloc` failure, not just the loader's
+own much larger contiguous-block demand.
+
+**Instrumentation added this session (build-verified, not hardware-tested) to gather one round
+of real launch-sequence data -- this directly serves the fragmentation/OOM hypothesis, and,
+via the candidate mechanism just above, may end up bearing on the `furi_check_failed`
+hypothesis too depending on what the numbers show; it does not by itself identify *which*
+`furi_check()` call trips, which still needs the serial-capture approach if this candidate
+mechanism doesn't pan out:**
+
+`flipper/flipper_esp32_over_ble.c` gained a temporary diagnostic, self-evidently named for
+easy removal (`h04_heap_diag_log()`, `H04_HEAP_DIAG_TEMP_FILENAME`, `h04_entry_free_heap`/
+`h04_entry_max_block` locals -- grep `h04_` to find and strip every site once field data is
+in). It appends one line per app launch/exit to
+`/ext/apps_data/flipper_esp32_over_ble/heap_diag_TEMP_H04.log` (same `build_app_data_path()`/
+`storage_file_*` convention as the existing `wardriving_publish_result.txt`/settings files;
+opened in `FSOM_OPEN_APPEND` mode, synced and closed immediately per call -- never
+`FURI_LOG_*`, since an active CLI session is itself one of the two things this is trying to
+isolate).
+
+Line format (space-separated, one line per call):
+
+```
+YYYY-MM-DD HH:MM:SS <entry|exit> free=<bytes> max_block=<bytes> dtr=<0|1> fault=0x<hex>
+```
+
+- `free`/`max_block`: `memmgr_get_free_heap()`/`memmgr_heap_get_max_free_block()` -- the exact
+  two metrics the ELF loader checks at launch. `entry` is measured before this app's own first
+  allocation (the message queue, in `Esp32App`'s initializer) but logged once
+  `app_data_root_path` resolves a few lines later (values captured early, write deferred only
+  because Storage isn't open yet at the true first instant). `exit` is measured as late as
+  possible: after every one of this app's own teardown calls (`stop_service()`, timer/mutex
+  frees, view port removal) but before `furi_record_close(RECORD_STORAGE)`.
+- `dtr`: `furi_hal_cdc_get_ctrl_line_state(0) & CdcCtrlLineDTR` -- 1 if a PC-side tool
+  currently has the USB CDC port open, matching this file's own CLI-session finding above.
+- `fault`: `furi_hal_rtc_get_fault_data()`, read (not cleared) by this app -- almost always
+  `0x00000000` by the time this app's `entry` line runs, per the desktop-fault-screen race
+  explained above (the firmware clears it on the user's dismissal before they can relaunch
+  this app), but cheap to include and directly relevant if that race ever doesn't resolve in
+  time.
+
+Build-verified via `tools/build_flipper.ps1` (`flipper_esp32_over_ble.fap`, 134188 bytes, up
+from 133052 before this change). `.bss` measured via `arm-none-eabi-size`: 32068 -> 32388
+(+320 bytes, exactly the two new 160-byte `static` line/path scratch buffers this function
+uses, both following this file's own "no locals >=100 bytes reachable from a tight thread"
+rule even though neither is actually reachable from one -- `h04_heap_diag_log()` is called
+only from `flipper_esp32_over_ble_app()` itself, the main thread, both call sites (grepped:
+lines near app entry and near the final teardown block), never from `BleEventWorker`, `Bt`, or
+the timer-service thread, so no stack-audit concern from this file's own tight-thread rule
+applies here). Not hardware-tested -- field data collection is the explicit next step, not
+done this session. **Temporary only: strip before this becomes a real feature branch**, per
+the naming convention above.
+
+**2026-09-24, first field data from the instrumentation above -- flashed, transferred over an
+active `runfap.py`/CLI session, then relaunched several times with plain Back-exit between
+launches (no device power-cycle), no crash this run.** Full log
+(`/ext/apps_data/flipper_esp32_over_ble/heap_diag_TEMP_H04.log`, read back via
+`scripts/storage.py -p COM8 read ...`):
+
+```
+entry free=20832 max_block=13288 dtr=0   <- right after runfap.py's transfer+auto-launch
+entry free=28352 max_block=26880 dtr=0   <- (no matching exit logged for launch 1 above)
+exit  free=23776 max_block=22240 dtr=0
+entry free=28184 max_block=26880 dtr=0
+exit  free=23600 max_block=22240 dtr=0
+entry free=28048 max_block=26880 dtr=0
+exit  free=23480 max_block=22240 dtr=0
+entry free=27888 max_block=26112 dtr=0
+exit  free=23312 max_block=21472 dtr=0
+entry free=27736 max_block=26272 dtr=0
+exit  free=23184 max_block=21632 dtr=0
+```
+
+**Reading this data:**
+
+- **The very first entry (right after the CLI-driven transfer) is the sharpest data point in
+  the log: `max_block` is roughly half** (13288) **of every subsequent launch's** (~26000-26880),
+  even though `dtr` already reads 0 by the time this line was captured -- consistent with this
+  file's own CLI-session finding above (the ~4-5 KB `CliShell` resident allocation plus
+  transfer-time buffering hadn't fully unwound yet) and the strongest real evidence so far that
+  a launch immediately following an active USB/CLI transfer is meaningfully more constrained
+  than a steady-state relaunch, even without a crash resulting this time.
+- **No `exit` line was logged for that first launch** -- `runfap.py` always force-launches
+  after a transfer and this project's own tooling (`tools/flash_flipper.ps1`) does not wait for
+  or drive an exit; the app was still on-screen when the user began their own manual
+  relaunch-cycle testing, which produced the second `entry` without an intervening `exit` line.
+  Expected, not a bug in the instrumentation.
+- **Entry-to-exit within one launch always drops ~4400-4700 bytes free / ~4600-4800 bytes
+  max_block, then jumps back up by roughly the same amount between one launch's `exit` and the
+  next launch's `entry`.** This is exactly what's expected, not a leak: this app's own runtime
+  allocations (mutexes/timers/GUI/storage buffers) are still held at the `exit` measurement
+  point (deliberately placed *before* `furi_record_close(RECORD_STORAGE)`, not after full ELF
+  teardown), and the loader only reclaims the app's ELF sections (`.text`/`.bss`/etc.) *after*
+  this app's own exit code finishes -- which is exactly the gap between one `exit` line and the
+  next `entry` line.
+- **A real, small, monotonic downward drift across the four complete relaunch cycles**: entry
+  `free` 28352 -> 28184 -> 28048 -> 27888 -> 27736 (-616 total, ~150-170/cycle); entry
+  `max_block` 26880 -> 26880 -> 26880 -> 26112 -> 26272 (mostly flat, one step down); exit
+  `free` and `max_block` show the same shape, offset by the constant in-app-footprint gap
+  above. This is a real, reproducible instance of the "fragmentation compounds slightly with
+  each relaunch" hypothesis from earlier in this entry -- but at only ~150-200 bytes/cycle
+  against a ~26-28 KB starting margin, it would take on the order of 100+ back-to-back relaunches
+  in one boot session to close that gap by drift alone. **This run's margin never got
+  anywhere close to tight enough to threaten a crash** (consistent with no crash occurring this
+  run) -- so slow steady-state drift alone does not explain a 3rd-launch crash; something
+  sharper (matching the CLI-transfer-launch's halved `max_block`, or a fresh instance of heavier
+  fragmentation than this run happened to hit) is still the more likely trigger for the earlier
+  hardware repro.
+- **Caveat on what these numbers actually measure:** `entry`/`exit` are read from *inside* the
+  already-loaded app, i.e. *after* the loader has already carved out this app's own
+  `.text`+`.rodata`+`.data`+`.bss` (~99 KB combined per this file's earlier measurements) from
+  the heap. So a `max_block` of ~26-27 KB here characterizes headroom for this app's *own small
+  runtime allocations* (the five `furi_mutex_alloc`/`furi_timer_alloc` calls this file's
+  "unifying candidate mechanism" section above flags, each only tens to a few hundred bytes) --
+  not the pre-load contiguous availability the loader itself needs for the ~99 KB ELF-section
+  placement. With 26+ KB of headroom for a handful of sub-1KB allocations, this run's data does
+  not support the runtime-`furi_check(...)`-trips-from-fragmentation theory being the active
+  mechanism *this time* -- there was ample margin. It remains plausible for a launch that starts
+  from a substantially worse pre-existing margin (e.g. the CLI-transfer case above, or whatever
+  state preceded the earlier 3rd-launch crash) that a mutex/timer alloc could still fail even
+  with generous *nominal* free bytes, if fragmentation is severe enough right at that moment --
+  just not demonstrated by this particular clean run.
+
+**Net effect on open questions:** the CLI-transfer-launch data point is genuinely new,
+concrete evidence supporting this file's USB/CLI section above (real degradation, not just a
+plausible-sounding mechanism). The steady-state relaunch drift is real but too slow by itself
+to explain a 3rd-launch crash. **The 3rd-launch `furi_check_failed` repro still has not been
+reproduced with this instrumentation active** -- next time it recurs with this build installed,
+read back `heap_diag_TEMP_H04.log` immediately (numbers right before the crash are the ones
+that matter) and report the exact text of the "Flipper crashed and was rebooted" popup before
+dismissing it, per the ask earlier in this entry.
+
+**2026-09-25: user confirmed the repro is specifically tied to an active wardriving session
+-- corroborates BL05's original title, which this file's own 2026-09-24 addendum had cast
+doubt on. Read-only trace of this app's own exit path plus the pinned firmware's BLE-profile
+teardown internals found a concrete, previously-unflagged cross-thread race, and a matching
+gap versus the firmware's own reference pattern for the exact same teardown sequence. Fixed
+(build-verified, not hardware-tested).**
+
+Re-grepped every `furi_check(...)`/`furi_assert(...)` site in `flipper/`: still exactly the
+same 8, all in `flipper_esp32_over_ble.c`, no new ones added since the growth this file
+already tracked. None of the wardriving record-handling path (`cbor_wardriving.c`,
+`handle_wardriving_status()`, `wardriving_csv_write_record()`) uses `furi_check`/`furi_assert`
+at all -- `feb_cbor_decode_wardriving_status_result_payload()` rejects (does not write past)
+any `array_count > FEB_WARDRIVING_MAX_RECORDS_PER_BATCH` before the decode loop touches
+`payload->records[i]` (`cbor_wardriving.c` ~line 678), so a corrupted/oversized backlog batch
+from H03's failure shape cannot itself overrun a fixed array here -- this rules out "a
+furi_check/bounds-check trip inside wardriving record decode" as this bug's mechanism, at
+least for the record-count dimension.
+
+**Traced this app's own exit path (`stop_service()`, called both on explicit Back-exit-while-
+paired and `BtStatusUnavailable`) against the pinned Unleashed checkout's BLE-profile
+lifecycle plumbing it calls into:**
+
+- `stop_service()` calls `bt_disconnect(app->bt)` then immediately (no delay)
+  `bt_profile_restore_default(app->bt)`. Traced `bt_disconnect()` into
+  `applications/services/bt/bt_service/bt_api.c`/`bt.c`: it resolves to `bt_close_connection()`,
+  which is only `bt_close_rpc_connection()` + `furi_hal_bt_stop_advertising()` -- **it does not
+  itself force-drop an already-established GATT link.** The actual link teardown only happens
+  inside `bt_profile_restore_default()`'s call chain
+  (`bt_profile_start(bt, ble_profile_serial, NULL)` -> `bt_change_profile()` ->
+  `furi_hal_bt_change_app()` -> `furi_hal_bt_reinit()`), and even there, `hci_reset()` (the
+  actual radio-level reset that forcibly drops any live connection) runs *after*
+  `current_profile->config->stop(current_profile)` -- i.e. after our own `profile_stop()` has
+  already unregistered the BLE event handler and `free(profile)`d the `Esp32BleProfile*`
+  (`furi_hal_bt.c`'s `furi_hal_bt_reinit()`, ~line 202-213).
+- **The BLE event handler list this app registers into has no locking at all**
+  (`targets/f7/ble_glue/furi_ble/event_dispatcher.c`): `ble_event_dispatcher_process_event()`
+  (called synchronously on `BleEventWorker` for every inbound HCI/GATT event) iterates the
+  same plain `m-list` (`handlers`) that `ble_event_dispatcher_unregister_svc_handler()` (called
+  from `profile_stop()`, itself invoked from the **Bt service thread** during the reinit above)
+  mutates via `GapSvcEventHandlerList_remove()`. Nothing serializes these two call sites
+  against each other beyond whatever timing accident happens to keep them apart.
+- **Net mechanism:** because the actual link is still fully live right up until `hci_reset()`,
+  and our own handler-unregister + `free(profile)` happens *before* that reset, there is a real
+  window in which `BleEventWorker` can still be mid-dispatch of an inbound GATT event for this
+  app's profile (a notification-sent ack, a write completion -- exactly what a busy wardriving
+  backlog drain generates continuously) at the same instant the Bt-service-thread's teardown
+  unregisters the handler and frees the struct that dispatch is using. This is a genuine
+  cross-thread teardown race, and it is close to unreachable on a quiet/idle connection (no
+  event in flight to collide with) but much more likely to be hit while wardriving is actively
+  streaming -- directly matching the user's confirmed correlation. A hit manifests as
+  undefined behavior in the unsynchronized linked-list (`GapSvcEventHandlerList_next`/`_remove`
+  racing each other) and/or a genuine use-after-free read/write through the freed
+  `Esp32BleProfile*` -- both are classic silent-heap-corruption shapes, consistent with this
+  file's own earlier fragmentation/heap-corruption framing: the corruption need not crash
+  *this* launch's exit at all, and can instead surface as a `furi_check(...)` NULL-check trip
+  on a *later* launch's early `furi_mutex_alloc`/`furi_timer_alloc`/`malloc(sizeof(Esp32BleProfile))`
+  call once the allocator's metadata is disturbed -- exactly the shape of the monotonic
+  1st-fast/2nd-slow/3rd-crashes repro already on record.
+- **This app's own teardown sequence deviates from the pinned firmware's own reference
+  pattern for this exact same `bt_disconnect()` -> `bt_profile_restore_default()` sequence**:
+  `applications/system/hid_app/hid.c` (the only other BLE-profile-owning app in the checkout
+  that tears down the same way) inserts `furi_delay_ms(200)` between the two calls (its own
+  comment: "Wait 2nd core to update nvm storage") at both its own teardown site (~line 352-359)
+  and its pairing-removal path (~line 27-32). This app's `stop_service()` had no equivalent
+  delay at all.
+
+**Fixed this session:** added the same `furi_delay_ms(200)` in `stop_service()`
+(`flipper/flipper_esp32_over_ble.c`), between `bt_disconnect(app->bt)` and the
+`bt_profile_restore_default(app->bt)` call, matching `hid_app.c`'s placement. This does not
+eliminate the underlying firmware-level race (this app cannot patch
+`event_dispatcher.c`'s missing lock), but it gives any BLE event already in flight on
+`BleEventWorker` a wide settle window to finish dispatching before this app's own handler is
+unregistered and its profile struct freed -- matching the only known-working reference
+pattern in this exact firmware for this exact sequence. Build-verified via
+`tools/build_flipper.ps1`: `flipper_esp32_over_ble.fap`, 133080 bytes (up from 133052 before
+this change, matching a small code addition, no new `.bss`). **Not hardware-tested** -- this
+session had no hardware access; confirming this actually prevents the crash (rather than just
+narrowing the race window) needs a live repro attempt with wardriving actively running,
+ideally several back-to-back relaunch cycles as in the original report.
+
+**Confidence ranking of candidate mechanisms for this bug, given everything traced across
+both sessions:**
+1. **(Highest, this session)** the cross-thread `BleEventWorker`-vs-Bt-service-thread teardown
+   race just described, exacerbated by a busy wardriving connection and this app's missing
+   settle delay -- directly explains the wardriving-specific correlation, and is now
+   mitigated (not proven eliminated) by the fix above.
+2. **(Still open, prior session)** heap fragmentation from a live USB/CLI session's resident
+   `CliShell` allocation, or ordinary cross-launch drift, causing one of the 5 alloc-guard
+   `furi_check()` sites (reassembly_mutex/wardriving_state_mutex/reassembly_timeout_timer/
+   gps_poll_timer/publish_poll_timer) to trip on `NULL`. Independent of mechanism 1 above --
+   both can co-occur, and mechanism 1's heap corruption could itself be what tips mechanism 2
+   over the edge on a subsequent launch.
+3. **(Ruled down, this session)** a wardriving-record decode/bounds issue tripping a
+   furi_check or overrunning a fixed array -- no `furi_check`/`furi_assert` exists anywhere in
+   the wardriving decode/CSV-write path, and the record-count bound is enforced before any
+   array write. Still theoretically possible for some *other* field's bound not audited this
+   session, but no longer the leading theory.
+
+**Still needs live hardware to fully close:** confirm the fix above actually prevents the
+crash under the user's original repro shape (wardriving running, several relaunches, same
+boot session) -- this session's build-only verification cannot distinguish "race window
+narrowed enough in practice" from "race window merely made statistically rarer."

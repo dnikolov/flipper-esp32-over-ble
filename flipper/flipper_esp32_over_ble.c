@@ -1208,10 +1208,13 @@ static void wardriving_settings_save(const Esp32App* app) {
    posts from inside profile_event_handler's call chain (BleEventWorker thread: synchronous,
    single-in-flight, never reentrant) -- safe to consolidate since furi_message_queue_put()
    copies the struct by value before any of these functions returns, so nothing depends on
-   the buffer's contents surviving past that call. bt_status_callback/gps_poll_timer_callback/
-   input_callback run on other system threads (Bt service/Timer service/GuiSrv) and keep
-   their own separate static AppEvent for that reason -- sharing across threads would be a
-   real data race, not just an in-flight one. */
+   the buffer's contents surviving past that call. bt_status_callback/input_callback run on
+   other system threads (Bt service/GuiSrv) and keep their own separate static AppEvent for
+   that reason -- sharing across threads would be a real data race, not just an in-flight
+   one. gps_poll_timer_callback/publish_poll_timer_callback share a third instance,
+   timer_service_event (declared next to them) -- both run on the same single FreeRTOS Timer
+   Service task, so the same single-in-flight argument applies to that pair specifically,
+   even though it's a different thread than this one. */
 static AppEvent shared_ble_event;
 
 /* shared_status_result: same single-in-flight BLE-thread reasoning as shared_ble_event just
@@ -3239,41 +3242,40 @@ static void reassembly_timeout_timer_callback(void* context) {
     }
 }
 
-/* Runs on the Furi timer-service thread, same as reassembly_timeout_timer_callback above --
-   but unlike that one, this must NOT touch session_seq_out/the shared cmd_payload_buf/
-   cmd_ciphertext_buf/cmd_record_buf itself (those are the main thread's alone to write, per
+/* gps_poll_timer_callback and publish_poll_timer_callback both run on the Furi timer-service
+   thread -- FreeRTOS's single Timer Service task, the one every furi_timer_alloc(...,
+   FuriTimerTypePeriodic, ...) callback in the whole firmware shares
+   (targets/f7/inc/FreeRTOSConfig.h's configTIMER_TASK_STACK_DEPTH, 256 words/1024 bytes).
+   That task processes one expired-timer callback at a time from its own command queue, so
+   these two callbacks can never actually be concurrent with *each other* -- only with
+   BleEventWorker/Bt/GuiSrv, i.e. with shared_ble_event/the Bt-thread event/input_callback's
+   own event, none of which this pair touches. They therefore safely share one static
+   AppEvent, timer_service_event, below -- same single-in-flight rationale as
+   shared_ble_event, just scoped to this one other thread instead. AppEvent is now large
+   enough (~500+ bytes) that a stack copy here would consume roughly half this thread's
+   entire budget; matches every other post_*()/callback's static-buffer convention in this
+   file (docs/LESSONS.md's BleEventWorker entry generalizes the rule to any tight system
+   thread). Explicit reset at the top of each callback because a static initializer only
+   runs once at load time, not per call. */
+static AppEvent timer_service_event;
+
+/* Must NOT touch session_seq_out/the shared cmd_payload_buf/cmd_ciphertext_buf/
+   cmd_record_buf itself (those are the main thread's alone to write, per
    send_wifi_scan_command()'s own cross-thread-safety argument). It only posts
    AppEventGpsPollTick; the main loop's own handler for that event is what actually calls
    send_gps_command(). */
 static void gps_poll_timer_callback(void* context) {
     Esp32App* app = context;
-    /* static, not stack-local: AppEvent is now large enough (~500+ bytes, grown further by
-       this capability's own gps_* fields) that a stack copy here would consume roughly half
-       of the FreeRTOS Timer Service task's entire 256-word/1024-byte stack
-       (targets/f7/inc/FreeRTOSConfig.h's configTIMER_TASK_STACK_DEPTH) -- the thread every
-       furi_timer_alloc(..., FuriTimerTypePeriodic, ...) callback in the whole firmware
-       shares, not one this app owns. Matches reassembly_timeout_timer_callback's own
-       static-buffer convention above and every post_*() function's in this file (see
-       docs/LESSONS.md's BleEventWorker entry for the general rule this generalizes to any
-       tight system thread, not just BleEventWorker). Deliberately its own static, not
-       shared_ble_event (see that declaration's comment) -- this thread can run concurrently
-       with BleEventWorker/Bt/GuiSrv, so sharing one buffer across threads would be a real
-       race, not just an in-flight one. Explicit reset below because a static initializer
-       only runs once at load time, not per call. */
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventGpsPollTick;
-    furi_message_queue_put(app->queue, &event, 0);
+    memset(&timer_service_event, 0, sizeof(timer_service_event));
+    timer_service_event.type = AppEventGpsPollTick;
+    furi_message_queue_put(app->queue, &timer_service_event, 0);
 }
 
-/* Same reasoning as gps_poll_timer_callback above -- separate static AppEvent, since this
-   also runs on the Furi timer-service thread and can be in flight concurrently with it. */
 static void publish_poll_timer_callback(void* context) {
     Esp32App* app = context;
-    static AppEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = AppEventPublishPollTick;
-    furi_message_queue_put(app->queue, &event, 0);
+    memset(&timer_service_event, 0, sizeof(timer_service_event));
+    timer_service_event.type = AppEventPublishPollTick;
+    furi_message_queue_put(app->queue, &timer_service_event, 0);
 }
 
 /* The exact fetch-and-run line from docs/WARDRIVING_PUBLISH.md's "Launch" section --
@@ -5015,6 +5017,18 @@ static void stop_service(Esp32App* app) {
     furi_timer_stop(reassembly_timeout_timer);
     furi_hal_bt_stop_advertising();
     bt_disconnect(app->bt);
+    /* bt_disconnect() only closes the RPC session and stops advertising -- it does not itself
+       drop an already-established GATT link; that only happens inside
+       bt_profile_restore_default()'s own furi_hal_bt_reinit()/hci_reset(). Without a settle
+       delay here, a still-live, busy connection (wardriving mid-backlog-drain is the
+       confirmed real-world trigger) can still be dispatching an inbound BLE event to
+       profile_event_handler on BleEventWorker at the exact moment profile_stop() -- called
+       from the Bt service thread inside that same reinit -- unregisters the handler and
+       frees profile: a cross-thread teardown race (event_dispatcher.c's handler list has no
+       locking against concurrent register/unregister vs. dispatch). Matches the pinned
+       firmware's own hid_app (applications/system/hid_app/hid.c), which inserts this same
+       200ms wait in the same spot for the same class of reason. */
+    furi_delay_ms(200);
     if(app->profile) {
         furi_check(bt_profile_restore_default(app->bt));
         app->profile = NULL;

@@ -133,21 +133,26 @@ gotcha, not a guess.
 | Onboard LED (`LED_BUILTIN`) | GPIO25 | plain LED, also DAC1 — **not** an addressable
 WS2812 like the C6's GPIO8 RGB LED; do not carry that driving code over. |
 | Boot/PRG button (`KEY_BUILTIN`) | GPIO0 | standard classic-ESP32 boot-mode strapping pin |
-| External GPS module RX | GPIO36 (`SENSOR_VP`/ADC1_CH0) | user-wired 2026-09-17, not a
-Heltec onboard pin — see note below. |
+| External GPS module RX | GPIO17 | user-wired 2026-09-23 (rewired from an earlier GPIO36
+bench test), not a Heltec onboard pin — see note below. |
+| GPS UART TX (configured, unused) | GPIO23 | not connected to the module; configured only so
+the UART peripheral's TX signal isn't left routed to an undefined pin (RX-only driver, never
+transmits). |
 
-**External GPS module wired to GPIO36 (2026-09-17):** an unlabeled/unidentified ("electronic
-scrap") GPS module, user-wired with its TX line to GPIO36 — no return line, since GPIO36 has no
-output driver (input-only, no internal pull resistor, per Espressif's datasheet) and can't drive
-anything back to the module anyway. Confirmed working via a throwaway UART-sniffer firmware
-(`heltec/gps_probe/`, not part of the real project firmware): valid NMEA 0183 sentences
+**External GPS module wired to GPIO17 (2026-09-23, rewired from GPIO36):** an
+unlabeled/unidentified ("electronic scrap") GPS module, first bench-tested 2026-09-17 wired to
+GPIO36 via a throwaway UART-sniffer firmware (`heltec/gps_probe/`, deleted after use, not part
+of the real project firmware) that confirmed valid NMEA 0183 sentences
 (`GPGGA`/`GPGLL`/`GPGSA`/`GPGSV`/`GPRMC`/`GPVTG`/`GPZDA`) at **9600 baud**, 100% printable bytes,
-occasionally showing a real fix (quality=1, 3-4 satellites). Module identity, exact chipset, and
-logic-level (3.3 V vs 5 V TTL) are unconfirmed — GPIO36 is not 5 V-tolerant, so this was wired at
-the user's own risk without that check. This removes the "no GPS wiring documented for this
-board" blocker noted against a future `gps` capability port (see `docs/PLAN.md`'s Phase 4 step
-7 and `.claude/agents/heltec-developer.md`), but a real driver integration (mirroring the C6's
-`nmea_parser.c`/`location.c`) has not been done — this was a wiring/UART-sanity check only.
+occasionally showing a real fix (quality=1, 3-4 satellites). The user has since rewired the same
+module's TX line to **GPIO17** for the real firmware integration (`heltec/main/location.c`/
+`nmea_parser.c`, ported from the C6's `esp32/main/location.c`/`nmea_parser.c` 2026-09-23) — GPIO17
+is not claimed by any onboard peripheral in the tables above and is not one of this board's
+classic-ESP32 strapping pins (GPIO0/2/4/5/12/15), so it carries no boot-mode risk, unlike the
+original GPIO36 (input-only, no pull resistor, not 5 V-tolerant) location. Module identity, exact
+chipset, and logic-level (3.3 V vs 5 V TTL) remain unconfirmed — wired at the user's own risk
+without that check, same as the original GPIO36 wiring. UART_NUM_1, 9600 8N1, RX-only (the module
+is never transmitted to) — same driver shape as the C6's, only the pin numbers differ.
 
 ## Strapping / boot-sampled pins — treat carefully
 
@@ -184,7 +189,13 @@ need the same caution as on any classic ESP32 design:
 - Do not carry forward this board's pin mappings to the C6, or the C6's pin mappings here —
   see `docs/hardware/esp32-c6-devkitc-1/README.md`, which already states the same caution in
   the other direction.
-- Not yet pinned to a specific ESP-IDF partition table, sdkconfig target, or flash-size
-  assumption — that starts only once a physical unit's actual flash size is measured
-  read-only via `esptool flash_id`, matching this project's hardware-safety convention (no
-  flashing/erasing/writing without explicit user request).
+- **Custom partition table since the `wardriving` port (2026-09-23):** `heltec/partitions.csv`,
+  sized against this board's confirmed 8 MB flash (`nvs` 24K, `phy_init` 4K, `factory` app 2MB,
+  `wardrive` data partition 2800K/700 x 4096-byte erase sectors, matching
+  `wardriving_log.c`'s own `WD_MAX_SECTORS` bound exactly) — see that file's own comments for
+  the full byte accounting. Wired via `CONFIG_PARTITION_TABLE_CUSTOM` in
+  `heltec/sdkconfig.defaults`, the same mechanism `esp32/` already uses for its own
+  4MB-sized `partitions.csv`. Before this, the board used ESP-IDF's stock/default partition
+  table, which left no headroom for a dedicated wardriving-log partition (see
+  `docs/BACKLOG.md` BL13) — do not carry the C6's `esp32/partitions.csv` byte offsets/sizes
+  over here or vice versa, they're sized against different flash sizes (4MB vs. 8MB).

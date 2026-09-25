@@ -259,7 +259,9 @@ and does not run two independently-parameterized concurrent scans.
 
 ### `gps` command and status payloads
 
-**Design frozen 2026-09-12, not yet implemented** — see [PLAN.md](PLAN.md)'s "Real GPS driver,
+**Implemented on both boards.** Hardware-verified on the ESP32-C6 2026-09-13. Ported to the
+Heltec WiFi LoRa 32 V2 2026-09-23 (build/boot-verified; end-to-end NMEA reception over a live
+paired session not yet confirmed there) — see [PLAN.md](PLAN.md)'s "Real GPS driver,
 wardriving fix-dependency, and real wardriving-record timestamps" for the design session this
 came out of. The `gps` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is a poll-only status
 query — unlike `wifi_scan`/`ble_scan` it has no scan-duration lifecycle and never runs to

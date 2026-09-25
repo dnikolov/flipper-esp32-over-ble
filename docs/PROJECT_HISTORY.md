@@ -2340,6 +2340,124 @@ Both fixes rebuilt, reflashed to the physical boards, and confirmed working by t
 afterward. Full root-cause writeup: [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)'s
 "Hardware-testing fixes" section.
 
+## 2026-09-23: `gps` capability ported to the Heltec (Phase 4 step 8)
+
+The GPS module previously bench-tested wired to the Heltec's GPIO36 (2026-09-17, RX-only,
+input-only ADC pin, see `docs/hardware/heltec-wifi-lora-32-v2/README.md`) was rewired by the
+user to GPIO17, resolving the "no physical UART wiring documented" blocker step 7 had flagged
+against porting `gps` to this board. The user asked to build and flash with GPS wired at
+GPIO17; delegated to the `heltec-developer` subagent.
+
+**Port.** `heltec/main/location.c`/`location.h` and `nmea_parser.c`/`nmea_parser.h` were added,
+copied from the C6's already hardware-verified (2026-09-13) `esp32/main/` originals.
+`nmea_parser.c` needed no changes (pure NMEA-sentence parsing, no board dependency).
+`location.c` only had its compile-time pins/UART port retargeted: `UART_NUM_1`, RX=GPIO17 (the
+user's wiring), TX=GPIO23 (configured but never driven — unclaimed, non-strapping pin, same
+"don't leave TX floating" rationale as the C6's own unused TX pin). `heltec/main/main.c` gained
+`handle_gps_command()` copied unchanged from the C6 (poll-only status query, reuses the shared,
+unmodified `components/feb_protocol/cbor_gps.c` codec — no wire-format changes), `feb_features[]`
+became `{"wifi_scan", "ble_scan", "gps"}`, and `handle_command()`'s dispatch gained the `"gps"`
+branch. `wardriving` and its GPS fix-dependency gating were deliberately *not* ported —
+wardriving doesn't exist on this board at all yet, so there is nothing for a fix-dependency gate
+to apply to.
+
+**Build issues found and fixed.** A nested `/*` in the first draft of `location.c` (trivial).
+More substantively: adding `esp_driver_uart` pushed classic ESP32's `iram0_0_seg` over budget by
+~750 bytes — this board's IRAM is tighter than the C6's memory layout, so unlike every prior
+Heltec port this was a genuinely new constraint. Fixed via
+`CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` (Espressif's documented mechanism for this
+overflow class on classic ESP32), added to `heltec/sdkconfig.defaults` and confirmed to have
+actually taken by deleting and regenerating `sdkconfig` (per this project's own "sdkconfig
+defaults aren't retroactive" lesson). This leaves Heltec's flash partition 96% full — tracked as
+`docs/BACKLOG.md` BL13 for whoever adds the next capability to this board.
+
+**Verification.** `heltec/`'s `idf.py build` passes clean. `esp32/`'s build, all five
+host-native test suites (including the existing `gps` codec vectors), and
+`tools/check_shared_headers.py` were reconfirmed unaffected. The wire shape was checked against
+`docs/PROTOCOL.md`'s `gps` section (which itself was still stale — "not yet implemented" even
+though the C6 had been hardware-verified since 2026-09-13 — and has now been corrected to note
+both boards). Flashed to the physical board via COM10 (reconfirmed via Device Manager,
+Silicon Labs CP210x, Status OK); a bounded ~25s boot-log capture showed a clean boot (ESP-IDF
+v5.5.2, chip rev v1.0, 8 MB flash, BLE scanning active) with no UART-init error lines — the best
+available boot-log-only evidence that GPS UART init succeeded, since `location_init()` only logs
+on failure by design (matching the C6).
+
+**Not yet confirmed.** No Flipper was paired during the capture window, so an actual `gps`
+status query hasn't been answered by this board yet, and NMEA byte reception from the
+GPIO17-wired module is unconfirmed end-to-end. The Flipper's cached capability record
+(`capabilities/heltec-a4cf1203ba58.dat`) still predates this change and must be deleted (see the
+project's `reference_flipper_sd_card_access` memory for the `storage.py` procedure) before the
+next `capability_query` will surface `gps` in this board's feature list.
+
+## 2026-09-23 (continued): `wifi_scan`/`ble_scan` hardware-confirmed, `wardriving` ported (Phase 4 step 9)
+
+Two follow-ups the same day as the `gps` port above.
+
+**`wifi_scan`/`ble_scan` hardware round-trip confirmed.** The user deleted the stale Flipper
+capability cache themselves (the Flipper's serial ports weren't reachable from this session at
+the time) and restarted the app. A first pass reported both capabilities returning empty
+results; before a debugging agent could dig in, the user reported it started working and asked
+to disregard the investigation — treated as resolved without a known root cause (plausibly a
+transient state from the stale-cache restart, not a firmware bug). This is nonetheless the first
+confirmed real hardware exercise of step 7's port.
+
+**`wardriving` ported** (by explicit user request — "add wardriving to this board" — continuing
+this project's established pattern of porting capabilities to Heltec out of the original Phase 4
+order once explicitly asked, same as steps 7 and 8). Delegated to the `heltec-developer`
+subagent with two risks flagged up front: Phase 4 step 5's coexistence sweep was explicitly
+skipped 2026-09-16, so no measured Wi-Fi+BLE-concurrent-load bounds exist for this board's
+radio — proceeding anyway was an informed user decision, not an oversight; and the board's flash
+was already at 96% (BL13) before adding wardriving's own several-hundred-KB engine and flash-log
+partition.
+
+**Port.** `wardriving_record_format.c/h`, `wardriving_validate.c/h`, `wardriving_dedup.c/h`,
+`wardriving_log.c/h`, `wardriving_persist.c/h` copied unchanged from `esp32/main/` — this engine
+is board-agnostic, consuming `location.c`'s already-ported fix state rather than touching
+hardware directly. `heltec/main/main.c` gained the full command/state-machine/scan-arbitration
+plumbing (`handle_wardriving_command()`, interval re-arm callbacks, start/stop/self-stop,
+backlog-drain sender, `WIFI_SCAN_SOURCE_WARDRIVING`/`BLE_SCAN_SOURCE_WARDRIVING` busy-flag
+sharing with the existing on-demand scan capabilities), ported line-for-line from the C6 and
+structurally diffed against it afterward (zero logic deviations besides the `board_id` prefix
+string and one redundant duplicate `ESP_LOGE` call dropped as cosmetic cleanup).
+`feb_features[]` is now `{"wifi_scan", "ble_scan", "gps", "wardriving"}`.
+`heltec/main/factory_reset.c/h` gained the GPIO0 short-press wardriving on/off toggle (same
+button already used for the hold-to-factory-reset gesture), ported unchanged from the C6.
+`heltec/main/status_led.c/h` gained `feb_status_led_set_wardriving_active()` — since this board's
+LED is plain on/off (no color, unlike the C6's RGB), the port made a cosmetic judgment call:
+double-speed blinking in the CONNECTING state while wardriving is active, in place of the C6's
+blue→purple color swap. Not spec'd anywhere; tracked as `docs/BACKLOG.md` BL14 for the user to
+confirm or override.
+
+**Partition table.** Heltec had been building against ESP-IDF's stock partition table the whole
+time (no `heltec/partitions.csv` existed before this), already 96% full per BL13.
+`wardriving_log.c`'s raw-flash circular log needs its own dedicated data partition (custom
+subtype `0x40`, not NVS/FAT/SPIFFS — same reasoning as the C6's own `wardrive` partition). A new
+`heltec/partitions.csv` was created and sized for this board's *confirmed* 8 MB flash (not
+borrowed from the C6's 4 MB table): `nvs` 24K, `phy_init` 4K, `factory` app 2 MB (the app binary
+is 0xfb2b0 bytes — 51% free, versus 96% full before this pass), `wardrive` data partition 2800
+KB / exactly 700×4096-byte sectors (deliberately matched to `wardriving_log.c`'s own
+`WD_MAX_SECTORS=700` bound rather than stretched further — a larger partition would just be
+silently truncated by that fixed-size array without also raising the constant). Total used ≈4.8
+MB of 8 MB, leaving ~3.2 MB headroom. `CONFIG_PARTITION_TABLE_CUSTOM` wired into
+`heltec/sdkconfig.defaults`, same mechanism `esp32/` already uses. Confirmed via
+`gen_esp32part.py` against the built `partition-table.bin` and independently via the live boot
+log's own partition-table printout.
+
+**Verification.** `idf.py build` clean on both `heltec/` and `esp32/`; `esp32/`'s five
+host-native suites and `tools/check_shared_headers.py` unaffected. Flashed to the physical board
+(COM10); boot log confirmed a clean boot — partition table matches design exactly, the
+wardriving log resumed cleanly against real flash (`active sector 0 (gen 1), 0 pending
+record(s)`), Wi-Fi STA + BT controller init clean, BLE scanning active, no crash or reset loop.
+
+**Explicitly not verified this pass** — flagged honestly by the subagent rather than overclaimed:
+no live wardriving capture was run (starting/stopping a capture needs physical Flipper button
+interaction, outside what an automated agent can do), the Flipper's stale cached capability
+record for this board wasn't deleted (its CLI serial port, previously COM8, wasn't enumerated
+during this session — only COM3/COM4/COM10 were present), and this board's radio coexistence
+under wardriving's concurrent Wi-Fi+BLE load remains genuinely untested — step 5's gap is not
+closed by this port, only reused as a starting point (the C6's tuned defaults:
+`wifi_interval_ms=5000`, `ble_window_ms=100`, `ble_interval_ms=500`).
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

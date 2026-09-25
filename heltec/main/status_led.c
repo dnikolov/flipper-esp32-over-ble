@@ -21,6 +21,9 @@ static feb_status_led_state_t current_state = FEB_STATUS_LED_CONNECTING;
 static bool factory_reset_active;
 static bool led_on;
 static uint32_t connecting_tick_count;
+/* See status_led.h's comment on feb_status_led_set_wardriving_active(): recorded for call-site
+   parity with the C6 build, not currently read by anything in this file. */
+static bool wardriving_active;
 
 void feb_led_set(bool on)
 {
@@ -73,19 +76,31 @@ void feb_status_led_set(feb_status_led_state_t state)
     apply_current_state();
 }
 
+void feb_status_led_set_wardriving_active(bool active)
+{
+    wardriving_active = active;
+}
+
 void feb_status_led_tick(void)
 {
     if (factory_reset_active) {
         return;
     }
     switch (current_state) {
-    case FEB_STATUS_LED_CONNECTING:
+    case FEB_STATUS_LED_CONNECTING: {
+        /* Blinks twice as fast while a wardriving capture is active, the closest this
+           board's single on/off LED can get to the C6's blue-vs-purple color distinction
+           (see status_led.h's comment on feb_status_led_set_wardriving_active()). */
+        uint32_t threshold = wardriving_active ?
+            (FEB_STATUS_LED_CONNECTING_TICKS / 2u) : FEB_STATUS_LED_CONNECTING_TICKS;
+
         connecting_tick_count++;
-        if (connecting_tick_count >= FEB_STATUS_LED_CONNECTING_TICKS) {
+        if (connecting_tick_count >= threshold) {
             connecting_tick_count = 0;
             feb_led_set(!led_on);
         }
         break;
+    }
     case FEB_STATUS_LED_FLUSHING:
         feb_led_set(!led_on);
         break;

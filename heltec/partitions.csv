@@ -1,0 +1,28 @@
+# Name,     Type, SubType, Offset,  Size,   Flags
+nvs,        data, nvs,     0x9000,  0x6000,
+phy_init,   data, phy,     0xf000,  0x1000,
+factory,    app,  factory, 0x10000, 0x200000,
+# `wardriving` capability's raw-flash circular log (heltec/main/wardriving_log.c, ported
+# unchanged from esp32/main/ -- see that file's own header comment for the crash-safety
+# rationale). Custom "data" subtype 0x40, same as esp32/partitions.csv's "wardrive" entry --
+# a dedicated esp_partition, not NVS/FAT/SPIFFS, since NOR flash only erases a whole sector
+# at a time and this log needs its own sector-eviction/checksum scheme (see
+# docs/PROTOCOL.md's "Flash log eviction" note).
+#
+# This board's 8MB flash (vs. the C6's 4MB) gives real headroom: `factory` above is sized at
+# 2MB (vs. the C6's 1.5MB-ish default-table factory partition that BL13 found already 96%
+# full after the `gps` port) so future capability growth doesn't immediately retighten this
+# board's own margin. `wardrive` is sized to exactly 700 x 4096-byte erase sectors
+# (0x2BC000 = 2,867,200 bytes), matching wardriving_log.c's own WD_MAX_SECTORS self-imposed
+# bound exactly (see that file) so no sector is silently truncated/unusable -- deliberately
+# not stretched further to consume the rest of this board's 8MB, since WD_MAX_SECTORS is a
+# fixed-size boot-scan bookkeeping array in wardriving_log.c and raising it is a separate,
+# not-yet-needed change. At ~150-190 bytes/record on-flash (wardriving_record_format.h),
+# 700 sectors holds tens of thousands of records -- the same "comfortably hours unattended"
+# bar as the C6's own wardrive partition, not a tight fit.
+#
+# Total used: 0x10000 (bootloader/table gap) + 0x200000 (factory) + 0x6000+0x1000 (nvs/phy,
+# already inside that gap) + 0x2BC000 (wardrive) = 0x4CC000 (~4.8MB) out of 8MB, leaving
+# ~3.2MB unallocated for future capability work (display/lora are explicitly out of scope
+# for this pass -- see docs/PLAN.md Phase 4 step 6).
+wardrive,   data, 0x40,    0x210000,0x2BC000,

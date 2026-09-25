@@ -53,6 +53,38 @@ this firmware's real feature list. **Still untested: an actual paired `wifi_scan
 round-trip against the Flipper**, and this board's Wi-Fi+BLE radio coexistence generally (step 5
 was skipped). Full detail: `docs/PROJECT_HISTORY.md`'s 2026-09-16/2026-09-17 entries.
 
+**Step 8 (`gps` capability porting) is build-verified and flashed 2026-09-23, hardware
+read-path verification still pending:** a GPS module was rewired from the earlier GPIO36
+bench-test spot to GPIO17, and `gps` was ported onto `heltec/main/main.c` (reusing the C6's
+frozen `location.c`/`nmea_parser.c`/`handle_gps_command()` unchanged, pins retargeted).
+`feb_features[]` is now `{"wifi_scan", "ble_scan", "gps"}`. Flashed to the physical board
+(COM10); boot log is clean with no UART-init errors, but no Flipper was paired during that
+capture, so a real `gps` query round-trip is still unconfirmed. The Flipper's cached capability
+record for this board again needs deleting before its next `capability_query` will see `gps`
+(same gotcha as step 7, not yet done as of this writing). Heltec's flash partition is now 96%
+full — see `docs/BACKLOG.md` BL13. Full narrative: `docs/PROJECT_HISTORY.md`'s 2026-09-23
+entry. **Same day, confirmed by the user:** the stale capability cache was deleted and
+`wifi_scan`/`ble_scan` work end-to-end on real Heltec hardware — the first real test of step
+7's port. The `gps` NMEA read path itself is still unconfirmed against a live fix.
+
+**Step 9 (`wardriving` capability porting) is build-verified and flashed 2026-09-23, hardware
+capture/coexistence verification still pending:** ported wholesale from the C6 (structurally
+diffed, zero logic deviations). `feb_features[]` is now
+`{"wifi_scan", "ble_scan", "gps", "wardriving"}`. This step deliberately proceeds without the
+radio-coexistence validation step 5 skipped — an explicit, informed user decision, not an
+oversight. A new custom `heltec/partitions.csv` replaces the previously-stock, 96%-full
+partition table (BL13, now resolved), sized for this board's confirmed 8 MB flash: 2 MB factory
+app (51% free) + a 2800 KB `wardrive` data partition + ~3.2 MB unallocated headroom. Flashed to
+the physical board (COM10); boot log confirmed healthy, new partition table and wardriving log
+initialized cleanly against real flash. **Not yet done:** deleting the Flipper's cached
+capability record (same gotcha as steps 7/8 — an automated agent can't do this, it needs the
+Flipper physically connected via USB with its CLI serial port enumerated, which wasn't available
+this session), a live multi-minute wardriving capture run against the paired Flipper, and any
+real signal on whether this board's Wi-Fi+BLE combo radio holds up under wardriving's concurrent
+load. A cosmetic judgment call — this board's plain on/off LED double-blinks during wardriving
+instead of the C6's color swap — is tracked as `docs/BACKLOG.md` BL14 for the user to confirm or
+override. Full narrative: `docs/PROJECT_HISTORY.md`'s 2026-09-23 entry.
+
 **Phase 7 (Wardriving screen redesign) implemented and build-verified 2026-09-21, hardware-verification pending.** Design: [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md). The
 Wardriving screen is now split into Stopped/Running (`AppScreenWardrivingStopped`/
 `AppScreenWardrivingRunning`), with a new persisted (`wardriving_settings.txt`) settings list on
