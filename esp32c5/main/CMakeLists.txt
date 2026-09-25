@@ -1,0 +1,1 @@
+idf_component_register(SRCS "main.c" "status_led.c" "location.c" "nmea_parser.c" "wardriving_record_format.c" "wardriving_log.c" "wardriving_validate.c" "wardriving_dedup.c" "wardriving_persist.c" INCLUDE_DIRS "." REQUIRES feb_protocol bt esp_timer mbedtls nvs_flash esp_hw_support esp_driver_gpio esp_driver_uart esp_wifi esp_netif esp_event esp_partition)

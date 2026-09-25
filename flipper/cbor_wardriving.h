@@ -10,21 +10,25 @@
    status payloads") ----
 
    `command.arguments` field order: action, sources, wifi_interval_ms, ble_window_ms,
-   ble_interval_ms, wifi_swelling, country -- matches PROTOCOL.md exactly (`wifi_swelling`/
-   `country` appended 2026-09-21, docs/WARDRIVING_REDESIGN.md, per this protocol's
-   append-only convention). `sources`/`wifi_interval_ms`/`ble_window_ms`+`ble_interval_ms`/
-   `wifi_swelling`/`country` are present only for `action = "start"`, and their presence is
-   derived purely from the map's own field count at this layer (0, 2, 3, or 5 trailing
-   fields after action+sources -- the surviving combinations once `wifi_swelling`/`country`
-   always co-occur with `wifi_interval_ms`, per PROTOCOL.md's "required when wifi is in
-   sources" rule; 1 and 4 trailing fields are therefore not decodable shapes) -- this codec
+   ble_interval_ms, wifi_swelling, country, wifi_band -- matches PROTOCOL.md exactly
+   (`wifi_swelling`/`country` appended 2026-09-21, docs/WARDRIVING_REDESIGN.md; `wifi_band`
+   appended 2026-09-26 for the OLIMEX MOD-ESP32-C5's dual-band radio, per this protocol's
+   append-only convention -- always sent regardless of board 5GHz capability, see
+   PROTOCOL.md's `wifi_band` row). `sources`/`wifi_interval_ms`/`ble_window_ms`+
+   `ble_interval_ms`/`wifi_swelling`/`country`/`wifi_band` are present only for
+   `action = "start"`, and their presence is derived purely from the map's own field count at
+   this layer (0, 2, 4, or 6 trailing fields after action+sources -- the surviving
+   combinations once `wifi_swelling`/`country`/`wifi_band` always co-occur with
+   `wifi_interval_ms` as a 4-field wifi block, per PROTOCOL.md's "required when wifi is in
+   sources" rule, and `ble_window_ms`/`ble_interval_ms` always co-occur as a 2-field ble
+   block; 1, 3, and 5 trailing fields are therefore not decodable shapes) -- this codec
    does NOT itself validate `action`'s or `sources`' element values against
-   "start"/"stop"/"wifi"/"ble", nor `wifi_swelling`'s/`country`'s own text against their
-   enumerated wire values (that is a dispatch-layer concern, same split as
-   feb_wifi_scan_ap_t's phy/auth not being validated here) -- the two new fields report
-   presence via has_wifi_swelling/has_country independently of has_wifi_interval_ms/
-   has_ble_params, even though the caller-side "required iff wifi in sources" rule ties them
-   together in practice. Internal representation choice: `sources` is captured as a small
+   "start"/"stop"/"wifi"/"ble", nor `wifi_swelling`'s/`country`'s/`wifi_band`'s own text
+   against their enumerated wire values (that is a dispatch-layer concern, same split as
+   feb_wifi_scan_ap_t's phy/auth not being validated here) -- the three fields report
+   presence via has_wifi_swelling/has_country/has_wifi_band independently of
+   has_wifi_interval_ms/has_ble_params, even though the caller-side "required iff wifi in
+   sources" rule ties them together in practice. Internal representation choice: `sources` is captured as a small
    array of caller-owned text pointers (FEB_WARDRIVING_MAX_SOURCES == 2, the only two
    defined values today), not as pre-resolved has_wifi_source/has_ble_source booleans --
    dispatch-layer code inspects the captured strings itself. `ble_window_ms`/
@@ -40,6 +44,7 @@
 #define FEB_WARDRIVING_SOURCE_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_SWELLING_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_COUNTRY_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
+#define FEB_WARDRIVING_BAND_MAX_LEN FEB_CBOR_MAX_TEXT_LEN
 #define FEB_WARDRIVING_WIFI_SSID_MAX_LEN FEB_WIFI_SCAN_SSID_MAX_LEN
 #define FEB_WARDRIVING_BLE_ADDRESS_LEN FEB_BLE_SCAN_ADDRESS_LEN
 #define FEB_WARDRIVING_BLE_NAME_MAX_LEN FEB_BLE_SCAN_NAME_MAX_LEN
@@ -63,6 +68,9 @@ typedef struct {
     const char *country;
     size_t country_len;
     int has_country;
+    const char *wifi_band;
+    size_t wifi_band_len;
+    int has_wifi_band;
 } feb_wardriving_command_payload_t;
 
 size_t feb_cbor_encode_wardriving_command_payload(uint8_t *out, size_t out_cap, const feb_wardriving_command_payload_t *payload);

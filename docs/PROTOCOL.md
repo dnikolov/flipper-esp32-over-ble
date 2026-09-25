@@ -315,9 +315,9 @@ inside `arguments` distinguishing start from stop, rather than two capability st
 envelope — `arguments` already exists as a map for exactly this kind of extension.
 
 `arguments` field order: `action`, `sources`, `wifi_interval_ms`, `ble_window_ms`,
-`ble_interval_ms`, `wifi_swelling`, `country`. `sources` and the interval/swelling/country
-fields are present only when `action = "start"`; `arguments = { "action": "stop" }` (that field
-alone) when stopping.
+`ble_interval_ms`, `wifi_swelling`, `country`, `wifi_band`. `sources` and the
+interval/swelling/country/band fields are present only when `action = "start"`;
+`arguments = { "action": "stop" }` (that field alone) when stopping.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -328,6 +328,7 @@ alone) when stopping.
 | `ble_interval_ms` | unsigned integer | BLE observer scan interval in milliseconds. Required together with `ble_window_ms` when `"ble"` or `"ble_passive"` is in `sources`; absent otherwise. |
 | `wifi_swelling` | text string | `"normal"` \| `"aggressive"` \| `"speed_based"` — WiFi per-channel scan dwell-time control (added 2026-09-21, [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)). Required when `"wifi"` is in `sources`; must be absent otherwise. Any other value is `invalid_command`. See that doc for full semantics (`"aggressive"` = 85ms active dwell per channel; `"speed_based"` = the ESP32 self-switches between normal/aggressive from its own GPS speed reading, no further wire traffic needed). |
 | `country` | text string | `"BG"` \| `"RoW"` — WiFi regulatory country code (added 2026-09-21, same doc). Required when `"wifi"` is in `sources`; must be absent otherwise. Any other value is `invalid_command`. `"RoW"` maps to `esp_wifi_set_country_code("01", false)` (today's implicit default: channels 1-11); `"BG"` maps to `esp_wifi_set_country_code("BG", false)` (channels 1-13, active-only). Applied once at wardriving start, not per scan cycle — a global radio setting, so a later manual `wifi_scan` observes whatever `country` wardriving last set. |
+| `wifi_band` | text string | `"2.4ghz"` \| `"5ghz_fast"` \| `"5ghz_full"` — Wi-Fi scan band selection (added 2026-09-26, dual-band-radio boards only). Required when `"wifi"` is in `sources`; must be absent otherwise. Any other value is `invalid_command`. Meaning: `"2.4ghz"` scans the 2.4 GHz band only (fastest); `"5ghz_full"` scans 2.4 GHz plus every 5 GHz channel including DFS channels, which require slow passive listening for radar detection (most thorough, slowest); `"5ghz_fast"` scans 2.4 GHz plus only the non-DFS 5 GHz channels (UNII-1 low, 36-48, and UNII-3, 149-165), skipping the slow DFS passive-scan channels for a middle-ground speed/coverage tradeoff. **A board with no 5 GHz radio (the C6, Heltec) accepts all three values without error but always scans 2.4 GHz only regardless of which is sent** — the field exists on the wire for every board (so the Flipper doesn't need per-board capability branching to decide whether to send it), but only has an observable effect on a board that actually has 5 GHz hardware. Applied once at wardriving start, not per scan cycle — same "global radio setting" semantics as `country`, so a later manual `wifi_scan` observes whatever `wifi_band` wardriving last set. |
 
 **Interval bounds and defaults.** Bounds are the interval/duty-cycle values validated in
 [PLAN.md](PLAN.md) step 4's radio-coexistence sweep: minimum (most conservative) is step 4's

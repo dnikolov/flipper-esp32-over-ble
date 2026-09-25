@@ -85,6 +85,90 @@ load. A cosmetic judgment call — this board's plain on/off LED double-blinks d
 instead of the C6's color swap — is tracked as `docs/BACKLOG.md` BL14 for the user to confirm or
 override. Full narrative: `docs/PROJECT_HISTORY.md`'s 2026-09-23 entry.
 
+**Phase 8 (OLIMEX MOD-ESP32-C5 board support) started 2026-09-25.** Third ESP32-family target,
+`esp32c5/`, same gate-override pattern as Phase 4/6/7. **Step 1 (board bring-up) is done and
+hardware-verified 2026-09-25:** chip confirmed as ESP32-C5 rev v1.0 (dual-band Wi-Fi 6 + BLE 5 +
+802.15.4, 8 MB flash, MAC `d0:cf:13:ff:fe:e0:88:40`, native USB) via read-only `esptool` on
+COM11; `esp32c5/` scaffolded mirroring `heltec/`'s layout, wired into the shared
+`components/feb_protocol/` component; unmodified baseline built, flashed, and confirmed booting
+cleanly over serial. **Explicit scope limits for this phase:** 2.4 GHz Wi-Fi only (this board's
+5 GHz capability is out of scope), and no factory-reset support (board has no onboard
+pushbutton — `docs/BACKLOG.md` BL15). GPS: ATGM336H wired to GPIO4(RX)/GPIO5(TX). A new
+`esp32c5-developer` subagent was added.
+
+**Step 2 (transport/pairing/session-crypto + `wifi_scan`/`ble_scan`/`gps` capability porting)
+is build-verified, flashed, and pairing-hardware-verified 2026-09-25.** `esp32c5/main/main.c`
+replaces the placeholder with the full port from `esp32/main/main.c` (RISC-V/NimBLE-central
+reference, not the Heltec's classic-Xtensa port): base transport/pairing/session-auth layer,
+plus `wifi_scan` (2.4 GHz-only via `esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY)`,
+confirmed against the installed ESP-IDF v5.5.2 headers), `ble_scan`, and `gps`
+(`location.c`/`nmea_parser.c` ported unchanged, pins retargeted to GPIO4 RX/GPIO5 TX).
+`feb_features[] = {"wifi_scan", "ble_scan", "gps"}` — no `wardriving`, matching this phase's
+scope cut. New two-LED `status_led.c`: green (GPIO27, USER_LED1) mirrors the C6/Heltec's
+connection-state indicator, red (GPIO26, USER_LED2) is wired for backlog-flushing but currently
+unreachable (no wardriving this phase). No `factory_reset.c` (no onboard button — BL15).
+`board_id` prefix `esp32c5-`. Partition table switched to
+`CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` (1500K factory) since the stock 1MB default was too
+small for this build. `idf.py build` in `esp32c5/` is clean (15% free); `components/
+feb_protocol/`, `esp32/`, and `heltec/` were not touched by this step. **Flashed to the physical
+board (COM11) 2026-09-25; boot log confirmed healthy** — Wi-Fi and BLE both initialized, "wifi
+band mode restricted to 2.4GHz only" logged, NimBLE started its v2 service-filtered scan, no
+crashes. First boot found a stray NVS `pairing_secret`-shaped blob left over from whatever the
+board ran before this project touched it (`idf.py flash` doesn't erase the NVS partition) and
+attempted runtime auth with it — harmless, as expected: an unrelated blob can't produce a
+matching session key, so it failed silently and fell through to a normal pairing window, exactly
+like the C6/Heltec do when their stored secret doesn't match. **User confirmed a successful
+pairing ceremony against the physical Flipper the same day** — this is this board's first-ever
+pairing under `board_id=esp32c5-d0cf13feffe0`, so no stale capability-cache concern applies (the
+gotcha that bit Heltec's steps 7/8/9). **Still unconfirmed:** a live `wifi_scan`/`ble_scan`/`gps`
+round-trip against the paired Flipper, and a coexistence sweep for this board's own Wi-Fi 6 +
+BLE 5 + 802.15.4 radio (new backlog item BL16, same accepted-gap class as Heltec's skipped step
+5). Full detail:
+`docs/PLAN.md`'s "Phase 8" section, `docs/BASELINES.md`'s MOD-ESP32-C5 entry,
+[docs/hardware/olimex-mod-esp32-c5/README.md](hardware/olimex-mod-esp32-c5/README.md).
+
+**Scope reversal + Step 3 (dual-band Wi-Fi + `wardriving` port), build-verified 2026-09-25,
+hardware-verification pending.** Same day, the user lifted both of Step 2's scope cuts:
+`start_wifi_subsystem()` now calls `esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO)` (2.4G+5G, no
+wire-format change needed — a `wifi_scan` result's `channel` field is band-agnostic and 2.4/5GHz
+channel numbers never overlap), and `wardriving` is now ported from the C6 reference (structurally
+matching the Heltec's own port — the five `wardriving_*.c/.h` files copied unchanged, `main.c`'s
+state machine/scan-arbitration/status-LED sync ported line-for-line, minus the boot-button
+toggle mechanism this board has no button to trigger). `feb_features[]` is now
+`{"wifi_scan", "ble_scan", "gps", "wardriving"}`. New custom `esp32c5/partitions.csv` (2 MB
+factory app + 700-sector `wardrive` partition, identical sizing to `heltec/partitions.csv`) —
+required deleting the generated `sdkconfig`/`build/` and rebuilding from scratch, since
+`sdkconfig.defaults`' new `CONFIG_PARTITION_TABLE_CUSTOM=y` didn't take on an incremental
+rebuild over Step 2's cached config (`docs/LESSONS.md`'s sdkconfig-defaults-not-retroactive
+class). Red LED (`FEB_STATUS_LED_FLUSHING`) is now reachable via wardriving's backlog-flush
+path; `feb_status_led_set_wardriving_active()` was added but is a deliberate no-op (BL17 — this
+board's two-LED design never specified a third "wardriving active" visual state). `idf.py build`
+clean for both changes, tested separately, no warnings; `components/feb_protocol/`, `esp32/`,
+`heltec/` untouched. **Not done this pass**: no flashing, no live `wifi_scan`(5GHz)/`wardriving`
+hardware verification (explicitly build-only per instruction). **Open, unconfirmed concern
+(BL18)**: an earlier hardware session saw an apparent reboot-loop after a `wifi_scan` trigger,
+recovered only by unplug/replug — not reproduced, not root-caused, and not chased in this
+build-only pass.
+
+**Step 4 (`wifi_band` — configurable dual-band scan speed/coverage), build-verified
+2026-09-26.** Step 3's dual-band default (every 5GHz channel including DFS) made a manual
+`wifi_scan` slow; user's explicit choice was "make it configurable". `wardriving`'s `start`
+action gained a `wifi_band` field (`"2.4ghz"`/`"5ghz_fast"`/`"5ghz_full"`) in the shared
+`cbor_wardriving.c`/`.h`, decoded like `country` (C6/Heltec decode-and-ignore it, no `main.c`
+change needed there). `esp32c5/main/main.c` applies it once at wardriving start
+(`wardriving_set_wifi_band_mode()` for the radio-level `esp_wifi_set_band_mode()` call,
+`wardriving_apply_wifi_band()` for a per-scan `wifi_scan_config_t.channel_bitmap` restricting
+`"5ghz_fast"` to 2.4GHz channels 1-14 + non-DFS 5GHz 36/40/44/48/149/153/157/161/165 — a
+single `esp_wifi_scan_start()` call, confirmed against the installed ESP-IDF v5.5.2 headers
+that a channel-bitmap scan needs no multi-scan restructuring). Boot default
+`WARDRIVING_BAND_5GHZ_FULL` (matches Step 3's already-verified behavior); wardriving autostart
+hardcodes the more conservative `WARDRIVING_BAND_2_4GHZ`, same reasoning as its existing
+swelling/country hardcoding. `idf.py build` clean in `esp32c5/`, `esp32/`, `heltec/`;
+`tests/esp32/build.ps1` host-native suite passes; `check_shared_headers.py` clean (Flipper
+mirror landed concurrently in another session). **Not done this pass**: hardware verification
+of any `wifi_band` value. Full detail: `docs/PLAN.md`'s Phase 8 Step 4,
+`docs/hardware/olimex-mod-esp32-c5/README.md`'s scope-decision section.
+
 **Phase 7 (Wardriving screen redesign) implemented and build-verified 2026-09-21, hardware-verification pending.** Design: [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md). The
 Wardriving screen is now split into Stopped/Running (`AppScreenWardrivingStopped`/
 `AppScreenWardrivingRunning`), with a new persisted (`wardriving_settings.txt`) settings list on

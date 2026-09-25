@@ -33,6 +33,29 @@ Do not carry forward C6 pin mappings to this board — see `docs/hardware/esp32-
 
 Full hardware reference (pinout, board-revision ambiguity, per-vendor-documentation caveats): [docs/hardware/heltec-wifi-lora-32-v2/README.md](hardware/heltec-wifi-lora-32-v2/README.md). Phase 4 design and step-by-step status (architecture decision confirmed, gate-override decision, step tracking): `docs/PLAN.md`'s "Phase 4: Heltec WiFi LoRa 32 V2 board support" section.
 
+## OLIMEX MOD-ESP32-C5 (started 2026-09-25)
+
+Third ESP32 target board, `esp32c5/`. A different chip family from both prior boards: RISC-V
+like the C6, but with a **dual-band Wi-Fi 6 (2.4 GHz + 5 GHz)** radio. Initial pass (Phase 8 Step
+2) scoped to 2.4 GHz only; lifted the same day (Step 3) — this board now scans both bands and
+has `wardriving` ported (see `docs/PLAN.md`'s Phase 8 section for the scope-reversal narrative).
+
+- Board: OLIMEX MOD-ESP32-C5 Rev. A, module ESP32-C5-WROOM-1-N8R4.
+- Chip: ESP32-C5, revision v1.0, single core + LP core, 240 MHz, BLE 5 (LE), IEEE 802.15.4.
+- Flash: **8 MB**, detected read-only via `esptool flash_id` on COM11.
+- MAC: `d0:cf:13:ff:fe:e0:88:40`.
+- USB: native USB-Serial/JTAG (no bridge chip), same reset/flash handling as the C6.
+- ESP-IDF `v5.5.2` already includes `esp32c5` SoC support; the `riscv32-esp-elf` toolchain is
+  shared with the C6 target (`idf_tools.py install --targets=esp32c5` found nothing new to
+  install beyond registering the target).
+- GPS: ATGM336H wired to GPIO4 (ESP32 RX ← GPS TX) / GPIO5 (ESP32 TX → GPS RX) — the board's
+  UEXT-connector UART pins, not GPIO2/GPIO3 (those are wired to UEXT I2C on this board and are
+  also JTAG strapping pins).
+- **No onboard pushbutton** — the factory-reset gesture (BOOT-hold 5s) used on the C6/Heltec
+  has no hardware input here; deferred, see `docs/BACKLOG.md` BL15.
+- Full hardware reference (pin map, schematic, strapping-pin notes):
+  [docs/hardware/olimex-mod-esp32-c5/README.md](hardware/olimex-mod-esp32-c5/README.md).
+
 ## Flipper
 
 - Distribution: Unleashed stable

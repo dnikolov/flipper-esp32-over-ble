@@ -755,14 +755,18 @@ static void test_wardriving_command_payload_codec(void) {
         payload.ble_window_ms = 30;
         payload.ble_interval_ms = 30;
         payload.has_ble_params = 1;
-        /* wifi_swelling/country: required alongside wifi_interval_ms whenever "wifi" is in
-           sources (docs/PROTOCOL.md, docs/WARDRIVING_REDESIGN.md, 2026-09-21). */
+        /* wifi_swelling/country/wifi_band: required alongside wifi_interval_ms whenever
+           "wifi" is in sources (docs/PROTOCOL.md, docs/WARDRIVING_REDESIGN.md, 2026-09-21;
+           wifi_band added 2026-09-26). */
         payload.wifi_swelling = "aggressive";
         payload.wifi_swelling_len = strlen(payload.wifi_swelling);
         payload.has_wifi_swelling = 1;
         payload.country = "BG";
         payload.country_len = strlen(payload.country);
         payload.has_country = 1;
+        payload.wifi_band = "5ghz_full";
+        payload.wifi_band_len = strlen(payload.wifi_band);
+        payload.has_wifi_band = 1;
 
         uint8_t out[192];
         size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
@@ -786,6 +790,10 @@ static void test_wardriving_command_payload_codec(void) {
         CHECK(
             decoded.has_country == 1 && memcmp(decoded.country, "BG", decoded.country_len) == 0,
             "WARDRIVING_CMD_START_BOTH: country == \"BG\"");
+        CHECK(
+            decoded.has_wifi_band == 1 &&
+                memcmp(decoded.wifi_band, "5ghz_full", decoded.wifi_band_len) == 0,
+            "WARDRIVING_CMD_START_BOTH: wifi_band == \"5ghz_full\"");
 
         uint8_t reencoded[192];
         size_t reencoded_len = feb_cbor_encode_wardriving_command_payload(reencoded, sizeof(reencoded), &decoded);
@@ -810,6 +818,9 @@ static void test_wardriving_command_payload_codec(void) {
         payload.country = "RoW";
         payload.country_len = strlen(payload.country);
         payload.has_country = 1;
+        payload.wifi_band = "2.4ghz";
+        payload.wifi_band_len = strlen(payload.wifi_band);
+        payload.has_wifi_band = 1;
 
         uint8_t out[128];
         size_t out_len = feb_cbor_encode_wardriving_command_payload(out, sizeof(out), &payload);
@@ -828,6 +839,10 @@ static void test_wardriving_command_payload_codec(void) {
         CHECK(
             decoded.has_country == 1 && memcmp(decoded.country, "RoW", decoded.country_len) == 0,
             "WARDRIVING_CMD_START_WIFI_ONLY: country == \"RoW\"");
+        CHECK(
+            decoded.has_wifi_band == 1 &&
+                memcmp(decoded.wifi_band, "2.4ghz", decoded.wifi_band_len) == 0,
+            "WARDRIVING_CMD_START_WIFI_ONLY: wifi_band == \"2.4ghz\"");
     }
 
     /* start, ble source only */
@@ -855,6 +870,9 @@ static void test_wardriving_command_payload_codec(void) {
         CHECK(
             decoded.has_ble_params == 1 && decoded.ble_window_ms == 100 && decoded.ble_interval_ms == 1000,
             "WARDRIVING_CMD_START_BLE_ONLY: ble params == 100/1000");
+        CHECK(
+            decoded.has_wifi_swelling == 0 && decoded.has_country == 0 && decoded.has_wifi_band == 0,
+            "WARDRIVING_CMD_START_BLE_ONLY: no wifi_swelling/country/wifi_band");
     }
 
     /* status query */
@@ -1512,6 +1530,18 @@ static void test_wardriving_csv_format_row(void) {
     CHECK(
         strstr(out, ",14,2484,") != NULL,
         "CSV_ROW_WIFI_CH14: channel 14's frequency is 2484MHz, not the linear-formula 2477MHz");
+
+    /* 5GHz channel (ESP32-C5 dual-band radio, docs/PLAN.md's Phase 8): the wire protocol's
+       `channel` field carries a bare channel number with no band flag, so this exercises the
+       channel_to_freq_mhz() branch added for 36-177 alongside the existing 2.4GHz mapping. */
+    wifi_record.payload.wifi.channel = 149;
+    size_t n5g = feb_wardriving_csv_format_row(
+        out, sizeof(out), &wifi_record, first_seen, strlen(first_seen));
+    CHECK(n5g > 0, "CSV_ROW_WIFI_5GHZ: format succeeds");
+    out[n5g] = '\0';
+    CHECK(
+        strstr(out, ",149,5745,") != NULL,
+        "CSV_ROW_WIFI_5GHZ: channel 149 (5GHz) maps to 5745MHz (5000+5*149)");
 
     /* ble record: no name (blank SSID field), no channel (blank Channel field), no auth. */
     feb_wardriving_record_t ble_record;

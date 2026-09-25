@@ -1,0 +1,16 @@
+CONFIG_IDF_TARGET="esp32c5"
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_MBEDTLS_HKDF_C=y
+
+# docs/PLAN.md Phase 8 Step 3 (2026-09-25): wardriving is now ported, needing its own
+# dedicated raw-flash "wardrive" data partition (wardriving_log.c) -- the stock single-app
+# table used during the step-2 transport+capability port (no wardrive partition) is replaced
+# by a custom table sized for this board's confirmed 8MB flash. See esp32c5/partitions.csv's
+# own header comment for the byte accounting.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000

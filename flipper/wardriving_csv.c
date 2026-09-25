@@ -101,12 +101,17 @@ static char auth_field[32];
 static char channel_field[16];
 static char freq_field[16];
 
-/* 2.4GHz-only channel->frequency map (this board has a single 2.4GHz radio, no 5GHz --
-   docs/hardware/esp32-c6-devkitc-1/README.md). Standard IEEE 802.11 mapping: channels 1-13 are
-   evenly spaced 5MHz apart starting at 2412MHz; channel 14 (Japan-only, 802.11b) breaks that
-   spacing at 2484MHz rather than the 2487MHz the linear formula would give. Returns -1 (blank
-   field, matching Channel's own blank convention) for anything outside 1-14 -- defensive only,
-   this board's Wi-Fi scan never reports a channel out of range. */
+/* Channel->frequency map covering both bands now in play project-wide (the ESP32-C5 board
+   has a native dual-band 2.4GHz+5GHz radio, unlike the C6/Heltec boards' 2.4GHz-only ones --
+   docs/PLAN.md's Phase 8 "Scope reversal 2026-09-25"). Wire protocol carries only a bare
+   channel number (docs/PROTOCOL.md's wifi_scan/wardriving `channel` field), no separate band
+   flag, which is safe because 2.4GHz (1-14) and 5GHz (36-177) channel numbers never overlap --
+   the band is already fully implicit in the number. 2.4GHz: channels 1-13 are evenly spaced
+   5MHz apart starting at 2412MHz; channel 14 (Japan-only, 802.11b) breaks that spacing at
+   2484MHz rather than the 2487MHz the linear formula would give. 5GHz: uniformly
+   5000 + 5*channel across the whole range (36->5180MHz, 149->5745MHz, 165->5825MHz), no
+   channel-14-style exception. Returns -1 (blank field, matching Channel's own blank
+   convention) for anything outside 1-14 or 36-177. */
 static long channel_to_freq_mhz(long channel) {
     if(channel == 14) {
         return 2484;
@@ -114,14 +119,18 @@ static long channel_to_freq_mhz(long channel) {
     if(channel >= 1 && channel <= 13) {
         return 2407 + 5 * channel;
     }
+    if(channel >= 36 && channel <= 177) {
+        return 5000 + 5 * channel;
+    }
     return -1;
 }
 
 /* Worst-case row length (see FEB_WARDRIVING_CSV_ROW_MAX_LEN's own comment in
    wardriving_csv.h): mac(17) + ssid_field(130, a 64-byte all-quote-character SSID escaped)
-   + auth_field(31) + first_seen(19) + channel(3) + freq(4, "2484") + rssi(4, "-128") + lat(11)
-   + lon(12) + the literal "0,0"(3) + type(4) + 11 field-separating commas + 1 newline ==
-   250 bytes. */
+   + auth_field(31) + first_seen(19) + channel(3) + freq(4, "2484" or any 5GHz value such as
+   "5825" -- every in-range frequency this function returns, either band, is exactly 4 digits)
+   + rssi(4, "-128") + lat(11) + lon(12) + the literal "0,0"(3) + type(4) + 11
+   field-separating commas + 1 newline == 250 bytes. */
 size_t feb_wardriving_csv_format_row(
     char *out,
     size_t out_cap,

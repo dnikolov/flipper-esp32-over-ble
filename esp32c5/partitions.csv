@@ -1,0 +1,30 @@
+# Name,     Type, SubType, Offset,  Size,   Flags
+nvs,        data, nvs,     0x9000,  0x6000,
+phy_init,   data, phy,     0xf000,  0x1000,
+factory,    app,  factory, 0x10000, 0x200000,
+# `wardriving` capability's raw-flash circular log (esp32c5/main/wardriving_log.c, ported
+# unchanged from esp32/main/ -- see that file's own header comment for the crash-safety
+# rationale). Custom "data" subtype 0x40, same as esp32/partitions.csv's/heltec/partitions.csv's
+# "wardrive" entry -- a dedicated esp_partition, not NVS/FAT/SPIFFS, since NOR flash only
+# erases a whole sector at a time and this log needs its own sector-eviction/checksum scheme
+# (see docs/PROTOCOL.md's "Flash log eviction" note).
+#
+# docs/PLAN.md Phase 8 Step 3 (2026-09-25): replaces this board's step-2 stock
+# CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE table (1500K factory, no wardrive partition) now that
+# wardriving is ported. This board's confirmed 8MB flash (docs/BASELINES.md's MOD-ESP32-C5
+# entry) gives the same headroom the Heltec port used: `factory` sized at 2MB (matching
+# heltec/partitions.csv's own sizing exactly -- the step-2 build measured ~1.31MB used of the
+# 1500K stock slot, and dual-band scanning/wardriving add negligible extra code size beyond
+# what wifi_scan/ble_scan/gps already needed, so 2MB keeps the same real margin the Heltec port
+# found sufficient). `wardrive` is sized to exactly 700 x 4096-byte erase sectors (0x2BC000 =
+# 2,867,200 bytes), matching wardriving_log.c's own WD_MAX_SECTORS self-imposed bound exactly
+# (see that file) so no sector is silently truncated/unusable -- identical sizing to
+# heltec/partitions.csv's own wardrive partition, not stretched further to consume the rest of
+# this board's 8MB. At ~150-190 bytes/record on-flash (wardriving_record_format.h), 700 sectors
+# holds tens of thousands of records -- the same "comfortably hours unattended" bar as the
+# C6/Heltec's own wardrive partitions.
+#
+# Total used: 0x10000 (bootloader/table gap) + 0x200000 (factory) + 0x6000+0x1000 (nvs/phy,
+# already inside that gap) + 0x2BC000 (wardrive) = 0x4CC000 (~4.8MB) out of 8MB, leaving
+# ~3.2MB unallocated for future capability work.
+wardrive,   data, 0x40,    0x210000,0x2BC000,

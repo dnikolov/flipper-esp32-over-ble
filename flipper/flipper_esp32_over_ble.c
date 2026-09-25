@@ -216,6 +216,18 @@ typedef enum {
     WardrivingCountryCount,
 } WardrivingCountry;
 
+/* wifi_band (added 2026-09-26, docs/PROTOCOL.md's `wardriving` command payload row of the
+   same name) -- Wi-Fi scan band selection for the OLIMEX MOD-ESP32-C5's dual-band radio.
+   Sent on every board regardless of 5GHz hardware (see that row's own wording); the C6/
+   Heltec accept all three values without error and always scan 2.4GHz only. Same 3-way
+   cycle shape as WardrivingSwelling above, not the 2-way WardrivingCountry. */
+typedef enum {
+    WardrivingWifiBand24Ghz = 0,
+    WardrivingWifiBand5GhzFast,
+    WardrivingWifiBand5GhzFull,
+    WardrivingWifiBandCount,
+} WardrivingWifiBand;
+
 /* wardriving_cooldown_ms (Esp32App) is not an enum -- it stores the wire's own
    wifi_interval_ms value directly (one of these three), matching the design doc's field
    naming. wardriving_cooldown_values/_labels below back the Left/Right cycling and the
@@ -286,6 +298,30 @@ static const char* wardriving_ble_mode_token(WardrivingBleMode mode) {
    strings ("BG"/"RoW"). */
 static const char* wardriving_country_wire_value(WardrivingCountry country) {
     return country == WardrivingCountryBg ? "BG" : "RoW";
+}
+
+static const char* wardriving_wifi_band_label(WardrivingWifiBand band) {
+    switch(band) {
+    case WardrivingWifiBand5GhzFast:
+        return "5GHz fast";
+    case WardrivingWifiBand5GhzFull:
+        return "5GHz full";
+    default:
+        return "2.4GHz";
+    }
+}
+
+/* Doubles as the persisted token -- both reuse docs/PROTOCOL.md's own `wifi_band` wire
+   strings ("2.4ghz"/"5ghz_fast"/"5ghz_full"). */
+static const char* wardriving_wifi_band_wire_value(WardrivingWifiBand band) {
+    switch(band) {
+    case WardrivingWifiBand5GhzFast:
+        return "5ghz_fast";
+    case WardrivingWifiBand5GhzFull:
+        return "5ghz_full";
+    default:
+        return "2.4ghz";
+    }
 }
 
 /* `gps` capability status (docs/PROTOCOL.md "`gps` command and status payloads", frozen
@@ -443,7 +479,7 @@ typedef struct {
     char wardriving_error_message[48];
     /* Stopped-screen settings (docs/WARDRIVING_REDESIGN.md) -- defaults set in
        flipper_esp32_over_ble_app() match the old WardrivingSourceMode default
-       (WardrivingSourceWifi2Ble): WiFi+BLE, Normal, 2000ms, Active, RoW. Persisted in
+       (WardrivingSourceWifi2Ble): WiFi+BLE, Normal, 2000ms, Active, RoW, 2.4GHz. Persisted in
        wardriving_settings.txt (wardriving_settings_load()/_save()), global not per-board
        (design doc decision 5). wardriving_settings_row is the Stopped screen's own
        Up/Down-selected row index, not persisted (resets to 0 each screen visit, same as
@@ -453,6 +489,7 @@ typedef struct {
     uint32_t wardriving_cooldown_ms;
     WardrivingBleMode wardriving_ble_mode;
     WardrivingCountry wardriving_country;
+    WardrivingWifiBand wardriving_wifi_band;
     size_t wardriving_settings_row;
     size_t wardriving_settings_scroll_offset;
     bool capability_has_gps;
@@ -659,6 +696,12 @@ static WardrivingBleMode wardriving_ble_mode_from_token(const char* token, size_
 
 static WardrivingCountry wardriving_country_from_token(const char* token, size_t len) {
     return text_matches(token, len, "BG") ? WardrivingCountryBg : WardrivingCountryRoW;
+}
+
+static WardrivingWifiBand wardriving_wifi_band_from_token(const char* token, size_t len) {
+    if(text_matches(token, len, "5ghz_fast")) return WardrivingWifiBand5GhzFast;
+    if(text_matches(token, len, "5ghz_full")) return WardrivingWifiBand5GhzFull;
+    return WardrivingWifiBand24Ghz;
 }
 
 static uint32_t wardriving_cooldown_ms_from_token(const char* token, size_t len) {
@@ -1065,18 +1108,21 @@ static bool capability_storage_load(
     return ok;
 }
 
-/* Sets app's five wardriving settings fields to today's defaults (docs/WARDRIVING_REDESIGN.md
+/* Sets app's six wardriving settings fields to today's defaults (docs/WARDRIVING_REDESIGN.md
    "Persistence": "Default to today's old defaults if the file doesn't exist yet" -- matches
    the pre-redesign WardrivingSourceMode default, WardrivingSourceWifi2Ble: WiFi+BLE source,
-   normal dwell, 2000ms cooldown, active BLE, world-safe (RoW) country). Called before
-   attempting to load the persisted file, so a missing/corrupt/partially-readable file always
-   leaves every field at a sane value rather than zero-initialized garbage. */
+   normal dwell, 2000ms cooldown, active BLE, world-safe (RoW) country, 2.4GHz-only band --
+   the last per this project's "faster/safer default" bias, docs/PROTOCOL.md's `wifi_band`
+   row, added 2026-09-26). Called before attempting to load the persisted file, so a
+   missing/corrupt/partially-readable file always leaves every field at a sane value rather
+   than zero-initialized garbage. */
 static void wardriving_settings_set_defaults(Esp32App* app) {
     app->wardriving_mode = WardrivingModeWifiBle;
     app->wardriving_swelling = WardrivingSwellingNormal;
     app->wardriving_cooldown_ms = 2000u;
     app->wardriving_ble_mode = WardrivingBleModeActive;
     app->wardriving_country = WardrivingCountryRoW;
+    app->wardriving_wifi_band = WardrivingWifiBand24Ghz;
 }
 
 /* Loads wardriving_settings.txt (flat `key=value` lines, same shape/parse style as
@@ -1138,6 +1184,8 @@ static void wardriving_settings_load(Esp32App* app) {
             app->wardriving_ble_mode = wardriving_ble_mode_from_token(value, value_len);
         } else if(text_matches(line, key_len, "country")) {
             app->wardriving_country = wardriving_country_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "wifi_band")) {
+            app->wardriving_wifi_band = wardriving_wifi_band_from_token(value, value_len);
         }
     }
 }
@@ -1162,12 +1210,13 @@ static void wardriving_settings_save(const Esp32App* app) {
     int written = snprintf(
         buf,
         sizeof(buf),
-        "mode=%s\nwifi_swelling=%s\nwifi_cooldown_ms=%lu\nble_mode=%s\ncountry=%s\n",
+        "mode=%s\nwifi_swelling=%s\nwifi_cooldown_ms=%lu\nble_mode=%s\ncountry=%s\nwifi_band=%s\n",
         wardriving_mode_token(app->wardriving_mode),
         wardriving_swelling_wire_value(app->wardriving_swelling),
         (unsigned long)app->wardriving_cooldown_ms,
         wardriving_ble_mode_token(app->wardriving_ble_mode),
-        wardriving_country_wire_value(app->wardriving_country));
+        wardriving_country_wire_value(app->wardriving_country),
+        wardriving_wifi_band_wire_value(app->wardriving_wifi_band));
     if(written <= 0 || (size_t)written >= sizeof(buf)) {
         FURI_LOG_E(TAG, "wardriving_settings_save: buffer too small");
         return;
@@ -2870,15 +2919,16 @@ static bool send_gps_command(Esp32App* app) {
 /* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
    values ("wifi"=1+4,"ble_passive"=1+11) + "wifi_interval_ms"key(1+16)+uint(5) +
    "ble_window_ms"key(1+13)+uint(5) + "ble_interval_ms"key(1+16)+uint(5) +
-   "wifi_swelling"key(1+13)+"speed_based"value(1+11) + "country"key(1+7)+"RoW"value(1+3) ==
-   ~150 bytes worst case (wifi_swelling/country added 2026-09-21,
-   docs/WARDRIVING_REDESIGN.md); sized with real margin (see the shared cmd_payload_buf
+   "wifi_swelling"key(1+13)+"speed_based"value(1+11) + "country"key(1+7)+"RoW"value(1+3) +
+   "wifi_band"key(1+9)+"5ghz_fast"value(1+9) == ~175 bytes worst case (wifi_swelling/country
+   added 2026-09-21, docs/WARDRIVING_REDESIGN.md; wifi_band added 2026-09-26,
+   docs/PROTOCOL.md); sized with real margin (see the shared cmd_payload_buf
    declaration's own comment above for why this project no longer shaves these to the byte).
    FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN itself lives on below only to size this function's
    local `arguments_buf`; the command payload/ciphertext/record scratch is the shared
    cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf declared with wifi_scan's command
    scratch above. */
-#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 192u
+#define FEB_WARDRIVING_CMD_PAYLOAD_MAX_LEN 224u
 static uint64_t wardriving_next_request_id = 1;
 
 /* Sends the wardriving `start` command (docs/PROTOCOL.md "`wardriving` command and status
@@ -2897,8 +2947,9 @@ static bool send_wardriving_start_command(Esp32App* app) {
     Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
 
     /* static, not stack-local: this struct grew to ~96 bytes once wifi_swelling/country
-       were added (2026-09-21), crossing this file's own "sizeable buffer on a BLE-thread-
-       reachable path must be static" rule of thumb (docs/LESSONS.md) -- send_wardriving_
+       were added (2026-09-21, further grown by wifi_band 2026-09-26), crossing this file's
+       own "sizeable buffer on a BLE-thread-reachable path must be static" rule of thumb
+       (docs/LESSONS.md) -- send_wardriving_
        status_query() below shares this same struct type and IS reached from BleEventWorker
        (handle_client_auth() -> send_wardriving_status_query()), so all three wardriving
        command-builder functions use the same static convention for consistency, even though
@@ -2935,6 +2986,9 @@ static bool send_wardriving_start_command(Esp32App* app) {
         command_args.has_country = 1;
         command_args.country = wardriving_country_wire_value(app->wardriving_country);
         command_args.country_len = strlen(command_args.country);
+        command_args.has_wifi_band = 1;
+        command_args.wifi_band = wardriving_wifi_band_wire_value(app->wardriving_wifi_band);
+        command_args.wifi_band_len = strlen(command_args.wifi_band);
     }
     command_args.has_ble_params = use_ble;
     if(use_ble) {
@@ -4112,6 +4166,7 @@ typedef enum {
     WardrivingSettingsRowCooldown,
     WardrivingSettingsRowBleMode,
     WardrivingSettingsRowCountry,
+    WardrivingSettingsRowWifiBand,
     WardrivingSettingsRowCount,
 } WardrivingSettingsRow;
 
@@ -4126,6 +4181,7 @@ static bool wardriving_settings_row_visible(const Esp32App* app, WardrivingSetti
     case WardrivingSettingsRowSwelling:
     case WardrivingSettingsRowCooldown:
     case WardrivingSettingsRowCountry:
+    case WardrivingSettingsRowWifiBand:
         return app->capability_has_wifi_scan;
     default:
         return false;
@@ -4229,6 +4285,11 @@ static void wardriving_settings_cycle_row(Esp32App* app, int delta) {
             ((int)app->wardriving_country + delta + WardrivingCountryCount) %
             WardrivingCountryCount);
         break;
+    case WardrivingSettingsRowWifiBand:
+        app->wardriving_wifi_band = (WardrivingWifiBand)(
+            ((int)app->wardriving_wifi_band + delta + WardrivingWifiBandCount) %
+            WardrivingWifiBandCount);
+        break;
     default:
         return;
     }
@@ -4270,6 +4331,10 @@ static void wardriving_settings_row_text(
     case WardrivingSettingsRowCountry:
         snprintf(label, label_cap, "Country");
         snprintf(value, value_cap, "%s", wardriving_country_wire_value(app->wardriving_country));
+        break;
+    case WardrivingSettingsRowWifiBand:
+        snprintf(label, label_cap, "WiFi Band");
+        snprintf(value, value_cap, "%s", wardriving_wifi_band_label(app->wardriving_wifi_band));
         break;
     default:
         label[0] = '\0';
