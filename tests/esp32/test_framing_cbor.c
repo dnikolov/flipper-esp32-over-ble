@@ -832,6 +832,161 @@ static void test_gps_status_payload(void)
     }
 }
 
+/* meshcore_scan codec vectors (docs/PROTOCOL.md "`meshcore_scan` command and status
+   payloads", Heltec-only, design plan "MeshCore Scan Capability -- Heltec Board (Phase 1)").
+   Mirrors gps/ble_scan's command-vector strategy above -- payload-codec-only, no
+   protected-record end-to-end wrap. Also confirms FEB_MESHCORE_MAX_NODES_PER_RESULT's
+   worst-case-sizing claim (cbor_meshcore.h's sizing-note comment): the generator
+   (tests/vectors/generate_vectors.py) already asserts this at vector-generation time, but a
+   fresh decode+re-encode round-trip here through the real C decoder/encoder (not just
+   Python's byte-length arithmetic) is the actual "host-native" confirmation the design plan
+   asked for. */
+static void test_meshcore_node_roundtrip(void)
+{
+    feb_meshcore_node_t node;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+    int ok;
+
+    encoded_len = feb_cbor_decode_meshcore_node(FEB_VEC_MESHCORE_NODE1, FEB_VEC_MESHCORE_NODE1_LEN,
+                                                 &node, &status);
+    ok = (encoded_len == FEB_VEC_MESHCORE_NODE1_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && node.node_id_len == 16 && memcmp(node.node_id, "aabbccddeeff0011", 16) == 0;
+    ok = ok && node.has_name && node.name_len == strlen("Bob's Node") &&
+         memcmp(node.name, "Bob's Node", node.name_len) == 0;
+    ok = ok && node.role_len == strlen("repeater") && memcmp(node.role, "repeater", node.role_len) == 0;
+    ok = ok && node.rssi_offset == 58 /* -70 + 128 */ && node.last_seen_ms == 12345;
+    ok = ok && !node.has_location;
+    check(ok, "meshcore node1: decodes node_id/name/role/rssi_offset/last_seen_ms, no location");
+
+    encoded_len = feb_cbor_encode_meshcore_node(encode_buf, sizeof(encode_buf), &node);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_NODE1, FEB_VEC_MESHCORE_NODE1_LEN),
+          "meshcore node1: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_meshcore_node(FEB_VEC_MESHCORE_NODE2, FEB_VEC_MESHCORE_NODE2_LEN,
+                                                 &node, &status);
+    ok = (encoded_len == FEB_VEC_MESHCORE_NODE2_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && !node.has_name;
+    ok = ok && node.rssi_offset == 0 /* -128 + 128, low extreme */;
+    ok = ok && node.has_location && node.lat_e7_offset == (uint64_t)(423601000 + 900000000) &&
+         node.lon_e7_offset == (uint64_t)(1800000000 - 710589000);
+    check(ok, "meshcore node2: no name (optional omission), has location, rssi at low extreme");
+
+    encoded_len = feb_cbor_encode_meshcore_node(encode_buf, sizeof(encode_buf), &node);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_NODE2, FEB_VEC_MESHCORE_NODE2_LEN),
+          "meshcore node2: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_meshcore_node(FEB_VEC_MESHCORE_NODE_BAD_LOCATION_PAIR,
+                                                 FEB_VEC_MESHCORE_NODE_BAD_LOCATION_PAIR_LEN,
+                                                 &node, &status);
+    check(encoded_len == 0 && status == FEB_CBOR_ERR_MISSING_FIELD,
+          "meshcore node (lat_e7_offset without lon_e7_offset): rejected FEB_CBOR_ERR_MISSING_FIELD");
+}
+
+static void test_meshcore_command_payload(void)
+{
+    feb_command_payload_t cmd;
+    feb_cbor_status_t status;
+    size_t arg_count;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_MESHCORE_COMMAND_PAYLOAD,
+                                              FEB_VEC_MESHCORE_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && cmd.capability_len == strlen("meshcore_scan") &&
+         memcmp(cmd.capability, "meshcore_scan", cmd.capability_len) == 0;
+    ok = ok && cmd.request_id == 701;
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 0;
+    check(ok, "meshcore_scan command payload: decodes capability/request_id/empty arguments");
+
+    encoded_len = feb_cbor_encode_command_payload(encode_buf, sizeof(encode_buf), &cmd);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_COMMAND_PAYLOAD,
+                   FEB_VEC_MESHCORE_COMMAND_PAYLOAD_LEN),
+          "meshcore_scan command payload: encode round-trip byte-identical");
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_MESHCORE_COMMAND_BAD_ARGUMENTS_PAYLOAD,
+                                              FEB_VEC_MESHCORE_COMMAND_BAD_ARGUMENTS_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 1;
+    check(ok, "meshcore_scan command payload (non-empty arguments): decodes structurally OK; "
+              "rejection is a main.c dispatch-layer concern (invalid_command), not a codec error");
+}
+
+static void test_meshcore_status_result_payload(void)
+{
+    feb_status_payload_t st;
+    feb_meshcore_status_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHCORE_STATUS_PAYLOAD,
+                                             FEB_VEC_MESHCORE_STATUS_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 701 && st.has_result;
+    ok = ok && st.state_len == strlen("ok") && memcmp(st.state, "ok", st.state_len) == 0;
+    check(ok, "meshcore_scan status: decodes request_id/state(\"ok\")/result");
+
+    if (ok) {
+        status = feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == 2 && result.total_known_nodes == 5;
+    }
+    check(ok, "meshcore_scan status: result decodes nodes[]/total_known_nodes "
+              "(total_known_nodes > nodes.length signals a truncated listing)");
+
+    if (ok) {
+        encoded_len = feb_cbor_encode_meshcore_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_RESULT_MULTI,
+                       FEB_VEC_MESHCORE_RESULT_MULTI_LEN),
+              "meshcore_scan status: result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_STATUS_PAYLOAD,
+                       FEB_VEC_MESHCORE_STATUS_PAYLOAD_LEN),
+              "meshcore_scan status: full status payload encode round-trip byte-identical");
+    } else {
+        check(0, "meshcore_scan status: result encode round-trip byte-identical");
+        check(0, "meshcore_scan status: full status payload encode round-trip byte-identical");
+    }
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD,
+                                             FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == 0 && result.total_known_nodes == 0;
+    }
+    check(ok, "meshcore_scan status (empty table): result decodes node_count=0/total_known_nodes=0");
+
+    /* Worst-case sizing vector: FEB_MESHCORE_MAX_NODES_PER_RESULT nodes, each at every
+       field's own simultaneous worst-case length -- confirms (via the real C decoder/
+       encoder, not just Python arithmetic) that this still fits FEB_CBOR_MAX_PAYLOAD. */
+    check(FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN <= FEB_CBOR_MAX_PAYLOAD,
+          "meshcore_scan status (worst case): frozen vector itself fits FEB_CBOR_MAX_PAYLOAD");
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD,
+                                             FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == FEB_MESHCORE_MAX_NODES_PER_RESULT;
+    }
+    check(ok, "meshcore_scan status (worst case): decodes a full FEB_MESHCORE_MAX_NODES_PER_RESULT batch");
+    if (ok) {
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(encoded_len > 0 && encoded_len <= FEB_CBOR_MAX_PAYLOAD &&
+              bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD,
+                       FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN),
+              "meshcore_scan status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    } else {
+        check(0, "meshcore_scan status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    }
+}
+
 int main(void)
 {
     test_fragment_record(23, FEB_VEC_FRAGS_MTU23, FEB_VEC_FRAGS_MTU23_LENS,
@@ -950,6 +1105,10 @@ int main(void)
 
     test_gps_command_payload();
     test_gps_status_payload();
+
+    test_meshcore_node_roundtrip();
+    test_meshcore_command_payload();
+    test_meshcore_status_result_payload();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

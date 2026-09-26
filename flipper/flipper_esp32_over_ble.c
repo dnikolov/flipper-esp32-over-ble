@@ -98,6 +98,13 @@
    specified in PROTOCOL.md, so this is a judgment call, not a re-derivation of a frozen
    number. */
 #define GPS_POLL_PERIOD_MS 2000
+/* `meshcore_scan` poll cadence while its screen is open -- same judgment-call reasoning as
+   GPS_POLL_PERIOD_MS above (no cadence is specified in PROTOCOL.md), reusing its exact value
+   since node presence changes at a similarly slow, non-push-latency-sensitive rate. Its own
+   timer/event pair rather than sharing gps_poll_timer, since the Meshcore screen has no
+   documented mutual-exclusion relationship with the Wardriving/GPS screens that already share
+   that timer -- see gps_poll_timer's own declaration comment. */
+#define MESHCORE_POLL_PERIOD_MS 2000
 /* Publish-result poll cadence/timeout (docs/WARDRIVING_PUBLISH.md "Result handling") -- the
    host script's own network call can legitimately take a while, so the timeout is generous;
    neither number is wire-format-pinned, just a judgment call bounding an otherwise-unbounded
@@ -142,6 +149,7 @@ typedef enum {
     AppScreenHome,
     AppScreenScan,
     AppScreenGps,
+    AppScreenMeshcore,
     AppScreenSettings,
     AppScreenAbout,
     AppScreenLegacy,
@@ -162,6 +170,7 @@ typedef enum {
     HomeMenuPublish,
     HomeMenuScan,
     HomeMenuGps,
+    HomeMenuMeshcore,
     HomeMenuSettings,
     HomeMenuAbout,
     HomeMenuLegacy,
@@ -336,6 +345,34 @@ typedef enum {
     GpsFixStateFix,
 } GpsFixState;
 
+/* `meshcore_scan` per-node display fields (docs/PROTOCOL.md's "`meshcore_scan` command and
+   status payloads"): unlike wifi_scan/ble_scan's per-item AppEventWifiScanAp/
+   AppEventBleScanDevice posts, a single status reply carries at most
+   FEB_MESHCORE_MAX_NODES_PER_RESULT (3) nodes total -- there is no partial/complete streaming
+   for this capability (see cbor_meshcore.h) -- so one AppEventMeshcoreStatus event carries the
+   whole reply, mirroring AppEventWardrivingBatch's own "one event per status record"
+   rationale rather than wifi_scan/ble_scan's per-item posting. Text fields are copied (not
+   aliased), same reason as wifi_scan_ap_phy/auth: the codec's decode buffers do not outlive
+   the BLE-thread handler that produces this event. role's display buffer is sized for the
+   longest defined role string ("room_server", 11 chars + NUL) with a little margin, not
+   FEB_CBOR_MAX_TEXT_LEN -- this codec's role field is caller-owned text (see cbor_meshcore.h),
+   but meshcore_proto.c only ever emits one of five known values. */
+#define MESHCORE_NODE_ID_DISPLAY_LEN (FEB_MESHCORE_NODE_ID_LEN + 1)
+#define MESHCORE_NAME_DISPLAY_LEN (FEB_MESHCORE_NAME_MAX_LEN + 1)
+#define MESHCORE_ROLE_DISPLAY_LEN 16
+
+typedef struct {
+    char node_id[MESHCORE_NODE_ID_DISPLAY_LEN];
+    bool has_name;
+    char name[MESHCORE_NAME_DISPLAY_LEN];
+    char role[MESHCORE_ROLE_DISPLAY_LEN];
+    int32_t rssi_dbm;
+    uint64_t last_seen_ms;
+    bool has_location;
+    uint64_t lat_e7_offset;
+    uint64_t lon_e7_offset;
+} MeshcoreNodeDisplay;
+
 typedef enum {
     AppEventInput,
     AppEventBtStatus,
@@ -370,6 +407,15 @@ typedef enum {
        comments for why the send itself never happens directly on the timer thread. */
     AppEventGpsStatus,
     AppEventGpsPollTick,
+    /* `meshcore_scan` (docs/PROTOCOL.md "`meshcore_scan` command and status payloads"):
+       AppEventMeshcoreStatus carries a whole decoded status reply (posted from the BLE
+       thread, see handle_meshcore_status()); AppEventMeshcorePollTick is posted by
+       meshcore_poll_timer's callback purely to make the main thread do the actual send --
+       same split as AppEventGpsStatus/AppEventGpsPollTick above, for the same reason (the
+       timer-service thread must never touch session_seq_out/the shared command buffers
+       itself). */
+    AppEventMeshcoreStatus,
+    AppEventMeshcorePollTick,
     /* No payload -- publish_poll_timer_callback() posts this purely to make the main thread
        do the actual file-existence check (same reasoning as AppEventGpsPollTick's own
        comment). */
@@ -434,6 +480,20 @@ typedef struct {
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
     uint64_t gps_speed_e1_kmh;
+    bool capability_has_meshcore_scan;
+    /* AppEventMeshcoreStatus fields. meshcore_now_estimate_ms is the largest last_seen_ms
+       across this reply's own nodes -- an approximation of the ESP32's boot-relative clock at
+       the moment this reply was composed, used to render a "seen Xs ago" age on-screen (see
+       draw_meshcore_screen()). This has the same accepted-approximation shape as
+       wardriving_csv.c's own FirstSeen backdating (docs/CAPABILITIES.md's wardriving section:
+       "anchoring the newest drained record to the Flipper's current clock and backdating the
+       rest") -- there is no `now`/`queried_at_ms` field on the wire (cbor_meshcore.h), so any
+       age shown is only as fresh as the most-recently-heard node in the reply, understating
+       every node's true age by however stale that one is. */
+    size_t meshcore_node_count;
+    MeshcoreNodeDisplay meshcore_nodes[FEB_MESHCORE_MAX_NODES_PER_RESULT];
+    uint64_t meshcore_total_known_nodes;
+    uint64_t meshcore_now_estimate_ms;
 } AppEvent;
 
 typedef struct {
@@ -508,6 +568,22 @@ typedef struct {
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
     uint64_t gps_speed_e1_kmh;
+    bool capability_has_meshcore_scan;
+    /* meshcore_status_known false means this session has never received a `meshcore_scan`
+       status reply yet (docs/LESSONS.md "UI must derive from real state"), same "unknown"
+       pattern as gps_status_known above. meshcore_now_estimate_ms/meshcore_receipt_tick
+       together let draw_meshcore_screen() extrapolate a live "seen Xs ago" age forward
+       between polls, the same tick-delta convention framing.c's own now_ms parameter uses
+       (furi_get_tick() treated directly as milliseconds on this platform) -- see
+       AppEventMeshcoreStatus's own field comment for the approximation this rests on. The
+       per-node display data itself lives in the file-scope static meshcore_nodes[]/
+       meshcore_node_count below, not here -- same off-stack-struct rationale as
+       wifi_scan_aps/ble_scan_devices (this app's own main-thread stack size isn't
+       documented/pinned). */
+    bool meshcore_status_known;
+    uint64_t meshcore_total_known_nodes;
+    uint64_t meshcore_now_estimate_ms;
+    uint32_t meshcore_receipt_tick;
     /* Publish screen state (docs/WARDRIVING_PUBLISH.md) -- publishing needs no ESP32
        connection at all, but publish_start() now actively tears down this app's own BLE
        profile for the duration of the transfer to relieve heap pressure on the GATT stack
@@ -612,6 +688,14 @@ static uint8_t outgoing_message_id;
    while connected" (a poll tick with no active session is just a harmless no-op send
    attempt -- see send_gps_command()'s own profile/pairing_phase guard). */
 static FuriTimer* gps_poll_timer;
+
+/* `meshcore_scan` poll timer, mirroring gps_poll_timer above exactly (poll only while the
+   Meshcore screen is open) -- its own instance rather than reusing gps_poll_timer, since the
+   Meshcore screen is not part of the Wardriving/GPS mutual-exclusion relationship that lets
+   those two screens safely share one timer (see gps_poll_timer_callback's own comment).
+   Allocated/freed alongside gps_poll_timer/publish_poll_timer; started/stopped on
+   Meshcore-screen entry/exit. */
+static FuriTimer* meshcore_poll_timer;
 
 /* Publish-result poll timer (docs/WARDRIVING_PUBLISH.md) -- allocated/freed alongside
    gps_poll_timer above; started only while AppScreenPublish is showing "waiting for
@@ -1266,10 +1350,10 @@ static void wardriving_settings_save(const Esp32App* app) {
    the buffer's contents surviving past that call. bt_status_callback/input_callback run on
    other system threads (Bt service/GuiSrv) and keep their own separate static AppEvent for
    that reason -- sharing across threads would be a real data race, not just an in-flight
-   one. gps_poll_timer_callback/publish_poll_timer_callback share a third instance,
-   timer_service_event (declared next to them) -- both run on the same single FreeRTOS Timer
-   Service task, so the same single-in-flight argument applies to that pair specifically,
-   even though it's a different thread than this one. */
+   one. gps_poll_timer_callback/meshcore_poll_timer_callback/publish_poll_timer_callback share
+   a third instance, timer_service_event (declared next to them) -- all three run on the same
+   single FreeRTOS Timer Service task, so the same single-in-flight argument applies to that
+   trio specifically, even though it's a different thread than this one. */
 static AppEvent shared_ble_event;
 
 /* shared_status_result: same single-in-flight BLE-thread reasoning as shared_ble_event just
@@ -1288,6 +1372,7 @@ static union {
     feb_ble_scan_result_payload_t ble_scan;
     feb_gps_result_payload_t gps;
     feb_wardriving_status_result_payload_t wardriving;
+    feb_meshcore_status_result_payload_t meshcore;
 } shared_status_result;
 
 static void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* reason) {
@@ -1736,6 +1821,15 @@ typedef struct {
 static BleScanDeviceDisplay ble_scan_devices[BLE_SCAN_MAX_DISPLAY_DEVICES];
 static size_t ble_scan_device_count;
 
+/* meshcore_scan display state, mirroring wifi_scan_aps/ble_scan_devices above -- same
+   off-stack-struct/static rationale (this app's own main-thread stack size isn't
+   documented/pinned). Small (FEB_MESHCORE_MAX_NODES_PER_RESULT is 3, not 32), but treated
+   with the same caution rather than assumed safe as an Esp32App member, matching the
+   comment on those two arrays. Populated only from the main loop's AppEventMeshcoreStatus
+   handler, never touched directly from the BLE thread. */
+static MeshcoreNodeDisplay meshcore_nodes[FEB_MESHCORE_MAX_NODES_PER_RESULT];
+static size_t meshcore_node_count;
+
 /* Solid-green-while-flushing / solid-blue-when-idle LED indicator for an active wardriving
    backlog flush (docs/PROTOCOL.md's backlog_remaining semantics) -- see
    handle_wardriving_status()'s "data" branch, further below, for both transition points.
@@ -1961,6 +2055,7 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
     event->capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
     event->capability_has_wardriving = capability_has_feature(payload, "wardriving");
     event->capability_has_gps = capability_has_feature(payload, "gps");
+    event->capability_has_meshcore_scan = capability_has_feature(payload, "meshcore_scan");
     furi_message_queue_put(app->queue, event, 0);
 }
 
@@ -2301,6 +2396,84 @@ static void
         return;
     }
     post_gps_status(app, state, result);
+}
+
+/* ---- `meshcore_scan` capability (docs/PROTOCOL.md "`meshcore_scan` command and status
+   payloads", Heltec WiFi LoRa 32 V2 only) ---- poll-only status query, no scan lifecycle and
+   no busy/error concept of its own, same as `gps` above. Unlike every other capability's
+   status payload, `state` is always the literal "ok" and `result` is always present -- there
+   is no multi-state lifecycle to distinguish. A single reply carries at most
+   FEB_MESHCORE_MAX_NODES_PER_RESULT nodes (no partial/complete streaming -- see
+   cbor_meshcore.h), so this posts one batch event per reply, mirroring wardriving's own
+   per-status-record posting rather than wifi_scan/ble_scan's per-item posting. */
+static void post_meshcore_status(
+    Esp32App* app, const feb_meshcore_status_result_payload_t* result) {
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventMeshcoreStatus;
+    event->meshcore_total_known_nodes = result->total_known_nodes;
+    size_t node_count = result->node_count > FEB_MESHCORE_MAX_NODES_PER_RESULT ?
+                            FEB_MESHCORE_MAX_NODES_PER_RESULT :
+                            result->node_count;
+    event->meshcore_node_count = node_count;
+    uint64_t freshest = 0;
+    for(size_t i = 0; i < node_count; i++) {
+        const feb_meshcore_node_t* node = &result->nodes[i];
+        MeshcoreNodeDisplay* display = &event->meshcore_nodes[i];
+        copy_clamped_text(
+            display->node_id, sizeof(display->node_id), node->node_id, node->node_id_len);
+        display->has_name = node->has_name ? true : false;
+        if(node->has_name) {
+            copy_clamped_text(display->name, sizeof(display->name), node->name, node->name_len);
+        } else {
+            display->name[0] = '\0';
+        }
+        copy_clamped_text(display->role, sizeof(display->role), node->role, node->role_len);
+        display->rssi_dbm = (int32_t)node->rssi_offset - 128;
+        display->last_seen_ms = node->last_seen_ms;
+        display->has_location = node->has_location ? true : false;
+        display->lat_e7_offset = node->lat_e7_offset;
+        display->lon_e7_offset = node->lon_e7_offset;
+        if(node->last_seen_ms > freshest) {
+            freshest = node->last_seen_ms;
+        }
+    }
+    event->meshcore_now_estimate_ms = freshest;
+    furi_message_queue_put(app->queue, event, 0);
+}
+
+/* `status` for `meshcore_scan` (docs/PROTOCOL.md): always `state == "ok"`, `result` always
+   present. Routed here by profile_event_handler's status dispatch matching directly on that
+   state text, same convention as gps/wardriving's own unambiguous state strings. */
+static void handle_meshcore_status(
+    Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
+    Esp32App* app = profile->app;
+    static feb_status_payload_t status_payload;
+    feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
+    if(status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "meshcore_scan status payload decode failed: %d; dropping", status);
+        return;
+    }
+    if(!text_matches(status_payload.state, status_payload.state_len, "ok")) {
+        FURI_LOG_W(
+            TAG,
+            "meshcore_scan status: unexpected state '%.*s'; dropping",
+            (int)status_payload.state_len,
+            status_payload.state);
+        return;
+    }
+    if(!status_payload.has_result) {
+        FURI_LOG_W(TAG, "meshcore_scan status: state=ok but no result; dropping");
+        return;
+    }
+    feb_meshcore_status_result_payload_t* result = &shared_status_result.meshcore;
+    feb_cbor_status_t result_status = feb_cbor_decode_meshcore_status_result_payload(
+        status_payload.result_span, status_payload.result_span_len, result);
+    if(result_status != FEB_CBOR_OK) {
+        FURI_LOG_W(TAG, "meshcore_scan status.result decode failed: %d; dropping", result_status);
+        return;
+    }
+    post_meshcore_status(app, result);
 }
 
 /* ---- wardriving capability (docs/PROTOCOL.md "`wardriving` command and status payloads",
@@ -2922,6 +3095,74 @@ static bool send_gps_command(Esp32App* app) {
     return true;
 }
 
+/* Sends the `meshcore_scan` `command` (capability="meshcore_scan", fresh request_id,
+   always-empty arguments per docs/PROTOCOL.md -- no `action` field, mirroring `gps`'s own
+   single-operation shape exactly). Triggered by meshcore_poll_timer's periodic tick while the
+   Meshcore screen is open; same no-cross-thread-race argument as send_gps_command()'s own
+   comment. Uses the same shared cmd_payload_buf/cmd_ciphertext_buf/cmd_record_buf. */
+static uint64_t meshcore_next_request_id = 1;
+
+static bool send_meshcore_status_query(Esp32App* app) {
+    if(app->profile == NULL || app->pairing_phase != PairingPhaseSessionActive) {
+        return false;
+    }
+    Esp32BleProfile* profile = (Esp32BleProfile*)app->profile;
+
+    uint8_t arguments_buf[2];
+    size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
+    if(arguments_len == 0) {
+        FURI_LOG_W(TAG, "meshcore_scan command: arguments encode failed");
+        return false;
+    }
+
+    feb_command_payload_t command = {
+        .capability = "meshcore_scan",
+        .capability_len = sizeof("meshcore_scan") - 1,
+        .request_id = meshcore_next_request_id++,
+        .arguments_span = arguments_buf,
+        .arguments_span_len = arguments_len,
+    };
+    size_t payload_len = feb_cbor_encode_command_payload(
+        cmd_payload_buf, sizeof(cmd_payload_buf), &command);
+    if(payload_len == 0) {
+        FURI_LOG_W(TAG, "meshcore_scan command: payload encode failed");
+        return false;
+    }
+    if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        FURI_LOG_W(TAG, "meshcore_scan command: session sequence at cap; reconnect required");
+        return false;
+    }
+
+    size_t record_len = feb_session_encrypt_record(
+        session_key,
+        2,
+        "command",
+        sizeof("command") - 1,
+        session_id_bytes,
+        session_board_id,
+        session_board_id_len,
+        FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32,
+        session_seq_out,
+        cmd_payload_buf,
+        payload_len,
+        cmd_ciphertext_buf,
+        sizeof(cmd_ciphertext_buf),
+        cmd_record_buf,
+        sizeof(cmd_record_buf));
+    if(record_len == 0) {
+        FURI_LOG_W(TAG, "meshcore_scan command: record encode failed");
+        return false;
+    }
+    if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
+        FURI_LOG_W(TAG, "meshcore_scan command: send failed");
+        return false;
+    }
+    session_seq_out++;
+    FURI_LOG_I(
+        TAG, "meshcore_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    return true;
+}
+
 /* map(1) + "action"key(1+6)+"start"value(1+5) + "sources"key(1+7)+array header(1)+2 text
    values ("wifi"=1+4,"ble_passive"=1+11) + "wifi_interval_ms"key(1+16)+uint(5) +
    "ble_window_ms"key(1+13)+uint(5) + "ble_interval_ms"key(1+16)+uint(5) +
@@ -3302,14 +3543,14 @@ static void reassembly_timeout_timer_callback(void* context) {
     }
 }
 
-/* gps_poll_timer_callback and publish_poll_timer_callback both run on the Furi timer-service
-   thread -- FreeRTOS's single Timer Service task, the one every furi_timer_alloc(...,
-   FuriTimerTypePeriodic, ...) callback in the whole firmware shares
+/* gps_poll_timer_callback, meshcore_poll_timer_callback, and publish_poll_timer_callback all
+   run on the Furi timer-service thread -- FreeRTOS's single Timer Service task, the one every
+   furi_timer_alloc(..., FuriTimerTypePeriodic, ...) callback in the whole firmware shares
    (targets/f7/inc/FreeRTOSConfig.h's configTIMER_TASK_STACK_DEPTH, 256 words/1024 bytes).
    That task processes one expired-timer callback at a time from its own command queue, so
-   these two callbacks can never actually be concurrent with *each other* -- only with
+   these callbacks can never actually be concurrent with *each other* -- only with
    BleEventWorker/Bt/GuiSrv, i.e. with shared_ble_event/the Bt-thread event/input_callback's
-   own event, none of which this pair touches. They therefore safely share one static
+   own event, none of which this trio touches. They therefore safely share one static
    AppEvent, timer_service_event, below -- same single-in-flight rationale as
    shared_ble_event, just scoped to this one other thread instead. AppEvent is now large
    enough (~500+ bytes) that a stack copy here would consume roughly half this thread's
@@ -3328,6 +3569,15 @@ static void gps_poll_timer_callback(void* context) {
     Esp32App* app = context;
     memset(&timer_service_event, 0, sizeof(timer_service_event));
     timer_service_event.type = AppEventGpsPollTick;
+    furi_message_queue_put(app->queue, &timer_service_event, 0);
+}
+
+/* Same cross-thread-safety argument as gps_poll_timer_callback above -- only posts
+   AppEventMeshcorePollTick; the main loop's handler calls send_meshcore_status_query(). */
+static void meshcore_poll_timer_callback(void* context) {
+    Esp32App* app = context;
+    memset(&timer_service_event, 0, sizeof(timer_service_event));
+    timer_service_event.type = AppEventMeshcorePollTick;
     furi_message_queue_put(app->queue, &timer_service_event, 0);
 }
 
@@ -3823,6 +4073,8 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                             text_matches(status_peek.state, status_peek.state_len, "acquiring") ||
                             text_matches(status_peek.state, status_peek.state_len, "fix")) {
                             handle_gps_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        } else if(text_matches(status_peek.state, status_peek.state_len, "ok")) {
+                            handle_meshcore_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else if(pending_command_kind == PendingCommandBleScan) {
                             handle_ble_scan_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else {
@@ -4475,6 +4727,9 @@ static bool home_menu_visible(Esp32App* app, HomeMenuItem item) {
                (app->capability_has_wifi_scan || app->capability_has_ble_scan);
     case HomeMenuGps:
         return app->pairing_phase == PairingPhaseSessionActive && app->capability_has_gps;
+    case HomeMenuMeshcore:
+        return app->pairing_phase == PairingPhaseSessionActive &&
+               app->capability_has_meshcore_scan;
     case HomeMenuSettings:
     case HomeMenuAbout:
     case HomeMenuLegacy:
@@ -4842,6 +5097,102 @@ static void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
     canvas_draw_str(canvas, 2, 52, line);
 }
 
+/* meshcore_scan results screen (docs/PROTOCOL.md "`meshcore_scan` command and status
+   payloads", Heltec WiFi LoRa 32 V2 only) -- single screen, not a Stopped/Running split like
+   Wardriving's: this capability is poll-only, with no start/stop to switch between (explicit
+   user decision, this session). Shows the up-to-FEB_MESHCORE_MAX_NODES_PER_RESULT nodes from
+   the latest reply plus a "+N more known" line when total_known_nodes exceeds that count --
+   not a scrollable list of every known node (docs/BACKLOG.md: real pagination is a known
+   future improvement, not built this pass). Row layout matches draw_wifi_scan_results()/
+   draw_ble_scan_results() exactly (22/32/42/52, 4 rows total, header at y=11); the canvas
+   clips visually at screen width if a row's text runs long, same accepted behavior as those
+   two screens' own longer lines. */
+#define MESHCORE_RESULTS_ROW_HEIGHT 10
+#define MESHCORE_RESULTS_MAX_ROWS 4
+#define MESHCORE_RESULTS_FIRST_ROW_Y 22
+
+static void draw_meshcore_screen(Canvas* canvas, const Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "MeshCore");
+    canvas_set_font(canvas, FontSecondary);
+
+    uint8_t y = MESHCORE_RESULTS_FIRST_ROW_Y;
+
+    if(!app->meshcore_status_known) {
+        /* Same "never queried yet this session" empty state as draw_gps_screen()'s own
+           has_fix==false rows -- distinct from "queried, and the board genuinely has no
+           nodes" below (docs/LESSONS.md "UI must derive from real state"). */
+        canvas_draw_str(canvas, 2, y, "Querying...");
+        return;
+    }
+
+    if(app->meshcore_total_known_nodes == 0) {
+        /* Same tone as wifi_scan/ble_scan's own "0 found" empty state. */
+        canvas_draw_str(canvas, 2, y, "No nodes seen yet");
+        return;
+    }
+
+    /* now_est_ms extrapolates meshcore_now_estimate_ms forward using the Flipper's own tick
+       delta since receipt -- treating furi_get_tick() deltas as milliseconds directly, same
+       convention framing.c's own now_ms parameter already uses on this platform. See
+       AppEventMeshcoreStatus's own field comment for the approximation this rests on: there
+       is no `now`/`queried_at_ms` field on the wire (cbor_meshcore.h), so this understates
+       every node's true age by however stale the freshest node in the reply actually was. */
+    uint32_t elapsed_ms = furi_get_tick() - app->meshcore_receipt_tick;
+    uint64_t now_est_ms = app->meshcore_now_estimate_ms + elapsed_ms;
+
+    size_t rows_used = 0;
+    for(size_t i = 0; i < meshcore_node_count && rows_used < MESHCORE_RESULTS_MAX_ROWS; i++) {
+        const MeshcoreNodeDisplay* node = &meshcore_nodes[i];
+        const char* label = node->has_name ? node->name : node->node_id;
+        uint64_t age_ms = now_est_ms > node->last_seen_ms ? now_est_ms - node->last_seen_ms : 0;
+        uint64_t age_s = age_ms / 1000;
+
+        /* Sized with margin over the worst case (24-byte name + "room_server" role +
+           signed rssi + a wide age + a lat/lon pair), matching this file's existing
+           -Werror=format-truncation discipline (docs/LESSONS.md). */
+        char line[96];
+        if(node->has_location) {
+            double lat = ((double)(int64_t)node->lat_e7_offset - (double)900000000) /
+                         (double)10000000;
+            double lon = ((double)(int64_t)node->lon_e7_offset - (double)1800000000) /
+                         (double)10000000;
+            snprintf(
+                line,
+                sizeof(line),
+                "%s %s %ldm %llus %.3f,%.3f",
+                label,
+                node->role,
+                (long)node->rssi_dbm,
+                (unsigned long long)age_s,
+                lat,
+                lon);
+        } else {
+            snprintf(
+                line,
+                sizeof(line),
+                "%s %s %ldm %llus",
+                label,
+                node->role,
+                (long)node->rssi_dbm,
+                (unsigned long long)age_s);
+        }
+        canvas_draw_str(canvas, 2, (uint8_t)(y + rows_used * MESHCORE_RESULTS_ROW_HEIGHT), line);
+        rows_used++;
+    }
+
+    if(rows_used < MESHCORE_RESULTS_MAX_ROWS &&
+       app->meshcore_total_known_nodes > (uint64_t)meshcore_node_count) {
+        char line[32];
+        snprintf(
+            line,
+            sizeof(line),
+            "+%llu more known",
+            (unsigned long long)(app->meshcore_total_known_nodes - (uint64_t)meshcore_node_count));
+        canvas_draw_str(canvas, 2, (uint8_t)(y + rows_used * MESHCORE_RESULTS_ROW_HEIGHT), line);
+    }
+}
+
 /* docs/WARDRIVING_PUBLISH.md "Publish flow" -- three distinct states, matching this app's own
    "don't conflate states" UI convention: idle instructions, waiting-with-poll, and outcome
    (one of PublishOutcome's four real values). Row y-coordinates match draw_gps_screen's own
@@ -4954,6 +5305,7 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
         "Publish",
         "Scan",
         "GPS",
+        "MeshCore",
         "Settings",
         "About",
         "Legacy",
@@ -5007,6 +5359,10 @@ static void draw_callback(Canvas* canvas, void* context) {
     }
     if(app->screen == AppScreenGps) {
         draw_gps_screen(canvas, app);
+        return;
+    }
+    if(app->screen == AppScreenMeshcore) {
+        draw_meshcore_screen(canvas, app);
         return;
     }
     if(app->screen == AppScreenSettings) {
@@ -5078,6 +5434,7 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
         app->screen = AppScreenHome;
     }
     furi_timer_stop(gps_poll_timer);
+    furi_timer_stop(meshcore_poll_timer);
     /* Publish is BLE-session-independent (it runs after the ESP32 is long gone, see
        docs/WARDRIVING_PUBLISH.md), so this reset path should never fire while it's in
        progress -- stopped here anyway, defensively, so a stray disconnect/reconnect can
@@ -5119,6 +5476,13 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
        above) -- the next authenticated session starts genuinely not knowing until the next
        poll tick's reply arrives. */
     app->gps_status_known = false;
+    /* Same "UI must derive from real state" reasoning as gps_status_known above, applied to
+       meshcore_scan. */
+    app->meshcore_status_known = false;
+    app->meshcore_total_known_nodes = 0;
+    app->meshcore_now_estimate_ms = 0;
+    app->meshcore_receipt_tick = 0;
+    meshcore_node_count = 0;
 }
 
 static void reset_scan_ui_state(Esp32App* app) {
@@ -5216,6 +5580,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     furi_check(reassembly_timeout_timer);
     gps_poll_timer = furi_timer_alloc(gps_poll_timer_callback, FuriTimerTypePeriodic, &app);
     furi_check(gps_poll_timer);
+    meshcore_poll_timer =
+        furi_timer_alloc(meshcore_poll_timer_callback, FuriTimerTypePeriodic, &app);
+    furi_check(meshcore_poll_timer);
     publish_poll_timer =
         furi_timer_alloc(publish_poll_timer_callback, FuriTimerTypePeriodic, &app);
     furi_check(publish_poll_timer);
@@ -5315,6 +5682,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.capability_has_ble_scan = event.capability_has_ble_scan;
             app.capability_has_wardriving = event.capability_has_wardriving;
             app.capability_has_gps = event.capability_has_gps;
+            app.capability_has_meshcore_scan = event.capability_has_meshcore_scan;
             /* Force-jump to Wardriving on connect (docs/WARDRIVING_REDESIGN.md, decision 6):
                the moment a session's capability info arrives and the board advertises
                wardriving, the Home cursor is forced here unconditionally, even if the user
@@ -5436,6 +5804,26 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             if(app.screen == AppScreenGps && app.capability_has_gps) {
                 send_gps_command(&app);
             }
+        } else if(event.type == AppEventMeshcoreStatus) {
+            app.meshcore_status_known = true;
+            app.meshcore_total_known_nodes = event.meshcore_total_known_nodes;
+            app.meshcore_now_estimate_ms = event.meshcore_now_estimate_ms;
+            /* Captured here, on the main thread, at the moment this reply is actually
+               processed -- the age extrapolation draw_meshcore_screen() does (adding the
+               Flipper's own tick delta since this instant) assumes this timestamp is close to
+               when the reply was received, which only holds if this event is drained promptly
+               (true today: this app's queue is only ever backed up by a large wardriving
+               batch, which cannot coexist with the Meshcore screen being open -- see
+               reset_scan_ui_state_impl()). */
+            app.meshcore_receipt_tick = furi_get_tick();
+            meshcore_node_count = event.meshcore_node_count;
+            for(size_t i = 0; i < meshcore_node_count; i++) {
+                meshcore_nodes[i] = event.meshcore_nodes[i];
+            }
+        } else if(event.type == AppEventMeshcorePollTick) {
+            if(app.screen == AppScreenMeshcore && app.capability_has_meshcore_scan) {
+                send_meshcore_status_query(&app);
+            }
         } else if(event.type == AppEventPublishPollTick) {
             if(app.screen == AppScreenPublish && app.publish_waiting) {
                 publish_poll_check(&app);
@@ -5513,6 +5901,20 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                         furi_timer_stop(gps_poll_timer);
                         furi_timer_start(gps_poll_timer, furi_ms_to_ticks(GPS_POLL_PERIOD_MS));
                         break;
+                    case HomeMenuMeshcore:
+                        app.screen = AppScreenMeshcore;
+                        /* Unlike the GPS/Wardriving screens above, send one query immediately
+                           on entry (not just on the first timer tick) -- meshcore_scan has no
+                           push-on-connect precedent to fall back on while waiting out the
+                           first MESHCORE_POLL_PERIOD_MS. */
+                        if(app.pairing_phase == PairingPhaseSessionActive &&
+                           app.capability_has_meshcore_scan) {
+                            send_meshcore_status_query(&app);
+                        }
+                        furi_timer_stop(meshcore_poll_timer);
+                        furi_timer_start(
+                            meshcore_poll_timer, furi_ms_to_ticks(MESHCORE_POLL_PERIOD_MS));
+                        break;
                     case HomeMenuSettings:
                         app.screen = AppScreenSettings;
                         app.settings_scroll_offset = 0;
@@ -5570,6 +5972,11 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 if(event.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
+                }
+            } else if(app.screen == AppScreenMeshcore) {
+                if(event.input.key == InputKeyBack) {
+                    app.screen = AppScreenHome;
+                    furi_timer_stop(meshcore_poll_timer);
                 }
             } else if(app.screen == AppScreenSettings) {
                 if(event.input.key == InputKeyBack) {
@@ -5727,6 +6134,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     furi_timer_stop(gps_poll_timer);
     furi_timer_free(gps_poll_timer);
     gps_poll_timer = NULL;
+    furi_timer_stop(meshcore_poll_timer);
+    furi_timer_free(meshcore_poll_timer);
+    meshcore_poll_timer = NULL;
     furi_timer_stop(publish_poll_timer);
     furi_timer_free(publish_poll_timer);
     publish_poll_timer = NULL;

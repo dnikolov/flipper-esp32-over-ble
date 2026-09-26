@@ -85,6 +85,49 @@ load. A cosmetic judgment call — this board's plain on/off LED double-blinks d
 instead of the C6's color swap — is tracked as `docs/BACKLOG.md` BL14 for the user to confirm or
 override. Full narrative: `docs/PROJECT_HISTORY.md`'s 2026-09-23 entry.
 
+**`meshcore_scan` capability (Heltec-only, Phase 1 "detection + display") added 2026-09-26,
+build-verified only, no hardware to test against.** Passively listens for MeshCore (a
+third-party open LoRa mesh-network protocol, unrelated to this project's own BLE protocol)
+`ADVERT` node-broadcast packets via the Heltec's previously-unused onboard SX1276, using the
+`jgromes/radiolib` managed component. `feb_features[]` is now `{"wifi_scan", "ble_scan",
+"gps", "wardriving", "meshcore_scan"}`. New files: `heltec/main/meshcore_proto.c/.h` (pure-C
+packet parser, host-tested against hand-built synthetic ADVERT frames — no real MeshCore
+node exists to test against — `tests/esp32/test_meshcore_proto.c`), `meshcore_table.c/.h`
+(12-entry in-RAM node table, RAM-only, cleared on reboot), `meshcore_radio.cpp/.h` (the one
+C++ file in this firmware, since RadioLib has no C API) plus a vendored `meshcore_esp_hal.c/
+.h`-equivalent (`meshcore_esp_hal.cpp/.h`) HAL adapter — the pinned `jgromes/radiolib`
+7.7.1 release turned out not to ship an ESP-IDF HAL at all (only added to RadioLib's
+unreleased master branch after that tag), so this project vendors RadioLib's own
+MIT-licensed adapter directly. A real, measured hard constraint (not a guess) shaped this:
+the original design's 64-entry table overflowed this classic-ESP32 board's DRAM by 4536
+bytes on a real `idf.py build`; fixed via `heltec/CMakeLists.txt` excluding every RadioLib
+modem family/protocol client this capability doesn't use (`RADIOLIB_EXCLUDE_*`) and shrinking
+the table to 12 tightly-packed entries — `docs/PLAN.md`'s design plan's original "64" sizing
+guess is superseded by this measured ceiling. New shared codec `components/feb_protocol/
+cbor_meshcore.c/.h` (host-tested, `tests/esp32/test_framing_cbor.c`) — **not yet mirrored
+into `flipper/`**, left for a follow-up agent (frozen field layout: see this session's
+handback report or `docs/PROTOCOL.md`'s new `meshcore_scan` section). `esp32`/`esp32c5`
+builds and all host-native test suites reconfirmed unaffected. **Not done this pass**: no
+flashing, no hardware verification of any kind (no MeshCore node available), no
+radio-coexistence sweep against this board's Wi-Fi/BT combo radio (new `docs/BACKLOG.md`
+BL19). **Capability-cache gotcha applies again**: this board's Flipper-side cached capability
+record was already populated (from steps 7/8/9) before `meshcore_scan` existed in
+`feb_features[]` — it must be deleted (same procedure as before) before the next
+`capability_query` will see the new feature, once the Flipper side is implemented.
+
+**Phase 9 (wired cluster), Heltec+C6 pair build-verified and flashed 2026-09-26, pairing/
+hardware round-trip still pending.** C6 + C5 + Heltec wired together over UART to eliminate
+radio coexistence by giving each board exactly one scanning job. Full design:
+[docs/CLUSTER.md](CLUSTER.md); step tracking: `docs/PLAN.md`'s "Phase 9" section. Shared
+`components/feb_cluster_link/` framing component (host-tested, 25/25), `esp32/cluster_worker/`
+(new, C6 2.4GHz-only worker), and `heltec/main/main.c` (additively updated — `wifi_scan` proxies
+to a present worker, falls back to local scan otherwise) are all flashed to physical boards and
+booting clean. **Real finding**: Phase 9 bring-up is on a *second* physical Heltec unit (MAC
+`a4:cf:12:03:b1:74`, confirmed with the user) than the Phase 4 board (`a4:cf:12:03:ba:58`) — this
+one has no stored pairing_secret yet. A fresh Flipper pairing against this specific unit is
+needed before a real end-to-end `wifi_scan` proxy test is possible; see
+`docs/hardware/heltec-wifi-lora-32-v2/README.md`'s new note.
+
 **Phase 8 (OLIMEX MOD-ESP32-C5 board support) started 2026-09-25.** Third ESP32-family target,
 `esp32c5/`, same gate-override pattern as Phase 4/6/7. **Step 1 (board bring-up) is done and
 hardware-verified 2026-09-25:** chip confirmed as ESP32-C5 rev v1.0 (dual-band Wi-Fi 6 + BLE 5 +

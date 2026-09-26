@@ -1134,6 +1134,99 @@ GPS_STATUS_ACQUIRING_PAYLOAD = raw(
 GPS_STATUS_FIX_PAYLOAD = status_payload(GPS_REQUEST_ID, "fix", GPS_RESULT_FIX)
 
 
+# =====================================================================================
+# meshcore_scan command/status payloads (docs/PROTOCOL.md "`meshcore_scan` command and
+# status payloads", Heltec-only). Poll-only, single `status` action, no partial/complete
+# streaming -- see cbor_meshcore.h's sizing-note comment for why FEB_MESHCORE_MAX_NODES_
+# PER_RESULT must be small enough that a full worst-case-sized batch still fits inside
+# FEB_CBOR_MAX_PAYLOAD (512 bytes); MESHCORE_STATUS_WORST_CASE_PAYLOAD below is exactly
+# that worst case and is asserted (both here and in the C host test) to fit.
+# =====================================================================================
+
+def meshcore_node_result(node_id_hex: str, name, role: str, rssi_dbm: int, last_seen_ms: int,
+                          lat=None, lon=None) -> bytes:
+    assert len(node_id_hex) == 16, "node_id must be exactly 16 hex chars"
+    assert -128 <= rssi_dbm <= 127, "rssi_dbm must fit the +128 unsigned-offset encoding"
+    has_location = lat is not None and lon is not None
+    count = 4 + (1 if name is not None else 0) + (2 if has_location else 0)
+    out = cbor_map_header(count)
+    out += cbor_text("node_id") + cbor_text(node_id_hex)
+    if name is not None:
+        out += cbor_text("name") + cbor_text(name)
+    out += cbor_text("role") + cbor_text(role)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    out += cbor_text("last_seen_ms") + cbor_uint(last_seen_ms)
+    if has_location:
+        lat_e7_offset = int(round(lat * 1e7)) + 900000000
+        lon_e7_offset = int(round(lon * 1e7)) + 1800000000
+        assert 1 <= lat_e7_offset <= 1800000001
+        assert 1 <= lon_e7_offset <= 3600000001
+        out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
+        out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
+    return out
+
+
+def meshcore_result(nodes, total_known_nodes: int) -> bytes:
+    out = cbor_array_header(len(nodes))
+    for n in nodes:
+        out += n
+    out = cbor_map_header(2) + cbor_text("nodes") + out
+    out += cbor_text("total_known_nodes") + cbor_uint(total_known_nodes)
+    return out
+
+
+MESHCORE_REQUEST_ID = 701
+
+# ---- <meshcore-node> vectors: NODE1 is a normal entry with a name, no location (ADVERT
+# flags bit 0x10 clear). NODE2 has no name at all (optional-field omission, appdata flags
+# bit 0x80 clear) but does carry a location, and sits at the rssi_offset encoding's low
+# extreme (-128). NODE_BAD_LOCATION_PAIR is a hand-crafted malformed record (lat_e7_offset
+# present, lon_e7_offset absent) that must be rejected FEB_CBOR_ERR_MISSING_FIELD -- the
+# same pairing-enforcement cbor_wardriving.c's ble_window_ms/ble_interval_ms gets. ----
+MESHCORE_NODE1 = meshcore_node_result("aabbccddeeff0011", "Bob's Node", "repeater", -70, 12345)
+MESHCORE_NODE2 = meshcore_node_result("1122334455667788", None, "sensor", -128, 999999,
+                                       lat=42.3601, lon=-71.0589)
+
+MESHCORE_NODE_BAD_LOCATION_PAIR = raw(
+    cbor_map_header(5),
+    cbor_text("node_id"), cbor_text("abcdef0123456789"),
+    cbor_text("role"), cbor_text("chat"),
+    cbor_text("rssi_offset"), cbor_uint(200),
+    cbor_text("last_seen_ms"), cbor_uint(1000),
+    cbor_text("lat_e7_offset"), cbor_uint(900000000))
+
+MESHCORE_RESULT_SINGLE = meshcore_result([MESHCORE_NODE1], 1)
+# total_known_nodes (5) > len(nodes) (2) deliberately -- exercises the Flipper-side
+# truncation signal (a real table holding more nodes than one status reply can carry).
+MESHCORE_RESULT_MULTI = meshcore_result([MESHCORE_NODE1, MESHCORE_NODE2], 5)
+MESHCORE_RESULT_EMPTY = meshcore_result([], 0)
+
+# ---- worst-case sizing vector: FEB_MESHCORE_MAX_NODES_PER_RESULT (6) nodes, each at every
+# field's own simultaneous worst-case declared length (16-char node_id, 24-char name,
+# 11-char "room_server" role -- the longest defined role string --, rssi_offset==255,
+# last_seen_ms >= 2^32 so it needs CBOR's full 9-byte uint64 encoding, both lat/lon present
+# at their max offset). See cbor_meshcore.h's sizing-note comment. ----
+MESHCORE_WORST_NODE_ID = "abcdef0123456789"
+MESHCORE_WORST_NAME = "A" * 24
+MESHCORE_WORST_ROLE = "room_server"
+MESHCORE_NODE_WORST = meshcore_node_result(MESHCORE_WORST_NODE_ID, MESHCORE_WORST_NAME,
+                                            MESHCORE_WORST_ROLE, 127, 5000000000,
+                                            lat=90.0, lon=180.0)
+MESHCORE_RESULT_WORST_CASE = meshcore_result([MESHCORE_NODE_WORST] * 3, 3)
+
+MESHCORE_COMMAND_PAYLOAD = command_payload("meshcore_scan", MESHCORE_REQUEST_ID, cbor_map_header(0))
+MESHCORE_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
+    "meshcore_scan", MESHCORE_REQUEST_ID, cbor_map_header(1) + cbor_text("foo") + cbor_uint(1))
+
+MESHCORE_STATUS_PAYLOAD = status_payload(MESHCORE_REQUEST_ID, "ok", MESHCORE_RESULT_MULTI)
+MESHCORE_STATUS_EMPTY_PAYLOAD = status_payload(MESHCORE_REQUEST_ID, "ok", MESHCORE_RESULT_EMPTY)
+MESHCORE_STATUS_WORST_CASE_PAYLOAD = status_payload(MESHCORE_REQUEST_ID, "ok", MESHCORE_RESULT_WORST_CASE)
+assert len(MESHCORE_STATUS_WORST_CASE_PAYLOAD) <= 512, (
+    "FEB_MESHCORE_MAX_NODES_PER_RESULT's worst-case batch no longer fits FEB_CBOR_MAX_PAYLOAD "
+    f"(got {len(MESHCORE_STATUS_WORST_CASE_PAYLOAD)} bytes) -- lower the constant in "
+    "cbor_meshcore.h")
+
+
 def c_bytes(name: str, data: bytes) -> str:
     hex_bytes = ", ".join(f"0x{b:02x}" for b in data)
     wrapped = textwrap.fill(hex_bytes, width=96, initial_indent="    ", subsequent_indent="    ")
@@ -1490,6 +1583,47 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_GPS_STATUS_NO_SIGNAL_PAYLOAD", GPS_STATUS_NO_SIGNAL_PAYLOAD))
     f.write(c_bytes("FEB_VEC_GPS_STATUS_ACQUIRING_PAYLOAD", GPS_STATUS_ACQUIRING_PAYLOAD))
     f.write(c_bytes("FEB_VEC_GPS_STATUS_FIX_PAYLOAD", GPS_STATUS_FIX_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* ---- meshcore_scan command/status payloads (docs/PROTOCOL.md \"`meshcore_scan`\n")
+    f.write("   command and status payloads\", Heltec-only). ---- */\n\n")
+
+    f.write("/* <meshcore-node> vectors: NODE1 has a name, no location. NODE2 has no name at\n")
+    f.write("   all (optional-field omission) but does carry a location, and sits at the\n")
+    f.write("   rssi_offset encoding's low extreme. NODE_BAD_LOCATION_PAIR carries\n")
+    f.write("   lat_e7_offset without lon_e7_offset -- must be rejected FEB_CBOR_ERR_MISSING_\n")
+    f.write("   FIELD (the pairing enforcement cbor_wardriving.c's ble_window_ms/\n")
+    f.write("   ble_interval_ms also gets). */\n")
+    f.write(c_bytes("FEB_VEC_MESHCORE_NODE1", MESHCORE_NODE1))
+    f.write(c_bytes("FEB_VEC_MESHCORE_NODE2", MESHCORE_NODE2))
+    f.write(c_bytes("FEB_VEC_MESHCORE_NODE_BAD_LOCATION_PAIR", MESHCORE_NODE_BAD_LOCATION_PAIR))
+    f.write("\n")
+
+    f.write("/* result maps ({\"nodes\": [...], \"total_known_nodes\": N}): one node, two nodes\n")
+    f.write("   with total_known_nodes > nodes.length (a truncated listing), the empty case,\n")
+    f.write("   and the worst-case-sized batch (FEB_MESHCORE_MAX_NODES_PER_RESULT nodes, every\n")
+    f.write("   field at its own simultaneous worst-case length) confirming\n")
+    f.write("   FEB_MESHCORE_MAX_NODES_PER_RESULT still fits FEB_CBOR_MAX_PAYLOAD. */\n")
+    f.write(c_bytes("FEB_VEC_MESHCORE_RESULT_SINGLE", MESHCORE_RESULT_SINGLE))
+    f.write(c_bytes("FEB_VEC_MESHCORE_RESULT_MULTI", MESHCORE_RESULT_MULTI))
+    f.write(c_bytes("FEB_VEC_MESHCORE_RESULT_EMPTY", MESHCORE_RESULT_EMPTY))
+    f.write(c_bytes("FEB_VEC_MESHCORE_RESULT_WORST_CASE", MESHCORE_RESULT_WORST_CASE))
+    f.write("\n")
+
+    f.write("/* command payload: valid (empty arguments) and malformed (non-empty arguments,\n")
+    f.write("   must be rejected with error code invalid_command -- same split as\n")
+    f.write("   wifi_scan/ble_scan/gps). */\n")
+    f.write(c_bytes("FEB_VEC_MESHCORE_COMMAND_PAYLOAD", MESHCORE_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHCORE_COMMAND_BAD_ARGUMENTS_PAYLOAD", MESHCORE_COMMAND_BAD_ARGUMENTS_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* status payloads: state is always \"ok\" (no multi-state lifecycle), result\n")
+    f.write("   always present. WORST_CASE is the full status payload wrapping\n")
+    f.write("   FEB_VEC_MESHCORE_RESULT_WORST_CASE -- must stay <= FEB_CBOR_MAX_PAYLOAD\n")
+    f.write("   (asserted at generation time above; re-asserted by the C host test). */\n")
+    f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_PAYLOAD", MESHCORE_STATUS_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD", MESHCORE_STATUS_EMPTY_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD", MESHCORE_STATUS_WORST_CASE_PAYLOAD))
 
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 

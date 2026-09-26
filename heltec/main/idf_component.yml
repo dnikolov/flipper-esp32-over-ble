@@ -1,0 +1,9 @@
+# Managed dependency for the `meshcore_scan` capability (docs/PLAN.md's "MeshCore Scan
+# Capability" design plan): a mature, actively-maintained SX127x driver with interrupt-driven
+# continuous-receive support, instead of writing a raw LoRa PHY/register driver from scratch.
+# Registered ESP-IDF component name after the manager fetches this is "jgromes__radiolib"
+# (namespace__name, not the "RadioLib" name used by the library's own in-repo examples that
+# reference it via a local path) -- see CMakeLists.txt's REQUIRES list.
+dependencies:
+  jgromes/radiolib:
+    version: "^7.7.1"

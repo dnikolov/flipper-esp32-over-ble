@@ -1,1 +1,1 @@
-idf_component_register(SRCS "framing.c" "pairing_crypto.c" "pairing.c" "session_crypto.c" "session.c" "cbor_primitives.c" "cbor_records.c" "cbor_wifi_scan.c" "cbor_ble_scan.c" "cbor_wardriving.c" "cbor_gps.c" INCLUDE_DIRS "." REQUIRES mbedtls)
+idf_component_register(SRCS "framing.c" "pairing_crypto.c" "pairing.c" "session_crypto.c" "session.c" "cbor_primitives.c" "cbor_records.c" "cbor_wifi_scan.c" "cbor_ble_scan.c" "cbor_wardriving.c" "cbor_gps.c" "cbor_meshcore.c" INCLUDE_DIRS "." REQUIRES mbedtls)

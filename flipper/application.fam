@@ -3,7 +3,7 @@ App(
     name="ESP32 over BLE",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="flipper_esp32_over_ble_app",
-    sources=["flipper_esp32_over_ble.c", "framing.c", "cbor_primitives.c", "cbor_records.c", "cbor_wifi_scan.c", "cbor_ble_scan.c", "cbor_wardriving.c", "cbor_gps.c", "wardriving_csv.c", "pairing_crypto.c", "pairing.c", "session_crypto.c", "session.c"],
+    sources=["flipper_esp32_over_ble.c", "framing.c", "cbor_primitives.c", "cbor_records.c", "cbor_wifi_scan.c", "cbor_ble_scan.c", "cbor_wardriving.c", "cbor_gps.c", "cbor_meshcore.c", "wardriving_csv.c", "pairing_crypto.c", "pairing.c", "session_crypto.c", "session.c"],
     requires=["gui", "bt"],
     stack_size=4 * 1024,
     fap_category="Connectivity",

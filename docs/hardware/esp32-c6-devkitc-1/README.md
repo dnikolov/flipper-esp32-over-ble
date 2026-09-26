@@ -41,6 +41,28 @@ The public `esp-dev-kits` repository currently provides the board-guide source a
 - The guide lists USB Type-C power, 5 V/GND headers, and 3V3/GND headers as power options. Treat these as mutually exclusive unless the board schematic explicitly approves the combined configuration.
 - J5 is provided for current measurement. Its jumper changes the module power path; retain it for normal operation unless performing a planned current measurement.
 
+## Phase 9 cluster inter-board UART link (wired 2026-09-26)
+
+Physically wired to a Heltec WiFi LoRa 32 V2 board for [docs/CLUSTER.md](../../CLUSTER.md)'s
+UART star topology (Heltec↔C6 leg). GPIO18/19 chosen because they're already electrically
+proven on this exact unit (same pins the standalone `esp32/main/location.c` GPS driver uses),
+and neither is a strapping/reserved pin.
+
+| Signal | C6 GPIO | Heltec GPIO | Wire color |
+| --- | --- | --- | --- |
+| C6 TX → Heltec RX | GPIO19 | GPIO33 | green |
+| Heltec TX → C6 RX | GPIO18 | GPIO32 | yellow |
+| GND | — | — | (connected) |
+
+**C6 side hardware-verified 2026-09-26**: `esp32/uart_link_test/` flashed to COM9 (confirmed via
+PnP VID/PID `303A:1001`, not assumed from a prior session), boots cleanly with no crash/reset
+loop, and transmits `"C6->HELTEC\n"` on a steady 1000ms cadence. A single stray 1-byte RX
+capture appeared once, before the Heltec side existed to drive the (then-floating) RX line —
+almost certainly floating-pin noise, not a real receive; recheck only if it recurs with the link
+actually connected. Still open: the Heltec side flash + the actual byte-round-trip test (Phase 9
+step 1's real "done when" bar) — blocked on confirming the Heltec's XTAL32 crystal footprint
+first.
+
 ## Firmware baseline
 
 Use ESP-IDF with the `esp32c6` target. Do not carry forward classic ESP32 or Heltec V2 pin mappings: this board has no onboard LoRa or OLED, includes IEEE 802.15.4, and has native USB hardware.

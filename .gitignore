@@ -2,6 +2,11 @@
 build/
 *.log
 
+# ESP-IDF component manager's fetched dependency sources (reproducible from each target's
+# idf_component.yml + dependencies.lock, which ARE tracked -- first needed 2026-09-26 when
+# heltec/ added jgromes/radiolib for the `meshcore_scan` capability)
+managed_components/
+
 # Editor/OS cruft
 .vscode/
 Thumbs.db

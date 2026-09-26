@@ -19,6 +19,11 @@ This plan implements the trusted-environment BLE pairing decision in [DECISIONS.
   scan/join code. **Explicit scope cut: no factory-reset support** — this board has no onboard
   pushbutton (see `docs/BACKLOG.md` BL15). See the "Phase 8: OLIMEX MOD-ESP32-C5 board support"
   section below for step tracking.
+- **Phase 9 (design frozen 2026-09-26):** wired cluster — C6, C5, and Heltec wired together over
+  UART, each dedicated to one scanning job (C6: 2.4GHz `wifi_scan`, C5: 5GHz `wifi_scan`, Heltec:
+  coordinator/`ble_scan`/`meshcore_scan`/GPS/wardriving aggregation) to eliminate radio
+  coexistence by construction and share one physical GPS module. Full design:
+  [docs/CLUSTER.md](CLUSTER.md). See the "Phase 9" section below for step tracking.
 
 For the full dated narrative of how each phase/step was designed, implemented, and debugged, see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md). For current state, see [docs/SESSION_MEMORY.md](SESSION_MEMORY.md); for the open backlog, see [docs/BACKLOG.md](BACKLOG.md).
 
@@ -884,6 +889,112 @@ adaptations only:
 - Do not carry forward C6/Heltec pin mappings, LED wiring, or radio-coexistence bounds to this
   board, or vice versa — this board's radio (dual-band Wi-Fi 6 + BLE 5 + 802.15.4) has no
   validated coexistence sweep of its own yet, same caution as Phase 4 step 5's gap for Heltec.
+
+## Phase 9: wired cluster (C6 + C5 + Heltec, distributed scanning)
+
+**Status: design frozen 2026-09-26, no code written yet.** Full design (motivation, role
+assignment and why, physical wiring, inter-board protocol sketch, composite behaviors, open
+questions): [docs/CLUSTER.md](CLUSTER.md) — read that first, this section is step tracking only.
+
+**Same gate-override pattern as Phase 4/6/7/8**: does not wait on any other phase's backlog.
+
+**Roles** (forced/derived, not arbitrary — see CLUSTER.md's reasoning): Heltec is the
+coordinator (sole Flipper BLE link, `ble_scan`, `meshcore_scan`, GPS, wardriving
+aggregation/flash-log/CSV); C6 does `wifi_scan` 2.4GHz-only; C5 does `wifi_scan` 5GHz-only.
+Neither C6 nor C5 talks BLE to the Flipper in cluster mode, and their standalone
+BLE-to-Flipper builds are kept as a separate, unaffected build variant — confirmed with the
+user, no regression to solo operation for either board.
+
+### Step breakdown
+
+**1. Physical wiring + inter-board link bring-up.** Wire Heltec↔C6 and Heltec↔C5 UART links
+(TX/RX/GND only, no shared bus). Pick GPIO pins per board avoiding strapping/JTAG pins
+(GPIO0/4/5/8/9/15) and record them in each board's `docs/hardware/*/README.md` once chosen —
+this needs the physical boards in hand, not guessed ahead of time.
+
+**Done when:** a raw byte round-trips over both links on real hardware, with no protocol logic
+yet — just confirming the wiring and UART peripherals work.
+
+**2. Inter-board framing.** Design and implement the minimal checksummed, unencrypted
+length-prefixed frame format from CLUSTER.md as a new shared component (mirroring
+`components/feb_protocol/`'s pattern), so coordinator and worker sides implement it identically.
+No third-party library — hand-rolled, matching this project's existing codec convention.
+
+**Done when:** host-native tests exercise encode/decode plus rejection of malformed/corrupted
+frames (checksum mismatch, truncated length), the same bar `framing.c`'s existing tests already
+meet for the BLE-facing protocol.
+
+**3. Cluster-mode worker firmware (C6, C5).** A new build variant, single-band Wi-Fi-scan-only,
+with no BLE stack, no pairing/session/crypto code compiled in at all. Reports `scan_result`
+frames continuously over its UART link. Built alongside each board's existing standalone
+`main.c` — not a replacement.
+
+**Done when:** each board's cluster-mode build boots and streams recognizable frames out its
+UART, verified with a host-side (PC) serial capture, before any coordinator-side code exists to
+consume them.
+
+**C6 half: ✅ build-verified 2026-09-26**, hardware-verification pending. New permanent project
+`esp32/cluster_worker/` (sibling to `esp32/main/`, untouched), wired to the new
+`components/feb_cluster_link/` shared component. `idf.py build` clean, zero warnings. 2.4GHz-only
+Wi-Fi STA scan, no BLE/crypto; sends `WORKER_HELLO` every 1000ms; a single-owner
+`scan_ctl_task`/FreeRTOS-queue design (a plain-FreeRTOS analogue of the standalone firmware's
+`ble_npl_callout` handoff pattern, since there's no NimBLE host task here) reacts to
+`SCAN_CONFIG_SET`'s `mode` (idle/continuous/manual-one-shot) and `dwell_mode`, reusing the
+standalone firmware's phy-generation-collapsing/auth-mapping/swelling-timing logic directly
+rather than re-deriving it. One real gap found and flagged, not solved:
+`dwell_mode=speed_based` has no GPS on this board and no speed field in the frame to carry one —
+see CLUSTER.md's "Open questions". A stack-overflow risk found during the coordinator-dispatch
+pass (a ~4KB multi-frame array as a stack-local in a 4096-byte task) is **fixed** — switched to
+byte-at-a-time decoding via `feb_cluster_decoder_feed_byte()`, task stack bumped to 6144 for
+headroom; rebuilt clean, host tests still 25/25. C5 half not started — follows once this pair
+(Heltec+C6) is confirmed working end-to-end, per the staged rollout above.
+
+**4. Coordinator dispatch (Heltec).** Worker presence detection (`worker_hello`), config
+forwarding (`scan_config_set`), and a manual-scan request/merge/reply path wired into the
+existing `capability_query`/`command` dispatch — a real Flipper `wifi_scan` request now merges
+results from two physically separate radios into one reply.
+
+**Done when:** a real Flipper's manual `wifi_scan` against Heltec returns a single merged
+top-32 list sourced from both C6 (2.4GHz) and C5 (5GHz) hardware, hardware-verified end-to-end.
+
+**Heltec↔C6 half: ✅ build-verified 2026-09-26**, hardware-verification pending. Additive change
+to the existing standalone `heltec/main/main.c` (no separate build variant — presence detection
+happens at runtime, so an unwired board behaves exactly as before). UART2 (TX=GPIO32/RX=GPIO33
+— UART1 was already GPS's). `wifi_scan` now proxies to the C6 worker when a `WORKER_HELLO`
+arrived within the last 3000ms, else falls back to today's local-radio scan unchanged;
+`wardriving`'s Wi-Fi source is untouched (step 5 scope, not this one). Existing top-32-by-RSSI
+selection logic reused verbatim for both sourcing paths, not duplicated. A real stack-overflow
+risk was found and is being fixed in the C6 worker side during this same pass (a ~4KB frame
+array as a stack-local in a 4096-byte task — same recurring bug class this project has hit four
+times before). The numeric→text `phy`/`auth` conversion stays coordinator-only for now (only
+consumer that exists) — not promoted to a shared header, revisit if a second consumer appears.
+
+**5. Wardriving composite.** Coordinator forwards config at `start`, continuously ingests both
+workers' streamed scan hits, geotags/dedups/logs them alongside its own `ble_scan` hits into the
+same flash-backed circular log, exactly as today's single-board wardriving engine already does
+for one source.
+
+**Done when:** a live multi-minute wardriving run produces one merged flash log/CSV export
+containing all three scan sources (C6's 2.4GHz, C5's 5GHz, Heltec's own BLE) with GPS
+timestamps, hardware-verified.
+
+**6. Worker-absence / degraded-mode behavior.** Define and implement what the coordinator
+reports to the Flipper when a worker's UART link is down or never sent `worker_hello` — a
+product decision CLUSTER.md deliberately leaves open, not an engineering default to assume.
+
+**Done when:** unplugging a worker mid-session produces defined, tested behavior (not a hang or
+crash), and the decision made is recorded here or in CLUSTER.md.
+
+**Staged rollout, confirmed 2026-09-26**: implementation proceeds with Heltec+C6 wired and
+validated first (steps 1-6 exercised end-to-end as a two-board cluster: coordinator +
+2.4GHz-only worker), before C5 is wired in at all. C5's 5GHz `wifi_scan` worker (repeating
+steps 1/3/4 for the second link) is a follow-on once the Heltec↔C6 pair is confirmed working —
+not built/wired simultaneously with C6 from the start.
+
+**Explicitly out of this phase's "done when" bar** (carried-forward, pre-existing, unrelated
+gaps — see CLUSTER.md's "Open questions"): a coexistence sweep for Heltec's LoRa radio running
+concurrently with its own combo-radio BLE activity (`docs/BACKLOG.md` BL19-class gap, unchanged
+by this design).
 
 ## Backlog
 
