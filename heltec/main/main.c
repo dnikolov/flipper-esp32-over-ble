@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -23,9 +24,12 @@
 #include "nvs_flash.h"
 
 #include "cbor_codec.h"
+#include "cluster_link.h"
 #include "factory_reset.h"
 #include "framing.h"
 #include "location.h"
+#include "meshcore_radio.h"
+#include "meshcore_table.h"
 #include "pairing.h"
 #include "pairing_crypto.h"
 #include "session.h"
@@ -105,6 +109,36 @@ static const char *TAG = "flipper_heltec_over_ble";
 #define FEB_BLE_SCAN_RAW_MAX 64u
 #define FEB_BLE_SCAN_WINDOW_MS 10000u
 #define FEB_BLE_SCAN_STATUS_ENCODE_HEADROOM 32u
+
+/* Phase 9 cluster inter-board UART link (docs/CLUSTER.md, this board's own
+   docs/hardware/heltec-wifi-lora-32-v2/README.md "Phase 9 cluster inter-board UART link"
+   section, hardware-confirmed 2026-09-26): UART_NUM_1 is already location.c's GPS UART on
+   this board, so this link uses UART_NUM_2 instead -- checked before picking a port, per
+   this agent's own read discipline. TX=GPIO32 -> C6 RX/GPIO18, RX=GPIO33 <- C6 TX/GPIO19.
+   Proxies only the wifi_scan capability's manual one-shot path to a present 2.4GHz worker
+   (esp32/cluster_worker/) -- wardriving's Wi-Fi source stays local-radio-only, unchanged
+   (a later, separate step per docs/CLUSTER.md's "Composite behaviors"). */
+#define FEB_CLUSTER_UART_PORT UART_NUM_2
+#define FEB_CLUSTER_UART_TX_GPIO 32
+#define FEB_CLUSTER_UART_RX_GPIO 33
+#define FEB_CLUSTER_UART_BAUD 115200u
+#define FEB_CLUSTER_UART_RX_BUF_SIZE 2048u
+#define FEB_CLUSTER_RX_CHUNK_SIZE 256u
+/* Task-stack-local decoder/frame buffers (see cluster_link_rx_task()'s own comment) push this
+   above the other lightweight tasks' 3072-byte precedent (location_task()'s FEB_GPS_TASK_STACK_SIZE,
+   factory_reset_task, reconnect_task) -- feb_cluster_decoder_t + feb_cluster_frame_t alone are
+   ~1KB, plus the chunk buffer and normal call-frame/switch-case overhead. */
+#define FEB_CLUSTER_RX_TASK_STACK_SIZE 4096u
+/* 3 missed 1000ms WORKER_HELLO beacons, per docs/CLUSTER.md's own stated presence rule. */
+#define FEB_CLUSTER_HELLO_TIMEOUT_MS 3000u
+/* Bounded wait for the worker's scan_batch_done after arming a manual one-shot scan.
+   Unvalidated/borrowed, not derived from any Heltec- or C6-specific coexistence measurement
+   (none exists yet) -- this is a UART-link wait bound, not a radio-coexistence bound, and a
+   2.4GHz-only manual scan is the lower-risk one-shot shape this project's coexistence notes
+   call out (see this agent's own scope notes) rather than a continuous concurrent capture.
+   Picked generously above a typical ~1.5-2s default esp_wifi_scan_start() sweep across all
+   14 2.4GHz channels plus UART transfer time for the result batch. */
+#define FEB_CLUSTER_MANUAL_SCAN_TIMEOUT_MS 5000u
 
 /* `wardriving` capability constants, ported unchanged from esp32/main/main.c -- see that
    file's fuller comments (interval bounds/defaults live in wardriving_validate.h, shared
@@ -216,7 +250,7 @@ static uint8_t rt_ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
 #define FEB_TX_PENDING_PROTECTED_COUNT 4u
 #define FEB_TX_PENDING_TYPE_MAX 32u
 
-static const char *const feb_features[] = {"wifi_scan", "ble_scan", "gps", "wardriving"};
+static const char *const feb_features[] = {"wifi_scan", "ble_scan", "gps", "wardriving", "meshcore_scan"};
 #define FEB_FEATURE_COUNT (sizeof(feb_features) / sizeof(feb_features[0]))
 
 /* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": wardriving's Wi-Fi/BLE
@@ -292,6 +326,20 @@ static uint16_t wifi_scan_send_next_index;
 static volatile bool wifi_scan_in_progress;
 static uint64_t wifi_scan_request_id;
 static struct ble_npl_callout wifi_scan_done_co;
+
+/* Phase 9 cluster inter-board UART link state. cluster_worker_last_hello_ms is written only
+   by cluster_link_rx_task() and read (without a lock) by cluster_worker_is_present() -- a
+   single-scalar timestamp update/read, same convention as wifi_scan_in_progress above (no
+   spinlock for a lone scalar in this file). cluster_scan_collecting is a two-way flag
+   (cluster_link_rx_task() clears it on scan_batch_done, cluster_scan_timeout_cb() clears it
+   on the NimBLE host task if scan_batch_done never arrives) -- guarded by
+   cluster_link_spinlock so exactly one of those two paths acts on any given manual scan,
+   same shape as location.c's location_spinlock guarding its own multi-writer state. */
+static portMUX_TYPE cluster_link_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t cluster_worker_last_hello_ms;
+static bool cluster_scan_collecting; /* guarded by cluster_link_spinlock */
+static struct ble_npl_callout cluster_scan_done_co;
+static struct ble_npl_callout cluster_scan_timeout_co;
 
 /* `ble_scan` per-window BLE device catalog, ported unchanged from esp32/main/main.c.
    Written only from gap_event()'s BLE_GAP_EVENT_DISC case (NimBLE host task) while
@@ -379,9 +427,17 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
 static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void handle_ble_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+static void handle_meshcore_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wifi_scan_send_next_batch(uint16_t conn_handle);
 static void wifi_scan_done_cb(struct ble_npl_event *ev);
 static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
+static void wifi_scan_select_top32(uint16_t raw_count);
+static void wifi_scan_start_local(uint16_t conn_handle);
+static void cluster_link_init(void);
+static bool cluster_worker_is_present(void);
+static void cluster_link_send_scan_config(uint8_t mode);
+static void cluster_scan_done_cb(struct ble_npl_event *ev);
+static void cluster_scan_timeout_cb(struct ble_npl_event *ev);
 static void ble_scan_catalog_advertisement(const struct ble_gap_disc_desc *disc);
 static void ble_scan_send_next_batch(uint16_t conn_handle);
 static void ble_scan_window_close_cb(struct ble_npl_event *ev);
@@ -1058,45 +1114,17 @@ static const char *ble_scan_addr_type_str(uint8_t addr_type)
    records, since that touches connection_handle/rt_tx_sequence/tx_fragment_* state owned by
    the NimBLE host task. Ported unchanged from esp32/main/main.c's manual-scan (non-
    wardriving) path -- this board has no wardriving source to hand raw results off to. */
-static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+/* Shared by wifi_scan_done_handler()'s local-radio path and the Phase 9 cluster-link
+   worker-sourced path (cluster_scan_done_cb()) -- selects the FEB_WIFI_SCAN_MAX_APS_PER_RECORD
+   (32) strongest of wifi_scan_raw_records[0..raw_count) by RSSI and converts them into
+   wire-ready feb_wifi_scan_ap_t entries in wifi_scan_selected[], in place. Extracted 2026-09-26
+   so a worker-sourced batch reuses the exact same top-32 truncation the local scan path
+   already had, instead of a second copy of this loop. */
+static void wifi_scan_select_top32(uint16_t raw_count)
 {
-    uint16_t total_found = 0;
-    uint16_t raw_count;
-    uint16_t keep;
+    uint16_t keep = (raw_count < FEB_WIFI_SCAN_MAX_APS_PER_RECORD) ? raw_count : FEB_WIFI_SCAN_MAX_APS_PER_RECORD;
     uint16_t k;
 
-    (void)arg;
-    (void)base;
-    (void)id;
-    (void)data;
-
-    if (esp_wifi_scan_get_ap_num(&total_found) != ESP_OK) {
-        total_found = 0;
-    }
-    raw_count = (total_found > FEB_WIFI_SCAN_RAW_MAX) ? FEB_WIFI_SCAN_RAW_MAX : total_found;
-    if (raw_count > 0 && esp_wifi_scan_get_ap_records(&raw_count, wifi_scan_raw_records) != ESP_OK) {
-        raw_count = 0;
-    }
-    if (total_found > FEB_WIFI_SCAN_RAW_MAX) {
-        ESP_LOGW(TAG, "wifi_scan found %u APs, exceeding the %u-entry raw-fetch bound; only "
-                      "the first %u (driver order, not RSSI order) are candidates for the "
-                      "top-%u selection", (unsigned)total_found, (unsigned)FEB_WIFI_SCAN_RAW_MAX,
-                 (unsigned)FEB_WIFI_SCAN_RAW_MAX, (unsigned)FEB_WIFI_SCAN_MAX_APS_PER_RECORD);
-    }
-
-    if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
-        /* G30 fix, ported unchanged from esp32/main/main.c: the wardriving dedup/append loop
-           runs in wifi_scan_done_cb() on the NimBLE host task instead -- the same task that
-           reads this log via wardriving_send_next_batch() -- so the two can never interleave.
-           This handler's only remaining job for the wardriving source is to hand the raw scan
-           results across that task boundary, same shape as the non-wardriving branch below
-           already uses wifi_scan_done_co for. */
-        wifi_scan_raw_count = raw_count;
-        ble_npl_callout_reset(&wifi_scan_done_co, 0);
-        return;
-    }
-
-    keep = (raw_count < FEB_WIFI_SCAN_MAX_APS_PER_RECORD) ? raw_count : FEB_WIFI_SCAN_MAX_APS_PER_RECORD;
     for (k = 0; k < keep; k++) {
         uint16_t best = k;
         uint16_t j;
@@ -1135,6 +1163,45 @@ static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id,
 
     wifi_scan_found_count = keep;
     wifi_scan_send_next_index = 0;
+}
+
+static void wifi_scan_done_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    uint16_t total_found = 0;
+    uint16_t raw_count;
+
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+
+    if (esp_wifi_scan_get_ap_num(&total_found) != ESP_OK) {
+        total_found = 0;
+    }
+    raw_count = (total_found > FEB_WIFI_SCAN_RAW_MAX) ? FEB_WIFI_SCAN_RAW_MAX : total_found;
+    if (raw_count > 0 && esp_wifi_scan_get_ap_records(&raw_count, wifi_scan_raw_records) != ESP_OK) {
+        raw_count = 0;
+    }
+    if (total_found > FEB_WIFI_SCAN_RAW_MAX) {
+        ESP_LOGW(TAG, "wifi_scan found %u APs, exceeding the %u-entry raw-fetch bound; only "
+                      "the first %u (driver order, not RSSI order) are candidates for the "
+                      "top-%u selection", (unsigned)total_found, (unsigned)FEB_WIFI_SCAN_RAW_MAX,
+                 (unsigned)FEB_WIFI_SCAN_RAW_MAX, (unsigned)FEB_WIFI_SCAN_MAX_APS_PER_RECORD);
+    }
+
+    if (wifi_scan_active_source == WIFI_SCAN_SOURCE_WARDRIVING) {
+        /* G30 fix, ported unchanged from esp32/main/main.c: the wardriving dedup/append loop
+           runs in wifi_scan_done_cb() on the NimBLE host task instead -- the same task that
+           reads this log via wardriving_send_next_batch() -- so the two can never interleave.
+           This handler's only remaining job for the wardriving source is to hand the raw scan
+           results across that task boundary, same shape as the non-wardriving branch below
+           already uses wifi_scan_done_co for. */
+        wifi_scan_raw_count = raw_count;
+        ble_npl_callout_reset(&wifi_scan_done_co, 0);
+        return;
+    }
+
+    wifi_scan_select_top32(raw_count);
     ble_npl_callout_reset(&wifi_scan_done_co, 0);
 }
 
@@ -1287,13 +1354,292 @@ static void wifi_scan_send_next_batch(uint16_t conn_handle)
     }
 }
 
-/* Ported unchanged from esp32/main/main.c. */
+/* Phase 9 cluster inter-board UART link (docs/CLUSTER.md). Converts one worker-sourced
+   feb_cluster_scan_result_t into the wifi_ap_record_t shape wifi_scan_select_top32() already
+   knows how to sort/convert -- only the fields wifi_scan_phy_str()/wifi_scan_auth_str()/the
+   selection loop actually read are filled in (ssid, bssid, primary, rssi, authmode, phy_11*
+   bits), everything else stays zeroed. `auth` is a direct cast: FEB_CLUSTER_AUTH_* 0..16
+   mirror wifi_auth_mode_t's own numeric values exactly (cluster_link.h's own comment), and
+   wifi_scan_auth_str()'s switch already defaults to "unknown" for anything else (including
+   FEB_CLUSTER_AUTH_UNKNOWN=17), so no range check is needed here either. */
+static void cluster_scan_result_to_ap_record(const feb_cluster_scan_result_t *in, wifi_ap_record_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out->ssid, in->ssid, in->ssid_len);
+    memcpy(out->bssid, in->bssid, FEB_CLUSTER_SCAN_RESULT_BSSID_LEN);
+    out->primary = in->channel;
+    out->rssi = in->rssi;
+    out->authmode = (wifi_auth_mode_t)in->auth;
+    switch ((feb_cluster_phy_t)in->phy) {
+    case FEB_CLUSTER_PHY_11AX:
+        out->phy_11ax = 1;
+        break;
+    case FEB_CLUSTER_PHY_11N:
+        out->phy_11n = 1;
+        break;
+    case FEB_CLUSTER_PHY_11G:
+        out->phy_11g = 1;
+        break;
+    case FEB_CLUSTER_PHY_11B:
+    default:
+        out->phy_11b = 1;
+        break;
+    }
+}
+
+/* Runs on its own dedicated task, sized (FEB_CLUSTER_RX_TASK_STACK_SIZE) with enough headroom
+   for its own locals -- unlike the BLE-callback-path tasks this project's recurring
+   BleEventWorker/task-stack-overflow bug class has hit (see docs/LESSONS.md), this task's
+   stack is a fresh heap allocation this call sizes explicitly, not a fixed shared budget
+   another subsystem also depends on, so `decoder`/`frame` (feb_cluster_frame_t alone is >500
+   bytes: FEB_CLUSTER_MAX_PAYLOAD=512 payload plus header) are deliberately task-stack-local
+   here rather than file-scope `static` -- this board's classic-ESP32 DRAM/.bss budget is
+   already tight (see heltec/CMakeLists.txt's RadioLib-exclusion comment) and two 512-byte-payload
+   structs living there permanently, for a link that's absent unless a C6 worker is physically
+   wired up, was measured to overflow it by ~4.5KB at build time; the heap this task's own stack
+   comes from has ample room by comparison. Only a single in-flight frame is ever needed (one
+   dedicated task, one byte-at-a-time decode, no batching) -- `feb_cluster_decoder_feed_byte()`
+   is called directly instead of the `_feed()` multi-frame convenience wrapper. */
+static void cluster_link_rx_task(void *arg)
+{
+    feb_cluster_decoder_t decoder;
+    uint8_t chunk[FEB_CLUSTER_RX_CHUNK_SIZE];
+    feb_cluster_frame_t frame;
+
+    (void)arg;
+    feb_cluster_decoder_init(&decoder);
+
+    for (;;) {
+        int read = uart_read_bytes(FEB_CLUSTER_UART_PORT, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
+        int i;
+
+        if (read <= 0) {
+            continue;
+        }
+        for (i = 0; i < read; i++) {
+            feb_cluster_decode_result_t result = feb_cluster_decoder_feed_byte(&decoder, chunk[i], &frame);
+
+            if (result != FEB_CLUSTER_DECODE_FRAME_READY) {
+                continue;
+            }
+            switch (frame.msg_type) {
+            case (uint8_t)FEB_CLUSTER_MSG_WORKER_HELLO: {
+                feb_cluster_worker_hello_t hello;
+
+                if (feb_cluster_decode_worker_hello(&frame, &hello)) {
+                    cluster_worker_last_hello_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                }
+                break;
+            }
+            case (uint8_t)FEB_CLUSTER_MSG_SCAN_RESULT: {
+                feb_cluster_scan_result_t scan_result;
+                bool collecting;
+
+                portENTER_CRITICAL(&cluster_link_spinlock);
+                collecting = cluster_scan_collecting;
+                portEXIT_CRITICAL(&cluster_link_spinlock);
+                if (!collecting) {
+                    /* No manual wifi_scan is currently waiting on this worker -- drop it
+                       (e.g. a straggler from a batch whose timeout already fired). */
+                    break;
+                }
+                if (feb_cluster_decode_scan_result(&frame, &scan_result) &&
+                    wifi_scan_raw_count < FEB_WIFI_SCAN_RAW_MAX) {
+                    cluster_scan_result_to_ap_record(&scan_result, &wifi_scan_raw_records[wifi_scan_raw_count]);
+                    wifi_scan_raw_count++;
+                }
+                break;
+            }
+            case (uint8_t)FEB_CLUSTER_MSG_SCAN_BATCH_DONE: {
+                feb_cluster_scan_batch_done_t done;
+                bool was_collecting;
+
+                if (!feb_cluster_decode_scan_batch_done(&frame, &done)) {
+                    break;
+                }
+                portENTER_CRITICAL(&cluster_link_spinlock);
+                was_collecting = cluster_scan_collecting;
+                cluster_scan_collecting = false;
+                portEXIT_CRITICAL(&cluster_link_spinlock);
+                if (was_collecting) {
+                    /* Handoff to the NimBLE host task, same shape as wifi_scan_done_co's own
+                       sys_evt-task-to-host-task handoff for the local-scan path. */
+                    ble_npl_callout_stop(&cluster_scan_timeout_co);
+                    ble_npl_callout_reset(&cluster_scan_done_co, 0);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+}
+
+/* Present if a WORKER_HELLO arrived within the last FEB_CLUSTER_HELLO_TIMEOUT_MS (3 missed
+   1000ms beacons), per docs/CLUSTER.md. Checked only at the moment a wifi_scan command needs
+   to decide which path to take (not polled continuously). Unsigned subtraction handles
+   esp_timer_get_time()'s ms-truncated wraparound the same way this codebase's other
+   millisecond-deadline checks do. */
+static bool cluster_worker_is_present(void)
+{
+    uint32_t last_hello_ms = cluster_worker_last_hello_ms;
+    uint32_t now_ms;
+
+    if (last_hello_ms == 0) {
+        return false;
+    }
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    return (uint32_t)(now_ms - last_hello_ms) <= FEB_CLUSTER_HELLO_TIMEOUT_MS;
+}
+
+static void cluster_link_send_scan_config(uint8_t mode)
+{
+    feb_cluster_scan_config_t cfg;
+    uint8_t frame[FEB_CLUSTER_MAX_FRAME_SIZE];
+    size_t frame_len;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = mode;
+    cfg.dwell_mode = (uint8_t)FEB_CLUSTER_DWELL_NORMAL; /* wifi_scan has no dwell-mode argument
+                                                            of its own (docs/PROTOCOL.md) --
+                                                            this is the sensible default. */
+    cfg.band_filter = (uint8_t)FEB_CLUSTER_BAND_FILTER_NA; /* only meaningful to a 5GHz worker */
+
+    frame_len = feb_cluster_encode_scan_config_set(frame, sizeof(frame), &cfg);
+    if (frame_len == 0) {
+        ESP_LOGE(TAG, "cluster_link: scan_config_set encode failed");
+        return;
+    }
+    uart_write_bytes(FEB_CLUSTER_UART_PORT, frame, frame_len);
+}
+
+/* If uart_driver_install()/uart_param_config()/uart_set_pin() fail, cluster_worker_last_hello_ms
+   simply stays 0 forever and cluster_worker_is_present() always reports absent -- wifi_scan
+   falls back to the local-radio path unconditionally, so there is no separate "link enabled"
+   flag to track. */
+static void cluster_link_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate = (int)FEB_CLUSTER_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err;
+
+    err = uart_driver_install(FEB_CLUSTER_UART_PORT, (int)FEB_CLUSTER_UART_RX_BUF_SIZE, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cluster_link: uart_driver_install failed: %s; worker proxying disabled",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = uart_param_config(FEB_CLUSTER_UART_PORT, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cluster_link: uart_param_config failed: %s; worker proxying disabled",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = uart_set_pin(FEB_CLUSTER_UART_PORT, FEB_CLUSTER_UART_TX_GPIO, FEB_CLUSTER_UART_RX_GPIO,
+                        UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cluster_link: uart_set_pin failed: %s; worker proxying disabled",
+                 esp_err_to_name(err));
+        return;
+    }
+
+    if (xTaskCreate(cluster_link_rx_task, "cluster_rx", FEB_CLUSTER_RX_TASK_STACK_SIZE, NULL,
+                    tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "cluster_link: failed to start rx task; worker proxying disabled");
+    }
+}
+
+/* Runs on the NimBLE host task (cluster_scan_done_co's queue), reached when
+   cluster_link_rx_task() decoded a scan_batch_done for the manual scan it armed. Mirrors
+   wifi_scan_done_cb()'s non-wardriving branch: check for an authenticated connection, then
+   reuse the same top-32 selection and batch-send path the local-scan source uses. */
+static void cluster_scan_done_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        ESP_LOGW(TAG, "wifi_scan (cluster-worker-sourced) completed with no authenticated "
+                      "connection; discarding %u result(s)", (unsigned)wifi_scan_raw_count);
+        wifi_scan_in_progress = false;
+        return;
+    }
+    wifi_scan_select_top32(wifi_scan_raw_count);
+    wifi_scan_send_next_batch(connection_handle);
+}
+
+/* Runs on the NimBLE host task. Fires if the worker never sent scan_batch_done within
+   FEB_CLUSTER_MANUAL_SCAN_TIMEOUT_MS of being armed -- per this task's own spec, falls back to
+   exactly today's local-radio scan path rather than reporting whatever partial worker results
+   arrived. Guarded against racing cluster_link_rx_task()'s own scan_batch_done handling via
+   cluster_link_spinlock: whichever of the two actually observes cluster_scan_collecting==true
+   is the one that acts; the other is a no-op. */
+static void cluster_scan_timeout_cb(struct ble_npl_event *ev)
+{
+    bool was_collecting;
+
+    (void)ev;
+
+    portENTER_CRITICAL(&cluster_link_spinlock);
+    was_collecting = cluster_scan_collecting;
+    cluster_scan_collecting = false;
+    portEXIT_CRITICAL(&cluster_link_spinlock);
+
+    if (!was_collecting) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "wifi_scan: cluster worker did not send scan_batch_done within %u ms; "
+                  "falling back to local-radio scan", (unsigned)FEB_CLUSTER_MANUAL_SCAN_TIMEOUT_MS);
+    wifi_scan_raw_count = 0;
+    if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        wifi_scan_in_progress = false;
+        return;
+    }
+    wifi_scan_start_local(connection_handle);
+}
+
+/* Extracted from esp32/main/main.c's inline wifi_scan_start block 2026-09-26 so the Phase 9
+   cluster-link timeout fallback (cluster_scan_timeout_cb()) can re-enter this exact path
+   without duplicating it -- uses wifi_scan_request_id/wifi_scan_in_progress, already set by
+   the caller before either this or the worker-delegation path is chosen. */
+static void wifi_scan_start_local(uint16_t conn_handle)
+{
+    wifi_scan_config_t scan_cfg;
+    esp_err_t err;
+
+    memset(&scan_cfg, 0, sizeof(scan_cfg));
+    err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
+        wifi_scan_in_progress = false;
+        if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
+                                  1, wifi_scan_request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "wifi_scan started locally (request_id=%llu)",
+             (unsigned long long)wifi_scan_request_id);
+}
+
+/* Ported from esp32/main/main.c, extended 2026-09-26 (Phase 9): delegates to a present 2.4GHz
+   cluster worker (esp32/cluster_worker/) when one is currently announcing itself via
+   WORKER_HELLO, falling back to this board's own local-radio scan otherwise -- see
+   cluster_worker_is_present()/cluster_link_send_scan_config(). The Flipper-facing reply shape
+   is identical either way (docs/CLUSTER.md's "What doesn't change": no PROTOCOL.md change). */
 static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
 {
     size_t arg_count;
     feb_cbor_status_t status;
-    esp_err_t err;
-    wifi_scan_config_t scan_cfg;
 
     if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
         arg_count != 0) {
@@ -1319,18 +1665,21 @@ static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_pay
     wifi_scan_in_progress = true;
     wifi_scan_active_source = WIFI_SCAN_SOURCE_MANUAL;
     wifi_scan_request_id = cmd->request_id;
-    memset(&scan_cfg, 0, sizeof(scan_cfg));
-    err = esp_wifi_scan_start(&scan_cfg, false);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
-        wifi_scan_in_progress = false;
-        if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
-                                  1, cmd->request_id)) {
-            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        }
+
+    if (cluster_worker_is_present()) {
+        wifi_scan_raw_count = 0;
+        portENTER_CRITICAL(&cluster_link_spinlock);
+        cluster_scan_collecting = true;
+        portEXIT_CRITICAL(&cluster_link_spinlock);
+        cluster_link_send_scan_config((uint8_t)FEB_CLUSTER_SCAN_MODE_MANUAL);
+        ble_npl_callout_reset(&cluster_scan_timeout_co,
+                              ble_npl_time_ms_to_ticks32(FEB_CLUSTER_MANUAL_SCAN_TIMEOUT_MS));
+        ESP_LOGI(TAG, "wifi_scan: 2.4GHz cluster worker present, delegating (request_id=%llu)",
+                 (unsigned long long)cmd->request_id);
         return;
     }
-    ESP_LOGI(TAG, "wifi_scan started (request_id=%llu)", (unsigned long long)cmd->request_id);
+
+    wifi_scan_start_local(conn_handle);
 }
 
 /* docs/PROTOCOL.md "`ble_scan` command and status payloads": parses one BLE_GAP_EVENT_DISC
@@ -1714,6 +2063,117 @@ static void handle_gps_command(uint16_t conn_handle, const feb_command_payload_t
     }
     ESP_LOGI(TAG, "gps status query answered (request_id=%llu, state=%s)",
              (unsigned long long)cmd->request_id, status_payload.state);
+}
+
+/* docs/PLAN.md "MeshCore Scan Capability -- Heltec Board (Phase 1)": poll-only, single
+   `status` action (no start/stop) -- the SX1276 RX task runs continuously from boot
+   (meshcore_radio_init(), called unconditionally in app_main() regardless of BLE connection
+   state, same posture as location_init()), so there is nothing here to start or stop and no
+   busy/exclusivity concept, matching handle_gps_command()'s shape exactly. `arguments` is
+   always an empty map -- this codebase has no existing single-operation capability that
+   wire-encodes an explicit "action" string (see cbor_meshcore.h's top comment); `wardriving`
+   is the only capability with one, and only because it genuinely has two operations
+   (start/stop) to distinguish. */
+static void handle_meshcore_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
+{
+    size_t arg_count;
+    feb_cbor_status_t status;
+    feb_status_payload_t status_payload = {0};
+    static feb_meshcore_status_result_payload_t result;
+    static meshcore_table_entry_t entries[FEB_MESHCORE_MAX_NODES_PER_RESULT];
+    size_t entry_count;
+    uint64_t total_known;
+    size_t i;
+    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t result_len;
+    size_t payload_len;
+
+    if (feb_cbor_decode_map_header(cmd->arguments_span, cmd->arguments_span_len, &arg_count, &status) == 0 ||
+        arg_count != 0) {
+        if (!send_protected_error(conn_handle, "invalid_command", strlen("invalid_command"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    memset(&result, 0, sizeof(result));
+    entry_count = meshcore_table_snapshot(entries, FEB_MESHCORE_MAX_NODES_PER_RESULT, &total_known);
+
+    for (i = 0; i < entry_count; i++) {
+        feb_meshcore_node_t *node = &result.nodes[i];
+        int32_t rssi_offset_signed;
+
+        node->node_id = entries[i].node_id_hex;
+        node->node_id_len = strlen(entries[i].node_id_hex);
+
+        if (entries[i].has_name) {
+            size_t name_len = strlen(entries[i].name);
+
+            if (name_len > FEB_MESHCORE_NAME_MAX_LEN) {
+                name_len = FEB_MESHCORE_NAME_MAX_LEN; /* codec bound; parser already caps
+                                                          its own name buffer well above
+                                                          this, see meshcore_proto.h */
+            }
+            node->name = entries[i].name;
+            node->name_len = name_len;
+            node->has_name = 1;
+        }
+
+        node->role = meshcore_role_to_string(entries[i].role);
+        node->role_len = strlen(node->role);
+
+        /* Clamp both directions before the unsigned +128 offset conversion: RadioLib's
+           getRSSI() is a real hardware reading (trusted), but is not itself bounded to
+           [-128, 127] dBm by contract, and an out-of-range value cast to the codec's
+           unsigned rssi_offset field would either wrap (if negative) or be rejected outright
+           by the encoder's own >255 check (if too high) -- clamping here keeps a single
+           implausible reading from failing the whole status reply. */
+        rssi_offset_signed = entries[i].rssi_dbm + 128;
+        if (rssi_offset_signed < 0) {
+            rssi_offset_signed = 0;
+        } else if (rssi_offset_signed > 255) {
+            rssi_offset_signed = 255;
+        }
+        node->rssi_offset = (uint64_t)rssi_offset_signed;
+
+        node->last_seen_ms = entries[i].last_seen_ms;
+
+        if (entries[i].has_location) {
+            node->has_location = 1;
+            node->lat_e7_offset = (uint64_t)((int64_t)entries[i].lat_e7 + 900000000LL);
+            node->lon_e7_offset = (uint64_t)((int64_t)entries[i].lon_e7 + 1800000000LL);
+        }
+    }
+    result.node_count = entry_count;
+    result.total_known_nodes = total_known;
+
+    result_len = feb_cbor_encode_meshcore_status_result_payload(result_buf, sizeof(result_buf), &result);
+    if (result_len == 0) {
+        if (!send_protected_error(conn_handle, "internal_error", strlen("internal_error"),
+                                  1, cmd->request_id)) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        return;
+    }
+
+    status_payload.request_id = cmd->request_id;
+    status_payload.state = "ok";
+    status_payload.state_len = strlen("ok");
+    status_payload.result_span = result_buf;
+    status_payload.result_span_len = result_len;
+    status_payload.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+    if (payload_len == 0 ||
+        !send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len)) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    ESP_LOGI(TAG, "meshcore_scan status query answered (request_id=%llu, %u/%llu node(s))",
+             (unsigned long long)cmd->request_id, (unsigned)entry_count,
+             (unsigned long long)total_known);
 }
 
 /* Re-arms the next Wi-Fi capture pass after wardriving_wifi_interval_ms (0 =
@@ -2414,6 +2874,9 @@ static void handle_command(uint16_t conn_handle, const feb_command_payload_t *cm
     } else if (cmd->capability_len == strlen("gps") &&
               memcmp(cmd->capability, "gps", cmd->capability_len) == 0) {
         handle_gps_command(conn_handle, cmd);
+    } else if (cmd->capability_len == strlen("meshcore_scan") &&
+              memcmp(cmd->capability, "meshcore_scan", cmd->capability_len) == 0) {
+        handle_meshcore_command(conn_handle, cmd);
     } else if (!send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
                               1, cmd->request_id)) {
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
@@ -2902,24 +3365,45 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         wardriving_tx_in_flight = false;
 
         if (wifi_scan_in_progress && wifi_scan_active_source == WIFI_SCAN_SOURCE_MANUAL) {
-            /* Don't clear wifi_scan_in_progress directly here -- the radio scan this
-               connection started may still be running, and a new connection's `command`
-               could otherwise race a still-in-flight wifi_scan_done_handler() write to
-               wifi_scan_raw_records/wifi_scan_selected from a stale scan.
-               esp_wifi_scan_stop() still fires WIFI_EVENT_SCAN_DONE for the aborted scan;
-               wifi_scan_done_cb() then finds no authenticated connection and clears the
-               flag there, uniformly. Gated to the manual source only -- wardriving's Wi-Fi
-               capture (if active) must keep running across this disconnect
-               (docs/PROTOCOL.md: "continues across BLE disconnects"), so wifi_scan_done_cb()'s
-               WARDRIVING branch does not check connection state at all. */
-            esp_err_t serr = esp_wifi_scan_stop();
+            bool cluster_was_collecting;
 
-            if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
-                ESP_LOGW(TAG, "esp_wifi_scan_stop failed during disconnect cleanup: %s",
-                         esp_err_to_name(serr));
+            portENTER_CRITICAL(&cluster_link_spinlock);
+            cluster_was_collecting = cluster_scan_collecting;
+            cluster_scan_collecting = false;
+            portEXIT_CRITICAL(&cluster_link_spinlock);
+
+            if (cluster_was_collecting) {
+                /* Phase 9 cluster-link worker-sourced scan in flight: unlike the local-scan
+                   branch below, no esp_wifi_scan_stop()-triggered WIFI_EVENT_SCAN_DONE will
+                   ever arrive here to clear wifi_scan_in_progress uniformly (the radio scan
+                   is running on the worker board, not this one) -- clear it directly and tell
+                   the worker to go idle so it doesn't keep streaming scan_result frames for a
+                   request nothing is listening for anymore. */
+                ble_npl_callout_stop(&cluster_scan_timeout_co);
+                cluster_link_send_scan_config((uint8_t)FEB_CLUSTER_SCAN_MODE_IDLE);
+                wifi_scan_in_progress = false;
+                ESP_LOGI(TAG, "wifi_scan (cluster-worker-sourced) was in progress at disconnect; "
+                              "stopping it (pending results will be discarded)");
+            } else {
+                /* Don't clear wifi_scan_in_progress directly here -- the radio scan this
+                   connection started may still be running, and a new connection's `command`
+                   could otherwise race a still-in-flight wifi_scan_done_handler() write to
+                   wifi_scan_raw_records/wifi_scan_selected from a stale scan.
+                   esp_wifi_scan_stop() still fires WIFI_EVENT_SCAN_DONE for the aborted scan;
+                   wifi_scan_done_cb() then finds no authenticated connection and clears the
+                   flag there, uniformly. Gated to the manual source only -- wardriving's Wi-Fi
+                   capture (if active) must keep running across this disconnect
+                   (docs/PROTOCOL.md: "continues across BLE disconnects"), so wifi_scan_done_cb()'s
+                   WARDRIVING branch does not check connection state at all. */
+                esp_err_t serr = esp_wifi_scan_stop();
+
+                if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
+                    ESP_LOGW(TAG, "esp_wifi_scan_stop failed during disconnect cleanup: %s",
+                             esp_err_to_name(serr));
+                }
+                ESP_LOGI(TAG, "wifi_scan was in progress at disconnect; stopping it "
+                              "(pending results will be discarded)");
             }
-            ESP_LOGI(TAG, "wifi_scan was in progress at disconnect; stopping it "
-                          "(pending results will be discarded)");
         }
 
         if (ble_scan_in_progress && ble_scan_active_source == BLE_SCAN_SOURCE_MANUAL) {
@@ -3284,6 +3768,9 @@ static void host_synced(void)
     ble_npl_callout_reset(&reassembly_timeout_co,
                           ble_npl_time_ms_to_ticks32(FEB_REASSEMBLY_CHECK_INTERVAL_MS));
     ble_npl_callout_init(&wifi_scan_done_co, nimble_port_get_dflt_eventq(), wifi_scan_done_cb, NULL);
+    ble_npl_callout_init(&cluster_scan_done_co, nimble_port_get_dflt_eventq(), cluster_scan_done_cb, NULL);
+    ble_npl_callout_init(&cluster_scan_timeout_co, nimble_port_get_dflt_eventq(),
+                        cluster_scan_timeout_cb, NULL);
     ble_npl_callout_init(&ble_scan_done_co, nimble_port_get_dflt_eventq(), ble_scan_window_close_cb, NULL);
     ble_npl_callout_init(&wardriving_wifi_interval_co, nimble_port_get_dflt_eventq(),
                         wardriving_wifi_interval_cb, NULL);
@@ -3345,6 +3832,8 @@ void app_main(void)
     feb_factory_reset_start();
 
     location_init();
+    cluster_link_init();
+    meshcore_radio_init();
     wardriving_log_init();
     wardriving_persist_load(&wardriving_persisted);
 

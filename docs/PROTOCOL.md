@@ -433,6 +433,85 @@ wear-levelling translation layer this project deliberately avoids. This has no w
 effect (the Flipper only ever sees whatever records the ESP32 still has), but is a real,
 documented behavioral property of the capability.
 
+### `meshcore_scan` command and status payloads
+
+**Heltec WiFi LoRa 32 V2 only** (the only board in this project with an onboard LoRa radio —
+see [CAPABILITIES.md](CAPABILITIES.md)). Implemented Phase 1 ("detection + display"),
+2026-09-26, build-verified only — no MeshCore hardware was available this session, so the
+parser's correctness is confirmed only against a synthetic-packet host-native test
+(`tests/esp32/test_meshcore_proto.c`), not a live capture. MeshCore is a third-party open
+LoRa mesh-network protocol, unrelated to this project's own BLE wire protocol; this capability
+passively listens for MeshCore's `ADVERT` (node advertisement) broadcast packets over LoRa RF
+and reports currently-known nodes on request. Like `gps`, it is a poll-only status query with
+no scan-duration lifecycle and no busy/exclusivity concept — the SX1276 radio listens
+continuously from boot, independent of the Wi-Fi/BLE radio the other capabilities contend
+over, so a `meshcore_scan` command never blocks on or conflicts with anything else.
+
+- `command` for `meshcore_scan`: `capability = "meshcore_scan"`, `arguments = {}` (always an
+  empty map — a non-empty `arguments` map is rejected `invalid_command`). No `action` field:
+  unlike `wardriving` (which genuinely has two operations, start/stop, to distinguish), this
+  capability has exactly one operation, so it needs no field to select it — same convention as
+  `gps`/`wifi_scan`/`ble_scan`'s own always-empty `arguments`.
+- `status` for `meshcore_scan`: `state` is always `"ok"` — there is no multi-state lifecycle
+  like `gps`'s `no_signal`/`acquiring`/`fix` or `wifi_scan`/`ble_scan`'s `partial`/`complete`.
+  `result` is always present (unlike every other capability's status payload in this protocol,
+  where `result` is conditionally omitted).
+
+`result` = `{ "nodes": [ <meshcore-node>, ... ], "total_known_nodes": unsigned integer }`.
+**There is no partial/complete streaming for this capability** — a single `status` reply is
+the whole design (unlike `wifi_scan`/`ble_scan`, which send one or more `partial` records
+followed by a final `complete`). This means `nodes` is capped at a small, fixed number
+(`FEB_MESHCORE_MAX_NODES_PER_RESULT`, currently 3) chosen so that a full batch — every field at
+its own simultaneous worst-case length — still fits inside the 512-byte `FEB_CBOR_MAX_PAYLOAD`
+cap (confirmed by a host-native test that encodes exactly that many maximally-sized nodes and
+checks the result stays under the cap, not just by arithmetic). `total_known_nodes` is the
+board's in-RAM node table's current total occupied-entry count, which may exceed `nodes`'s
+length — an independent piece of information (not recoverable from the array's own length),
+mirroring `wardriving`'s `backlog_remaining` field: it lets the Flipper detect a truncated
+listing (`total_known_nodes > nodes.length`) rather than silently showing an incomplete list
+with no indication anything was omitted. When the table holds more entries than one reply can
+carry, the board reports the most-recently-seen subset first.
+
+`<meshcore-node>` field order: `node_id`, `name` (optional), `role`, `rssi_offset`,
+`last_seen_ms`, `lat_e7_offset` (optional, paired with `lon_e7_offset`), `lon_e7_offset`
+(optional, paired with `lat_e7_offset`).
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node_id` | text string, exactly 16 characters | Stable node identity: the first 16 hex characters of the ADVERT's 32-byte Ed25519 public key, lowercase — matches the convention used by community wdgwars MeshCore-feeder tools. Used as the board's own dedup key (a repeated sighting of the same `node_id` updates its existing table entry rather than adding a duplicate). |
+| `name` | text string, optional | The node's self-advertised display name, present only if the ADVERT's `appdata` carried one (its flags byte's `0x80` bit) — omitted from the wire entirely when absent, not an empty string, same optional-field convention as `ble_scan`'s `<device-result>.name`. |
+| `role` | text string | One of `"chat"`, `"repeater"`, `"room_server"`, `"sensor"`, or `"unknown"` (any role-nibble value the ADVERT's flags byte didn't define, including a flags byte with no role bits set at all) — decoded from the low nibble of the ADVERT's `appdata` flags byte. Caller-owned text, same convention as `wifi_scan`'s `phy`/`auth` or `ble_scan`'s `addr_type` — this codec does not restrict the value. |
+| `rssi_offset` | unsigned integer | `rssi_dbm + 128`, same convention as `wifi_scan`/`ble_scan`/`wardriving` — but sourced from the LoRa radio's own per-frame RSSI reading (RadioLib), not anything carried in the MeshCore packet itself. |
+| `last_seen_ms` | unsigned integer | Milliseconds since the board's own boot (`esp_timer_get_time() / 1000`), same boot-relative convention as `wardriving`'s `timestamp_ms` — this board has no real-time clock. Deliberately **not** derived from the ADVERT's own embedded timestamp field, which is the sending node's unverified clock (see the signature note below) and not synchronized with this board's in any way. |
+| `lat_e7_offset` | unsigned integer, optional | Same encoding as `wardriving`'s record field above — present only if the ADVERT's `appdata` carried a position (flags byte bit `0x10`). MeshCore's own wire encoding for latitude is decimal degrees × 1,000,000; the board converts this to this protocol's × 10,000,000 (`lat_e7`) convention before applying the usual `+ 900000000` offset. Always present together with `lon_e7_offset` — seeing exactly one of the two is a malformed record. |
+| `lon_e7_offset` | unsigned integer, optional | Same treatment as `lat_e7_offset`, longitude. |
+
+**No ADVERT signature verification.** Every ADVERT carries a 64-byte Ed25519 signature over
+its public key, timestamp, and appdata, but this capability never verifies it — MeshCore's own
+protocol signs ADVERTs specifically to let a legitimate mesh member confirm authenticity when
+it chooses to, while still transmitting them unencrypted so anyone can passively observe node
+presence; this capability deliberately takes the latter posture only. A malicious or corrupted
+ADVERT can therefore cause this capability to report a fabricated node, name, role, or
+location — this is an accepted, explicit scope cut for Phase 1 ("detection + display"), not an
+oversight. Implausible location values (outside the physically valid ±90°/±180° range once
+converted) are dropped (the node is still reported, just without `lat_e7_offset`/
+`lon_e7_offset`) rather than propagated, both because they cannot be trusted and because an
+unbounded value could otherwise break this capability's single-reply wire-size guarantee above.
+
+**Fixed radio parameters.** The SX1276 is configured at a single fixed compile-time preset
+matching MeshCore's EU-868 default (869.525 MHz, 250 kHz bandwidth, spreading factor 11,
+coding rate 4/5) — no runtime configuration, no frequency-hopping, no multi-preset scanning.
+Only MeshCore's `ADVERT` payload type (header byte value `0x04`) is decoded; every other
+payload type (chat messages, acks, path-return, etc.) is received but deliberately left
+unparsed and dropped.
+
+**No radio-coexistence validation.** This board's SX1276 (SPI-attached) is a physically
+separate chip from its Wi-Fi/BT combo radio, and this capability only ever listens (never
+transmits), which is lower risk than the bidirectional, duty-cycled traffic
+[docs/LESSONS.md](LESSONS.md)'s coexistence writeups are about — but no actual coexistence
+sweep between the two radios has been run for this capability. See
+[docs/BACKLOG.md](BACKLOG.md).
+
 ## Reliability and reconnect behavior
 
 - BLE delivery is treated as ordered within an active connection; protocol records are not retransmitted automatically.

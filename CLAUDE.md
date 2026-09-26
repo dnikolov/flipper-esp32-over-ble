@@ -28,6 +28,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
 | [docs/UI_REDESIGN.md](docs/UI_REDESIGN.md) | Design-only Flipper FAP menu/navigation overhaul (Home/Menu/Scan/GPS/Settings/About) — no phase assigned yet, no code written against it. |
+| [docs/CLUSTER.md](docs/CLUSTER.md) | Phase 9 design (frozen, not yet implemented): C6 + C5 + Heltec wired together over UART, each dedicated to one scanning job, to eliminate radio coexistence and share one GPS module. |
 | [docs/WARDRIVING_REDESIGN.md](docs/WARDRIVING_REDESIGN.md) | Phase 7 (implemented, hardware-verified 2026-09-21): Wardriving Stopped/Running screen split, persisted per-run settings, WiFi scan-dwell/country-code control, GPS speed. Supersedes UI_REDESIGN.md's Wardriving subsection. |
 | [docs/WARDRIVING_PUBLISH.md](docs/WARDRIVING_PUBLISH.md) | Phase 6 design (frozen, not yet implemented): publishing the wardriving CSV to wdgwars.pl via a Flipper-triggered BadUSB/host-script flow. |
 | [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |

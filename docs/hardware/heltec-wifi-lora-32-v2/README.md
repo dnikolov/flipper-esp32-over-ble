@@ -154,6 +154,47 @@ chipset, and logic-level (3.3 V vs 5 V TTL) remain unconfirmed — wired at the 
 without that check, same as the original GPIO36 wiring. UART_NUM_1, 9600 8N1, RX-only (the module
 is never transmitted to) — same driver shape as the C6's, only the pin numbers differ.
 
+## Second physical unit in use for Phase 9 (confirmed 2026-09-26)
+
+Phase 9 cluster bring-up is happening on a **second, different physical Heltec WiFi LoRa 32 V2
+board** than the one used for Phase 4's GPS/`meshcore_scan` work — confirmed by the efuse MAC
+mismatch during flashing (`a4:cf:12:03:b1:74`, vs. the Phase 4 unit's `a4:cf:12:03:ba:58` in
+`docs/BASELINES.md`), and confirmed with the user directly. This second unit has **no stored
+pairing_secret** (fresh/never-paired `board_id=heltec-a4cf1203b174` as of this writing) and its
+physical GPS/antenna wiring status is unconfirmed — do not assume either board's physical setup
+(GPS module wiring, LoRa antenna, prior pairing state) carries over to the other. Track which
+physical unit is on the bench before trusting any state assumption in this doc or `BASELINES.md`.
+
+## Phase 9 cluster inter-board UART link (wired 2026-09-26)
+
+Physically wired to a C6-DevKitC-1 board for [docs/CLUSTER.md](../../CLUSTER.md)'s UART star
+topology (Heltec↔C6 leg, the first pair wired per the staged rollout in `docs/PLAN.md`'s Phase
+9 section — C5 follows later). GPIO32/33 chosen from a vendor pinout diagram the user supplied:
+neither is arrow-marked as an onboard OLED/LoRa connection, both are genuinely bidirectional
+(unlike the input-only GPIO34-39 group), and neither is claimed by this project's own existing
+GPS/LED/I2C/console usage.
+
+**One caveat, not yet resolved**: GPIO32/33 are labeled `XTAL32` on that diagram — shared with an
+*optional* 32.768kHz crystal footprint some ESP32 boards populate for deep-sleep timing accuracy.
+Not yet visually confirmed whether this specific board populated that footprint. If it did, these
+pins are not usable as plain GPIO. Check for a small 2-pin crystal can near an `XTAL`/`32.768`
+silkscreen mark close to these header pins before fully trusting this wiring.
+
+| Signal | Heltec GPIO | C6 GPIO | Wire color |
+| --- | --- | --- | --- |
+| C6 TX → Heltec RX | GPIO33 | GPIO19 | green |
+| Heltec TX → C6 RX | GPIO32 | GPIO18 | yellow |
+| GND | — | — | (connected) |
+
+Two pins from the earlier candidate list were tried and rejected before this — recorded here so
+a future session doesn't re-propose them: **GPIO12** (classic-ESP32 flash-voltage strapping pin,
+"the single most common way to soft-brick a classic ESP32 board") and **GPIO36** (the same
+input-only, no-pull-resistor pin already rejected once for GPS wiring, and silicon-incapable of
+driving a TX line regardless).
+
+Not yet verified: whether the XTAL32 footprint is populated, and the byte-level echo test
+(Phase 9 step 1's "done when" bar).
+
 ## Strapping / boot-sampled pins — treat carefully
 
 Classic ESP32's strapping pins (sampled into the `GPIO_STRAP` register at reset, per
