@@ -42,11 +42,14 @@ static const char *TAG = "flipper_esp32_over_ble";
 #define MAX_RECONNECT_RETRIES 5
 #define FEB_RX_FRAGMENT_BUFFER_SIZE 256u
 /* ceil(FEB_MAX_RECORD_SIZE / feb_fragment_capacity(FEB_FLIPPER_WRITE_EFFECTIVE_MTU)) =
-   ceil(768/60) = 13. Assumes ATT MTU negotiation succeeds to >= FEB_FLIPPER_WRITE_EFFECTIVE_MTU
-   (67), per encode_and_queue_pairing_record()'s MTU clamp below. If MTU exchange never
-   completes and negotiated_att_mtu stays at the pre-negotiation default of 23, capacity
-   drops to feb_fragment_capacity(23) = 16 and a near-max-size record could need up to 48
-   fragments -- an accepted, currently-unhandled gap on that fallback path. */
+   ceil(768/240) = 4 at the current 244-byte FEB_WRITE_CHAR_MAX_LEN (was ceil(768/60) = 13
+   at the old 64-byte cap). Left at 13, its original worst-case value: over-provisioned
+   headroom, never a shortfall, so no resize is needed when the per-fragment capacity only
+   grows. Assumes ATT MTU negotiation succeeds to >= FEB_FLIPPER_WRITE_EFFECTIVE_MTU (247),
+   per encode_and_queue_pairing_record()'s MTU clamp below. If MTU exchange never completes
+   and negotiated_att_mtu stays at the pre-negotiation default of 23, capacity drops to
+   feb_fragment_capacity(23) = 16 and a near-max-size record could need up to 48 fragments --
+   an accepted, currently-unhandled gap on that fallback path. */
 #define FEB_TX_MAX_FRAGMENTS 13u
 #define FEB_REASSEMBLY_CHECK_INTERVAL_MS (FEB_REASSEMBLY_TIMEOUT_MS / 2)
 /* Cadence for the aggregate BLE_GAP_EVENT_DISC summary log emitted from
@@ -90,14 +93,16 @@ static const char *TAG = "flipper_esp32_over_ble";
 #define FEB_IDLE_TIMEOUT_MS 30000u
 
 /* The Flipper's Write characteristic (flipper_esp32_over_ble.c PAYLOAD_MAX) has a fixed
-   max GATT attribute value length of 64 bytes, set once at registration and independent of
-   the negotiated ATT MTU. Writes to it must never exceed this length, however large the
+   max GATT attribute value length, set once at registration and independent of the
+   negotiated ATT MTU. Writes to it must never exceed this length, however large the
    negotiated MTU is. Modeling it as an "MTU" of length+ATT_WRITE_OVERHEAD lets us reuse
-   feb_fragment_capacity() unchanged: feb_fragment_capacity(64 + 3) = 64 - 4 = 60 payload
+   feb_fragment_capacity() unchanged: feb_fragment_capacity(244 + 3) = 244 - 4 = 240 payload
    bytes/fragment, and clamping the real negotiated MTU down to this before calling
    feb_fragment_capacity() keeps the smaller value when the real MTU is even tinier (e.g.
-   the pre-negotiation default of 23). */
-#define FEB_FLIPPER_WRITE_CHAR_MAX_LEN 64u
+   the pre-negotiation default of 23). Sourced from components/feb_protocol/framing.h's
+   FEB_WRITE_CHAR_MAX_LEN so both firmwares stay in lockstep rather than hardcoding their
+   own copy. */
+#define FEB_FLIPPER_WRITE_CHAR_MAX_LEN FEB_WRITE_CHAR_MAX_LEN
 #define FEB_FLIPPER_WRITE_EFFECTIVE_MTU (FEB_FLIPPER_WRITE_CHAR_MAX_LEN + FEB_ATT_WRITE_OVERHEAD)
 
 /* docs/PLAN.md step 7: hand-maintained, opaque, per-firmware-target constants -- not
@@ -175,6 +180,27 @@ static const ble_uuid128_t write_uuid = BLE_UUID128_INIT(
 static const ble_uuid128_t notify_uuid = BLE_UUID128_INIT(
     0x9c, 0x3f, 0x7e, 0x6a, 0xf4, 0x03, 0x4c, 0x31,
     0x9e, 0xa2, 0x58, 0xa7, 0xa2, 0x0f, 0xb8, 0x13);
+
+/* docs/HARDENING_BACKLOG.md H05 Phase A: tighten the connection interval for faster
+   wardriving-record bulk transfer. itvl 6-12 (7.5-15ms) sits inside the Flipper's own
+   accepted range (flipper_esp32_over_ble.c's conn_int_min=6/conn_int_max=36) and matches
+   its own preference for the low end. supervision_timeout=400 (4s) clears the spec's
+   supervision_timeout_ms > (1+latency)*itvl_max_ms*2 requirement (30ms here) with large
+   margin -- also stricter than NimBLE's own connect-default of 2.56s. scan_itvl/scan_window/
+   min_ce_len/max_ce_len left at NimBLE's own ble_gap_connect() defaults (0x0010/0x0010/0/0).
+   Applied for the whole connection lifetime, not just during wardriving publish -- this is
+   a battery-tolerant, screen-on use case, and a transfer-scoped toggle would add a second
+   state machine to reason about alongside the existing TX single-flight logic. */
+static const struct ble_gap_conn_params tight_conn_params = {
+    .scan_itvl = 0x0010,
+    .scan_window = 0x0010,
+    .itvl_min = 6,
+    .itvl_max = 12,
+    .latency = 0,
+    .supervision_timeout = 400,
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
 
 static uint8_t own_addr_type;
 static uint16_t connection_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -3275,7 +3301,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
             ESP_LOGI(TAG, "found v2 peer, connecting");
             ble_gap_disc_cancel();
-            rc = ble_gap_connect(own_addr_type, &event->disc.addr, 30000, NULL,
+            rc = ble_gap_connect(own_addr_type, &event->disc.addr, 30000, &tight_conn_params,
                                  gap_event, NULL);
             if (rc != 0) {
                 ESP_LOGW(TAG, "connect start failed: %d", rc);
@@ -3328,6 +3354,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
                                              deliberately persist across connect/disconnect */
         wardriving_pending_drain_count = 0;
+        rc = ble_gap_set_prefered_le_phy(connection_handle, BLE_GAP_LE_PHY_2M_MASK,
+                                         BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "2M PHY request failed: %d (staying on negotiated PHY)", rc);
+        } else {
+            ESP_LOGI(TAG, "2M PHY requested");
+        }
+
         ESP_LOGI(TAG, "connected; exchanging MTU");
         rc = ble_gattc_exchange_mtu(connection_handle, mtu_exchanged, NULL);
         if (rc != 0) {
@@ -3650,6 +3684,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         }
         return 0;
     }
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        if (event->phy_updated.status != 0) {
+            ESP_LOGW(TAG, "PHY update failed: status=%d (staying on 1M PHY)",
+                     event->phy_updated.status);
+        } else {
+            ESP_LOGI(TAG, "PHY updated: tx=%u rx=%u",
+                     (unsigned)event->phy_updated.tx_phy,
+                     (unsigned)event->phy_updated.rx_phy);
+        }
+        return 0;
 
     default:
         return 0;
