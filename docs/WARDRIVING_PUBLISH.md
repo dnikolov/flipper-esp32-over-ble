@@ -74,6 +74,15 @@ and the server-side parser is the whole point of using this method (no on-device
 
 ## Publish flow
 
+**Added 2026-09-26 (heap-pressure mitigation, docs/HARDENING_BACKLOG.md H04):** publishing
+needs no ESP32 connection at all, so `publish_start()` now stops this app's own BLE profile
+(`bt_profile_restore_default()`) for the duration of the transfer, freeing the GATT stack's
+heap, and restarts it once the transfer concludes, is cancelled, or times out. This follows a
+real hardware `furi_check()` out-of-memory crash during a large (~3.7 MB) CSV publish while
+the multi-minute CLI-serial session was held open on top of a still-resident BLE profile — a
+mitigation that reduces heap pressure regardless of which exact allocation was losing the
+race, not a confirmed root-cause fix.
+
 ### 1. Launch: BadUSB as a bootstrap trigger only
 
 **Resolved 2026-09-17 (Open Item 4): direct HID typing, not chain-launching the bundled BadUSB

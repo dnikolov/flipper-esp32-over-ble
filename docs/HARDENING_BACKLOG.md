@@ -743,3 +743,75 @@ both sessions:**
 crash under the user's original repro shape (wardriving running, several relaunches, same
 boot session) -- this session's build-only verification cannot distinguish "race window
 narrowed enough in practice" from "race window merely made statistically rarer."
+
+**2026-09-26: new field report -- publishing crashed the Flipper (OOM-shaped) while
+`scripts/publish_wardriving.ps1` was pulling a large CSV over `storage read_chunks`. Confirmed
+via `storage.py list` that `wardriving/wardriving_current.csv` is 3,768,352 bytes (~3.7 MB) and
+still present, unrenamed** -- matches this app's own "only rename the CSV on a confirmed
+successful upload" design (`docs/WARDRIVING_PUBLISH.md`), so no data was lost; the crash
+happened during the read, before any archive/rename step.
+
+This is the same CLI-session-narrows-heap-margin mechanism this entry already documents
+(the DTR-triggered, ~4-5 KB resident `CliShell` allocation for as long as a PC tool holds the
+port open), but at a scale not previously exercised: a ~3.7 MB transfer at `read_chunks`' 8192-byte
+chunk size is ~460 chunk round-trips, each gated on the `Ready?`/single-byte-`y` handshake --
+plausibly minutes, not the seconds-scale CLI sessions (`storage.py list`/`stat`, a `runfap.py`
+transfer) this entry's existing field data was gathered from. That's a qualitatively longer
+window for this app's own concurrent runtime activity (idle-timeout BLE reconnect/advertise
+cycling with no ESP32 present, since publish is designed to run without one) to compete for
+heap against the same narrowed margin, not just a bigger one-time bite.
+
+**No heap-margin data was captured for this occurrence** -- `h04_heap_diag_log()` (confirmed via
+`storage.py list`: no `heap_diag_TEMP_H04.log` on this SD card) was stripped from
+`flipper/flipper_esp32_over_ble.c` after the 2026-09-25 wardriving-teardown-race fix landed, per
+this entry's own "temporary only, strip once field data is in" note -- so this report has a
+confirmed trigger condition (large CLI pull) and a confirmed safe outcome (no data loss) but no
+new quantitative evidence beyond that.
+
+**Crash-popup text captured this time (per this entry's own standing "practical ask"): "Flipper
+crashed and was rebooted -- out of memory."** This resolves which failure class this occurrence
+was, and it's a different one from the `furi_check_failed` shape the 2026-09-24/25 addenda above
+focused on: grepped `furi/core/memmgr_heap.c` in the pinned Unleashed checkout --
+`furi_check(pvReturn, xWantedSize ? "out of memory" : "malloc(0)")` (~line 466) is the *only*
+`furi_check()` call site anywhere in the firmware or this app that carries the literal message
+`"out of memory"`, and it fires inside the heap allocator itself, on **any** `malloc()`/
+`pvPortMalloc()` in the whole system returning NULL -- not one of this app's own 8 argument-less
+`furi_check(...)` sites (which, per `check.c`'s own logic already traced above, would show the
+generic `"furi_check failed"`, not this message). Also distinct from the ELF loader's own launch-
+time rejection path (`LoaderStatusErrorOutOfMemory`, `applications/services/loader/loader.c`),
+which doesn't route through this same `furi_check()` call at all and isn't in play here anyway --
+this app was already running, not launching, when the crash hit.
+
+**Net effect: this is confirmed genuine, generic heap exhaustion -- some `malloc()` call,
+anywhere in the running firmware, returned NULL at the moment of the crash** -- not a localized
+bug in one of this app's own five alloc-guard sites (H04's earlier "unifying candidate
+mechanism" section). This is squarely consistent with, and now the strongest evidence yet for,
+this entry's CLI-session-narrows-heap-margin mechanism: a multi-minute `read_chunks` transfer
+holding the ~4-5 KB `CliShell` allocation resident is exactly the kind of sustained margin
+reduction that would make some *other*, otherwise-routine allocation (this app's own BLE
+reconnect/advertise cycling while idle-waiting with no ESP32 present, a GATT-stack realloc, or
+something else in the firmware entirely) fail outright rather than merely trip one of this app's
+own named guards. **Which specific allocation failed is still unconfirmed** -- the popup message
+identifies the failure *class*, not the call site; only a live serial capture spanning the crash
+(`__furi_crash_implementation()` logs the failing allocation's context over serial, per this
+entry's earlier tracing) would localize it further.
+
+**Practical near-term implication for `docs/WARDRIVING_PUBLISH.md`:** that design's accepted
+tradeoff ("no size cap... if the current file grows large enough that wdgwars rejects or chokes
+on it, publishing just fails with a clear on-screen error... easy to avoid by publishing
+regularly") assumed the downside of letting the CSV grow large was a slow or server-rejected
+upload -- not a Flipper crash during the *pull* step, before the file ever reaches wdgwars. This
+field report shows the crash risk scales with how long it's been since the last successful
+publish, which is a sharper practical argument for publishing often than that doc currently
+states. Not re-scoped or fixed here -- flagging the correction, not deciding the fix (re-adding
+the diagnostic instrumentation for a targeted repro, or a chunk-size/timeout retune on the CLI
+pull side, are both still open options, neither attempted this session).
+
+**Mitigation implemented 2026-09-26, build-verified only, not yet hardware-verified:**
+`publish_start()` (`flipper/flipper_esp32_over_ble.c`) now tears down this app's own BLE
+profile (`stop_ble_profile()`, a new helper factored out of `stop_service()`) for the
+duration of the publish transfer, freeing the GATT stack's heap, and restarts it
+(`publish_finish_waiting()`) once the transfer concludes, is cancelled, or times out. This
+reduces heap pressure during publish regardless of which exact allocation was losing the
+race above -- it is a mitigation, not a confirmed root-cause fix; "which allocation failed"
+remains open.

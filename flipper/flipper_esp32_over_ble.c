@@ -507,12 +507,16 @@ typedef struct {
     uint64_t gps_utc_timestamp_s;
     uint64_t gps_altitude_dm_offset;
     uint64_t gps_speed_e1_kmh;
-    /* Publish screen state (docs/WARDRIVING_PUBLISH.md) -- independent of any BLE session or
-       ESP32 pairing, since the whole point of this flow is publishing later, at a computer,
-       with no board present. publish_waiting is true only while polling for the host
+    /* Publish screen state (docs/WARDRIVING_PUBLISH.md) -- publishing needs no ESP32
+       connection at all, but publish_start() now actively tears down this app's own BLE
+       profile for the duration of the transfer to relieve heap pressure on the GATT stack
+       (docs/HARDENING_BACKLOG.md H04, 2026-09-26 field report: a real out-of-memory crash
+       during a large-CSV publish). publish_waiting is true only while polling for the host
        script's result file; publish_outcome is PublishOutcomeNone until a poll or a trigger
-       failure sets it. */
+       failure sets it. publish_bt_stopped is true only when this publish run is the one that
+       stopped the profile, so publish_finish_waiting() knows whether to restart it. */
     bool publish_waiting;
+    bool publish_bt_stopped;
     uint32_t publish_poll_elapsed_ms;
     PublishOutcome publish_outcome;
     uint32_t publish_imported;
@@ -615,6 +619,7 @@ static FuriTimer* gps_poll_timer;
 static FuriTimer* publish_poll_timer;
 
 static const FuriHalBleProfileTemplate profile_callbacks;
+static void start_profile(Esp32App* app);
 
 /* ---- pairing ceremony state: single BLE connection, single-threaded BLE event dispatch
    (see profile_event_handler), so static storage for the one in-flight ceremony is safe
@@ -3551,6 +3556,19 @@ static bool publish_try_read_result(Esp32App* app, const char* path) {
     return true;
 }
 
+/* Ends the "waiting for publish" state and, if this publish run stopped the BLE profile to
+   relieve heap pressure (see publish_start()'s own comment), restarts it now that the
+   transfer has concluded one way or another. Shared by publish_poll_check()'s two terminal
+   branches and the Publish screen's Back-press cancel handler. */
+static void publish_finish_waiting(Esp32App* app) {
+    furi_timer_stop(publish_poll_timer);
+    app->publish_waiting = false;
+    if(app->publish_bt_stopped) {
+        start_profile(app);
+        app->publish_bt_stopped = false;
+    }
+}
+
 /* Called from the main loop's AppEventPublishPollTick handler, only while AppScreenPublish is
    showing "waiting for publish..." (see that handler's own guard). */
 static void publish_poll_check(Esp32App* app) {
@@ -3561,15 +3579,38 @@ static void publish_poll_check(Esp32App* app) {
     }
     if(storage_file_exists(app->storage, result_path) &&
        publish_try_read_result(app, result_path)) {
-        furi_timer_stop(publish_poll_timer);
-        app->publish_waiting = false;
+        publish_finish_waiting(app);
         return;
     }
     app->publish_poll_elapsed_ms += FEB_PUBLISH_POLL_PERIOD_MS;
     if(app->publish_poll_elapsed_ms >= FEB_PUBLISH_POLL_TIMEOUT_MS) {
-        furi_timer_stop(publish_poll_timer);
-        app->publish_waiting = false;
+        publish_finish_waiting(app);
         app->publish_outcome = PublishOutcomeTimeout;
+    }
+}
+
+/* Profile-teardown sequence shared by stop_service() (full app-exit/BT-unavailable path) and
+   publish_start() (temporary pause for the duration of a publish transfer). Deliberately
+   does not touch pairing/session state, scan UI, or notifications -- those resets belong to
+   whichever caller actually needs them (stop_service() applies them itself). */
+static void stop_ble_profile(Esp32App* app) {
+    furi_hal_bt_stop_advertising();
+    bt_disconnect(app->bt);
+    /* bt_disconnect() only closes the RPC session and stops advertising -- it does not itself
+       drop an already-established GATT link; that only happens inside
+       bt_profile_restore_default()'s own furi_hal_bt_reinit()/hci_reset(). Without a settle
+       delay here, a still-live, busy connection (wardriving mid-backlog-drain is the
+       confirmed real-world trigger) can still be dispatching an inbound BLE event to
+       profile_event_handler on BleEventWorker at the exact moment profile_stop() -- called
+       from the Bt service thread inside that same reinit -- unregisters the handler and
+       frees profile: a cross-thread teardown race (event_dispatcher.c's handler list has no
+       locking against concurrent register/unregister vs. dispatch). Matches the pinned
+       firmware's own hid_app (applications/system/hid_app/hid.c), which inserts this same
+       200ms wait in the same spot for the same class of reason. */
+    furi_delay_ms(200);
+    if(app->profile) {
+        furi_check(bt_profile_restore_default(app->bt));
+        app->profile = NULL;
     }
 }
 
@@ -3596,6 +3637,15 @@ static void publish_start(Esp32App* app) {
             sizeof(app->publish_fail_message) - 1);
         app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
         return;
+    }
+
+    /* Publishing needs no ESP32 connection at all -- drop this app's own BLE profile for the
+       transfer to free the GATT stack's heap (docs/HARDENING_BACKLOG.md H04, 2026-09-26: a
+       real out-of-memory crash during a large-CSV publish). */
+    app->publish_bt_stopped = false;
+    if(app->profile) {
+        stop_ble_profile(app);
+        app->publish_bt_stopped = true;
     }
 
     app->publish_waiting = true;
@@ -5080,24 +5130,7 @@ static void reset_scan_ui_state_keep_screen(Esp32App* app) {
 
 static void stop_service(Esp32App* app) {
     furi_timer_stop(reassembly_timeout_timer);
-    furi_hal_bt_stop_advertising();
-    bt_disconnect(app->bt);
-    /* bt_disconnect() only closes the RPC session and stops advertising -- it does not itself
-       drop an already-established GATT link; that only happens inside
-       bt_profile_restore_default()'s own furi_hal_bt_reinit()/hci_reset(). Without a settle
-       delay here, a still-live, busy connection (wardriving mid-backlog-drain is the
-       confirmed real-world trigger) can still be dispatching an inbound BLE event to
-       profile_event_handler on BleEventWorker at the exact moment profile_stop() -- called
-       from the Bt service thread inside that same reinit -- unregisters the handler and
-       frees profile: a cross-thread teardown race (event_dispatcher.c's handler list has no
-       locking against concurrent register/unregister vs. dispatch). Matches the pinned
-       firmware's own hid_app (applications/system/hid_app/hid.c), which inserts this same
-       200ms wait in the same spot for the same class of reason. */
-    furi_delay_ms(200);
-    if(app->profile) {
-        furi_check(bt_profile_restore_default(app->bt));
-        app->profile = NULL;
-    }
+    stop_ble_profile(app);
     pairing_reset_state();
     session_reset_state();
     reset_scan_ui_state_keep_screen(app);
@@ -5637,8 +5670,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                        persists data" convention -- the result file (if the host script does
                        eventually write one) is simply never read; nothing on the Flipper
                        side is lost by cancelling. */
-                    furi_timer_stop(publish_poll_timer);
-                    app.publish_waiting = false;
+                    publish_finish_waiting(&app);
                     app.screen = AppScreenHome;
                 } else if(event.input.key == InputKeyOk && !app.publish_waiting) {
                     publish_start(&app);
