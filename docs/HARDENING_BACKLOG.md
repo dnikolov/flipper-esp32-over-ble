@@ -170,6 +170,109 @@ means the deferred item's practical impact is broader than previously documented
 reconnect-with-pending-backlog, not just explicit commands). Re-confirm the deferral still
 stands, now with this fuller picture, before it comes up again.
 
+## H05 — RESOLVED 2026-09-26, see docs/PROJECT_HISTORY.md
+
+Wardriving-record transfer to the Flipper was slow. Root-caused to a fixed 64-byte Flipper
+Write-characteristic attribute length capping every fragment regardless of negotiated ATT MTU,
+plus default (untuned) BLE connection parameters. Fixed via connection-parameter tuning (2M
+PHY + tighter interval, ESP32-C5-only) and raising the fixed chunk size to 244 bytes
+(cross-firmware, via a new shared `FEB_WRITE_CHAR_MAX_LEN` constant) — **not** via
+write-without-response, which this project had already ruled out for this exact reason (see
+`docs/LESSONS.md`'s "efficiency-fix-the-constraint-not-the-symptom"). Build/host-test verified
+on both firmwares; hardware verification still pending. Full investigation and implementation
+narrative in `docs/PROJECT_HISTORY.md`'s "2026-09-26: ESP32-C5-to-Flipper wardriving transfer
+throughput fix" entry.
+
+**Known follow-up, not yet decided:** `esp32/` (C6) and `heltec/` still hardcode the old
+64-byte cap — only `esp32c5/` was ported this pass.
+
+<details>
+<summary>Original investigation (kept for the reasoning trail; superseded by the resolution above)</summary>
+
+**Discovered:** 2026-09-26, from a user-reported symptom during a live wardriving session
+("transfer to the flipper is very slow"). An external code-review agent audited
+`esp32c5/main/main.c` and flagged four throughput bottlenecks; each was independently
+re-verified against the actual code (not taken on the review's word) before acting on any of
+it. Two turned out to be safe, connection-parameter-only tuning with no protocol impact
+(implemented directly, not logged here — 2M PHY request + tighter connection interval on
+connect). The other two are logged here because they are a real wire-protocol change, not a
+quick patch, and one of them reproduces a bug class this project has already been bitten by
+once.
+
+**What the review got right:** the ESP32 currently pushes each wardriving-record fragment via
+`ble_gattc_write_flat()` (GATT Write **with** response) in `send_next_tx_fragment()`
+(`esp32c5/main/main.c`), blocking on the peer's ATT ack before sending the next fragment — one
+fragment per round trip, capping throughput to roughly one fragment per connection interval.
+Fragment size is also capped well below what the negotiated ATT MTU could carry.
+
+**Why this isn't a quick fix — two compounding reasons:**
+
+1. **Write-without-response needs real flow control, not a recursive fire-all.** The review's
+   proposed replacement (`ble_gattc_write_no_rsp_flat()` called recursively for every fragment
+   with no backpressure) will overrun NimBLE's host TX queue under real load — a full
+   record-write burst has no acknowledgment to gate on, so the sender must check the return
+   code and retry/back off when the host queue is full, not assume every call succeeds. It
+   also breaks this file's existing per-fragment completion bookkeeping
+   (`tx_dispatching_completion`, `wardriving_tx_in_flight`, `write_complete()`'s single call per
+   real GATT event) if `write_complete()` is faked instead of driven by a real completion event.
+   Switching the Write direction to write-without-response is also a **Flipper-side firmware
+   change**, not ESP32-only: the Flipper's Write characteristic is currently declared
+   `CHAR_PROP_WRITE` only (`flipper/flipper_esp32_over_ble.c:580`) — no
+   `CHAR_PROP_WRITE_WITHOUT_RESP` bit. That property combination does exist and is used
+   elsewhere in the pinned Unleashed checkout (`targets/f7/ble_glue/services/serial_service.c`
+   combines both), so it's feasible, but it's a real change on both sides, not a config flip.
+   `docs/PROTOCOL.md`'s Fragmentation section (`docs/PROTOCOL.md:25`) also explicitly documents
+   the current one-byte fragment-header field sizing as relying on "write-with-response and a
+   single active BLE connection mean only one message is ever being reassembled per direction at
+   a time" — that reasoning needs to be re-examined against a no-response transport, not
+   silently invalidated.
+
+2. **The 64-byte write-chunk cap is not a client-side buffer size — it's the peer's declared
+   GATT attribute length, and this exact bug class has already been hit once.**
+   `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` (`esp32c5/main/main.c`, currently 64) has to match
+   `PAYLOAD_MAX` (`flipper/flipper_esp32_over_ble.c:33`, also 64), which is the Flipper's Write
+   characteristic's own *fixed declared value length*
+   (`.data.fixed.length = PAYLOAD_MAX`, `flipper/flipper_esp32_over_ble.c:576`). A write larger
+   than the characteristic's own declared max fails with `ATT_ERR_INVALID_ATTR_VALUE_LEN`
+   independent of how much headroom the negotiated ATT MTU has — this is precisely
+   `docs/LESSONS.md`'s "att-mtu-vs-attribute-length" entry, which already documents this exact
+   failure shooting live once and explicitly warns: *"don't 'improve' this back to the raw
+   MTU."* Raising the chunk size for real throughput gain means raising `PAYLOAD_MAX` on the
+   Flipper side by the same amount, in lockstep, and re-verifying on hardware — a one-file
+   `#define` bump on the ESP32 side alone reproduces the exact regression that lesson warns
+   against.
+
+**Proposed fix (not yet implemented):**
+- Re-derive `docs/PROTOCOL.md`'s fragmentation-layer ordering/multiplexing assumptions for a
+  no-response transport before changing any code, since the one-byte fragment-header field
+  sizing rationale is written against write-with-response specifically.
+- Add real flow control to the ESP32 send path for write-without-response (queue depth limit,
+  retry-on-`ENOMEM`-equivalent, driven by NimBLE's actual buffer-availability signal — not a
+  recursive fire-all).
+- Raise `PAYLOAD_MAX` (Flipper) and `FEB_FLIPPER_WRITE_CHAR_MAX_LEN`
+  (`FEB_FLIPPER_WRITE_EFFECTIVE_MTU`) (ESP32) together, add `CHAR_PROP_WRITE_WITHOUT_RESP` to
+  the Flipper's Write characteristic, and hardware-verify both directions at the new size
+  before calling it done — per this project's two-firmwares-in-lockstep convention.
+
+**Needs before implementing:**
+- A decision on target chunk size (review suggested 244, comfortably inside standard 247-byte
+  ATT MTU) and confirmation the Flipper's `FlipperGattCharacteristicDataFixed` path and BLE
+  stack handle a value that size without other side effects (the Notify characteristic's own
+  `FEB_NOTIFY_CHAR_EFFECTIVE_MTU` mirrors the same fixed-length constraint in the other
+  direction — check whether it needs a matching change or can stay independent).
+- Hardware verification plan for both the flow-control change and the attribute-length change,
+  given the attribute-length change alone has a documented one-shot precedent for shipping
+  clean and failing only once a real oversized write is exercised
+  (`docs/LESSONS.md:117-121`) — a host test pinned to a conservative fragment size will not
+  catch a regression here; the test suite needs to also exercise the new real chunk size.
+
+**Severity:** P2 — a real, user-observed performance problem (not a correctness bug), but the
+fix is a wire-protocol change with a documented precedent for shipping broken if rushed. Not
+blocking correctness or safety; the ESP32-only connection-parameter tuning implemented
+alongside this entry provides a lower-risk partial improvement in the meantime.
+
+</details>
+
 ## H04 — Flipper app intermittently fails to launch with an OOM message (Flipper reboots)
 
 **Discovered:** 2026-09-13, from a live user-reported symptom ("app often cannot start causing

@@ -30,15 +30,16 @@
 #include "wardriving_csv.h"
 
 #define TAG "Esp32OverBle"
-#define PAYLOAD_MAX 64
+#define PAYLOAD_MAX FEB_WRITE_CHAR_MAX_LEN
 /* Default (pre-MTU-negotiation) BLE ATT MTU. Used as negotiated_att_mtu's initial/reset value
    until the real ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE event arrives (see profile_event_handler,
    G12 fix) -- send_pairing_record() falls back to this conservative value for any record sent
    before that happens. */
 #define FEB_DEFAULT_ATT_MTU 23
 /* G12 fix: the real cap on an outgoing fragment is not the negotiated ATT MTU alone -- it's
-   whichever is smaller of that and this Notify characteristic's own fixed 64-byte declared max
-   value length (PAYLOAD_MAX). Exceeding the characteristic's own cap fails independently of MTU
+   whichever is smaller of that and this Notify characteristic's own fixed declared max
+   value length (PAYLOAD_MAX, = FEB_WRITE_CHAR_MAX_LEN, 244 bytes as of 2026-09-26, was 64).
+   Exceeding the characteristic's own cap fails independently of MTU
    headroom (ATT_ERR_INVALID_ATTR_VALUE_LEN) -- see docs/LESSONS.md's "att-mtu-vs-attribute-
    length" entry, which is exactly this same fact on the ESP32's Write-characteristic direction
    (FEB_FLIPPER_WRITE_EFFECTIVE_MTU there); this mirrors it for the Flipper's Notify direction. */

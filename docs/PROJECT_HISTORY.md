@@ -2458,6 +2458,75 @@ under wardriving's concurrent Wi-Fi+BLE load remains genuinely untested — step
 closed by this port, only reused as a starting point (the C6's tuned defaults:
 `wifi_interval_ms=5000`, `ble_window_ms=100`, `ble_interval_ms=500`).
 
+## 2026-09-26: ESP32-C5-to-Flipper wardriving transfer throughput fix (Phase A + Phase B)
+
+User-reported symptom: wardriving-record transfer from the ESP32-C5 to the Flipper was very
+slow. An external code-review agent audited `esp32c5/main/main.c` and flagged four
+bottlenecks; each was independently re-verified against the actual code before acting on any
+of it (see `docs/HARDENING_BACKLOG.md`'s H05 entry for the full investigation — resolved and
+removed from that file now that this is implemented and build-verified; summary below).
+
+**Phase A (ESP32-C5-only, no protocol impact) — connection-parameter tuning:**
+- `ble_gap_connect()` now requests a tight connection interval (7.5-15ms, was NimBLE's 30-50ms
+  default) via a new `tight_conn_params` struct — confirmed to sit inside the Flipper's own
+  `gap_verify_connection_parameters()` acceptance window (`[6,36]` in 1.25ms units), so no
+  renegotiation fight expected.
+- `ble_gap_set_prefered_le_phy()` requests LE 2M PHY on connect (non-fatal on failure, degrades
+  to 1M PHY), with a new `BLE_GAP_EVENT_PHY_UPDATE_COMPLETE` case logging the real negotiated
+  result. `ble_gap_phy_update()` (the API name in the original review) does not exist in this
+  ESP-IDF's NimBLE — the real function is `ble_gap_set_prefered_le_phy()`.
+- Whole-connection default, not transfer-scoped (battery-tolerant use case; a transfer-scoped
+  toggle would add a second `ble_gap_update_params()` state machine interacting with the
+  already-fragile TX single-flight logic, G07/H03 history).
+- Confirmed orthogonal to the known idle-timeout LED-flicker backlog item (that's driven by the
+  30s idle-timeout disconnect/reconnect cycle, not the established connection's interval).
+- Build-verified (`idf.py build`, clean). Not hardware-tested this session.
+
+**Phase B (cross-firmware) — raised the fixed Write/Notify characteristic chunk size, 64 → 244
+bytes:**
+- The review also proposed switching to GATT write-without-response. Rejected: this project
+  already made this exact call once before (`docs/LESSONS.md`'s
+  "efficiency-fix-the-constraint-not-the-symptom" entry) — write-without-response gives NimBLE
+  no usable backpressure signal (`ble_gattc_write_no_rsp_flat()` silently queues into an
+  internal, uncapped `bhc_tx_q` even when controller buffer credits are exhausted), and the
+  shared reassembly layer (`components/feb_protocol/framing.c`) has exactly one buffer per
+  direction with no message-interleaving detection. Raising the chunk size solves the actual
+  reported symptom without touching either problem.
+- New shared constant `FEB_WRITE_CHAR_MAX_LEN 244u` added to `components/feb_protocol/framing.h`
+  and its mirror `flipper/framing.h`, closing the `docs/BACKLOG.md` item asking for this
+  cross-firmware constant to live in the shared contract instead of two independently-hardcoded
+  literals. The Flipper's `PAYLOAD_MAX` and the ESP32-C5's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` now
+  both reference it instead of hardcoding `64u`/`244u` separately.
+- Target size chosen because it's comfortably inside a standard 247-byte ATT MTU, matches
+  direct shipping precedent in the pinned Unleashed firmware's own built-in Serial service
+  (486-byte fixed characteristic, 243-byte per-write chunk), and exactly matches test vectors
+  (`FEB_VEC_FRAGS_MTU247`) already generated and already wired into both host test suites — no
+  vector regeneration needed.
+- Flipper-side GATT attribute-value pool budget verified with real numbers against
+  `targets/f7/ble_glue/app_conf.h`'s `CFG_BLE_ATT_VALUE_ARRAY_SIZE (1344)` and its own
+  per-attribute accounting formula: this app's profile (GAP+GATT auto-services plus its own two
+  characteristics) totals 568 bytes at the new size, 42% utilized, 776 bytes headroom.
+- No ESP32-C5 buffer resizing needed: `tx_fragment_buf`/`FEB_TX_MAX_FRAGMENTS` were already
+  sized for the old 60-byte-per-fragment worst case (13 fragments for a 768-byte record); the
+  new 240-byte-per-fragment capacity only needs 4, well inside the existing headroom.
+- `docs/LESSONS.md`'s "att-mtu-vs-attribute-length" and
+  "efficiency-fix-the-constraint-not-the-symptom" entries updated to state the new value as
+  fact, keeping each lesson's original reasoning intact.
+- Host tests pass on both sides (435/435 on the Flipper suite, all pass on the ESP32 suite,
+  including the MTU-247 vectors). Both firmwares build clean
+  (`flipper_esp32c5_over_ble.bin`, `flipper_esp32_over_ble.fap` 134248 bytes).
+- **Scope note, not yet decided:** this pass only touched `esp32c5/`. `esp32/` (C6) and
+  `heltec/` both still hardcode `FEB_FLIPPER_WRITE_CHAR_MAX_LEN 64u` — not a correctness bug
+  (they'll keep working at the old, smaller, safe chunk size against a Flipper that now accepts
+  larger writes), just a missed throughput win on those two boards, and the
+  `docs/BACKLOG.md` constant-duplication item is only half-closed until they're ported to the
+  same shared constant too.
+
+**Not yet done, either phase:** no hardware was flashed or touched this session (build/host-test
+verification only, per the hardware-safety rule) — real on-device PHY negotiation, the GATT
+stack's acceptance of the larger declared attribute length at registration time, and the actual
+measured throughput improvement all remain hardware-pending.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

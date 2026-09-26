@@ -96,9 +96,12 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
 ## Other open items (not covered by the cross-model review)
 
 - **BL08 — Home screen space optimization:** consolidate display by showing "Pairing:Y/N" instead of "saved pairing" and "ESP:waiting"/"ESP:session" instead of "Waiting for ESP"; move all current status data to settings screen in a scrollable view for full visibility.
-- Promote implicit cross-firmware constants into the shared contract — e.g. the Flipper's
-  `PAYLOAD_MAX` (64) is silently duplicated as the ESP32's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN`
-  rather than living in `framing.h`/PROTOCOL.md where both sides' tests would catch drift.
+- **DONE 2026-09-26 (esp32c5/ + flipper/ only, see BACKLOG_COMPLETED.md):** Promote implicit
+  cross-firmware constants into the shared contract — the Flipper's `PAYLOAD_MAX` and the
+  ESP32-C5's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` now both reference a new `FEB_WRITE_CHAR_MAX_LEN`
+  in `framing.h` instead of independently hardcoding the same literal. **Not yet done for
+  `esp32/` or `heltec/`**, which still hardcode their own `64u` copy — reopen or file a fresh
+  row if those get ported too.
 - Step 9 must exercise the real negotiated ATT MTU, not only step 3's forced-small fragments —
   the oversized-write path has never been tested this way (how a later real ATT-length bug
   stayed latent through step 3).

@@ -111,8 +111,11 @@ The negotiated ATT MTU (256 here) tells you what the *link* can carry — it say
 what the peer's *attribute* will accept. A GATT characteristic's declared max value length is
 an independent cap enforced regardless of MTU headroom; exceeding it fails with ATT error
 0x0D (`ATT_ERR_INVALID_ATTR_VALUE_LEN`, surfaced by NimBLE as status 269 = `BLE_HS_ATT_BASE` +
-13). The Flipper's Write characteristic is fixed at 64 bytes (`PAYLOAD_MAX` in
-`flipper/flipper_esp32_over_ble.c`), so outgoing fragments must be sized against
+13). The Flipper's Write characteristic was originally fixed at 64 bytes (`PAYLOAD_MAX` in
+`flipper/flipper_esp32_over_ble.c`); raised to 244 bytes on 2026-09-26 (now defined as the
+shared `FEB_WRITE_CHAR_MAX_LEN` in `framing.h`, referenced by both firmwares rather than
+each hardcoding its own copy) to cut the ATT-round-trip overhead on bulk transfers like
+wardriving-record delivery. Either way, outgoing fragments must be sized against
 `FEB_FLIPPER_WRITE_EFFECTIVE_MTU`, not `negotiated_att_mtu` — don't "improve" this back to the
 raw MTU. This shipped with a clean build and passing host tests; a test that pins
 `feb_fragment_capacity()` to a conservative value (16-byte fragments, exercising multi-fragment
@@ -339,14 +342,18 @@ active-vs-passive change already shipped once on an unconfirmed mechanism and di
 
 ### efficiency-fix-the-constraint-not-the-symptom
 
-The 64-byte Write characteristic means each record costs ~4x the ATT round trips it needs at
-the negotiated 256-byte MTU, and fragments are written sequentially (each waiting on the prior
-write-completion callback), so latency is round-trips × connection interval —
-`pair_init` took ~110 ms across 3 fragments. Irrelevant for a once-per-reset ceremony; it will
-matter for bulk transfers like wardriving. The right fix is raising the Flipper's
+The original 64-byte Write characteristic meant each record cost ~4x the ATT round trips it
+needed at the negotiated 256-byte MTU, and fragments are written sequentially (each waiting on
+the prior write-completion callback), so latency is round-trips × connection interval —
+`pair_init` took ~110 ms across 3 fragments. Irrelevant for a once-per-reset ceremony; it does
+matter for bulk transfers like wardriving. The right fix was raising the Flipper's
 characteristic declaration (a cross-firmware change), **not** switching to
 write-without-response, which would give up the ordered reliable delivery the framing layer
-assumes. Before optimizing a transfer path, check whether a declared limit is the real cost.
+assumes — done 2026-09-26, raised to 244 bytes (`FEB_WRITE_CHAR_MAX_LEN` in `framing.h`),
+matching the pinned Unleashed firmware's own built-in Serial service precedent (a 486-byte
+fixed Write characteristic with a 243-byte per-write chunk cap) and verified against the
+GATT attribute-value pool budget (`CFG_BLE_ATT_VALUE_ARRAY_SIZE`) before landing. Before
+optimizing a transfer path, check whether a declared limit is the real cost.
 
 ---
 

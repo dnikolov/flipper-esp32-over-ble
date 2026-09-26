@@ -33,6 +33,8 @@ Fixed limits:
 
 A receiver must reject, without allocating based on peer-controlled lengths: duplicate fragments, fragments with an inconsistent `fragment_count` for a `message_id` already in progress, fragments that would exceed the absolute maximum record size, an incomplete message left after the reassembly timeout, and out-of-order fragments (a fragment whose `fragment_index` does not match the next expected index for the in-progress `message_id` is rejected, not buffered for later reordering).
 
+The Flipper's Write and Notify characteristics additionally declare a fixed max attribute value length (`FEB_WRITE_CHAR_MAX_LEN` in `framing.h`, currently 244 bytes), independent of and generally smaller than the negotiated ATT MTU — a GATT-stack-enforced cap, not a fragmentation-layer rule. Both firmwares must clamp their outgoing fragment capacity against whichever is smaller: the negotiated ATT MTU, or this constant.
+
 ## Protocol versions and identifiers
 
 - `version` is the unsigned integer `2` for this protocol.

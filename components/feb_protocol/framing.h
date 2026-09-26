@@ -11,6 +11,11 @@
 #define FEB_MAX_RECORD_SIZE 768u  /* full on-wire record, either shape, pre-CBOR-decode */
 #define FEB_MAX_FRAGMENTS 255u
 #define FEB_REASSEMBLY_TIMEOUT_MS 2000u
+/* The Flipper's Write/Notify characteristics' declared fixed max attribute value length --
+   independent of negotiated ATT MTU, a GATT-stack-enforced cap (see docs/LESSONS.md
+   "att-mtu-vs-attribute-length"). Both firmwares must reference this rather than hardcode
+   their own copy: the Flipper's PAYLOAD_MAX and the ESP32's FEB_FLIPPER_WRITE_CHAR_MAX_LEN. */
+#define FEB_WRITE_CHAR_MAX_LEN 244u
 
 typedef enum {
     FEB_FRAME_OK = 0,
