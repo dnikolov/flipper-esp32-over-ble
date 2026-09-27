@@ -6,8 +6,8 @@
    encryption/'s statement that this header is always sent unencrypted specifically so relays
    without a channel's key can still forward what they can't read.
 
-   The name-decode path (decrypt_default_channel_payload/protobuf field walk) additionally
-   relies on:
+   The name/position-decode path (decrypt_default_channel_payload/protobuf field walk)
+   additionally relies on:
    - meshtastic/firmware's src/mesh/Channels.h `defaultpsk[16]` (AES-128 key for the
      public default channel, PSK index 1 = "unmodified") and its generateHash() channel-hash
      algorithm (xorHash(name) ^ xorHash(psk)).
@@ -20,6 +20,15 @@
      ... }`, and meshtastic/portnums.proto's `NODEINFO_APP = 4`. This file decodes
      `short_name`, not `long_name` -- see MESHTASTIC_USER_FIELD_SHORT_NAME's own comment for
      why.
+   - meshtastic/protobufs' portnums.proto's `POSITION_APP = 3` and mesh.proto's `Position {
+     optional sfixed32 latitude_i = 1; optional sfixed32 longitude_i = 2; ... }` -- both
+     confirmed directly against github.com/meshtastic/protobufs' actual source this session
+     (not assumed from secondhand summaries): latitude_i/longitude_i are wire type 5 (32-bit
+     fixed), raw little-endian signed int32, already in "multiply by 1e-7 to get degrees"
+     units -- i.e. this project's own lat_e7/lon_e7 convention with no rescale needed (unlike
+     MeshCore's *1e6 wire encoding, see meshcore_proto.c). A packet's decrypted Data.payload
+     is either a NodeInfo (User) or a Position, never both, so this file's decrypt path
+     dispatches on whatever portnum it actually finds -- see decrypt_default_channel_payload().
    None of this is secret -- Meshtastic explicitly designs the default channel to be publicly
    listenable/decryptable, matching this capability's scope (see meshtastic_proto.h). */
 #include "meshtastic_proto.h"
@@ -29,9 +38,12 @@
 #include <mbedtls/aes.h>
 
 #define MESHTASTIC_HEADER_LEN 16u
+#define MESHTASTIC_PORTNUM_POSITION_APP 3u
 #define MESHTASTIC_PORTNUM_NODEINFO_APP 4u
 #define MESHTASTIC_DATA_FIELD_PORTNUM 1u
 #define MESHTASTIC_DATA_FIELD_PAYLOAD 2u
+#define MESHTASTIC_POSITION_FIELD_LATITUDE_I 1u
+#define MESHTASTIC_POSITION_FIELD_LONGITUDE_I 2u
 /* short_name (User message field 3), not long_name (field 2) -- Meshtastic's own convention
    is that short_name is a compact per-node tag (an emoji or short callsign, UI-enforced at a
    few characters in the official apps, though the wire field itself carries no hard length
@@ -56,6 +68,11 @@ static const uint8_t MESHTASTIC_DEFAULT_PSK[16] = {
 static uint32_t read_u32_le(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int32_t read_i32_le(const uint8_t *p)
+{
+    return (int32_t)read_u32_le(p);
 }
 
 static void node_id_to_hex(uint32_t node_num, char *out_hex)
@@ -226,13 +243,89 @@ static bool all_printable_ascii(const uint8_t *data, size_t len)
     return true;
 }
 
-/* Attempts to decrypt+parse a default-("LongFast")-channel payload down to a NODEINFO_APP
-   long_name. Returns false (leaving *out_name untouched) for anything short of a fully
+/* Extracts a NODEINFO_APP User.short_name from an already-decrypted+portnum-matched inner
+   payload. Returns false (out->has_name left false) for anything short of a fully
    structurally-valid, printable-ASCII result -- see meshtastic_proto.h's top comment on why
    this path is held to a stricter bar than meshcore_proto.c's plaintext ADVERT decode. */
-static bool decrypt_default_channel_name(const uint8_t *ciphertext, size_t ciphertext_len,
-                                          uint32_t from_node, uint32_t packet_id,
-                                          char *out_name, size_t out_name_cap)
+static void decode_nodeinfo_payload(const uint8_t *inner_payload, size_t inner_payload_len,
+                                     meshtastic_advert_t *out)
+{
+    const uint8_t *name_data = NULL;
+    size_t name_len = 0;
+    bool ok;
+
+    ok = protobuf_find_field(inner_payload, inner_payload_len, MESHTASTIC_USER_FIELD_SHORT_NAME,
+                              &name_data, &name_len, NULL);
+    if (!ok || name_len == 0u) {
+        return;
+    }
+    if (name_len > sizeof(out->name) - 1u) {
+        name_len = sizeof(out->name) - 1u; /* truncate, same convention as meshcore_proto.c */
+    }
+    if (!all_printable_ascii(name_data, name_len)) {
+        /* A garbage/implausible name means either the wrong key was applied (channel-hash
+           collision with a private channel we can't actually decrypt) or a bug in the
+           reverse-engineered layout above -- report no name at all rather than a name that
+           could be actively misleading. */
+        return;
+    }
+
+    memcpy(out->name, name_data, name_len);
+    out->name[name_len] = '\0';
+    out->has_name = true;
+}
+
+/* Extracts a POSITION_APP Position.latitude_i/longitude_i from an already-decrypted+portnum-
+   matched inner payload. Returns false (out->has_location left false) for a missing field or
+   an out-of-range decoded value -- mirrors meshcore_proto.c's own "reject implausible
+   coordinates rather than propagate them" posture (see meshtastic_proto.h's field comment on
+   this struct's lat_e7/lon_e7 for why no rescale is needed here, unlike MeshCore's). */
+static void decode_position_payload(const uint8_t *inner_payload, size_t inner_payload_len,
+                                     meshtastic_advert_t *out)
+{
+    const uint8_t *lat_data = NULL;
+    const uint8_t *lon_data = NULL;
+    size_t lat_len = 0;
+    size_t lon_len = 0;
+    int32_t lat_e7;
+    int32_t lon_e7;
+
+    if (!protobuf_find_field(inner_payload, inner_payload_len, MESHTASTIC_POSITION_FIELD_LATITUDE_I,
+                              &lat_data, &lat_len, NULL) || lat_len != 4u) {
+        return;
+    }
+    if (!protobuf_find_field(inner_payload, inner_payload_len, MESHTASTIC_POSITION_FIELD_LONGITUDE_I,
+                              &lon_data, &lon_len, NULL) || lon_len != 4u) {
+        return;
+    }
+
+    lat_e7 = read_i32_le(lat_data);
+    lon_e7 = read_i32_le(lon_data);
+
+    /* Physically valid decimal-degree range (+-90 / +-180 degrees, i.e. +-900,000,000 /
+       +-1,800,000,000 in this project's lat_e7/lon_e7 units) -- same bound
+       meshcore_proto.c applies, protecting cbor_mesh_log.h's own sizing guarantees against a
+       corrupted or (since the position payload's authenticity is never verified any more than
+       MeshCore's ADVERT is) adversarial value. */
+    if (lat_e7 < -900000000 || lat_e7 > 900000000 ||
+        lon_e7 < -1800000000 || lon_e7 > 1800000000) {
+        return;
+    }
+
+    out->lat_e7 = lat_e7;
+    out->lon_e7 = lon_e7;
+    out->has_location = true;
+}
+
+/* Decrypts a default-("LongFast")-channel ciphertext, reads its Data.portnum, and dispatches
+   to whichever payload decoder matches: NODEINFO_APP -> decode_nodeinfo_payload() (name),
+   POSITION_APP -> decode_position_payload() (location). A real packet on this channel is one
+   or the other, never both, so out->has_name and out->has_location are never both set from a
+   single frame. Leaves *out untouched (both false) for any other portnum or a structurally
+   invalid decrypt result. */
+static void decrypt_default_channel_payload(const uint8_t *ciphertext, size_t ciphertext_len,
+                                             uint32_t from_node, uint32_t packet_id,
+                                             meshtastic_advert_t *out)
 {
     uint8_t nonce[16];
     uint8_t stream_block[16];
@@ -243,12 +336,10 @@ static bool decrypt_default_channel_name(const uint8_t *ciphertext, size_t ciphe
     uint64_t portnum = 0;
     const uint8_t *inner_payload = NULL;
     size_t inner_payload_len = 0;
-    const uint8_t *name_data = NULL;
-    size_t name_len = 0;
     bool ok;
 
     if (ciphertext_len == 0u || ciphertext_len > sizeof(plaintext)) {
-        return false;
+        return;
     }
 
     memset(nonce, 0, sizeof(nonce));
@@ -269,7 +360,7 @@ static bool decrypt_default_channel_name(const uint8_t *ciphertext, size_t ciphe
     if (ret != 0) {
         mbedtls_aes_free(&aes);
         meshtastic_secure_zero(nonce, sizeof(nonce));
-        return false;
+        return;
     }
 
     ret = mbedtls_aes_crypt_ctr(&aes, ciphertext_len, &nc_off, nonce, stream_block,
@@ -279,45 +370,29 @@ static bool decrypt_default_channel_name(const uint8_t *ciphertext, size_t ciphe
     meshtastic_secure_zero(stream_block, sizeof(stream_block));
     if (ret != 0) {
         meshtastic_secure_zero(plaintext, sizeof(plaintext));
-        return false;
+        return;
     }
 
     ok = protobuf_find_field(plaintext, ciphertext_len, MESHTASTIC_DATA_FIELD_PORTNUM,
                               NULL, NULL, &portnum);
-    if (!ok || portnum != MESHTASTIC_PORTNUM_NODEINFO_APP) {
+    if (!ok) {
         meshtastic_secure_zero(plaintext, sizeof(plaintext));
-        return false;
+        return;
     }
 
     ok = protobuf_find_field(plaintext, ciphertext_len, MESHTASTIC_DATA_FIELD_PAYLOAD,
                               &inner_payload, &inner_payload_len, NULL);
     if (!ok) {
         meshtastic_secure_zero(plaintext, sizeof(plaintext));
-        return false;
+        return;
     }
 
-    ok = protobuf_find_field(inner_payload, inner_payload_len, MESHTASTIC_USER_FIELD_SHORT_NAME,
-                              &name_data, &name_len, NULL);
-    if (!ok || name_len == 0u) {
-        meshtastic_secure_zero(plaintext, sizeof(plaintext));
-        return false;
+    if (portnum == MESHTASTIC_PORTNUM_NODEINFO_APP) {
+        decode_nodeinfo_payload(inner_payload, inner_payload_len, out);
+    } else if (portnum == MESHTASTIC_PORTNUM_POSITION_APP) {
+        decode_position_payload(inner_payload, inner_payload_len, out);
     }
-    if (name_len > out_name_cap - 1u) {
-        name_len = out_name_cap - 1u; /* truncate, same convention as meshcore_proto.c */
-    }
-    if (!all_printable_ascii(name_data, name_len)) {
-        /* A garbage/implausible name means either the wrong key was applied (channel-hash
-           collision with a private channel we can't actually decrypt) or a bug in the
-           reverse-engineered layout above -- report no name at all rather than a name that
-           could be actively misleading. */
-        meshtastic_secure_zero(plaintext, sizeof(plaintext));
-        return false;
-    }
-
-    memcpy(out_name, name_data, name_len);
-    out_name[name_len] = '\0';
     meshtastic_secure_zero(plaintext, sizeof(plaintext));
-    return true;
 }
 
 bool meshtastic_proto_parse(const uint8_t *frame, size_t frame_len, meshtastic_advert_t *out)
@@ -343,8 +418,7 @@ bool meshtastic_proto_parse(const uint8_t *frame, size_t frame_len, meshtastic_a
     ciphertext_len = frame_len - MESHTASTIC_HEADER_LEN;
 
     if (ciphertext_len > 0u && channel == meshtastic_default_channel_hash()) {
-        out->has_name = decrypt_default_channel_name(ciphertext, ciphertext_len, from_node,
-                                                      packet_id, out->name, sizeof(out->name));
+        decrypt_default_channel_payload(ciphertext, ciphertext_len, from_node, packet_id, out);
     }
 
     return true;

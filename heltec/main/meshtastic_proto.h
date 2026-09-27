@@ -6,8 +6,11 @@
    Host-testable: tests/esp32/test_meshtastic_proto.c.
 
    Scope (docs/PLAN.md's "Meshtastic Scan Capability" design, Phase 1, mirroring
-   meshcore_scan's own Phase 1 "detection + display" tier): passive presence detection only,
-   default ("LongFast") primary channel only. Every field here was derived from Meshtastic's
+   meshcore_scan's own Phase 1 "detection + display" tier): passive presence detection,
+   default ("LongFast") primary channel only, plus (added for docs/WARDRIVING_PUBLISH.md's
+   mesh-node-publishing feed) an opportunistic decode of a node's own self-reported position
+   when it broadcasts one -- see meshtastic_advert_t's has_location/lat_e7/lon_e7 fields and
+   meshtastic_proto.c's decrypt path. Every field here was derived from Meshtastic's
    own public documentation and firmware/protobuf source (meshtastic.org's docs, the
    meshtastic/firmware and meshtastic/protobufs GitHub repos) during this session's research
    -- there is no MeshCore-style vendor "packet_format.md" for Meshtastic's raw-header layout,
@@ -16,14 +19,15 @@
    hardware available) -- only against synthetic frames this project constructs itself
    (tests/esp32/test_meshtastic_proto.c), exactly like meshcore_proto.c's own caveat, but with
    materially higher risk here: Meshtastic's header-only presence detection (below) is
-   low-risk (a fixed, publicly-documented raw byte layout), but the *optional* name field
-   requires reversing an AES-128-CTR decryption + a hand-rolled protobuf field walk, which is
-   a larger surface for a subtle mistake (wrong nonce byte order, wrong field number, wrong
-   channel-hash math) to silently produce a wrong-but-plausible-looking name rather than a
-   clean "field absent" -- see meshtastic_proto.c's decrypt path for the defensive checks
-   (printable-ASCII validation) added specifically because of this. Treat the presence/
-   node-id path as solid, the name-decode path as "our best reconstruction, unverified" until
-   a real capture confirms it. */
+   low-risk (a fixed, publicly-documented raw byte layout), but the *optional* name and
+   position fields both require reversing an AES-128-CTR decryption + a hand-rolled protobuf
+   field walk, which is a larger surface for a subtle mistake (wrong nonce byte order, wrong
+   field number, wrong channel-hash math) to silently produce a wrong-but-plausible-looking
+   value rather than a clean "field absent" -- see meshtastic_proto.c's decrypt path for the
+   defensive checks (printable-ASCII validation for name, range validation for position)
+   added specifically because of this. Treat the presence/node-id path as solid, the name-
+   and position-decode paths as "our best reconstruction, unverified" until a real capture
+   confirms them. */
 #ifndef FEB_MESHTASTIC_PROTO_H
 #define FEB_MESHTASTIC_PROTO_H
 
@@ -64,6 +68,20 @@ typedef struct {
                                                  decrypts to a structurally valid NODEINFO_APP
                                                  Data/User protobuf pair with a printable-ASCII
                                                  long_name -- see meshtastic_proto.c. */
+    bool has_location;
+    int32_t lat_e7; /* meaningful only if has_location. Meshtastic's own protobuf source
+                        (meshtastic/protobufs' portnums.proto POSITION_APP = 3, mesh.proto's
+                        `Position { optional sfixed32 latitude_i = 1; optional sfixed32
+                        longitude_i = 2; ... }`, both confirmed against the actual upstream
+                        source during this session's research, not assumed) already encodes
+                        latitude/longitude as "multiply by 1e-7 to get degrees in floating
+                        point" -- i.e. the wire value already *is* this project's own
+                        lat_e7/lon_e7 convention (gps/wardriving) with no rescale needed,
+                        unlike meshcore_proto.h's lat_e7/lon_e7 (which does need a *10 rescale
+                        from MeshCore's *1e6 wire encoding) -- see meshtastic_proto.c's
+                        decrypt path for the same "reject implausible/out-of-range value"
+                        posture meshcore_proto.c applies. */
+    int32_t lon_e7;
 } meshtastic_advert_t;
 
 /* Parses one raw LoRa PHY payload (as returned by RadioLib's readData()) into *out. The

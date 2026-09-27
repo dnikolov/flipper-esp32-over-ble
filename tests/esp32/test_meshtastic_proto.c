@@ -11,7 +11,7 @@
    device. Treat this as "the parser does what our research says the protocol should look
    like", not as proof it correctly decodes whatever a real Meshtastic firmware actually
    transmits on air -- that remains genuinely untested (see meshtastic_proto.h's top comment
-   for the fuller risk framing, especially for the name-decode path). */
+   for the fuller risk framing, especially for the name- and position-decode paths). */
 #include <stdio.h>
 #include <string.h>
 
@@ -124,6 +124,38 @@ static size_t build_nodeinfo_data(uint8_t *out, uint32_t portnum, const char *sh
     pos = append_varint(out, pos, portnum);
     pos = append_tag(out, pos, 2 /* payload */, 2);
     pos = append_length_delimited(out, pos, user_buf, user_len);
+    return pos;
+}
+
+static void append_sfixed32(uint8_t *buf, size_t *pos, uint32_t field, int32_t value)
+{
+    *pos = append_tag(buf, *pos, field, 5 /* 32-bit fixed */);
+    write_u32_le(buf + *pos, (uint32_t)value);
+    *pos += 4u;
+}
+
+/* Builds a plaintext Data{portnum, payload=Position{latitude_i, longitude_i}} protobuf
+   message (only the fields this parser actually reads). has_lat/has_lon let a test omit
+   either field to exercise the "missing field" rejection path. */
+static size_t build_position_data(uint8_t *out, uint32_t portnum,
+                                   bool has_lat, int32_t lat_e7,
+                                   bool has_lon, int32_t lon_e7)
+{
+    uint8_t position_buf[32];
+    size_t position_len = 0;
+    size_t pos = 0;
+
+    if (has_lat) {
+        append_sfixed32(position_buf, &position_len, 1 /* latitude_i */, lat_e7);
+    }
+    if (has_lon) {
+        append_sfixed32(position_buf, &position_len, 2 /* longitude_i */, lon_e7);
+    }
+
+    pos = append_tag(out, pos, 1 /* portnum */, 0);
+    pos = append_varint(out, pos, portnum);
+    pos = append_tag(out, pos, 2 /* payload */, 2);
+    pos = append_length_delimited(out, pos, position_buf, position_len);
     return pos;
 }
 
@@ -264,6 +296,64 @@ int main(void)
         check(meshtastic_proto_parse(frame, frame_len, &advert),
               "exactly-16-byte frame (header only, no payload): parses (presence only)");
         check(!advert.has_name, "exactly-16-byte frame: has_name is false (nothing to decrypt)");
+    }
+
+    /* --- Test 8: a frame on the default channel whose payload decrypts to a POSITION_APP
+       Data/Position pair carrying a valid latitude_i/longitude_i -- has_location should be
+       true with lat_e7/lon_e7 passed through unscaled (see meshtastic_proto.h's field
+       comment: Meshtastic's own wire encoding is already *1e7, unlike MeshCore's *1e6). --- */
+    {
+        uint32_t from_node = 0x11223344u;
+        uint32_t packet_id = 0x00000005u;
+        int32_t want_lat_e7 = 425000000; /* 42.5 degrees */
+        int32_t want_lon_e7 = -712345670; /* -71.234567 degrees */
+
+        plaintext_len = build_position_data(plaintext, 3 /* POSITION_APP */,
+                                             true, want_lat_e7, true, want_lon_e7);
+        frame_len = build_header(frame, 0xFFFFFFFFu, from_node, packet_id, default_channel);
+        aes128_ctr_encrypt(from_node, packet_id, plaintext, plaintext_len, frame + frame_len);
+        frame_len += plaintext_len;
+
+        check(meshtastic_proto_parse(frame, frame_len, &advert),
+              "default channel, POSITION_APP: parses");
+        check(strcmp(advert.node_id_hex, "11223344") == 0,
+              "default channel, POSITION_APP: node_id_hex derived from the header's `from` field");
+        check(!advert.has_name, "default channel, POSITION_APP: has_name is false (not a NodeInfo)");
+        check(advert.has_location && advert.lat_e7 == want_lat_e7 && advert.lon_e7 == want_lon_e7,
+              "default channel, POSITION_APP: has_location true, lat_e7/lon_e7 pass through unscaled");
+    }
+
+    /* --- Test 9: POSITION_APP payloads that must be rejected (has_location stays false,
+       never a garbage/implausible value): an out-of-range latitude, and a payload missing
+       longitude_i entirely. Mirrors the name path's own defensive-rejection coverage
+       (Tests 4-5 above) and meshcore_proto.c's own out-of-range guard. --- */
+    {
+        uint32_t from_node = 0x55667788u;
+        uint32_t packet_id = 0x00000006u;
+        int32_t out_of_range_lat_e7 = 950000000; /* > +-900,000,000 (90 degrees) */
+
+        plaintext_len = build_position_data(plaintext, 3 /* POSITION_APP */,
+                                             true, out_of_range_lat_e7, true, 0);
+        frame_len = build_header(frame, 0xFFFFFFFFu, from_node, packet_id, default_channel);
+        aes128_ctr_encrypt(from_node, packet_id, plaintext, plaintext_len, frame + frame_len);
+        frame_len += plaintext_len;
+
+        check(meshtastic_proto_parse(frame, frame_len, &advert),
+              "default channel, out-of-range POSITION_APP latitude: still parses (presence only)");
+        check(!advert.has_location,
+              "default channel, out-of-range POSITION_APP latitude: has_location is false, never a garbage value");
+
+        packet_id = 0x00000007u;
+        plaintext_len = build_position_data(plaintext, 3 /* POSITION_APP */,
+                                             true, 100000000, false, 0);
+        frame_len = build_header(frame, 0xFFFFFFFFu, from_node, packet_id, default_channel);
+        aes128_ctr_encrypt(from_node, packet_id, plaintext, plaintext_len, frame + frame_len);
+        frame_len += plaintext_len;
+
+        check(meshtastic_proto_parse(frame, frame_len, &advert),
+              "default channel, POSITION_APP missing longitude_i: still parses (presence only)");
+        check(!advert.has_location,
+              "default channel, POSITION_APP missing longitude_i: has_location is false");
     }
 
     if (g_failures == 0) {

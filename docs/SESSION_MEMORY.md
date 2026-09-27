@@ -189,11 +189,9 @@ call sites in `lora_shared_radio.cpp`'s RX task, recording any sighting that car
 to a new dedicated checksummed circular flash log (`heltec/main/mesh_log.c/.h`,
 `mesh_log_record_format.c/.h`, mirroring `wardriving_log.c`'s architecture), independent of
 `wardriving`'s start/stop lifecycle. `feb_features[]` is now `{"wifi_scan", "ble_scan", "gps",
-"wardriving", "meshcore_scan", "meshtastic_scan", "mesh_log"}`. **Confirmed by reading
-`meshtastic_proto.h` directly this session (not assumed): Meshtastic never contributes a
-sighting here today** — its Phase 1 parser doesn't decode `POSITION_APP` at all, so every
-recorded sighting is currently MeshCore-only; this is a real, current gap, flagged explicitly
-per the task's own request, not silently papered over.
+"wardriving", "meshcore_scan", "meshtastic_scan", "mesh_log"}`. At the time this capability was
+added, Meshtastic contributed no sightings here (its Phase 1 parser didn't decode
+`POSITION_APP`) — **closed the same day, see the `meshtastic_scan` `POSITION_APP` entry below.**
 
 **Dedup decision (superseded same day, see below):** the frozen design's preferred
 heap-allocated table (sized against a real `esp_get_free_heap_size()` boot-time reading) could
@@ -298,8 +296,26 @@ across the whole protocol, not merely within that capability. `wardriving` alrea
 since `cbor_mesh_log.h` isn't mirrored into `flipper/` yet, same as `cbor_meshtastic.h`).
 **Not done this pass**: no flashing, no hardware verification of any kind (no board available);
 no manual on-demand query exists for this capability by design (it is push-only, mirroring the
-frozen design's own framing — see `docs/PROTOCOL.md`); the Flipper-side accumulator
-(`mesh/mesh_nodes_current.txt`, per the frozen design) is a follow-up task, not started here.
+frozen design's own framing — see `docs/PROTOCOL.md`).
+
+**Flipper-side `mesh_log` accumulator + Mesh Log screen, and the host publish script's mesh
+upload: done, build-verified, hardware pending (2026-09-27).** ✅ `flipper/mesh_nodes.c/.h` +
+`cbor_mesh_log.h/.c` + `handle_mesh_log_status()`/`AppScreenMeshLog` implement the
+`mesh/mesh_nodes_current.txt` accumulator and its display screen this section previously
+called "a follow-up task, not started" — that was stale, corrected here.
+`scripts/publish_wardriving.ps1` now also publishes that file to wdgwars.pl (Method 2,
+JSON+HMAC) as its own independent operation alongside the existing CSV upload, archiving on
+confirmed success. See `docs/WARDRIVING_PUBLISH.md`'s "Mesh node publishing" section for the
+full implementation notes and corrected response-field names. Still open: `docs/BACKLOG.md`
+BL26 (the Flipper's Publish screen doesn't display the mesh outcome yet, only the CSV one).
+
+**`meshtastic_scan` `POSITION_APP` decode + `mesh_log` wiring: done, build/host-test-verified
+2026-09-27, no hardware to test against.** ✅ `meshtastic_proto.c` now decrypts a default-
+channel `POSITION_APP` payload's `latitude_i`/`longitude_i` (portnum/field numbers confirmed
+against github.com/meshtastic/protobufs' actual source, no rescale needed — already *1e7
+degrees); `lora_handle_meshtastic_frame()` now calls `mesh_log_record_sighting()` on
+`has_location`, mirroring MeshCore's own call. `idf.py size` unchanged (45 B IRAM / 40 B DRAM
+headroom, same as BL25). New host tests in `tests/esp32/test_meshtastic_proto.c` pass.
 
 **Heltec onboard SSD1306 OLED status display: done, hardware-verified 2026-09-27.** ✅ See
 `docs/PROJECT_HISTORY.md`'s 2026-09-27 entry for the full narrative (IRAM-overflow root cause

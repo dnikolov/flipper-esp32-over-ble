@@ -276,7 +276,7 @@ Instead:
   empty file, and this status tells the Flipper screen to say so plainly rather than showing a
   false failure.
 
-## Mesh node publishing (design frozen 2026-09-27; ESP32/Heltec side implemented 2026-09-27, `flipper/` side implemented 2026-09-27, build-verified only, hardware pending)
+## Mesh node publishing (design frozen 2026-09-27; ESP32/Heltec side implemented 2026-09-27, `flipper/` side implemented 2026-09-27, host publish script implemented 2026-09-27 — all build-verified only, hardware pending)
 
 **`flipper/` side implementation note (2026-09-27):** the wire codec
 (`flipper/cbor_mesh_log.h/.c`, byte-for-byte header mirror of
@@ -284,12 +284,34 @@ Instead:
 `tools/check_shared_headers.py`) and the `mesh/mesh_nodes_current.txt` flat-line accumulator
 (`flipper/mesh_nodes.c/.h` for pure formatting, storage/session-lifecycle wiring in
 `flipper/flipper_esp32_over_ble.c`'s `handle_mesh_log_status()`) are both implemented and
-FAP build-verified. **Still out of scope, deferred to separate future tasks:** the
-`mesh/mesh_nodes_current.txt` → `mesh/<timestamp>.txt` archiving-on-confirmed-publish-success
-(will live in the host PowerShell script, `scripts/publish_wardriving.ps1`, mirroring how the
-wardriving CSV's own archiving already works there rather than in the FAP), and the actual
-Method 2 (JSON + HMAC-SHA256) upload to wdgwars.pl itself. No hardware verification has been
-done yet for the Flipper-side receive/decode/append path.
+FAP build-verified. No hardware verification has been done yet for the Flipper-side
+receive/decode/append path.
+
+**Host publish script implementation note (2026-09-27):** `scripts/publish_wardriving.ps1`
+now also pulls `mesh/mesh_nodes_current.txt` from the Flipper, parses its flat
+`node_id|network|lat|lon` lines (skipping any malformed line rather than aborting the whole
+publish, mirroring `flipper/mesh_nodes.c`'s own tolerance), and — if it has at least one valid
+record — POSTs them as a `meshcore_nodes` JSON array to `POST https://wdgwars.pl/api/upload`
+(Method 2: `{"data": base64(json), "nonce": <16 hex chars>, "sig": hex(HMAC-SHA256(apiKey,
+nonce+data))}`, same `X-API-Key` header as the CSV upload, same stored key — no new
+credential). This runs as a fully independent second operation within the same publish run
+(own endpoint, own archive-on-success rename to `mesh/<timestamp>.txt`, own block of
+`mesh_`-prefixed keys in `wardriving_publish_result.txt`), exactly as this section's
+"Publish-flow integration" describes below — a CSV-publish failure or no-op never blocks the
+mesh publish, or vice versa.
+
+**Corrected against wdgwars.pl's own docs (re-read 2026-09-27, this implementation pass):**
+this section's original design guessed generic `imported`/`rejected` response field names
+below (see "Recorded fields" and "Result-reporting format" language elsewhere in this
+section) before the real API docs had been checked for this specific call. The actual
+response fields are `meshcore_imported` (a count) and `meshcore_reject_reasons` (an object of
+reason → count, e.g. `bad_network`/`bad_node_id`/`no_gps`). The host script flattens the
+latter into individual `mesh_reject_<reason>=<count>` result-file lines rather than storing a
+nested blob, since this firmware's result file is flat key=value text with no JSON decoder
+anywhere (same reasoning that already kept the credential store as flat text). Not yet
+implemented: reading these mesh-specific result fields back out on the Flipper's Publish
+screen (today it only displays the CSV-side `status`/counts) — the mesh outcome currently
+only surfaces via the result file's raw text and this script's own console output.
 
 **Corrected/confirmed 2026-09-27, during implementation** (see `docs/PROTOCOL.md`'s `mesh_log`
 section for the full wire contract these produced):
@@ -327,11 +349,16 @@ section for the full wire contract these produced):
   `heltec/main/mesh_log.c`'s top comment for the full mechanism, and its boot log's new "mesh
   log dedup table seeded with N entries from existing log" line for how to sanity-check it on a
   future hardware session.
-- **Meshtastic contributes no sightings yet.** `meshtastic_scan`'s Phase 1 parser does not
-  decode Meshtastic's `POSITION_APP` payload at all, so `mesh_log` currently only ever records
-  MeshCore nodes — confirmed by reading `meshtastic_proto.h` directly this session, not
-  assumed. The design below still describes both networks since the wire format and dedup
-  logic are network-agnostic; only the *current* data source is MeshCore-only.
+- **Meshtastic now contributes sightings too (corrected 2026-09-27, later same day).** The
+  bullet above originally said Meshtastic's Phase 1 parser never decodes `POSITION_APP` and so
+  `mesh_log` only ever recorded MeshCore nodes — that gap was closed the same day:
+  `meshtastic_proto.c` now decrypts a default-channel `POSITION_APP` payload's
+  `latitude_i`/`longitude_i` (confirmed field numbers/wire encoding against
+  github.com/meshtastic/protobufs' actual source) and `lora_shared_radio.cpp`'s
+  `lora_handle_meshtastic_frame()` calls `mesh_log_record_sighting()` on it, mirroring
+  MeshCore's own call — gated on `has_location`, same as MeshCore. Build/host-test verified
+  only, no real Meshtastic hardware available to confirm against an over-the-air capture (same
+  caveat the existing NODEINFO_APP name-decode already carried).
 
 Reached via a grill-me design session with the user, 2026-09-27, after wdgwars.pl's own docs
 (`https://wdgwars.pl/help/#api-docs`, read this session) confirmed it accepts LoRa mesh node

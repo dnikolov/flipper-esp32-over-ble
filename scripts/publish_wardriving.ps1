@@ -10,7 +10,8 @@
 param(
     [string]$Port = "auto",
     [string]$AppDataPath = "/ext/apps_data/flipper_esp32_over_ble",
-    [string]$UploadUrl = "https://wdgwars.pl/api/upload-csv"
+    [string]$UploadUrl = "https://wdgwars.pl/api/upload-csv",
+    [string]$MeshUploadUrl = "https://wdgwars.pl/api/upload"
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,10 @@ $script:WardrivingDir = "$AppDataPath/wardriving"
 $script:CsvFlipperPath = "$script:WardrivingDir/wardriving_current.csv"
 $script:CredentialsFlipperPath = "$AppDataPath/wdgwars_credentials.txt"
 $script:ResultFlipperPath = "$AppDataPath/wardriving_publish_result.txt"
+# mesh_log's own accumulator (docs/WARDRIVING_PUBLISH.md "Flipper-side storage") -- own
+# subdirectory, own independent current/archive lifecycle, distinct from wardriving/'s CSV.
+$script:MeshDir = "$AppDataPath/mesh"
+$script:MeshNodesFlipperPath = "$script:MeshDir/mesh_nodes_current.txt"
 
 # ---------------------------------------------------------------------------
 # Low-level CLI-over-serial client
@@ -389,6 +394,108 @@ function Send-WdgwarsUpload {
 }
 
 # ---------------------------------------------------------------------------
+# mesh_log upload (Method 2: JSON + HMAC-SHA256, docs/WARDRIVING_PUBLISH.md
+# "Publish-flow integration") -- independent of the CSV upload above: different endpoint,
+# different auth scheme (signed body, not just the X-API-Key header), same stored key.
+# ---------------------------------------------------------------------------
+
+# Parses flipper/mesh_nodes.h's flat "node_id|network|lat|lon" lines (feb_mesh_log_format_line's
+# own wire shape) into wdgwars' `meshcore_nodes` upload entries. Skips (rather than aborts on) a
+# malformed line -- same tolerance as the Flipper's own feb_mesh_log_parse_line(), since a
+# partially-written or hand-edited file should degrade one record, not the whole publish.
+function Get-MeshNodesFromLines {
+    param([string[]]$Lines)
+
+    $nodes = @()
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line -split '\|'
+        if ($parts.Count -ne 4) {
+            Write-Host "Skipping malformed mesh log line: $line"
+            continue
+        }
+        $lat = 0.0
+        $lon = 0.0
+        # Explicit invariant-culture overload: this project's own lat/lon text is always
+        # '.'-separated (feb_mesh_log_format_line's "%.7f"), but plain TryParse(string, [ref])
+        # uses the host machine's current culture -- on a comma-decimal locale (confirmed
+        # against this session's own bg-BG host) it silently fails to parse every dot-separated
+        # value, which would have discarded every mesh node record on such a machine.
+        $styles = [System.Globalization.NumberStyles]::Float
+        $invariant = [System.Globalization.CultureInfo]::InvariantCulture
+        if (-not [double]::TryParse($parts[2], $styles, $invariant, [ref]$lat) -or
+            -not [double]::TryParse($parts[3], $styles, $invariant, [ref]$lon)) {
+            Write-Host "Skipping mesh log line with unparsable lat/lon: $line"
+            continue
+        }
+        $nodes += [ordered]@{
+            node_id = $parts[0]
+            network = $parts[1]
+            lat     = $lat
+            lon     = $lon
+        }
+    }
+    return $nodes
+}
+
+# wdgwars.pl's Method 2 (https://wdgwars.pl/help/#api-docs, read 2026-09-27): body is
+# {"data": base64(json), "nonce": <16 hex chars>, "sig": hex(HMAC-SHA256(apiKey, nonce+data))},
+# POSTed alongside the same X-API-Key header the CSV upload already uses. Only ever sends
+# `meshcore_nodes` (never `networks` -- that stays the CSV path's job, see the design doc's
+# "Separate HTTP calls" note). Synchronous (no 202/job_id queueing documented for this endpoint,
+# unlike the CSV v1/v2 pair), so only HTTP 200 + ok:true counts as confirmed success.
+function Send-WdgwarsMeshUpload {
+    param([string]$Url, [string]$ApiKey, [array]$MeshNodes)
+
+    $payload = @{ meshcore_nodes = $MeshNodes }
+    $json = $payload | ConvertTo-Json -Depth 6 -Compress
+    $dataB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+
+    $nonceBytes = New-Object byte[] 8
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nonceBytes)
+    $nonce = -join ($nonceBytes | ForEach-Object { $_.ToString("x2") })
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256
+    try {
+        $hmac.Key = [System.Text.Encoding]::UTF8.GetBytes($ApiKey)
+        $sigBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($nonce + $dataB64))
+    } finally {
+        $hmac.Dispose()
+    }
+    $sig = -join ($sigBytes | ForEach-Object { $_.ToString("x2") })
+
+    $bodyJson = (@{ data = $dataB64; nonce = $nonce; sig = $sig } | ConvertTo-Json -Compress)
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = "POST"
+    $request.ContentType = "application/json"
+    $request.Headers.Add("X-API-Key", $ApiKey)
+    $request.ContentLength = $bodyBytes.Length
+    $request.Timeout = 60000
+
+    $reqStream = $request.GetRequestStream()
+    $reqStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    $reqStream.Close()
+
+    try {
+        $response = $request.GetResponse()
+    } catch [System.Net.WebException] {
+        $response = $_.Exception.Response
+        if (-not $response) { throw }
+    }
+
+    $statusCode = [int]$response.StatusCode
+    $stream = $response.GetResponseStream()
+    $reader = New-Object System.IO.StreamReader($stream)
+    $bodyText = $reader.ReadToEnd()
+    $reader.Close()
+    $response.Close()
+
+    return @{ StatusCode = $statusCode; Body = $bodyText }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -406,7 +513,14 @@ function Write-ResultFile {
 
 $tempCsv = $null
 $tempCreds = $null
+$tempMesh = $null
 $cli = $null
+# Accumulates fields from both independent operations below into the one result file the
+# Flipper's Publish screen reads (docs/WARDRIVING_PUBLISH.md "One result file, two outcome
+# blocks") -- unprefixed keys are the CSV/wifi-ble outcome, `mesh_`-prefixed keys are the
+# mesh_log outcome. Written exactly once, after both have had a chance to run, so neither
+# operation having nothing to publish (or failing) ever hides the other's real result.
+$resultFields = @{}
 
 try {
     if ($Port -eq "auto") {
@@ -418,33 +532,22 @@ try {
 
     $cli = Open-FlipperCli -PortName $Port
 
-    if (-not (Test-FlipperFileExists -Cli $cli -Path $script:CsvFlipperPath)) {
-        Write-Host "No wardriving CSV found on the Flipper -- nothing to publish."
-        Write-ResultFile -Cli $cli -Fields @{ status = "nothing_to_publish" }
-        return
-    }
+    $haveCsv = Test-FlipperFileExists -Cli $cli -Path $script:CsvFlipperPath
+    $haveMesh = Test-FlipperFileExists -Cli $cli -Path $script:MeshNodesFlipperPath
 
-    $tempCsv = Join-Path $env:TEMP "wardriving_current_$([guid]::NewGuid()).csv"
-    Write-Host "Pulling current CSV from the Flipper..."
-    Receive-FlipperFile -Cli $cli -FlipperPath $script:CsvFlipperPath -LocalPath $tempCsv
-
-    $csvLines = Get-Content -LiteralPath $tempCsv
-    # WigleWifi-1.6 export is two header lines (metadata line, then column-name line); anything
-    # beyond that is real data.
-    if ($csvLines.Count -le 2) {
-        Write-Host "CSV has no data rows yet -- nothing to publish."
-        Write-ResultFile -Cli $cli -Fields @{ status = "nothing_to_publish" }
-        return
-    }
-
+    # Credentials are shared between both uploads (docs/WARDRIVING_PUBLISH.md "Separate HTTP
+    # calls": mesh reuses "the same 64-char wdgwars API key already stored" -- no new
+    # credential), so this is loaded/prompted-for once, before either operation, rather than
+    # duplicated per-operation.
     $tempCreds = Join-Path $env:TEMP "wdgwars_credentials_$([guid]::NewGuid()).txt"
-    $haveCreds = Test-FlipperFileExists -Cli $cli -Path $script:CredentialsFlipperPath
-    if ($haveCreds) {
+    $haveCredsFile = Test-FlipperFileExists -Cli $cli -Path $script:CredentialsFlipperPath
+    if ($haveCredsFile) {
         Receive-FlipperFile -Cli $cli -FlipperPath $script:CredentialsFlipperPath -LocalPath $tempCreds
     }
     $creds = Get-CredentialsMap -LocalPath $tempCreds
 
-    if (-not $creds.ContainsKey("wdgwars") -or [string]::IsNullOrWhiteSpace($creds["wdgwars"])) {
+    if (($haveCsv -or $haveMesh) -and
+        (-not $creds.ContainsKey("wdgwars") -or [string]::IsNullOrWhiteSpace($creds["wdgwars"]))) {
         Write-Host ""
         Write-Host "No wdgwars.pl API key stored on this Flipper yet."
         $apiKey = Read-Host "Paste your wdgwars.pl API key (from your profile -> API Keys)"
@@ -454,44 +557,135 @@ try {
         Send-FlipperFile -Cli $cli -LocalPath $tempCreds -FlipperPath $script:CredentialsFlipperPath
     }
 
-    Write-Host "Uploading to wdgwars.pl..."
-    $result = Send-WdgwarsUpload -Url $UploadUrl -ApiKey $creds["wdgwars"] -CsvPath $tempCsv
-    Write-Host "wdgwars.pl responded with HTTP $($result.StatusCode)"
-    Write-Host $result.Body
-
-    $parsed = $null
-    try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
-
-    # 202 is wdgwars.pl's async-queued acknowledgement (docs/WARDRIVING_PUBLISH.md's v2
-    # upload-job behavior) -- confirmed 2026-09-18 that even /api/upload-csv (v1) can return
-    # it under real conditions, not just the documented v2 endpoint. ok:true here means the
-    # server has accepted and queued the upload, which this project treats as confirmed
-    # enough to archive -- an explicit user decision over waiting on the job to finish via
-    # poll_url, which this script does not do.
-    if (($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) -and $parsed -and $parsed.ok -eq $true) {
-        $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-        $archivePath = "$script:WardrivingDir/$timestamp.csv"
-        Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
-        Rename-FlipperFile -Cli $cli -OldPath $script:CsvFlipperPath -NewPath $archivePath
-
-        $fields = @{ status = "ok" }
-        foreach ($name in @("imported", "captured", "updated", "duplicates", "no_gps", "bad_rows")) {
-            if ($parsed.PSObject.Properties.Name -contains $name) { $fields[$name] = $parsed.$name }
-        }
-        Write-ResultFile -Cli $cli -Fields $fields
-        Write-Host "Done."
+    # ---- CSV (wifi/ble) publish -- Method 1, unchanged from before mesh_log existed ----
+    if (-not $haveCsv) {
+        Write-Host "No wardriving CSV found on the Flipper -- nothing to publish."
+        $resultFields["status"] = "nothing_to_publish"
     } else {
-        Write-Host "Upload not confirmed as successful -- leaving the CSV in place, nothing renamed."
-        Write-ResultFile -Cli $cli -Fields @{
-            status  = "fail"
-            message = "HTTP $($result.StatusCode): $($result.Body)"
+        $tempCsv = Join-Path $env:TEMP "wardriving_current_$([guid]::NewGuid()).csv"
+        Write-Host "Pulling current CSV from the Flipper..."
+        Receive-FlipperFile -Cli $cli -FlipperPath $script:CsvFlipperPath -LocalPath $tempCsv
+
+        $csvLines = Get-Content -LiteralPath $tempCsv
+        # WigleWifi-1.6 export is two header lines (metadata line, then column-name line);
+        # anything beyond that is real data.
+        if ($csvLines.Count -le 2) {
+            Write-Host "CSV has no data rows yet -- nothing to publish."
+            $resultFields["status"] = "nothing_to_publish"
+        } else {
+            try {
+                Write-Host "Uploading CSV to wdgwars.pl..."
+                $result = Send-WdgwarsUpload -Url $UploadUrl -ApiKey $creds["wdgwars"] -CsvPath $tempCsv
+                Write-Host "wdgwars.pl responded with HTTP $($result.StatusCode)"
+                Write-Host $result.Body
+
+                $parsed = $null
+                try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
+
+                # 202 is wdgwars.pl's async-queued acknowledgement (docs/WARDRIVING_PUBLISH.md's
+                # v2 upload-job behavior) -- confirmed 2026-09-18 that even /api/upload-csv (v1)
+                # can return it under real conditions, not just the documented v2 endpoint.
+                # ok:true here means the server has accepted and queued the upload, which this
+                # project treats as confirmed enough to archive -- an explicit user decision
+                # over waiting on the job to finish via poll_url, which this script does not do.
+                if (($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) -and $parsed -and $parsed.ok -eq $true) {
+                    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+                    $archivePath = "$script:WardrivingDir/$timestamp.csv"
+                    Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
+                    Rename-FlipperFile -Cli $cli -OldPath $script:CsvFlipperPath -NewPath $archivePath
+
+                    $resultFields["status"] = "ok"
+                    foreach ($name in @("imported", "captured", "updated", "duplicates", "no_gps", "bad_rows")) {
+                        if ($parsed.PSObject.Properties.Name -contains $name) { $resultFields[$name] = $parsed.$name }
+                    }
+                } else {
+                    Write-Host "Upload not confirmed as successful -- leaving the CSV in place, nothing renamed."
+                    $resultFields["status"] = "fail"
+                    $resultFields["message"] = "HTTP $($result.StatusCode): $($result.Body)"
+                }
+            } catch {
+                Write-Host "CSV publish failed: $($_.Exception.Message)"
+                $resultFields["status"] = "fail"
+                $resultFields["message"] = $_.Exception.Message
+            }
         }
     }
+
+    # ---- Mesh node (MeshCore/Meshtastic) publish -- Method 2, independent of the CSV above:
+    # own endpoint, own auth scheme (HMAC-signed body), own archive file, own result-file
+    # block. A failure or no-op here never blocks or is blocked by the CSV outcome above. ----
+    if (-not $haveMesh) {
+        Write-Host "No mesh node log found on the Flipper -- nothing to publish."
+        $resultFields["mesh_status"] = "nothing_to_publish"
+    } else {
+        $tempMesh = Join-Path $env:TEMP "mesh_nodes_current_$([guid]::NewGuid()).txt"
+        Write-Host "Pulling mesh node log from the Flipper..."
+        Receive-FlipperFile -Cli $cli -FlipperPath $script:MeshNodesFlipperPath -LocalPath $tempMesh
+
+        $meshLines = @(Get-Content -LiteralPath $tempMesh -ErrorAction SilentlyContinue)
+        $meshNodes = @(Get-MeshNodesFromLines -Lines $meshLines)
+
+        if ($meshNodes.Count -eq 0) {
+            Write-Host "Mesh node log has no valid records -- nothing to publish."
+            $resultFields["mesh_status"] = "nothing_to_publish"
+        } else {
+            try {
+                Write-Host "Uploading $($meshNodes.Count) mesh node(s) to wdgwars.pl..."
+                $result = Send-WdgwarsMeshUpload -Url $MeshUploadUrl -ApiKey $creds["wdgwars"] -MeshNodes $meshNodes
+                Write-Host "wdgwars.pl responded with HTTP $($result.StatusCode)"
+                Write-Host $result.Body
+
+                $parsed = $null
+                try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
+
+                # Method 2 is synchronous (no job_id/poll_url documented for /api/upload, unlike
+                # the CSV v1/v2 pair) -- only a plain 200 + ok:true counts as confirmed.
+                if ($result.StatusCode -eq 200 -and $parsed -and $parsed.ok -eq $true) {
+                    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+                    $archivePath = "$script:MeshDir/$timestamp.txt"
+                    Write-Host "Mesh upload confirmed -- archiving mesh node log on the Flipper as $timestamp.txt"
+                    Rename-FlipperFile -Cli $cli -OldPath $script:MeshNodesFlipperPath -NewPath $archivePath
+
+                    $resultFields["mesh_status"] = "ok"
+                    # Real field names confirmed against wdgwars.pl's own docs (read 2026-09-27):
+                    # `meshcore_imported` (count) and `meshcore_reject_reasons` (an object of
+                    # reason -> count, e.g. bad_network/bad_node_id/no_gps). Flattened into
+                    # individual mesh_reject_<reason>=<count> lines rather than stored as a
+                    # nested blob -- this firmware's result file is flat key=value text with no
+                    # JSON decoder anywhere (same reasoning as the credentials file).
+                    if ($parsed.PSObject.Properties.Name -contains "meshcore_imported") {
+                        $resultFields["mesh_imported"] = $parsed.meshcore_imported
+                    }
+                    if ($parsed.PSObject.Properties.Name -contains "meshcore_reject_reasons") {
+                        $reasons = $parsed.meshcore_reject_reasons
+                        if ($reasons) {
+                            foreach ($prop in $reasons.PSObject.Properties) {
+                                $resultFields["mesh_reject_$($prop.Name)"] = $prop.Value
+                            }
+                        }
+                    }
+                } else {
+                    Write-Host "Mesh upload not confirmed as successful -- leaving the mesh log in place, nothing renamed."
+                    $resultFields["mesh_status"] = "fail"
+                    $resultFields["mesh_message"] = "HTTP $($result.StatusCode): $($result.Body)"
+                }
+            } catch {
+                Write-Host "Mesh publish failed: $($_.Exception.Message)"
+                $resultFields["mesh_status"] = "fail"
+                $resultFields["mesh_message"] = $_.Exception.Message
+            }
+        }
+    }
+
+    Write-ResultFile -Cli $cli -Fields $resultFields
+    Write-Host "Done."
 } catch {
     Write-Host "Publish failed: $($_.Exception.Message)"
     if ($cli) {
         try {
-            Write-ResultFile -Cli $cli -Fields @{ status = "fail"; message = $_.Exception.Message }
+            if (-not $resultFields.ContainsKey("status")) { $resultFields["status"] = "fail" }
+            if (-not $resultFields.ContainsKey("message")) { $resultFields["message"] = $_.Exception.Message }
+            Write-ResultFile -Cli $cli -Fields $resultFields
         } catch {
             Write-Host "(could not write a result file back to the Flipper either)"
         }
@@ -501,6 +695,7 @@ try {
     # Only the transient local copies get deleted -- the SD-persisted credential file is
     # intentionally left on the Flipper (see docs/WARDRIVING_PUBLISH.md, "Credential storage").
     if ($tempCsv -and (Test-Path $tempCsv)) { Remove-Item -LiteralPath $tempCsv -Force -ErrorAction SilentlyContinue }
+    if ($tempMesh -and (Test-Path $tempMesh)) { Remove-Item -LiteralPath $tempMesh -Force -ErrorAction SilentlyContinue }
     if ($tempCreds -and (Test-Path $tempCreds)) { Remove-Item -LiteralPath $tempCreds -Force -ErrorAction SilentlyContinue }
     # No confirmation gate (docs/WARDRIVING_PUBLISH.md): the script just finishes and returns
     # control to the interactive PowerShell prompt the bootstrap opened, leaving output visible

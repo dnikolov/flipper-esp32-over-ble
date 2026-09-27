@@ -233,13 +233,16 @@ static void lora_handle_meshtastic_frame(size_t len)
         ESP_LOGI(TAG, "diag: [meshtastic] meshtastic_proto_parse() succeeded, node_id=%s, has_name=%d",
                   advert.node_id_hex, (int)advert.has_name);
         meshtastic_table_upsert(&advert, rssi_dbm, now_ms);
-        /* No mesh_log_record_sighting() call here: meshtastic_advert_t (meshtastic_proto.h)
-           has no lat/lon field at all -- decoding a POSITION_APP payload is explicitly out of
-           this capability's Phase 1 scope (see that header's top comment) -- so no Meshtastic
-           sighting currently has any position source to record. Confirmed by reading
-           meshtastic_proto.h directly this session, not assumed: `mesh_log` therefore only
-           ever accumulates MeshCore nodes today, until a future phase adds Meshtastic position
-           decoding. */
+        /* docs/WARDRIVING_PUBLISH.md "Mesh node publishing": same has_location gate as the
+           MeshCore call above -- a Meshtastic node only ever carries a position when it
+           broadcasts a POSITION_APP payload on the default channel (meshtastic_proto.c's
+           decrypt_default_channel_payload()), added by this task; previously this file never
+           called mesh_log_record_sighting() for Meshtastic at all because
+           meshtastic_advert_t had no lat/lon field. */
+        if (advert.has_location) {
+            mesh_log_record_sighting(advert.node_id_hex, strlen(advert.node_id_hex),
+                                     MESH_LOG_NETWORK_MESHTASTIC, advert.lat_e7, advert.lon_e7);
+        }
     } else {
         ESP_LOGI(TAG, "diag: [meshtastic] meshtastic_proto_parse() failed (frame shorter than a header)");
     }
