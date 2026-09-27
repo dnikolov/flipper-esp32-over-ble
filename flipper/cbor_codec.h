@@ -71,5 +71,6 @@ typedef enum {
 #include "cbor_wardriving.h"
 #include "cbor_gps.h"
 #include "cbor_meshcore.h"
+#include "cbor_mesh_log.h"
 
 #endif /* FEB_CBOR_CODEC_H */

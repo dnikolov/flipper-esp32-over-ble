@@ -107,7 +107,7 @@ Once `ESP32 session active` (solid blue LED) is established, if 30 seconds pass 
 
 Once an authenticated session is active and the Flipper's status line shows the board model and its capabilities (e.g., `esp32-c6-devkit: wifi_scan`), you can trigger a Wi-Fi network scan directly from the Flipper — the first capability command now implemented end to end.
 
-**How to scan:** With the app showing `ESP32 session active`, press **Left** from the main screen to start a Wi-Fi scan on the connected ESP32 (if the board advertises `ble_scan` too, **Right** triggers that instead — see the status line's feature list). The app moves to a new results view showing all detected Wi-Fi access points (APs). From inside that results view, pressing **OK** re-triggers another scan.
+**How to scan:** With the app showing `ESP32 session active`, select **Scan** from the Home menu (**Up**/**Down** to highlight it, then **OK**). If the board advertises both `wifi_scan` and `ble_scan`, a Scan submenu appears — use **Up**/**Down** to choose **Wi-Fi scan**, then **OK** to start it. If the board only advertises `wifi_scan`, selecting Scan starts the Wi-Fi scan immediately. Either way, the app moves to a new results view showing all detected Wi-Fi access points (APs). From inside that results view, pressing **OK** re-triggers another scan.
 
 **Results display:** Each line shows:
 - **SSID** — the network's name, or empty if the network is hidden.
@@ -129,7 +129,7 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 
 Once an authenticated session is active and the Flipper's status line shows the board model and its capabilities (e.g., `esp32-c6-devkit: wifi_scan ble_scan`), you can trigger a BLE advertisement scan directly from the Flipper — the second capability command now implemented end to end.
 
-**How to scan:** With the app showing `ESP32 session active`, press **Right** from the main screen to start a BLE scan on the connected ESP32 (if the board advertises only `wifi_scan`, the Right button does nothing — **Left** triggers `wifi_scan` instead). The app moves to a new results view showing all detected BLE devices. From inside that results view, pressing **OK** re-triggers another scan.
+**How to scan:** With the app showing `ESP32 session active`, select **Scan** from the Home menu (**Up**/**Down** to highlight it, then **OK**). If the board advertises both `wifi_scan` and `ble_scan`, a Scan submenu appears — use **Up**/**Down** to choose **BLE scan**, then **OK** to start it. If the board only advertises `ble_scan`, selecting Scan starts the BLE scan immediately. Either way, the app moves to a new results view showing all detected BLE devices. From inside that results view, pressing **OK** re-triggers another scan.
 
 **Results display:** Each line shows:
 - **Address** — the device's Bluetooth MAC address.
@@ -148,8 +148,9 @@ The results list is scrollable via **Up/Down**. A header line at the top shows t
 ## Wardriving
 
 Once an authenticated session is active and the Flipper's status line shows the board
-advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Up**
-from the main screen to open the wardriving screen. This feature is hardware-verified as of 2026-09-21.
+advertises `wardriving` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), select
+**Wardriving** from the Home menu (**Up**/**Down** to highlight it, then **OK**) to open the
+wardriving screen. This feature is hardware-verified as of 2026-09-21.
 
 The wardriving screen has two layouts depending on whether recording is currently running:
 
@@ -224,13 +225,14 @@ powered on.
 
 ## Home menu behavior with wardriving
 
-When you connect to a board that advertises the `wardriving` capability, the Home menu's cursor automatically jumps to the Wardriving option as soon as the session becomes active, even if you were viewing a different menu item (like Settings or About). This is a convenience feature to make wardriving easily accessible — if you want to stay on a different menu item, you can navigate away as normal. Additionally, in the Home menu, the Publish option now appears immediately after Wardriving in the menu order, making the publish flow easier to access after a wardriving session.
+When you connect to a board that advertises the `wardriving` capability, the Home menu's cursor automatically jumps to the Wardriving option as soon as the session becomes active, even if you were viewing a different menu item (like Scan, GPS, or Publish). This is a convenience feature to make wardriving easily accessible — if you want to stay on a different menu item, you can navigate away as normal. Additionally, in the Home menu, the Publish option now appears immediately after Wardriving in the menu order, making the publish flow easier to access after a wardriving session.
 
 ## GPS screen
 
 Once an authenticated session is active and the Flipper's status line shows the board
-advertises `gps` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), press **Down**
-from the main screen to view live GPS data read from the board. The screen displays:
+advertises `gps` (e.g., `esp32-c6-devkit: wifi_scan ble_scan wardriving gps`), select **GPS**
+from the Home menu (**Up**/**Down** to highlight it, then **OK**) to view live GPS data read
+from the board. The screen displays:
 
 - **Latitude/Longitude** — the board's current position as reported by the GPS receiver.
 - **Altitude and Speed** — altitude in meters and ground speed in km/h (shown as `--` when there is no GPS fix yet).

@@ -170,7 +170,9 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
     Defaults stay compile-time constants for now.
   - Per-channel Wi-Fi scan dwell time ("WiFi Swelling") configurable from the Flipper UI: **done
     2026-09-21**, see [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md) — landed on the new
-    Wardriving Stopped screen's settings list rather than the still-placeholder Settings screen,
+    Wardriving Stopped screen's settings list rather than a dedicated Settings screen (which
+    didn't exist as more than a placeholder at the time, and was removed entirely 2026-09-27 —
+    see [docs/UI_REDESIGN.md](UI_REDESIGN.md)),
     with the regulatory country-code item below implemented alongside it as that doc's own
     scoping decision required. Scoped to wardriving's own WiFi scan calls only, not the manual
     `wifi_scan` capability — see that doc's "Scope boundaries."
@@ -185,11 +187,6 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   (reusing Wardriving's capture engine without persistence). Needs its own implementation pass
   once the runtime BLE active/passive toggle above exists.
 - **ESP32-side `wifi_swelling`/`country` (Phase 7, [docs/WARDRIVING_REDESIGN.md](WARDRIVING_REDESIGN.md)) are not persisted across the button-toggle or boot-autostart wardriving-start paths** — only a Flipper-sent `start` command carries them; autostart/button-toggle always run at Normal/RoW. See that doc's "Open items" for full detail. Not scoped for this pass.
-- **`docs/USER_GUIDE.md` still describes every screen's entry point as a direct Left/Right/Up/Down button press "from the main screen"** (wifi_scan/ble_scan/wardriving/gps sections all read this way) — this predates the Phase 3a Home-menu redesign and was never updated to describe menu-based navigation (`HomeMenuWardriving`/`HomeMenuScan`/etc., OK to select). Noticed 2026-09-21 while syncing the guide for Phase 7; left alone as out-of-scope for that pass since it spans sections unrelated to wardriving specifically. Needs its own doc-wide pass.
-- Decide whether `AppScreenLegacy`/`HomeMenuLegacy` (a compatibility screen preserving the old
-  direct-button-shortcut flow, found during the Phase 3a implementation but never part of
-  [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s original design) is kept long-term or removed once
-  Scan/GPS/Settings/About are trusted to fully replace it.
 - **Cosmetic, needs a hardware/visual check:** the Home menu's "Connection lost" banner and each
   non-Home screen's own title may visually overlap — both are drawn at nearly the same canvas
   position (banner at y=12 `FontSecondary`, titles at y=11 `FontPrimary`). Found while reading

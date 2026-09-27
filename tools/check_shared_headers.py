@@ -34,6 +34,7 @@ HEADER_PAIRS = [
     ("components/feb_protocol/cbor_wardriving.h", "flipper/cbor_wardriving.h"),
     ("components/feb_protocol/cbor_gps.h", "flipper/cbor_gps.h"),
     ("components/feb_protocol/cbor_meshcore.h", "flipper/cbor_meshcore.h"),
+    ("components/feb_protocol/cbor_mesh_log.h", "flipper/cbor_mesh_log.h"),
     ("components/feb_protocol/framing.h", "flipper/framing.h"),
     ("components/feb_protocol/pairing.h", "flipper/pairing.h"),
     ("components/feb_protocol/pairing_crypto.h", "flipper/pairing_crypto.h"),

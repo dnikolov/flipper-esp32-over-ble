@@ -2,6 +2,21 @@
 
 **Status: Home/menu shell implementation complete and hardware-verified 2026-09-13.** Tracked as **Phase 3a** in [PLAN.md](PLAN.md). The Home screen, capability-gated menu, and reconnect-stays-put behavior are all working end-to-end; the "Current-state baseline" section below describes exactly what's built vs. still open against the target design further down this file (notably: the `ViewDispatcher`/scene-manager architecture step was skipped, and the Scan screen is a placeholder picker, not yet the five-mode design). See [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md)'s 2026-09-12 entry for the implementing commits and 2026-09-13 entry for hardware verification summary.
 
+**Superseded 2026-09-27 (Settings/About/Legacy removal, MeshCore -> Mesh Log):** the Settings,
+About, and Legacy screens/menu items described below (as shipped 2026-09-13) were removed
+entirely, build-verified — Settings/About were read-only diagnostics/placeholders fully
+redundant with data visible elsewhere, and Legacy's only unique behavior (the manual
+first-time-pairing trigger, `OK` when `!app->profile`) moved directly onto the Home screen's
+own input handling, with a terse "OK: pair" hint line added to `draw_home_screen()` for
+discoverability while unpaired. The former MeshCore live-poll screen (`HomeMenuMeshcore`/
+`AppScreenMeshcore`) was repurposed the same pass into `HomeMenuMeshLog`/`AppScreenMeshLog`,
+now backed by the `mesh_log` capability's captured-backlog data
+(`mesh/mesh_nodes_current.txt`) instead of polling `meshcore_scan` — see
+[docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md) "Mesh node publishing" for that
+capability's own design, and [docs/CAPABILITIES.md](CAPABILITIES.md)'s `mesh_log` entry for
+the current screen description. Everything below this note describing Settings/About/Legacy/
+MeshCore is left as historical record of the original Phase 3a shell, not current behavior.
+
 This replaces today's flat, button-shortcut Main screen with a menu-driven Home screen.
 Reached via a grill-me design session with the user; decisions and rationale are recorded
 below rather than left in chat, per this project's documentation conventions.

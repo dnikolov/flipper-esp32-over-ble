@@ -591,9 +591,11 @@ work on this board should expect very little DRAM margin left to spend.
 
 ### `mesh_log` command and status payloads
 
-**Heltec WiFi LoRa 32 V2 only**, ESP32 side implemented 2026-09-27, build/host-test-verified
-only (no hardware available this session) — [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)'s
-"Mesh node publishing" section is the frozen design; this section is the wire contract itself.
+**Heltec WiFi LoRa 32 V2 capture only** (the Flipper side is board-agnostic, same as every
+other capability), ESP32/Heltec side implemented 2026-09-27, `flipper/` side implemented
+2026-09-27 — both build/host-test-verified only (no hardware session exercising this
+capability end-to-end yet) — [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)'s "Mesh node
+publishing" section is the frozen design; this section is the wire contract itself.
 `mesh_log` is the missing capture/accumulate/drain layer feeding wdgwars.pl's mesh-node upload,
 separate from `meshcore_scan`/`meshtastic_scan` (both unchanged by this capability).
 
@@ -665,8 +667,19 @@ until a future phase adds Meshtastic position decoding.
 **Dedup.** A given `node_id` is recorded into the flash log at most once, ever (matching
 wdgwars.pl's own "existence, not frequency" server-side semantics) — gating what the ESP32
 appends, not a wire-visible behavior. See `heltec/main/mesh_log.c`'s top comment for this
-build's dedup strategy (a flash scan, not a heap-allocated table) and the reasoning behind that
-choice.
+build's dedup strategy — a heap-allocated table seeded from the existing flash log at boot
+(not a per-append flash scan; revised 2026-09-27 after a real free-heap measurement, see
+`docs/BACKLOG.md` BL24) — and the reasoning behind that choice. The Flipper side does not
+dedup at all: it appends every record it receives unconditionally, since the ESP32 side has
+already dedupped "once ever" before a record ever reaches the wire.
+
+**`flipper/` side implemented 2026-09-27**, build-verified only, hardware pending: wire codec
+`flipper/cbor_mesh_log.h/.c` (byte-for-byte header mirror of this section's
+`components/feb_protocol/cbor_mesh_log.h`), routed by `flipper_esp32_over_ble.c`'s `status`
+dispatch peeking `state == "mesh_data"` into `handle_mesh_log_status()`, which appends each
+decoded record as a `node_id|network|lat|lon` line (decimal lat/lon, not the raw e7_offset
+integers) to `mesh/mesh_nodes_current.txt` on the SD card — see
+[docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)'s "Flipper-side storage" section.
 
 **No radio-coexistence concern of its own** — this capability captures via the same always-on
 LoRa RX task `meshcore_scan`/`meshtastic_scan` already run continuously; it adds a flash-log

@@ -276,7 +276,20 @@ Instead:
   empty file, and this status tells the Flipper screen to say so plainly rather than showing a
   false failure.
 
-## Mesh node publishing (design frozen 2026-09-27; ESP32 side implemented 2026-09-27, `flipper/` side not yet implemented)
+## Mesh node publishing (design frozen 2026-09-27; ESP32/Heltec side implemented 2026-09-27, `flipper/` side implemented 2026-09-27, build-verified only, hardware pending)
+
+**`flipper/` side implementation note (2026-09-27):** the wire codec
+(`flipper/cbor_mesh_log.h/.c`, byte-for-byte header mirror of
+`components/feb_protocol/cbor_mesh_log.h`, macros/prototypes confirmed via
+`tools/check_shared_headers.py`) and the `mesh/mesh_nodes_current.txt` flat-line accumulator
+(`flipper/mesh_nodes.c/.h` for pure formatting, storage/session-lifecycle wiring in
+`flipper/flipper_esp32_over_ble.c`'s `handle_mesh_log_status()`) are both implemented and
+FAP build-verified. **Still out of scope, deferred to separate future tasks:** the
+`mesh/mesh_nodes_current.txt` → `mesh/<timestamp>.txt` archiving-on-confirmed-publish-success
+(will live in the host PowerShell script, `scripts/publish_wardriving.ps1`, mirroring how the
+wardriving CSV's own archiving already works there rather than in the FAP), and the actual
+Method 2 (JSON + HMAC-SHA256) upload to wdgwars.pl itself. No hardware verification has been
+done yet for the Flipper-side receive/decode/append path.
 
 **Corrected/confirmed 2026-09-27, during implementation** (see `docs/PROTOCOL.md`'s `mesh_log`
 section for the full wire contract these produced):
@@ -418,12 +431,23 @@ already kept the wdgwars credential store as flat `key=value` lines instead of J
 - Archived in place to `mesh/<timestamp>.txt` **only on a confirmed successful mesh upload** —
   same "never rename without positive confirmation" rule the existing CSV already follows, for
   the same reason (a wrongly-archived file paired with an actually-failed upload is a real
-  data-loss risk).
-- **No new dedicated Flipper screen** for a pending-node count. The existing
-  `meshcore_scan`/`meshtastic_scan` screens keep showing their own live snapshots unchanged; this
-  new accumulator is purely backend plumbing for the publish flow, with counts only ever
-  surfacing via the Publish screen's result (see below). Matches this project's existing Phase 1
-  scope discipline for these capabilities.
+  data-loss risk). Like the CSV's own archiving, this lives in the host PowerShell script
+  (`scripts/publish_wardriving.ps1`), not the FAP itself — the FAP (implemented 2026-09-27,
+  `flipper/mesh_nodes.c`/`handle_mesh_log_status()`) only ever appends to the current file.
+  The host-script archiving step for this file is not yet implemented (separate future task).
+- **A dedicated Flipper screen now exists (added 2026-09-27, build-verified, hardware
+  pending):** the former MeshCore live-poll screen (`HomeMenuMeshcore`/`AppScreenMeshcore`,
+  which polled `meshcore_scan` directly) was repurposed into `HomeMenuMeshLog`/
+  `AppScreenMeshLog` ("Mesh Log"), gated on the new `capability_has_mesh_log` flag instead of
+  `capability_has_meshcore_scan`. It shows a scrollable list of `node_id`/`network`/`lat,lon`
+  rows parsed from `mesh/mesh_nodes_current.txt` on entry (`mesh_log_display_reload()`,
+  `flipper/mesh_nodes.c`'s `feb_mesh_log_parse_line()`), plus anything
+  `handle_mesh_log_status()` appends live while the screen stays open. Since `mesh_log` has no
+  command/query shape at all (see below), this is "refreshed on open, plus anything that
+  streams in while open," not continuous polling. The old `meshcore_scan`/`meshtastic_scan`
+  poll-query machinery this screen used to drive was removed from the Flipper side entirely
+  (those capabilities are unchanged on the ESP32/Heltec side; the Flipper just no longer polls
+  `meshcore_scan` for this screen).
 
 ### Publish-flow integration: independent of the existing CSV upload
 

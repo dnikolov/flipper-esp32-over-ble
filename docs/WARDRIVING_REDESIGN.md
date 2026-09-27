@@ -166,9 +166,11 @@ file directly — locate whatever generator produced it first.
   last). `HomeMenuWardriving` is already index 0 — unchanged.
 - **Force-jump to Wardriving on connect:** the moment a session transitions to active with the
   board advertising `wardriving`, the Home cursor is forced to `HomeMenuWardriving`
-  unconditionally, even if the user was sitting on Settings/About/Publish/Legacy at that
-  moment. This is in addition to, not a replacement for, the existing "clamp to first visible
-  item if the current selection stops being visible" safety net.
+  unconditionally, even if the user was sitting on a different menu item (e.g. `HomeMenuPublish`)
+  at that moment. This is in addition to, not a replacement for, the existing "clamp to first
+  visible item if the current selection stops being visible" safety net. (Settings/About/Legacy,
+  mentioned here in the original design pass, were removed entirely 2026-09-27 — see
+  [docs/UI_REDESIGN.md](UI_REDESIGN.md)'s own superseding note.)
 
 ### Wardriving: two screens instead of one
 

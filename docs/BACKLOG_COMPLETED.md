@@ -56,3 +56,16 @@ reopening a closed one here.
 
 - Canonical, agent-usable build/flash scripts for both platforms — DONE 2026-09-12. `tools/build_esp32.ps1` (build, `-Port`/`-SkipBuild`/`-CaptureBootLog`/`-CaptureSeconds`), `tools/build_flipper.ps1` (syncs into the pinned Unleashed checkout and builds, optional `-Port` to transfer), `tools/flash_flipper.ps1` (transfers a built FAP via `runfap.py`, never auto-launches) are the canonical entry points now.
 - BLE active scanning for `ble_scan` and wardriving's own capture engine — DONE (enabled 2026-09-11, `e92aad9`; confirmed 2026-09-12 already hardcoded on for wardriving too). The runtime active/passive *toggle* remains open — still tracked in BACKLOG.md.
+
+## Other open items (not covered by the cross-model review)
+
+- `docs/USER_GUIDE.md` describing every screen's entry point as a direct Left/Right/Up/Down
+  button press "from the main screen" (predating the Phase 3a Home-menu redesign) — DONE
+  2026-09-27, alongside the Settings/About/Legacy removal below: the Wi-Fi scan/BLE scan/
+  Wardriving/GPS sections now describe the real Home-menu Up/Down-to-highlight-then-OK
+  navigation.
+- Decide whether `AppScreenLegacy`/`HomeMenuLegacy` is kept long-term or removed — DONE
+  2026-09-27: removed entirely, along with the also-placeholder `AppScreenSettings`/
+  `AppScreenAbout`. Legacy's one unique behavior (the `!app->profile` + OK first-time-pairing
+  trigger) moved directly onto the Home screen's own input handling, with a new "OK: pair"
+  on-screen hint. See `docs/UI_REDESIGN.md`'s superseding note.
