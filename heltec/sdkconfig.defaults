@@ -21,3 +21,12 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 # code (BLE/NimBLE controller callbacks, the GPIO factory-reset ISR) depends on the
 # functions this option relocates, only ordinary task-context FreeRTOS API calls do.
 CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# status_display.c (OLED, 2026-09-27) newly links esp_driver_i2c into this build for the first
+# time, pushing iram0_0_seg over budget by another 664 bytes -- the I2C master ISR handler is
+# placed in IRAM by Kconfig default (for cache-miss performance, not cache-disabled safety:
+# CONFIG_I2C_ISR_IRAM_SAFE, the option that would actually require this, stays unset/off).
+# This firmware's I2C usage (status_display.c only) is a best-effort, non-latency-critical
+# once-a-second OLED refresh from ordinary task context, so the perf cost of leaving the ISR
+# handler in flash is irrelevant here.
+CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=n

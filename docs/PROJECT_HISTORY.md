@@ -2527,6 +2527,55 @@ verification only, per the hardware-safety rule) — real on-device PHY negotiat
 stack's acceptance of the larger declared attribute length at registration time, and the actual
 measured throughput improvement all remain hardware-pending.
 
+## 2026-09-27: Heltec onboard SSD1306 OLED status display, IRAM overflow fixed, hardware-verified
+
+Another agent had left `heltec/main/status_display.c`/`.h` (local SSD1306 driver, renderer,
+low-priority refresh task) and the `main.c`/`CMakeLists.txt` integration in place but unverified
+by a fresh build — reported to overflow `iram0_0_seg` by ~664 bytes when the display task was
+actually started, with no successful post-fix build confirmed.
+
+**Root cause, found via the linker map, not guessed:** the display was the *first* thing in this
+firmware to link `esp_driver_i2c`. Its I2C master ISR handler is placed in IRAM by Kconfig
+default (`CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=y`, for cache-miss performance — not
+cache-disabled safety; `CONFIG_I2C_ISR_IRAM_SAFE`, the option that would actually require that,
+was and stays unset). Nothing had linked this component before, so none of it was previously
+dead-stripped. **Fix:** `CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=n` added to
+`heltec/sdkconfig.defaults` — irrelevant performance cost for a best-effort, once-a-second,
+non-latency-critical OLED refresh from ordinary task context. Same failure class as the
+2026-09-27 `mesh_log`/IRAM issue elsewhere in this file's Heltec entries.
+
+A clean `idf.py build` after the fix reports **45 bytes IRAM headroom and 40 bytes DRAM
+headroom** — the tightest margin yet recorded for this board (see `docs/BACKLOG.md` BL25).
+Code review of the display integration (BLE-state accuracy, I2C failure cleanup, framebuffer
+bounds, GPIO pin usage, task stack sizing via a real `-fstack-usage` measurement) found no bugs.
+
+Flashed to the physical unit (COM10). Boot log showed clean init, BLE pairing/runtime-auth
+completing normally, no panics. The user then reported the physical board was mounted upside
+down, so the OLED image needed flipping — fixed by swapping the SSD1306's segment-remap and
+COM-output-scan-direction init bytes (`0xA1`/`0xC8` → `0xA0`/`0xC0`), a controller-level 180°
+rotation requiring no framebuffer or column-addressing changes. The user also asked for the
+display to show GPS time and ground speed whenever there's a fix: added as a new bottom line
+(`HH:MM:SSZ speed.dKMH`, blank when `location_get_fix()` isn't `FEB_LOCATION_FIX`) using the
+display's previously-unused 8th text row — `location_get_fix()` and `esp_driver_uart` were
+already wired into this board's build from the earlier GPS port, so no new component linkage was
+needed. A concurrent rebuild+reflash pass (kicked off for the orientation fix) picked up the GPS
+addition too since both edits landed on disk before that build ran; it also caught and fixed a
+`snprintf` truncation warning by widening the per-line text buffer from 22 to 32 bytes across
+`render_meshcore`/`render_meshtastic`/`render_gps`.
+
+Reflashed and confirmed by the user: correct physical orientation, correct BLE-state/node-summary
+rendering, all working. `docs/USER_GUIDE.md` gained its first-ever Heltec-board section
+describing the display (deferred until this point specifically because it wasn't yet
+hardware-verified — the user was asked and chose to wait rather than document it early).
+
+**Concurrent-session note:** this repo had roughly 15 peer Claude Code sessions active at the
+same time, several with their own uncommitted changes in flight (a Flipper-side MeshCore mesh
+log, a Flipper UI redesign removing legacy screens and updating menu-navigation wording in
+`docs/USER_GUIDE.md`/`docs/BACKLOG.md`). Committing this work required `git add -p` to stage only
+this session's own hunks in files those other sessions were simultaneously editing
+(`docs/BACKLOG.md`, `docs/USER_GUIDE.md`), leaving their in-progress edits untouched and
+uncommitted for them to commit separately.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

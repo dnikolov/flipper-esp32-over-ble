@@ -38,6 +38,7 @@
 #include "pairing_crypto.h"
 #include "session.h"
 #include "session_crypto.h"
+#include "status_display.h"
 #include "status_led.h"
 #include "wardriving_log.h"
 #include "wardriving_record_format.h"
@@ -684,6 +685,7 @@ static void start_scan(void)
     }
     if (!connecting_permitted()) {
         ESP_LOGI(TAG, "pairing window closed; staying idle");
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_DISCONNECTED);
         return;
     }
 
@@ -697,6 +699,11 @@ static void start_scan(void)
     rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "scan start failed: %d", rc);
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_DISCONNECTED);
+    } else {
+        feb_status_display_set_ble_state(pairing_window_is_open() ?
+                                         FEB_DISPLAY_BLE_PAIRING_MODE :
+                                         FEB_DISPLAY_BLE_SCANNING);
     }
 }
 
@@ -3607,6 +3614,7 @@ static int write_complete(uint16_t conn_handle,
         break;
     case TX_DONE_RUNTIME_AUTHENTICATED:
         runtime_auth_state = RUNTIME_AUTH_STATE_AUTHENTICATED;
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_AUTHENTICATED);
         rt_tx_sequence = 1;
         rt_rx_sequence = 1;
         ESP_LOGI(TAG, "client_auth sent; runtime session authenticated");
@@ -3682,8 +3690,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             rc = ble_gap_connect(own_addr_type, &event->disc.addr, 30000, &tight_conn_params,
                                  gap_event, NULL);
             if (rc != 0) {
+                feb_status_display_set_ble_state(FEB_DISPLAY_BLE_DISCONNECTED);
                 ESP_LOGW(TAG, "connect start failed: %d", rc);
                 schedule_reconnect();
+            } else {
+                feb_status_display_set_ble_state(FEB_DISPLAY_BLE_CONNECTING);
             }
         }
         return 0;
@@ -3696,10 +3707,14 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status != 0) {
+            feb_status_display_set_ble_state(FEB_DISPLAY_BLE_DISCONNECTED);
             ESP_LOGW(TAG, "connection failed: %d", event->connect.status);
             schedule_reconnect();
             return 0;
         }
+        feb_status_display_set_ble_state(pairing_window_is_open() ?
+                                         FEB_DISPLAY_BLE_PAIRING :
+                                         FEB_DISPLAY_BLE_AUTHENTICATING);
         connection_handle = event->connect.conn_handle;
         reconnect_retries = 0;
         service_start_handle = 0;
@@ -3752,6 +3767,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
         ESP_LOGW(TAG, "disconnected: reason=%d", event->disconnect.reason);
         connection_handle = BLE_HS_CONN_HANDLE_NONE;
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_DISCONNECTED);
         service_start_handle = 0;
         service_end_handle = 0;
         write_value_handle = 0;
@@ -4253,6 +4269,7 @@ void app_main(void)
 
     feb_status_led_init();
     feb_factory_reset_start();
+    feb_status_display_start();
 
     location_init();
     cluster_link_init();

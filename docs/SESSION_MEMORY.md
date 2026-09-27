@@ -301,6 +301,11 @@ no manual on-demand query exists for this capability by design (it is push-only,
 frozen design's own framing — see `docs/PROTOCOL.md`); the Flipper-side accumulator
 (`mesh/mesh_nodes_current.txt`, per the frozen design) is a follow-up task, not started here.
 
+**Heltec onboard SSD1306 OLED status display: done, hardware-verified 2026-09-27.** ✅ See
+`docs/PROJECT_HISTORY.md`'s 2026-09-27 entry for the full narrative (IRAM-overflow root cause
+and fix, 180° orientation flip, GPS time/speed line); `docs/BACKLOG.md` BL25 for the resulting
+IRAM/DRAM margin. `docs/USER_GUIDE.md` now has a Heltec-board section describing it.
+
 **Phase 8 (OLIMEX MOD-ESP32-C5 board support) started 2026-09-25.** Third ESP32-family target,
 `esp32c5/`, same gate-override pattern as Phase 4/6/7. **Step 1 (board bring-up) is done and
 hardware-verified 2026-09-25:** chip confirmed as ESP32-C5 rev v1.0 (dual-band Wi-Fi 6 + BLE 5 +

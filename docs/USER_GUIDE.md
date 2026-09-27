@@ -238,6 +238,21 @@ from the main screen to view live GPS data read from the board. The screen displ
 
 This screen updates in real time while the board has an active GPS fix. Speed data is particularly useful when wardriving with Speed-based WiFi Swelling enabled — the same speed value determines whether the scan dwell time switches to aggressive 85ms per-channel tuning.
 
+## Heltec board: OLED status display
+
+This section describes the **Heltec WiFi LoRa 32 V2**, a separate board from the ESP32-C6 + Flipper pair covered in the rest of this guide. The Heltec runs its own independent firmware (`heltec/` directory) and is used for MeshCore/Meshtastic mesh-network scanning and GPS/wardriving capabilities on that board.
+
+The Heltec board has an onboard 128x64 SSD1306 OLED display (I2C, address 0x3C) that starts automatically at boot — no user action is needed to enable it. It refreshes once per second and displays:
+
+- **Top line:** the board's current BLE connection state to the Flipper, one of **scanning/disconnected**, **pairing-mode scanning**, **connecting**, **pairing**, **authenticating**, or **authenticated** (mirroring the same lifecycle as the ESP32-C6 pairing states described earlier in this guide, but from the BLE central role).
+- **Node counts:** MeshCore and Meshtastic total node counts in the format `MC:<n> MT:<n>`.
+- **Alternating node details:** every 4 seconds the display toggles between showing the latest-heard MeshCore node's details and the latest-heard Meshtastic node's details. Each shows the node's name (or **UNKNOWN** if not broadcast), its node ID, RSSI in dBm, and time since last heard (`SEEN: Ns AGO` / `SEEN: Nm AGO`). If no node has been heard yet for that network, **NO NODES HEARD** is shown instead.
+- **GPS footer (when fix is active):** a bottom line showing the current UTC time and ground speed, for example `12:34:56Z 45.3KMH`. This line is blank whenever there is no GPS fix.
+
+If the OLED display fails to initialize or a write operation fails (for example, if the hardware is not connected), the display is silently disabled — this never affects BLE, LoRa, or any other board function.
+
+Hardware-verified 2026-09-27: confirmed working with correct physical orientation and on-screen rendering on the physical unit.
+
 ## Wardriving autostart and boot-button toggle
 
 Once wardriving has been started on the ESP32, the board persists its on/off state to NVS flash. On the next boot, if wardriving was running when powered off, it automatically resumes — no action required.
