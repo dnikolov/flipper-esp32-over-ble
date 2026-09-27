@@ -119,10 +119,11 @@
 /* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
    section: this runs unattended, with no review step, so "whatever's on the default branch
    right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
-   wire format). This is the commit where scripts/publish_wardriving.ps1 last changed (treat
-   HTTP 202/queued as confirmed success), confirmed pushed to origin/wardriving-publish via
-   `git ls-remote` -- bump it again if that script's contract changes after this. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "37e59bfd4dc6add498d9567a5d9728da29a41d46"
+   wire format). This is the commit where scripts/publish_wardriving.ps1 last changed (added
+   the independent mesh-node/Method-2 upload alongside the existing CSV upload), confirmed
+   pushed to origin/main via `git ls-remote` -- bump it again if that script's contract
+   changes after this. */
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "3d32551009311f62aa41f57f94043dd346f195de"
 
 typedef enum {
     CharacteristicWrite,
