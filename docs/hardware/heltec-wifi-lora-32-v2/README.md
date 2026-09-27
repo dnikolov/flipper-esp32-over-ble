@@ -159,11 +159,21 @@ is never transmitted to) — same driver shape as the C6's, only the pin numbers
 Phase 9 cluster bring-up is happening on a **second, different physical Heltec WiFi LoRa 32 V2
 board** than the one used for Phase 4's GPS/`meshcore_scan` work — confirmed by the efuse MAC
 mismatch during flashing (`a4:cf:12:03:b1:74`, vs. the Phase 4 unit's `a4:cf:12:03:ba:58` in
-`docs/BASELINES.md`), and confirmed with the user directly. This second unit has **no stored
-pairing_secret** (fresh/never-paired `board_id=heltec-a4cf1203b174` as of this writing) and its
+`docs/BASELINES.md`), and confirmed with the user directly. This second unit had **no stored
+pairing_secret** (fresh/never-paired `board_id=heltec-a4cf1203b174`) as of 2026-09-26; its
 physical GPS/antenna wiring status is unconfirmed — do not assume either board's physical setup
 (GPS module wiring, LoRa antenna, prior pairing state) carries over to the other. Track which
 physical unit is on the bench before trusting any state assumption in this doc or `BASELINES.md`.
+
+**Update 2026-09-27:** a hardware session flashing this same unit (`heltec-a4cf1203b174`, COM10)
+with the `mesh_log`/`meshtastic_scan` build found `load_pairing_secret()` now returning true
+("stored pairing_secret found; attempting runtime auth") — a change from the 2026-09-26 note
+above. No pairing ceremony was run during this session, so this wasn't newly created by it; a
+pairing must have happened against this unit sometime between 2026-09-26 and 2026-09-27 in a
+session not narrated here, or this is a stray/unvalidated NVS blob (the same class of harmless
+false-positive the ESP32-C5 saw on its first flash — see `docs/SESSION_MEMORY.md`'s Phase 8 Step
+2 entry). Not chased further this session (no Flipper was connected to confirm a real matching
+secret); flagging so a future session doesn't assume "no stored pairing_secret" still holds.
 
 ## Phase 9 cluster inter-board UART link (wired 2026-09-26)
 

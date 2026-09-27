@@ -987,6 +987,270 @@ static void test_meshcore_status_result_payload(void)
     }
 }
 
+/* meshtastic_scan codec vectors (docs/PROTOCOL.md "`meshtastic_scan` command and status
+   payloads", Heltec-only). Mirrors test_meshcore_node_roundtrip()/etc above -- same
+   payload-codec-only strategy -- but <meshtastic-node> has no role/location fields, and
+   FEB_MESHTASTIC_MAX_NODES_PER_RESULT/FEB_MESHTASTIC_NAME_MAX_LEN are both much smaller (see
+   cbor_meshtastic.h's sizing-note comment on why: this board's DRAM budget, not a wire-size
+   constraint). Also confirms FEB_MESHTASTIC_MAX_NODES_PER_RESULT's worst-case-sizing claim
+   the same way the meshcore test does. */
+static void test_meshtastic_node_roundtrip(void)
+{
+    feb_meshtastic_node_t node;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+    int ok;
+
+    encoded_len = feb_cbor_decode_meshtastic_node(FEB_VEC_MESHTASTIC_NODE1, FEB_VEC_MESHTASTIC_NODE1_LEN,
+                                                   &node, &status);
+    ok = (encoded_len == FEB_VEC_MESHTASTIC_NODE1_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && node.node_id_len == 8 && memcmp(node.node_id, "433d2b1c", 8) == 0;
+    ok = ok && node.has_name && node.name_len == strlen("Bob") &&
+         memcmp(node.name, "Bob", node.name_len) == 0;
+    ok = ok && node.rssi_offset == 58 /* -70 + 128 */ && node.last_seen_ms == 12345;
+    check(ok, "meshtastic node1: decodes node_id/name/rssi_offset/last_seen_ms");
+
+    encoded_len = feb_cbor_encode_meshtastic_node(encode_buf, sizeof(encode_buf), &node);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_NODE1, FEB_VEC_MESHTASTIC_NODE1_LEN),
+          "meshtastic node1: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_meshtastic_node(FEB_VEC_MESHTASTIC_NODE2, FEB_VEC_MESHTASTIC_NODE2_LEN,
+                                                   &node, &status);
+    ok = (encoded_len == FEB_VEC_MESHTASTIC_NODE2_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && !node.has_name;
+    ok = ok && node.rssi_offset == 0 /* -128 + 128, low extreme */;
+    check(ok, "meshtastic node2: no name (optional omission), rssi at low extreme");
+
+    encoded_len = feb_cbor_encode_meshtastic_node(encode_buf, sizeof(encode_buf), &node);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_NODE2, FEB_VEC_MESHTASTIC_NODE2_LEN),
+          "meshtastic node2: encode round-trip byte-identical");
+}
+
+static void test_meshtastic_command_payload(void)
+{
+    feb_command_payload_t cmd;
+    feb_cbor_status_t status;
+    size_t arg_count;
+    uint8_t encode_buf[128];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_MESHTASTIC_COMMAND_PAYLOAD,
+                                              FEB_VEC_MESHTASTIC_COMMAND_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && cmd.capability_len == strlen("meshtastic_scan") &&
+         memcmp(cmd.capability, "meshtastic_scan", cmd.capability_len) == 0;
+    ok = ok && cmd.request_id == 801;
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 0;
+    check(ok, "meshtastic_scan command payload: decodes capability/request_id/empty arguments");
+
+    encoded_len = feb_cbor_encode_command_payload(encode_buf, sizeof(encode_buf), &cmd);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_COMMAND_PAYLOAD,
+                   FEB_VEC_MESHTASTIC_COMMAND_PAYLOAD_LEN),
+          "meshtastic_scan command payload: encode round-trip byte-identical");
+
+    status = feb_cbor_decode_command_payload(FEB_VEC_MESHTASTIC_COMMAND_BAD_ARGUMENTS_PAYLOAD,
+                                              FEB_VEC_MESHTASTIC_COMMAND_BAD_ARGUMENTS_PAYLOAD_LEN, &cmd);
+    ok = (status == FEB_CBOR_OK);
+    ok = ok && feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) > 0
+            && arg_count == 1;
+    check(ok, "meshtastic_scan command payload (non-empty arguments): decodes structurally OK; "
+              "rejection is a main.c dispatch-layer concern (invalid_command), not a codec error");
+}
+
+static void test_meshtastic_status_result_payload(void)
+{
+    feb_status_payload_t st;
+    feb_meshtastic_status_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHTASTIC_STATUS_PAYLOAD,
+                                             FEB_VEC_MESHTASTIC_STATUS_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 801 && st.has_result;
+    ok = ok && st.state_len == strlen("ok") && memcmp(st.state, "ok", st.state_len) == 0;
+    check(ok, "meshtastic_scan status: decodes request_id/state(\"ok\")/result");
+
+    if (ok) {
+        status = feb_cbor_decode_meshtastic_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == 2 && result.total_known_nodes == 5;
+    }
+    check(ok, "meshtastic_scan status: result decodes nodes[]/total_known_nodes "
+              "(total_known_nodes > nodes.length signals a truncated listing)");
+
+    if (ok) {
+        encoded_len = feb_cbor_encode_meshtastic_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_RESULT_MULTI,
+                       FEB_VEC_MESHTASTIC_RESULT_MULTI_LEN),
+              "meshtastic_scan status: result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_STATUS_PAYLOAD,
+                       FEB_VEC_MESHTASTIC_STATUS_PAYLOAD_LEN),
+              "meshtastic_scan status: full status payload encode round-trip byte-identical");
+    } else {
+        check(0, "meshtastic_scan status: result encode round-trip byte-identical");
+        check(0, "meshtastic_scan status: full status payload encode round-trip byte-identical");
+    }
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHTASTIC_STATUS_EMPTY_PAYLOAD,
+                                             FEB_VEC_MESHTASTIC_STATUS_EMPTY_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_meshtastic_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == 0 && result.total_known_nodes == 0;
+    }
+    check(ok, "meshtastic_scan status (empty table): result decodes node_count=0/total_known_nodes=0");
+
+    /* Worst-case sizing vector: FEB_MESHTASTIC_MAX_NODES_PER_RESULT nodes, each at every
+       field's own simultaneous worst-case length -- confirms (via the real C decoder/
+       encoder, not just Python arithmetic) that this still fits FEB_CBOR_MAX_PAYLOAD. */
+    check(FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD_LEN <= FEB_CBOR_MAX_PAYLOAD,
+          "meshtastic_scan status (worst case): frozen vector itself fits FEB_CBOR_MAX_PAYLOAD");
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD,
+                                             FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_meshtastic_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.node_count == FEB_MESHTASTIC_MAX_NODES_PER_RESULT;
+    }
+    check(ok, "meshtastic_scan status (worst case): decodes a full FEB_MESHTASTIC_MAX_NODES_PER_RESULT batch");
+    if (ok) {
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(encoded_len > 0 && encoded_len <= FEB_CBOR_MAX_PAYLOAD &&
+              bytes_eq(encode_buf, encoded_len, FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD,
+                       FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD_LEN),
+              "meshtastic_scan status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    } else {
+        check(0, "meshtastic_scan status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    }
+}
+
+/* mesh_log status payloads (docs/PROTOCOL.md "`mesh_log` command and status payloads",
+   Heltec-only, docs/WARDRIVING_PUBLISH.md "Mesh node publishing"). No command payload test
+   exists for this capability -- see cbor_mesh_log.h's top comment: the ESP32 never decodes a
+   `command` for it at all, only encodes/decodes the record and status.result shapes. */
+static void test_mesh_log_record_roundtrip(void)
+{
+    feb_mesh_log_record_t record;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+    int ok;
+
+    encoded_len = feb_cbor_decode_mesh_log_record(FEB_VEC_MESH_LOG_RECORD1, FEB_VEC_MESH_LOG_RECORD1_LEN,
+                                                  &record, &status);
+    ok = (encoded_len == FEB_VEC_MESH_LOG_RECORD1_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && record.node_id_len == 16 && memcmp(record.node_id, "aabbccddeeff0011", 16) == 0;
+    ok = ok && record.network_len == strlen("meshcore") && memcmp(record.network, "meshcore", record.network_len) == 0;
+    ok = ok && record.lat_e7_offset == (uint64_t)(423601000 + 900000000) &&
+         record.lon_e7_offset == (uint64_t)(1800000000 - 710589000);
+    check(ok, "mesh_log record1: decodes node_id/network/lat_e7_offset/lon_e7_offset (MeshCore-shaped)");
+
+    encoded_len = feb_cbor_encode_mesh_log_record(encode_buf, sizeof(encode_buf), &record);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RECORD1, FEB_VEC_MESH_LOG_RECORD1_LEN),
+          "mesh_log record1: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_mesh_log_record(FEB_VEC_MESH_LOG_RECORD2, FEB_VEC_MESH_LOG_RECORD2_LEN,
+                                                  &record, &status);
+    ok = (encoded_len == FEB_VEC_MESH_LOG_RECORD2_LEN) && (status == FEB_CBOR_OK);
+    ok = ok && record.node_id_len == 8 && memcmp(record.node_id, "433d2b1c", 8) == 0;
+    ok = ok && record.network_len == strlen("meshtastic") &&
+         memcmp(record.network, "meshtastic", record.network_len) == 0;
+    check(ok, "mesh_log record2: decodes a shorter Meshtastic-shaped 8-hex node_id");
+
+    encoded_len = feb_cbor_encode_mesh_log_record(encode_buf, sizeof(encode_buf), &record);
+    check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RECORD2, FEB_VEC_MESH_LOG_RECORD2_LEN),
+          "mesh_log record2: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_mesh_log_record(FEB_VEC_MESH_LOG_RECORD_BAD_FIELD,
+                                                  FEB_VEC_MESH_LOG_RECORD_BAD_FIELD_LEN,
+                                                  &record, &status);
+    check(encoded_len == 0 && status == FEB_CBOR_ERR_UNEXPECTED_TYPE,
+          "mesh_log record (unrecognized field in place of lon_e7_offset): rejected FEB_CBOR_ERR_UNEXPECTED_TYPE");
+}
+
+static void test_mesh_log_status_result_payload(void)
+{
+    feb_status_payload_t st;
+    feb_mesh_log_status_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+    int ok;
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESH_LOG_STATUS_PAYLOAD,
+                                             FEB_VEC_MESH_LOG_STATUS_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.request_id == 0 && st.has_result;
+    ok = ok && st.state_len == strlen("mesh_data") && memcmp(st.state, "mesh_data", st.state_len) == 0;
+    check(ok, "mesh_log status: decodes request_id(0)/state(\"mesh_data\")/result");
+
+    if (ok) {
+        status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.record_count == 1 && result.backlog_remaining == 0;
+    }
+    check(ok, "mesh_log status: result decodes records[]/backlog_remaining (caught up to live)");
+
+    if (ok) {
+        encoded_len = feb_cbor_encode_mesh_log_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RESULT_ONE, FEB_VEC_MESH_LOG_RESULT_ONE_LEN),
+              "mesh_log status: result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(bytes_eq(encode_buf, encoded_len, FEB_VEC_MESH_LOG_STATUS_PAYLOAD,
+                       FEB_VEC_MESH_LOG_STATUS_PAYLOAD_LEN),
+              "mesh_log status: full status payload encode round-trip byte-identical");
+    } else {
+        check(0, "mesh_log status: result encode round-trip byte-identical");
+        check(0, "mesh_log status: full status payload encode round-trip byte-identical");
+    }
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESH_LOG_STATUS_MORE_PENDING_PAYLOAD,
+                                             FEB_VEC_MESH_LOG_STATUS_MORE_PENDING_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.record_count == 1 && result.backlog_remaining == 3;
+    }
+    check(ok, "mesh_log status (more pending): backlog_remaining > 0 with only one record in this reply");
+
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD,
+                                             FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.record_count == 0 && result.backlog_remaining == 0;
+    }
+    check(ok, "mesh_log status (empty): result decodes record_count=0/backlog_remaining=0");
+
+    /* Worst-case sizing vector: the one record FEB_MESH_LOG_MAX_RECORDS_PER_BATCH allows, at
+       every field's own simultaneous worst-case length -- confirms (via the real C decoder/
+       encoder, not just Python arithmetic) that this still fits FEB_CBOR_MAX_PAYLOAD. */
+    check(FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN <= FEB_CBOR_MAX_PAYLOAD,
+          "mesh_log status (worst case): frozen vector itself fits FEB_CBOR_MAX_PAYLOAD");
+    status = feb_cbor_decode_status_payload(FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD,
+                                             FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN, &st);
+    ok = (status == FEB_CBOR_OK) && st.has_result;
+    if (ok) {
+        status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+        ok = (status == FEB_CBOR_OK) && result.record_count == FEB_MESH_LOG_MAX_RECORDS_PER_BATCH;
+    }
+    check(ok, "mesh_log status (worst case): decodes a full FEB_MESH_LOG_MAX_RECORDS_PER_BATCH batch");
+    if (ok) {
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        check(encoded_len > 0 && encoded_len <= FEB_CBOR_MAX_PAYLOAD &&
+              bytes_eq(encode_buf, encoded_len, FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD,
+                       FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN),
+              "mesh_log status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    } else {
+        check(0, "mesh_log status (worst case): re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    }
+}
+
 int main(void)
 {
     test_fragment_record(23, FEB_VEC_FRAGS_MTU23, FEB_VEC_FRAGS_MTU23_LENS,
@@ -1109,6 +1373,13 @@ int main(void)
     test_meshcore_node_roundtrip();
     test_meshcore_command_payload();
     test_meshcore_status_result_payload();
+
+    test_meshtastic_node_roundtrip();
+    test_meshtastic_command_payload();
+    test_meshtastic_status_result_payload();
+
+    test_mesh_log_record_roundtrip();
+    test_mesh_log_status_result_payload();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

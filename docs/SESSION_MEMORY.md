@@ -128,6 +128,179 @@ one has no stored pairing_secret yet. A fresh Flipper pairing against this speci
 needed before a real end-to-end `wifi_scan` proxy test is possible; see
 `docs/hardware/heltec-wifi-lora-32-v2/README.md`'s new note.
 
+**`meshtastic_scan` capability (Heltec-only, Phase 1 "detection + display") added
+2026-09-27, build-verified only, no hardware to test against.** Passively detects nearby
+Meshtastic (a different, unrelated open LoRa mesh firmware/protocol from MeshCore) nodes over
+the same onboard SX1276 `meshcore_scan` already uses. `feb_features[]` is now `{"wifi_scan",
+"ble_scan", "gps", "wardriving", "meshcore_scan", "meshtastic_scan"}`. **Radio-sharing decision
+(the one open design question this task raised):** MeshCore's own fixed EU-868 preset and
+Meshtastic's EU_868 "LongFast" default preset turned out (this session's own research into
+Meshtastic's public radio-settings docs) to use *identical* RF modem parameters (869.525 MHz,
+250 kHz BW, SF11, CR4/5) — the only per-protocol radio setting that differs is the SX1276's
+one-byte sync-word register (MeshCore: RadioLib's default 0x12; Meshtastic: 0x2B, confirmed
+against meshtastic/firmware's own RadioInterface config). This made time-multiplexing (option
+1 of the three the task offered) clearly the best fit: switching listen mode is a cheap
+`setSyncWord()` + `startReceive()` call, not a full re-tune, so no new wire-protocol
+mode-select command (option 2) was needed for either capability. The old `meshcore_radio.cpp/
+.h` (sole owner of the physical SX1276) was renamed to `lora_shared_radio.cpp/.h` and extended
+to alternate listen modes on a fixed, **unvalidated** 60-second-per-side interval
+(`LORA_SHARED_RADIO_DWELL_MS`) — an engineering guess, since neither protocol's real-world
+broadcast interval has been observed by this project (new `docs/BACKLOG.md` BL22). New files:
+`heltec/main/meshtastic_proto.h/.c` (pure-C header decode + a researched, **unverified-against-
+real-hardware** AES-128-CTR decrypt of Meshtastic's public default "LongFast" channel's
+NODEINFO_APP `short_name` field, using mbedTLS's AES module — the one board-local protocol
+parser in this project with an mbedtls dependency, host-tested via a dedicated
+`build_meshtastic_proto.ps1` that also links mbedtls's `aes.c`), `meshtastic_table.c/.h`
+(3-entry in-RAM node table, RAM-only, cleared on reboot), new shared codec
+`components/feb_protocol/cbor_meshtastic.c/.h` (host-tested, `tests/esp32/test_framing_cbor.c`
++ new vectors in `tests/vectors/generate_vectors.py`) — **not yet mirrored into `flipper/`**,
+same follow-up-agent deferral as `cbor_meshcore.h` got. Presence detection (`node_id`, RSSI,
+last-seen) works for *any* heard Meshtastic packet regardless of channel, since Meshtastic's
+raw 16-byte packet header is always sent in cleartext by design; only the optional `name`
+field requires a successful default-channel decrypt. **A real, measured hard DRAM constraint**
+(same class as meshcore_scan's own 64-to-12-entry cut, but tighter): this board's classic-ESP32
+DRAM was already mostly consumed by `meshcore_scan`'s own tables/scratch, so fitting a clean
+`idf.py build` required (1) sharing one 512-byte CBOR result-encode scratch buffer between
+`handle_meshcore_command()`/`handle_meshtastic_command()` instead of each having its own
+(`main.c`'s new `lora_capability_result_buf`), (2) decoding Meshtastic's compact `short_name`
+field instead of the longer `long_name`, and (3) cutting `meshtastic_table.h`'s
+`MESHTASTIC_TABLE_MAX_ENTRIES` to 3, `meshtastic_proto.h`'s `MESHTASTIC_NAME_MAX_LEN` to 8, and
+`cbor_meshtastic.h`'s `FEB_MESHTASTIC_MAX_NODES_PER_RESULT` to 2 — all well below
+`meshcore_scan`'s own equivalents (12/24/3). The final build leaves only **~120 bytes of
+`.dram0.bss` headroom** (measured via `idf.py size` on the real `heltec/` target, not a guess)
+— new `docs/BACKLOG.md` BL23 flags this as a hard ceiling any future capability work on this
+board needs to plan around. `esp32`/`esp32c5` builds and all host-native test suites
+reconfirmed unaffected (`tests/esp32/build.ps1`, `build_pairing.ps1`, `build_session.ps1`,
+`build_location.ps1`, `build_wardriving.ps1`, `build_cluster_link.ps1`,
+`build_meshcore_proto.ps1`, new `build_meshtastic_proto.ps1` — all pass); `check_shared_
+headers.py` clean. **Not done this pass**: no flashing, no hardware verification of any kind
+(no Meshtastic node available), no radio-coexistence sweep against this board's Wi-Fi/BT combo
+radio or against `meshcore_scan`'s own listen windows (BL22). **Capability-cache gotcha applies
+again**: this board's Flipper-side cached capability record was already populated before
+`meshtastic_scan` existed in `feb_features[]` — it must be deleted (same procedure as before)
+before the next `capability_query` will see the new feature, once the Flipper side implements
+this capability.
+
+**`mesh_log` capability (Heltec-only, ESP32 side) added 2026-09-27, build/host-test-verified
+only, no hardware to test against.** The missing capture/accumulate/drain layer feeding
+wdgwars.pl's mesh-node upload (`docs/WARDRIVING_PUBLISH.md`'s "Mesh node publishing", design
+frozen the same day) — hooks into `meshcore_table_upsert()`'s/`meshtastic_table_upsert()`'s own
+call sites in `lora_shared_radio.cpp`'s RX task, recording any sighting that carries a position
+to a new dedicated checksummed circular flash log (`heltec/main/mesh_log.c/.h`,
+`mesh_log_record_format.c/.h`, mirroring `wardriving_log.c`'s architecture), independent of
+`wardriving`'s start/stop lifecycle. `feb_features[]` is now `{"wifi_scan", "ble_scan", "gps",
+"wardriving", "meshcore_scan", "meshtastic_scan", "mesh_log"}`. **Confirmed by reading
+`meshtastic_proto.h` directly this session (not assumed): Meshtastic never contributes a
+sighting here today** — its Phase 1 parser doesn't decode `POSITION_APP` at all, so every
+recorded sighting is currently MeshCore-only; this is a real, current gap, flagged explicitly
+per the task's own request, not silently papered over.
+
+**Dedup decision (superseded same day, see below):** the frozen design's preferred
+heap-allocated table (sized against a real `esp_get_free_heap_size()` boot-time reading) could
+not initially be built — **no physical Heltec board was available this session**, and free
+heap is a runtime quantity that `idf.py size`/`idf.py build` cannot report the way it can for
+static `.dram0.bss` (BL23's own measurement stayed valid; this one simply couldn't be taken at
+all). `mesh_log.c` therefore first used the frozen design's own documented fallback: a flash
+scan of the log itself before every append, no RAM table. `main.c`'s `app_main()` logged
+`esp_get_free_heap_size()` right after `mesh_log_init()` so a future hardware session could read
+the real number and reconsider a heap-table upgrade.
+
+**Dedup switched to the heap-table approach, same day (2026-09-27), once real hardware was
+connected.** A hardware-verification pass (second physical unit, `heltec-a4cf1203b174`, COM10)
+measured `esp_get_free_heap_size()` at **121808 bytes free** (logged before Wi-Fi/BLE stack
+init, so an upper bound rather than the true steady-state figure) and reconfirmed `idf.py size`
+still showed a razor-thin 80 bytes of `.dram0.bss` headroom. Given that free-heap number, the
+dedup mechanism was switched from the flash-scan fallback to a **heap-allocated 128-entry
+table** (`ml_dedup_entry_t`, 17 bytes each, ~2.2 KB total, `malloc()`'d once in
+`mesh_log_init()`, never `static`) — the frozen design's originally-preferred option. Only a
+pointer + count + one-time-warned-flag (8 bytes) were added to `.bss`; `idf.py size`
+re-confirmed **72 bytes DRAM headroom** after the switch (down from 80, exactly the predicted
+8-byte cost). **Eviction policy**: none — once full, further new node_ids simply aren't
+deduped (a one-time warning logs this), accepted given mesh nodes are expected sparse and
+wdgwars.pl already tolerates duplicate uploads server-side. `ml_scan_contains_node_id()` (the old
+flash-scan function) was deleted as dead code. Re-flashed and re-verified: clean ~60s boot
+capture, no crash/reset loop, `mesh_log_init()`/`lora_shared_radio_init()` both still succeed
+(same COM10 unit). Host-native test suite (`tests/esp32/build.ps1`) reconfirmed passing
+unaffected (no shared-codec files touched — this was ESP32-side-only logic).
+
+**Reboot caveat closed same day (third pass), not just accepted as a trade-off.** The heap
+table above started empty every boot, reopening the persistence property the flash-scan
+fallback it replaced had incidentally provided — the user asked for this actually closed, not
+documented as accepted. Fix: `mesh_log_init()` now seeds `ml_dedup_entries` from the existing
+flash log once at boot, decoding every still-present record (drained or not — a node logged
+once, drained, and later re-heard must still not re-append) and inserting each distinct
+`node_id`, reusing the same record-walking loop that already existed there for
+`ml_undrained_in_sector`/oldest-cursor bookkeeping rather than adding a second pass over the
+same sectors. This is a one-time boot-time cost (bounded by the partition's small 4-sector
+size), not recurring, and adds no new `.bss`: `idf.py size` reported the same **72 bytes** DRAM
+headroom before and after. A new boot log line ("mesh log dedup table seeded with N entries
+from existing log") reports the seeded count. Reflashed and re-verified a third time: clean
+boot, no crash/reset loop, log correctly showed "seeded 0 entries" (this unit's `meshlog`
+partition is still empty — expected, not a bug, since no real MeshCore/Meshtastic sighting has
+ever been captured on it). Host-native tests reconfirmed passing again. Net effect: this heap
+table now has both the fast runtime lookup the original switch to heap storage was for, and the
+flash log's own cross-reboot persistence the flash-scan fallback had — not a trade-off between
+the two. Full detail: `docs/BACKLOG.md` BL24, `docs/WARDRIVING_PUBLISH.md`'s "Dedup" bullet,
+`heltec/main/mesh_log.c`'s top comment.
+
+**A second real, measured hard DRAM constraint, tighter than either mesh-scan capability's
+own** (docs/BACKLOG.md BL23's ~120-byte headroom had nothing left for this capability at all):
+a straightforward first implementation overflowed `idf.py build`'s `.dram0.bss` region by 360
+bytes. Clearing it required, in order of impact: (1) capping the wire format itself at
+**exactly one `<mesh-log-record>` per `status` reply** (`FEB_MESH_LOG_MAX_RECORDS_PER_BATCH` =
+1, `components/feb_protocol/cbor_mesh_log.h` — a permanent constraint on both firmwares, not
+just this build's sending choice, since `wardriving`'s own dynamic multi-record batching would
+have needed a batch-sized scratch buffer this board cannot spare); (2) narrowing every sector/
+offset bookkeeping field to `uint8_t`/`uint16_t` and removing several fields entirely in favor
+of recomputing them on demand (a summed pending-count instead of a stored running total; a
+fixed-at-compile-time sector count instead of a discovered-and-stored one; a per-record-decode
+instead of a cached "next position" pointer); (3) a 4-sector (16KB) `meshlog` flash partition
+(`heltec/partitions.csv`) rather than `wardriving_log.c`'s own headroom-above-actual sizing
+convention; and (4) moving `mesh_log_record_sighting()`'s own CBOR encode/decode scratch buffer
+(the single largest remaining item, ~83 bytes) onto the LoRa RX task's stack instead of
+`.bss` — a deliberate, explicitly-documented exception to this codebase's usual "non-trivial
+buffers on a BLE/radio-callback path default to `static`" convention, justified by that task's
+4096-byte stack budget having ample room and no real `-fstack-usage`/hardware check being
+possible this session (flagged, not silently assumed safe). The final build leaves **72 bytes**
+of `.dram0.bss` headroom (measured via a real `idf.py build`, matching BL23's own discipline) —
+new `docs/BACKLOG.md` BL24 flags this as an even tighter ceiling than BL23's own for any future
+work on this board. New shared codec `components/feb_protocol/cbor_mesh_log.c/.h` (host-tested,
+`tests/esp32/test_framing_cbor.c` + new vectors in `tests/vectors/generate_vectors.py`) — **not
+yet mirrored into `flipper/`**, same follow-up-agent deferral as `cbor_meshtastic.h` got.
+
+**Hardware verification pass 2026-09-27 (second physical unit, `heltec-a4cf1203b174`, COM10):**
+flashed the current `mesh_log`/`meshtastic_scan` build and captured ~90s of boot log — clean
+boot, no crash/reset loop, `mesh_log_init()`/`lora_shared_radio_init()`/wardriving_log/NimBLE
+scan all started successfully, the 60s MeshCore/Meshtastic listen-mode multiplexer fired on
+schedule, no MeshCore/Meshtastic sighting logged (expected, no real node in range). **The real
+`esp_get_free_heap_size()` number BL24 was waiting on: 121808 bytes free** — but that log line
+runs *before* Wi-Fi/BLE stack init (a discrepancy from its own code comment), so it's an upper
+bound, not the true steady-state figure. `idf.py size` reconfirmed the DRAM ceiling is still
+razor-thin (80 bytes free, vs. 72 previously reported — small unexplained drift). Also found:
+this unit's `load_pairing_secret()` now returns true, contradicting the 2026-09-26 hardware doc
+note that it had none — not chased further (no Flipper connected this session). Full detail:
+`docs/BASELINES.md`'s 2026-09-27 Heltec entry, `docs/BACKLOG.md` BL24,
+`docs/hardware/heltec-wifi-lora-32-v2/README.md`'s "Second physical unit" section. No code
+changes made this pass — measurement only, per explicit instruction.
+
+**A real wire-shape gap this design hadn't spelled out, found by reading the Flipper's actual
+routing code (`flipper/flipper_esp32_over_ble.c`), not assumed:** the Flipper dispatches an
+inbound `status` record purely by peeking its `state` text — there is no `capability`
+discriminator field on `status` at all — so every capability's `state` value(s) must be unique
+across the whole protocol, not merely within that capability. `wardriving` already owns
+`"data"`; `mesh_log` uses `"mesh_data"` instead. Corrected inline in
+`docs/WARDRIVING_PUBLISH.md` and specified in `docs/PROTOCOL.md`'s new `mesh_log` section.
+
+`esp32`/`esp32c5` builds and all host-native test suites reconfirmed unaffected
+(`tests/esp32/build.ps1`, `build_pairing.ps1`, `build_session.ps1`, `build_location.ps1`,
+`build_wardriving.ps1`, `build_cluster_link.ps1`, `build_meshcore_proto.ps1`,
+`build_meshtastic_proto.ps1` — all pass); `tools/check_shared_headers.py` clean (unaffected,
+since `cbor_mesh_log.h` isn't mirrored into `flipper/` yet, same as `cbor_meshtastic.h`).
+**Not done this pass**: no flashing, no hardware verification of any kind (no board available);
+no manual on-demand query exists for this capability by design (it is push-only, mirroring the
+frozen design's own framing — see `docs/PROTOCOL.md`); the Flipper-side accumulator
+(`mesh/mesh_nodes_current.txt`, per the frozen design) is a follow-up task, not started here.
+
 **Phase 8 (OLIMEX MOD-ESP32-C5 board support) started 2026-09-25.** Third ESP32-family target,
 `esp32c5/`, same gate-override pattern as Phase 4/6/7. **Step 1 (board bring-up) is done and
 hardware-verified 2026-09-25:** chip confirmed as ESP32-C5 rev v1.0 (dual-band Wi-Fi 6 + BLE 5 +

@@ -23,11 +23,12 @@
    link" section and esp32/uart_link_test/ (the throwaway bring-up test this
    firmware supersedes).
 
-   All Wi-Fi scan lifecycle state (s_mode/s_dwell_mode/s_scan_in_progress) is owned
-   exclusively by scan_ctl_task: both the UART-RX task (on a new scan_config_set)
-   and the Wi-Fi scan-done event handler (on the sys_evt task) only ever post an
-   event onto s_control_queue and never touch that state directly, so there is
-   nothing to lock. */
+   All Wi-Fi scan lifecycle state (s_mode/s_dwell_mode/s_scan_in_progress/
+   s_interval_ms/s_rearm_pending/s_rearm_deadline) is owned exclusively by
+   scan_ctl_task: both the UART-RX task (on a new scan_config_set) and the Wi-Fi
+   scan-done event handler (on the sys_evt task) only ever post an event onto
+   s_control_queue and never touch that state directly, so there is nothing to
+   lock. */
 
 #define UART_PORT UART_NUM_1
 #define UART_TX_PIN 19
@@ -66,6 +67,14 @@ static QueueHandle_t s_control_queue;
 static feb_cluster_scan_mode_t s_mode = FEB_CLUSTER_SCAN_MODE_IDLE;
 static feb_cluster_dwell_mode_t s_dwell_mode = FEB_CLUSTER_DWELL_NORMAL;
 static bool s_scan_in_progress;
+
+/* Continuous-mode inter-pass delay (feb_cluster_scan_config_t's interval_ms, 0 =
+   back-to-back). s_rearm_pending/s_rearm_deadline let handle_scan_done() defer the
+   next start_one_scan() without blocking scan_ctl_task's queue wait -- see
+   scan_ctl_task()'s own comment for how the timeout is derived from these. */
+static uint16_t s_interval_ms;
+static bool s_rearm_pending;
+static TickType_t s_rearm_deadline;
 
 /* Written by wifi_scan_done_handler() (sys_evt task) strictly before it enqueues
    CLUSTER_EVT_SCAN_DONE, read by handle_scan_done() (scan_ctl_task) strictly after
@@ -147,8 +156,14 @@ static void handle_config_set(const feb_cluster_scan_config_t *cfg)
     }
 
     s_dwell_mode = (feb_cluster_dwell_mode_t)cfg->dwell_mode;
+    s_interval_ms = cfg->interval_ms;
     /* cfg->band_filter only means anything to the 5GHz (C5) worker per
        docs/CLUSTER.md -- this board is 2.4GHz-only, so it's read and ignored. */
+
+    /* Any applied config change cancels a pending re-arm wait: the mode/interval
+       it was scheduled under may no longer hold, and the IDLE/non-IDLE branches
+       below already decide -- immediately -- whether a new scan should start. */
+    s_rearm_pending = false;
 
     if (new_mode == FEB_CLUSTER_SCAN_MODE_IDLE) {
         s_mode = FEB_CLUSTER_SCAN_MODE_IDLE;
@@ -226,9 +241,19 @@ static void handle_scan_done(void)
         return;
     }
 
-    /* continuous: re-arm immediately, same "back-to-back" shape as
-       esp32/main/main.c's wardriving_wifi_interval_ms == 0 default. */
-    start_one_scan();
+    if (s_interval_ms == 0) {
+        /* continuous, no configured delay: re-arm immediately, same "back-to-back"
+           shape as esp32/main/main.c's wardriving_wifi_interval_ms == 0 default. */
+        start_one_scan();
+        return;
+    }
+
+    /* continuous with a configured delay: don't start the next pass from here --
+       record the deadline and let scan_ctl_task's queue-wait timeout fire
+       start_one_scan() once it elapses, so a config/idle event arriving during the
+       wait is still handled the instant it's posted, not after a stale delay. */
+    s_rearm_pending = true;
+    s_rearm_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(s_interval_ms);
 }
 
 /* Runs on the sys_evt task (esp_event's default loop task) -- kept minimal, per
@@ -272,8 +297,24 @@ static void scan_ctl_task(void *arg)
 
     for (;;) {
         cluster_worker_event_t evt;
+        TickType_t wait_ticks = portMAX_DELAY;
 
-        if (xQueueReceive(s_control_queue, &evt, portMAX_DELAY) != pdTRUE) {
+        /* While a continuous re-arm is pending, wait only until its deadline
+           instead of forever, so a timed-out receive (no event arrived in time)
+           is the signal to fire the deferred start_one_scan(); a real event still
+           arrives immediately regardless of this timeout and is handled below,
+           same as with portMAX_DELAY. */
+        if (s_rearm_pending) {
+            TickType_t now = xTaskGetTickCount();
+
+            wait_ticks = (s_rearm_deadline > now) ? (s_rearm_deadline - now) : 0;
+        }
+
+        if (xQueueReceive(s_control_queue, &evt, wait_ticks) != pdTRUE) {
+            if (s_rearm_pending) {
+                s_rearm_pending = false;
+                start_one_scan();
+            }
             continue;
         }
         switch (evt.type) {

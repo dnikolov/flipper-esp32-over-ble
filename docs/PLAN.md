@@ -172,6 +172,7 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 4. **Zigbee/Thread recon** (Phase 5a): passive `zigbee`/`thread` scanning/sniffing capabilities, matching the `wifi_scan`/`ble_scan` pattern — no network joining or commissioning.
 5. **Zigbee/Thread participation** (Phase 5b, much later, separately scoped): active stack participation — an order of magnitude larger effort; not committed to a timeline.
 6. **`gpio_control`** (Phase 5): generic GPIO control, reserving strapping/JTAG pins (GPIO0, 4, 5, 8, 9, 15) from generic control actions.
+7. **`mesh_log`** (Heltec, Phase 6 follow-on, design frozen 2026-09-27, ESP32-side implemented 2026-09-27, build/host-test-verified only, `flipper/` mirroring not yet done): flash-backed capture/drain pipeline for MeshCore/Meshtastic node sightings, feeding wdgwars.pl's mesh-node upload — depends on `meshcore_scan`/`meshtastic_scan`. Full design: [WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md#mesh-node-publishing-design-frozen-2026-09-27-not-yet-implemented); implementation status: [SESSION_MEMORY.md](SESSION_MEMORY.md)'s 2026-09-27 entry.
 
 ### Multi-board pairing
 

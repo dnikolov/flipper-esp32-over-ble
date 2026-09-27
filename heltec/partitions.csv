@@ -26,3 +26,20 @@ factory,    app,  factory, 0x10000, 0x200000,
 # ~3.2MB unallocated for future capability work (display/lora are explicitly out of scope
 # for this pass -- see docs/PLAN.md Phase 4 step 6).
 wardrive,   data, 0x40,    0x210000,0x2BC000,
+# `mesh_log` capability's own raw-flash circular log (heltec/main/mesh_log.c,
+# docs/WARDRIVING_PUBLISH.md "Mesh node publishing", design frozen 2026-09-27) -- same
+# checksummed circular-log architecture as `wardrive` above, deliberately a separate
+# partition/module rather than sharing wardriving_log.c's own (mesh node sightings are a
+# logically independent, always-on data source, not gated by wardriving's start/stop
+# lifecycle). Custom subtype 0x41 (0x40 already taken by `wardrive`). Sized small --
+# mesh nodes are sparse ("dozens, not hundreds/thousands" per docs/WARDRIVING_PUBLISH.md) --
+# exactly 4 x 4096-byte erase sectors (0x4000 = 16,384 bytes), matching mesh_log.c's own
+# ML_MAX_SECTORS bound exactly. Deliberately not sized with wardriving_log.c's own
+# headroom-above-actual convention: every extra sector costs real per-sector bookkeeping
+# bytes this board's severe DRAM ceiling (docs/BACKLOG.md BL23) cannot spare, and 4 sectors
+# already holds well over a hundred tightly-packed ~90-byte records -- generous headroom
+# above the expected sparse population.
+#
+# New total used: 0x4CC000 (prior total, see above) + 0x4000 (meshlog) = 0x4D0000
+# (~5.05MB) out of 8MB, leaving ~3.19MB still unallocated.
+meshlog,    data, 0x41,    0x4CC000,0x4000,

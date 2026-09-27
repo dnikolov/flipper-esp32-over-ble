@@ -103,8 +103,9 @@ static void test_roundtrip_scan_config_set(void)
     msg.mode = FEB_CLUSTER_SCAN_MODE_CONTINUOUS;
     msg.dwell_mode = FEB_CLUSTER_DWELL_SPEED_BASED;
     msg.band_filter = FEB_CLUSTER_BAND_FILTER_FULL;
+    msg.interval_ms = 2000u;
     len = feb_cluster_encode_scan_config_set(buf, sizeof(buf), &msg);
-    check(len == 2u + 1u + 2u + 3u + 2u, "scan_config_set: encoded length matches frame layout");
+    check(len == 2u + 1u + 2u + 5u + 2u, "scan_config_set: encoded length matches frame layout");
 
     feb_cluster_decoder_init(&dec);
     produced = feb_cluster_decoder_feed(&dec, buf, len, &frame, 1);
@@ -112,7 +113,8 @@ static void test_roundtrip_scan_config_set(void)
     check(feb_cluster_decode_scan_config_set(&frame, &decoded) == 1 &&
               decoded.mode == FEB_CLUSTER_SCAN_MODE_CONTINUOUS &&
               decoded.dwell_mode == FEB_CLUSTER_DWELL_SPEED_BASED &&
-              decoded.band_filter == FEB_CLUSTER_BAND_FILTER_FULL,
+              decoded.band_filter == FEB_CLUSTER_BAND_FILTER_FULL &&
+              decoded.interval_ms == 2000u,
           "scan_config_set: round-trip fields match");
 }
 

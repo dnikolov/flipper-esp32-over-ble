@@ -40,7 +40,9 @@ $sources = @(
     (Join-Path $sharedDir "cbor_ble_scan.c"),
     (Join-Path $sharedDir "cbor_wardriving.c"),
     (Join-Path $sharedDir "cbor_gps.c"),
-    (Join-Path $sharedDir "cbor_meshcore.c")
+    (Join-Path $sharedDir "cbor_meshcore.c"),
+    (Join-Path $sharedDir "cbor_meshtastic.c"),
+    (Join-Path $sharedDir "cbor_mesh_log.c")
 ) -join " "
 
 $includeDirs = "/I `"$sharedDir`" /I `"$vectorsDir`""

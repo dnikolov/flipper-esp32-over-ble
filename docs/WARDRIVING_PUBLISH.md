@@ -276,6 +276,189 @@ Instead:
   empty file, and this status tells the Flipper screen to say so plainly rather than showing a
   false failure.
 
+## Mesh node publishing (design frozen 2026-09-27; ESP32 side implemented 2026-09-27, `flipper/` side not yet implemented)
+
+**Corrected/confirmed 2026-09-27, during implementation** (see `docs/PROTOCOL.md`'s `mesh_log`
+section for the full wire contract these produced):
+- **Global state-string uniqueness.** This design's "mirrors `wardriving`'s own unsolicited
+  backlog-drain convention" phrasing didn't spell out that the Flipper routes an inbound
+  `status` record purely by peeking its `state` text (confirmed by reading
+  `flipper/flipper_esp32_over_ble.c`'s actual routing switch, not assumed) — so `mesh_log`
+  could not reuse `wardriving`'s own `"data"` state value; it uses `"mesh_data"` instead. Any
+  future push-capable capability needs a state string that doesn't collide with any other
+  capability's, not just its own.
+- **Batch size is 1, not a dynamic pack-as-many-as-fit batch.** This board's classic-ESP32 DRAM
+  budget was already exhausted by `meshcore_scan`/`meshtastic_scan`'s own tables/scratch before
+  this capability existed (`docs/BACKLOG.md` BL23); fitting a clean `idf.py build` required
+  `mesh_log` to push its buffered backlog one record per `status` reply, chained via
+  `backlog_remaining` the same way `wardriving` chains multiple batches. This is now a
+  permanent wire-format constraint (`FEB_MESH_LOG_MAX_RECORDS_PER_BATCH == 1`), not just an
+  ESP32-side sending choice — see `components/feb_protocol/cbor_mesh_log.h`.
+- **Dedup now uses the heap-table path this design originally preferred** (revised
+  2026-09-27, twice the same day): implementation first landed with a flash-scan fallback
+  because no physical Heltec board was available to take the `esp_get_free_heap_size()`
+  reading this design called for; a same-day hardware session then measured it (**121808 bytes
+  free**, taken before Wi-Fi/BLE stack init, so an upper bound rather than the true steady-state
+  figure — see `docs/BACKLOG.md` BL24), and the dedup mechanism was switched to a heap-allocated
+  128-entry table (~2.2 KB, `malloc()`'d once in `mesh_log_init()`) against that real number —
+  see `heltec/main/mesh_log.c`'s top comment for the full sizing/eviction-policy rationale.
+  **The reboot-resets-the-table caveat this first raised is now closed, not just accepted**
+  (same day, third pass): `mesh_log_init()` seeds `ml_dedup_entries` from the existing flash log
+  once at boot — decoding every still-present record (drained or not) and inserting each
+  distinct `node_id` before the mutex is created, up to the same 128-entry capacity — reusing
+  the record walk that already existed there for `ml_undrained_in_sector`/oldest-cursor
+  bookkeeping rather than adding a second pass, so this costs no extra flash reads and no new
+  `.bss` (confirmed: `idf.py size` reports the same 72 bytes DRAM headroom before and after).
+  This heap table now gets both the fast runtime lookup the switch to heap storage was for, and
+  the flash log's own cross-reboot persistence the original flash-scan fallback had — see
+  `heltec/main/mesh_log.c`'s top comment for the full mechanism, and its boot log's new "mesh
+  log dedup table seeded with N entries from existing log" line for how to sanity-check it on a
+  future hardware session.
+- **Meshtastic contributes no sightings yet.** `meshtastic_scan`'s Phase 1 parser does not
+  decode Meshtastic's `POSITION_APP` payload at all, so `mesh_log` currently only ever records
+  MeshCore nodes — confirmed by reading `meshtastic_proto.h` directly this session, not
+  assumed. The design below still describes both networks since the wire format and dedup
+  logic are network-agnostic; only the *current* data source is MeshCore-only.
+
+Reached via a grill-me design session with the user, 2026-09-27, after wdgwars.pl's own docs
+(`https://wdgwars.pl/help/#api-docs`, read this session) confirmed it accepts LoRa mesh node
+sightings (MeshCore and Meshtastic) as a distinct data type from WiFi/BLE, uploaded a completely
+different way: a JSON `meshcore_nodes` array inside a **Method 2 (JSON + HMAC-SHA256)** POST to
+`/api/upload` — never CSV. The server dedups globally by `node_id` ("what counts is that the node
+exists, not how many times you've seen it, one node is one record worldwide") — re-sending an
+already-known node is harmless, not wasteful, and only counts once for whoever logged it first.
+Requires a position: a node with no GPS fix embedded in its own broadcast is rejected (`no_gps`).
+
+This depends on the Heltec's `meshcore_scan` capability (implemented 2026-09-26) and
+`meshtastic_scan` capability (implemented 2026-09-27, mirroring it), since a LoRa mesh radio
+only exists on that board. Neither capability accumulates sightings across a session or
+persists anything — both are poll-only, a 12/3-entry RAM table cleared on reboot, explicit
+Phase 1 scope cuts. **There was no data source to publish from at all before this section's
+own capture/accumulate layer (`mesh_log`, below) was implemented.**
+
+### Why polling the existing 12-slot tables doesn't work
+
+`meshcore_table_upsert()` (and its Meshtastic counterpart) evicts the single
+least-recently-seen entry once its 12-slot table is full. A Flipper-side loop that periodically
+polls `meshcore_scan`/`meshtastic_scan`'s `status` snapshot would silently lose any node
+LRU-evicted between two polls — a real, undetectable gap during a busy multi-hour drive, not a
+tuning problem to fix with a shorter poll interval. Capture instead has to happen **at the point
+the radio actually decodes a sighting**, on the Heltec itself, independent of anything the
+Flipper does or how often it asks.
+
+### New capability: `mesh_log`
+
+A new capability, separate from the poll-only `meshcore_scan`/`meshtastic_scan` (which are
+unchanged by this work — they keep reporting their own live 12-entry snapshots for on-screen
+display, nothing about them changes):
+
+- **Capture is event-driven**, hooked into the same upsert call each protocol's parser already
+  makes into its own 12-slot live table — every successfully decoded sighting also gets a chance
+  to be recorded here, before the live table's own eviction can ever discard it.
+- **Only sightings carrying a position are recorded** (`has_location == true`). wdgwars rejects
+  positionless nodes anyway (`no_gps`); storing one here would be dead weight.
+- **Recorded fields are minimal**: `node_id`, `network` (`"meshcore"` | `"meshtastic"`), `lat`,
+  `lon`. Nothing else — `name`/`role` stay exactly where they already live (the existing
+  poll-only tables), not duplicated into this new pipeline, since wdgwars' own upload format
+  doesn't accept them anyway. `public_key` (wdgwars: optional, "worth sending for MeshCore") is
+  never available to send regardless — this project's MeshCore parser only ever retains the
+  first 8 bytes of a node's pubkey as `node_id`, never the full 32 bytes.
+- **Dedup: a given `node_id` is recorded at most once, ever** (until archived by a successful
+  publish — see below), gating what gets appended. This matches the server's own "existence, not
+  frequency" semantics exactly. **Revised 2026-09-27**, after the just-landed `meshtastic_scan`
+  work measured this board's static `.bss`/`.data` DRAM headroom at only ~120 bytes (`docs/
+  BACKLOG.md` BL23) — too tight for any new `static` dedup table. The table is instead
+  **heap-allocated** (`malloc`/`heap_caps_malloc`, once at `mesh_log_init()`), which draws from
+  runtime heap rather than the exhausted static budget; size it against a real boot-time
+  `esp_get_free_heap_size()` measurement (this board already runs WiFi+BLE+LoRa+GPS concurrently,
+  so real free heap plausibly has more room than the static margin suggests, but this is
+  something to measure, not assume — same discipline as every other sizing decision in this
+  capability family). **Fall back to flash-based dedup** (scanning the mesh log itself for a
+  matching `node_id` before appending, no RAM table at all) only if that measurement shows heap
+  is also too tight — this would need new lookup-capable code added to the log module, since
+  `wardriving_log.c`'s existing peek/drain API isn't built for arbitrary lookups. Same
+  reboot-resets-the-table accepted-gap precedent as `wardriving_dedup.c` applies to the
+  heap-allocated table (it's reallocated fresh at every boot, not persisted) — a reboot
+  mid-session can cause one harmless re-append per node still being heard at that moment, not a
+  correctness issue, since a duplicate `node_id` upload is a no-op server-side.
+- **Storage: a new, dedicated flash partition** (`heltec/partitions.csv`, alongside the existing
+  `wardrive` partition — plenty of headroom on this board's 8MB flash), using the same
+  checksummed circular-log architecture as `wardriving_log.c` (append/peek/mark-drained), sized
+  small — mesh nodes are "sparse/persistent infrastructure" (per `meshcore_table.h`'s own
+  framing), not a large transient population like WiFi/BLE. Survives reboot/power-loss the same
+  way wardriving's own log does, and sidesteps this board's tight DRAM ceiling (the 12-entry live
+  table already needed shrinking to fit).
+- **Runs independently of `wardriving`'s start/stop lifecycle** — capture is always-on once
+  booted, the same posture as the LoRa radio's own continuous receive and `location_init()`'s GPS
+  driver. Nothing about a node's position depends on the Heltec's own GPS fix (unlike WiFi/BLE
+  wardriving records, where the *scanning device's* fix is the record's position) — a mesh node's
+  position is embedded in its own broadcast, entirely independent of whether the Heltec currently
+  has a fix. Tying capture to `wardriving`'s lifecycle would just discard real sightings for no
+  reason tied to data quality.
+- **Its own wire message type and drain mechanism**, not folded into `wardriving`'s envelope —
+  `wardriving`'s contract is "a start/stop-gated capture session over a shared, contended radio,"
+  which doesn't describe this at all. Mirrors `wardriving`'s own unsolicited backlog-drain
+  convention instead (automatic on every authenticated session, reserved `request_id = 0`,
+  peek/mark-drained batching) — same proven mechanism, pointed at a second, independent log, so
+  drained data never depends on the Flipper remembering to ask for it.
+
+Full wire shape (message field order, CBOR encoding, nesting) is specified in
+[PROTOCOL.md](PROTOCOL.md)'s `mesh_log` section — this section is the frozen design, not the
+wire contract itself.
+
+### Flipper-side storage
+
+Drained `mesh_log` records accumulate into a flat file — **not JSON**: this firmware has no JSON
+encoder/decoder anywhere (CBOR is the only structured format in use), the same reasoning that
+already kept the wdgwars credential store as flat `key=value` lines instead of JSON.
+
+- `mesh/mesh_nodes_current.txt` — flat `node_id|network|lat|lon` lines, one new subdirectory
+  (`mesh/`), distinct from `wardriving/`'s own current/archive files, since this is a logically
+  separate data source with its own independent lifecycle.
+- Archived in place to `mesh/<timestamp>.txt` **only on a confirmed successful mesh upload** —
+  same "never rename without positive confirmation" rule the existing CSV already follows, for
+  the same reason (a wrongly-archived file paired with an actually-failed upload is a real
+  data-loss risk).
+- **No new dedicated Flipper screen** for a pending-node count. The existing
+  `meshcore_scan`/`meshtastic_scan` screens keep showing their own live snapshots unchanged; this
+  new accumulator is purely backend plumbing for the publish flow, with counts only ever
+  surfacing via the Publish screen's result (see below). Matches this project's existing Phase 1
+  scope discipline for these capabilities.
+
+### Publish-flow integration: independent of the existing CSV upload
+
+The mesh JSON upload and the existing CSV upload (wifi/ble) are **two fully independent
+operations within one publish run**, not one atomic action:
+
+- **Separate HTTP calls.** The mesh nodes go out as their own Method 2 (JSON body, HMAC-SHA256
+  signature) `POST /api/upload`, carrying only `meshcore_nodes` (network-neutral name from
+  wdgwars' own docs — it carries both MeshCore and Meshtastic entries, distinguished by each
+  entry's own `network` field). Signed with the **same 64-char wdgwars API key already stored** on
+  the Flipper's SD card for the CSV upload — no new credential needed. The existing CSV upload
+  (Method 1, `POST /api/upload-csv`) is completely untouched; it was considered whether to unify
+  both data types into one Method 2 call (wdgwars' docs note `networks` and `meshcore_nodes` can
+  coexist in one payload) but rejected — that would mean rewriting the working, hardware-verified
+  CSV path to build the full wifi/ble JSON array on-device instead of letting wdgwars' own CSV
+  parser do that work server-side, for no functional gain.
+- **Independent archiving.** Each upload archives its own file only on its own confirmed success
+  (`ok: true`, same 200-or-202-with-`ok:true` rule the CSV path already established). A failing
+  mesh upload never blocks archiving a successful CSV upload, or vice versa — they're different
+  data types, different endpoints, different auth schemes, with no reason to couple their
+  outcomes. One attempt per publish action, same as the CSV path — no automatic retry.
+- **One result file, two outcome blocks.** `wardriving_publish_result.txt` gains a second block
+  of `mesh_`-prefixed flat `key=value` lines (`mesh_status=ok|fail|nothing_to_publish`, then on
+  `ok` the response's own `imported`/`rejected` fields, or on `fail` a `mesh_message=...` line)
+  alongside the existing unprefixed CSV fields — one file, one publish event from the user's
+  perspective, even though it's two independent HTTP round-trips underneath. The Publish screen
+  shows both outcomes.
+
+### Sequencing
+
+This depends on the in-progress `meshtastic_scan`/shared-radio work (`meshtastic_table.h`,
+`lora_shared_radio.h/.cpp`) landing first, since `mesh_log` hooks directly into both protocols'
+table-upsert call sites. Implementation does not start until that work is confirmed
+build/host-test-verified.
+
 ## wigle.net (explicitly deferred)
 
 Not built in this phase. The only forward-looking accommodation made now is the keyed

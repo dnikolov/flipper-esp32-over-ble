@@ -118,7 +118,11 @@ the failure mode this must recover from.
   `dwell_mode: u8` (`0`/`1`/`2`, mirrors today's single-board Normal/Aggressive/Speed-based
   swelling enum), `band_filter: u8` (only meaningful to the 5GHz worker: `0` = n/a, `1` =
   fast/non-DFS, `2` = full — mirrors today's `wifi_band` values, minus the `2.4ghz` option since
-  that's simply which worker you're talking to now, not a per-worker setting).
+  that's simply which worker you're talking to now, not a per-worker setting), `interval_ms: u16`
+  little-endian (added 2026-09-26 for wardriving cluster delegation: the worker's own inter-pass
+  delay in `mode=1`, wire-identical in meaning to the BLE-facing protocol's `wifi_interval_ms` —
+  `0` = back-to-back/no delay. Meaningless in `mode=0`/`mode=2`, a manual pass is always exactly
+  one sweep).
 - **`0x03 SCAN_RESULT`** (worker → coordinator, one per discovered AP, streamed as found in either
   `mode=1` or `mode=2`). Payload: `ssid_len: u8`, `ssid: bytes[ssid_len]` (max 32), `bssid: u8[6]`,
   `rssi: i8`, `channel: u8`, `phy: u8`, `auth: u8` — `phy`/`auth` use the same enumerations
@@ -153,13 +157,28 @@ step actually needs to do that conversion. Flagged, not solved here.
   truncates to the top 32 by RSSI (matching today's existing single-board cap), replies to the
   Flipper as one `status` — indistinguishable on the wire from today's single-board response.
 - **`wardriving`**: at `start`, the coordinator forwards per-band config to C6/C5
-  (`scan_config_set`); both stream `scan_result` continuously. The coordinator geotags each
-  incoming hit with its own current GPS fix (unchanged fix-dependency rule — a hit arriving while
-  the coordinator isn't reporting `state = "fix"` is discarded, exactly like today's single-board
-  behavior), dedups, and appends to its own flash-backed circular log — now merging three logical
-  input streams (its own `ble_scan` hits, plus two forwarded `wifi_scan` streams) instead of one.
-  Backlog drain/CSV export to the Flipper is unchanged from the coordinator's point of view; it
-  already owns that logic today.
+  (`scan_config_set`, `mode = FEB_CLUSTER_SCAN_MODE_CONTINUOUS`); both stream `scan_result`
+  continuously. The coordinator geotags each incoming hit with its own current GPS fix (unchanged
+  fix-dependency rule — a hit arriving while the coordinator isn't reporting `state = "fix"` is
+  discarded, exactly like today's single-board behavior), dedups, and appends to its own
+  flash-backed circular log — now merging logical input streams (its own `ble_scan` hits, plus
+  each forwarded `wifi_scan` stream) instead of one. Backlog drain/CSV export to the Flipper is
+  unchanged from the coordinator's point of view; it already owns that logic today. **Implemented
+  on the Heltec side, 2026-09-26** (`heltec/main/main.c`'s `wardriving_start_internal()`/
+  `wardriving_stop_internal()`/`wardriving_wifi_interval_cb()`): worker presence
+  (`cluster_worker_is_present()`) is checked exactly once, at `wardriving` `start`, not
+  re-checked for the rest of the run (a worker that drops mid-run is not detected or fallen back
+  from — see this decision's rationale in `wardriving_start_internal()`'s own comment). When
+  delegated, `wardriving_wifi_interval_ms` doubles as both the worker's own `interval_ms`
+  (its inter-pass rescan delay) and the coordinator's own flush cadence — `SCAN_RESULT` frames
+  accumulate into a heap-allocated snapshot buffer (freed when wardriving stops; a static
+  second copy of that size did not fit this board's DRAM budget) and are periodically drained
+  through the same dedup/geotag/append path the local-radio source already uses, reusing
+  `wardriving_wifi_interval_co`'s own re-arm timer for the "flush" role instead of "re-trigger a
+  local scan". Currently only a single worker link exists in the Heltec's implementation (the
+  2.4GHz C6 worker) — this doc's "forwards per-band config to C6/C5" description of the full
+  two-worker design is still the target shape, not yet what's wired up; see
+  `docs/SESSION_MEMORY.md`'s Phase 9 entry for current per-board implementation status.
 - **`meshcore_scan`** is unaffected — stays exactly as it is today, Heltec-only.
 
 ## What doesn't change
@@ -179,6 +198,11 @@ step actually needs to do that conversion. Flagged, not solved here.
   configuration** (confirmed with the user: no regression to solo operation for either board).
 - New coordinator-side dispatch/aggregation logic on Heltec's `main.c`: worker presence detection,
   config forwarding, manual-scan request/merge/reply, merged capability reporting.
+- **Wardriving's own Wi-Fi capture now delegates to a present cluster worker too** (2026-09-26,
+  see the "Composite behaviors" bullet above for the implementation shape) — previously only the
+  manual one-shot `wifi_scan` capability delegated; wardriving unconditionally burned the
+  Heltec's own local radio regardless of a worker being present. Still hardware-unverified (no
+  physical wardriving-delegation run against a live worker yet); build/host-test verified only.
 
 ## Open questions / deferred (not resolved by this design)
 

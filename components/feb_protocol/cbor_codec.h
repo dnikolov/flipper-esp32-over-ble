@@ -2,14 +2,17 @@
    mirrored there and in docs/PROTOCOL.md, or the two firmwares diverge.
 
    Umbrella header (docs/OPTIMIZATION.md item 1, split 2026-09-08; cbor_gps.h added
-   2026-09-12; cbor_meshcore.h added 2026-09-26, Heltec-only `meshcore_scan` capability): the
+   2026-09-12; cbor_meshcore.h added 2026-09-26, Heltec-only `meshcore_scan` capability;
+   cbor_meshtastic.h added 2026-09-27, Heltec-only `meshtastic_scan` capability;
+   cbor_mesh_log.h added 2026-09-27, Heltec-only `mesh_log` capability,
+   docs/WARDRIVING_PUBLISH.md "Mesh node publishing"): the
    codec implementation is split per capability into cbor_primitives.c/.h, cbor_records.c/.h,
    cbor_wifi_scan.c/.h, cbor_ble_scan.c/.h, cbor_wardriving.c/.h, cbor_gps.c/.h,
-   cbor_meshcore.c/.h -- this file now holds only the macros/typedef genuinely shared across
-   every one of those (the CBOR status enum and the generic length/nesting bounds), then
-   #includes the six split headers so every declaration is still reachable through
-   `#include "cbor_codec.h"` exactly as before the split. See each split header's own top
-   comment for its scope; the split headers' comments preserve the original
+   cbor_meshcore.c/.h, cbor_meshtastic.c/.h, cbor_mesh_log.c/.h -- this file now holds only the macros/typedef
+   genuinely shared across every one of those (the CBOR status enum and the generic
+   length/nesting bounds), then #includes the split headers so every declaration is still
+   reachable through `#include "cbor_codec.h"` exactly as before the split. See each split
+   header's own top comment for its scope; the split headers' comments preserve the original
    section-boundary documentation (nesting-depth rationale, field-order notes, etc.)
    verbatim from before the split.
 
@@ -65,5 +68,7 @@ typedef enum {
 #include "cbor_wardriving.h"
 #include "cbor_gps.h"
 #include "cbor_meshcore.h"
+#include "cbor_meshtastic.h"
+#include "cbor_mesh_log.h"
 
 #endif /* FEB_CBOR_CODEC_H */

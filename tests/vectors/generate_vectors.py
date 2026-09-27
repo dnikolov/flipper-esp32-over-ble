@@ -1227,6 +1227,155 @@ assert len(MESHCORE_STATUS_WORST_CASE_PAYLOAD) <= 512, (
     "cbor_meshcore.h")
 
 
+# =====================================================================================
+# meshtastic_scan command/status payloads (docs/PROTOCOL.md "`meshtastic_scan` command and
+# status payloads", Heltec-only). Poll-only, single `status` action, same shape as
+# meshcore_scan above but with a smaller <meshtastic-node> (no role/location fields -- see
+# cbor_meshtastic.h's top comment for why) and much smaller FEB_MESHTASTIC_MAX_NODES_PER_
+# RESULT/FEB_MESHTASTIC_NAME_MAX_LEN -- both cut hard by this board's DRAM budget once
+# meshtastic_scan's node table had to coexist with meshcore_scan's own (see
+# meshtastic_table.h's sizing note), not by a wire-size constraint.
+# =====================================================================================
+
+def meshtastic_node_result(node_id_hex: str, name, rssi_dbm: int, last_seen_ms: int) -> bytes:
+    assert len(node_id_hex) == 8, "node_id must be exactly 8 hex chars"
+    assert -128 <= rssi_dbm <= 127, "rssi_dbm must fit the +128 unsigned-offset encoding"
+    count = 3 + (1 if name is not None else 0)
+    out = cbor_map_header(count)
+    out += cbor_text("node_id") + cbor_text(node_id_hex)
+    if name is not None:
+        out += cbor_text("name") + cbor_text(name)
+    out += cbor_text("rssi_offset") + cbor_uint(rssi_dbm + 128)
+    out += cbor_text("last_seen_ms") + cbor_uint(last_seen_ms)
+    return out
+
+
+def meshtastic_result(nodes, total_known_nodes: int) -> bytes:
+    out = cbor_array_header(len(nodes))
+    for n in nodes:
+        out += n
+    out = cbor_map_header(2) + cbor_text("nodes") + out
+    out += cbor_text("total_known_nodes") + cbor_uint(total_known_nodes)
+    return out
+
+
+MESHTASTIC_REQUEST_ID = 801
+
+# ---- <meshtastic-node> vectors: NODE1 has a short name (a decoded Meshtastic short_name).
+# NODE2 has no name at all (optional-field omission -- either the payload wasn't on the
+# default channel, or this board couldn't decrypt/parse a NODEINFO_APP out of it) and sits at
+# the rssi_offset encoding's low extreme (-128). ----
+MESHTASTIC_NODE1 = meshtastic_node_result("433d2b1c", "Bob", -70, 12345)
+MESHTASTIC_NODE2 = meshtastic_node_result("a1b2c3d4", None, -128, 999999)
+
+MESHTASTIC_RESULT_SINGLE = meshtastic_result([MESHTASTIC_NODE1], 1)
+# total_known_nodes (5) > len(nodes) (2) deliberately -- exercises the Flipper-side truncation
+# signal (a real table holding more nodes than one status reply can carry).
+MESHTASTIC_RESULT_MULTI = meshtastic_result([MESHTASTIC_NODE1, MESHTASTIC_NODE2], 5)
+MESHTASTIC_RESULT_EMPTY = meshtastic_result([], 0)
+
+# ---- worst-case sizing vector: FEB_MESHTASTIC_MAX_NODES_PER_RESULT (2) nodes, each at every
+# field's own simultaneous worst-case declared length (8-char node_id, 8-char name,
+# rssi_offset==255, last_seen_ms >= 2^32 so it needs CBOR's full 9-byte uint64 encoding). See
+# cbor_meshtastic.h's sizing-note comment. ----
+MESHTASTIC_WORST_NODE_ID = "abcdef01"
+MESHTASTIC_WORST_NAME = "A" * 8
+MESHTASTIC_NODE_WORST = meshtastic_node_result(MESHTASTIC_WORST_NODE_ID, MESHTASTIC_WORST_NAME,
+                                                127, 5000000000)
+MESHTASTIC_RESULT_WORST_CASE = meshtastic_result([MESHTASTIC_NODE_WORST] * 2, 2)
+
+MESHTASTIC_COMMAND_PAYLOAD = command_payload("meshtastic_scan", MESHTASTIC_REQUEST_ID, cbor_map_header(0))
+MESHTASTIC_COMMAND_BAD_ARGUMENTS_PAYLOAD = command_payload(
+    "meshtastic_scan", MESHTASTIC_REQUEST_ID, cbor_map_header(1) + cbor_text("foo") + cbor_uint(1))
+
+MESHTASTIC_STATUS_PAYLOAD = status_payload(MESHTASTIC_REQUEST_ID, "ok", MESHTASTIC_RESULT_MULTI)
+MESHTASTIC_STATUS_EMPTY_PAYLOAD = status_payload(MESHTASTIC_REQUEST_ID, "ok", MESHTASTIC_RESULT_EMPTY)
+MESHTASTIC_STATUS_WORST_CASE_PAYLOAD = status_payload(MESHTASTIC_REQUEST_ID, "ok", MESHTASTIC_RESULT_WORST_CASE)
+assert len(MESHTASTIC_STATUS_WORST_CASE_PAYLOAD) <= 512, (
+    "FEB_MESHTASTIC_MAX_NODES_PER_RESULT's worst-case batch no longer fits FEB_CBOR_MAX_PAYLOAD "
+    f"(got {len(MESHTASTIC_STATUS_WORST_CASE_PAYLOAD)} bytes) -- lower the constant in "
+    "cbor_meshtastic.h")
+
+
+# =====================================================================================
+# mesh_log command/status payloads (docs/PROTOCOL.md "`mesh_log` command and status
+# payloads", Heltec-only, docs/WARDRIVING_PUBLISH.md "Mesh node publishing", design frozen
+# 2026-09-27). No `command` shape exists for this capability at all -- the ESP32 only ever
+# pushes `status(state="mesh_data", request_id=0)` records unsolicited, one
+# <mesh-log-record> at a time (FEB_MESH_LOG_MAX_RECORDS_PER_BATCH == 1, forced by this
+# board's severe DRAM budget -- see cbor_mesh_log.h's sizing-note comment), chained via
+# `backlog_remaining` like `wardriving`'s own drain. MESH_LOG_STATUS_WORST_CASE_PAYLOAD below
+# is the worst-case single record (every field at its own simultaneous worst-case length)
+# and is asserted (both here and in the C host test) to fit FEB_CBOR_MAX_PAYLOAD.
+# =====================================================================================
+
+def mesh_log_record(node_id_hex: str, network: str, lat: float, lon: float) -> bytes:
+    assert 1 <= len(node_id_hex) <= 16, "node_id must be 1..16 hex chars"
+    lat_e7_offset = int(round(lat * 1e7)) + 900000000
+    lon_e7_offset = int(round(lon * 1e7)) + 1800000000
+    assert 1 <= lat_e7_offset <= 1800000001
+    assert 1 <= lon_e7_offset <= 3600000001
+    out = cbor_map_header(4)
+    out += cbor_text("node_id") + cbor_text(node_id_hex)
+    out += cbor_text("network") + cbor_text(network)
+    out += cbor_text("lat_e7_offset") + cbor_uint(lat_e7_offset)
+    out += cbor_text("lon_e7_offset") + cbor_uint(lon_e7_offset)
+    return out
+
+
+def mesh_log_status_result(records, backlog_remaining: int) -> bytes:
+    out = cbor_array_header(len(records))
+    for r in records:
+        out += r
+    body = cbor_map_header(2)
+    body += cbor_text("records") + out
+    body += cbor_text("backlog_remaining") + cbor_uint(backlog_remaining)
+    return body
+
+
+MESH_LOG_DATA_REQUEST_ID = 0  # unsolicited push sentinel, per docs/PROTOCOL.md -- this
+                              # capability never has a genuine command request_id at all
+
+# ---- <mesh-log-record> vectors: RECORD1 is a MeshCore-shaped node (16-hex node_id).
+# RECORD2 is a Meshtastic-shaped node (8-hex node_id) -- included for wire-shape coverage
+# even though this build's own mesh_log.c never actually records one yet (Meshtastic has no
+# position source in this project's Phase 1 scope, see lora_shared_radio.cpp). ----
+MESH_LOG_RECORD1 = mesh_log_record("aabbccddeeff0011", "meshcore", 42.3601, -71.0589)
+MESH_LOG_RECORD2 = mesh_log_record("433d2b1c", "meshtastic", 51.5074, -0.1278)
+
+MESH_LOG_RESULT_ONE = mesh_log_status_result([MESH_LOG_RECORD1], 0)
+# backlog_remaining (3) > 0 with only one record in this reply -- exercises the
+# "more still buffered" case distinctly from the caught-up-to-live (0) case above.
+MESH_LOG_RESULT_MORE_PENDING = mesh_log_status_result([MESH_LOG_RECORD2], 3)
+MESH_LOG_RESULT_EMPTY = mesh_log_status_result([], 0)
+
+# ---- worst-case sizing vector: the one record FEB_MESH_LOG_MAX_RECORDS_PER_BATCH allows,
+# at every field's own simultaneous worst-case declared length (16-char node_id, the longer
+# "meshtastic" network string, both lat/lon at their max offset). See cbor_mesh_log.h's
+# sizing-note comment. ----
+MESH_LOG_WORST_RECORD = mesh_log_record("abcdef0123456789", "meshtastic", 90.0, 180.0)
+MESH_LOG_RESULT_WORST_CASE = mesh_log_status_result([MESH_LOG_WORST_RECORD], 0)
+
+MESH_LOG_STATUS_PAYLOAD = status_payload(MESH_LOG_DATA_REQUEST_ID, "mesh_data", MESH_LOG_RESULT_ONE)
+MESH_LOG_STATUS_MORE_PENDING_PAYLOAD = status_payload(
+    MESH_LOG_DATA_REQUEST_ID, "mesh_data", MESH_LOG_RESULT_MORE_PENDING)
+MESH_LOG_STATUS_EMPTY_PAYLOAD = status_payload(MESH_LOG_DATA_REQUEST_ID, "mesh_data", MESH_LOG_RESULT_EMPTY)
+MESH_LOG_STATUS_WORST_CASE_PAYLOAD = status_payload(
+    MESH_LOG_DATA_REQUEST_ID, "mesh_data", MESH_LOG_RESULT_WORST_CASE)
+assert len(MESH_LOG_STATUS_WORST_CASE_PAYLOAD) <= 512, (
+    "mesh_log's worst-case single-record batch no longer fits FEB_CBOR_MAX_PAYLOAD "
+    f"(got {len(MESH_LOG_STATUS_WORST_CASE_PAYLOAD)} bytes)")
+
+# ---- malformed record: an unrecognized field name, which
+# feb_cbor_decode_mesh_log_record() must hard-reject (FEB_CBOR_ERR_UNEXPECTED_TYPE). ----
+MESH_LOG_RECORD_BAD_FIELD = raw(
+    cbor_map_header(4),
+    cbor_text("node_id"), cbor_text("aabbccddeeff0011"),
+    cbor_text("network"), cbor_text("meshcore"),
+    cbor_text("lat_e7_offset"), cbor_uint(900000000),
+    cbor_text("foo"), cbor_uint(1))
+
+
 def c_bytes(name: str, data: bytes) -> str:
     hex_bytes = ", ".join(f"0x{b:02x}" for b in data)
     wrapped = textwrap.fill(hex_bytes, width=96, initial_indent="    ", subsequent_indent="    ")
@@ -1624,6 +1773,83 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_PAYLOAD", MESHCORE_STATUS_PAYLOAD))
     f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD", MESHCORE_STATUS_EMPTY_PAYLOAD))
     f.write(c_bytes("FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD", MESHCORE_STATUS_WORST_CASE_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* ---- meshtastic_scan command/status payloads (docs/PROTOCOL.md\n")
+    f.write("   \"`meshtastic_scan` command and status payloads\", Heltec-only). ---- */\n\n")
+
+    f.write("/* <meshtastic-node> vectors: NODE1 has a name (a decoded Meshtastic short_name).\n")
+    f.write("   NODE2 has no name at all (optional-field omission) and sits at the rssi_offset\n")
+    f.write("   encoding's low extreme. */\n")
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_NODE1", MESHTASTIC_NODE1))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_NODE2", MESHTASTIC_NODE2))
+    f.write("\n")
+
+    f.write("/* result maps ({\"nodes\": [...], \"total_known_nodes\": N}): one node, two nodes\n")
+    f.write("   with total_known_nodes > nodes.length (a truncated listing), the empty case,\n")
+    f.write("   and the worst-case-sized batch (FEB_MESHTASTIC_MAX_NODES_PER_RESULT nodes,\n")
+    f.write("   every field at its own simultaneous worst-case length) confirming\n")
+    f.write("   FEB_MESHTASTIC_MAX_NODES_PER_RESULT still fits FEB_CBOR_MAX_PAYLOAD. */\n")
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_RESULT_SINGLE", MESHTASTIC_RESULT_SINGLE))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_RESULT_MULTI", MESHTASTIC_RESULT_MULTI))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_RESULT_EMPTY", MESHTASTIC_RESULT_EMPTY))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_RESULT_WORST_CASE", MESHTASTIC_RESULT_WORST_CASE))
+    f.write("\n")
+
+    f.write("/* command payload: valid (empty arguments) and malformed (non-empty arguments,\n")
+    f.write("   must be rejected with error code invalid_command -- same split as\n")
+    f.write("   wifi_scan/ble_scan/gps/meshcore_scan). */\n")
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_COMMAND_PAYLOAD", MESHTASTIC_COMMAND_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_COMMAND_BAD_ARGUMENTS_PAYLOAD", MESHTASTIC_COMMAND_BAD_ARGUMENTS_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* status payloads: state is always \"ok\" (no multi-state lifecycle), result\n")
+    f.write("   always present. WORST_CASE is the full status payload wrapping\n")
+    f.write("   FEB_VEC_MESHTASTIC_RESULT_WORST_CASE -- must stay <= FEB_CBOR_MAX_PAYLOAD\n")
+    f.write("   (asserted at generation time above; re-asserted by the C host test). */\n")
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_STATUS_PAYLOAD", MESHTASTIC_STATUS_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_STATUS_EMPTY_PAYLOAD", MESHTASTIC_STATUS_EMPTY_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESHTASTIC_STATUS_WORST_CASE_PAYLOAD", MESHTASTIC_STATUS_WORST_CASE_PAYLOAD))
+    f.write("\n")
+
+    f.write("/* ---- mesh_log status payloads (docs/PROTOCOL.md \"`mesh_log` command and status\n")
+    f.write("   payloads\", Heltec-only, docs/WARDRIVING_PUBLISH.md \"Mesh node publishing\").\n")
+    f.write("   No `command` shape exists for this capability -- see cbor_mesh_log.h's top\n")
+    f.write("   comment. request_id is always the unsolicited-push sentinel (0). ---- */\n\n")
+
+    f.write("/* <mesh-log-record> vectors: RECORD1 is MeshCore-shaped (16-hex node_id),\n")
+    f.write("   RECORD2 is Meshtastic-shaped (8-hex node_id, included for wire-shape coverage\n")
+    f.write("   even though this build never actually records one yet -- see\n")
+    f.write("   lora_shared_radio.cpp). Both fields' lat/lon are always present (unlike\n")
+    f.write("   <meshcore-node>'s optional pair): mesh_log only ever records a sighting that\n")
+    f.write("   already carries a position. */\n")
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RECORD1", MESH_LOG_RECORD1))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RECORD2", MESH_LOG_RECORD2))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RECORD_BAD_FIELD", MESH_LOG_RECORD_BAD_FIELD))
+    f.write("\n")
+
+    f.write("/* result maps ({\"records\": [...], \"backlog_remaining\": N}): one record caught\n")
+    f.write("   up to live (backlog_remaining=0), one record with more still buffered\n")
+    f.write("   (backlog_remaining=3), the empty case, and the worst-case-sized single record\n")
+    f.write("   (every field at its own simultaneous worst-case length) confirming it fits\n")
+    f.write("   FEB_CBOR_MAX_PAYLOAD. */\n")
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RESULT_ONE", MESH_LOG_RESULT_ONE))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RESULT_MORE_PENDING", MESH_LOG_RESULT_MORE_PENDING))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RESULT_EMPTY", MESH_LOG_RESULT_EMPTY))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_RESULT_WORST_CASE", MESH_LOG_RESULT_WORST_CASE))
+    f.write("\n")
+
+    f.write("/* status payloads: state is always \"mesh_data\" (a state string unique across\n")
+    f.write("   this whole protocol, not just this capability -- the Flipper routes an inbound\n")
+    f.write("   `status` record by peeking only its `state` text, so every capability's state\n")
+    f.write("   value(s) must avoid colliding with any other capability's, not just its own;\n")
+    f.write("   see docs/PROTOCOL.md's note on this). WORST_CASE is the full status payload\n")
+    f.write("   wrapping FEB_VEC_MESH_LOG_RESULT_WORST_CASE -- must stay <= FEB_CBOR_MAX_PAYLOAD\n")
+    f.write("   (asserted at generation time above; re-asserted by the C host test). */\n")
+    f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_PAYLOAD", MESH_LOG_STATUS_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_MORE_PENDING_PAYLOAD", MESH_LOG_STATUS_MORE_PENDING_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD", MESH_LOG_STATUS_EMPTY_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD", MESH_LOG_STATUS_WORST_CASE_PAYLOAD))
 
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 

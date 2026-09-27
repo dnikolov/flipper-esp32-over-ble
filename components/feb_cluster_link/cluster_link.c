@@ -60,7 +60,7 @@ size_t feb_cluster_encode_worker_hello(uint8_t *out, size_t out_cap,
 size_t feb_cluster_encode_scan_config_set(uint8_t *out, size_t out_cap,
                                            const feb_cluster_scan_config_t *msg)
 {
-    uint8_t payload[3];
+    uint8_t payload[5];
 
     if (msg == NULL) {
         return 0;
@@ -68,6 +68,8 @@ size_t feb_cluster_encode_scan_config_set(uint8_t *out, size_t out_cap,
     payload[0] = msg->mode;
     payload[1] = msg->dwell_mode;
     payload[2] = msg->band_filter;
+    payload[3] = (uint8_t)(msg->interval_ms & 0xFFu);
+    payload[4] = (uint8_t)((msg->interval_ms >> 8) & 0xFFu);
     return build_frame(out, out_cap, (uint8_t)FEB_CLUSTER_MSG_SCAN_CONFIG_SET, payload, sizeof(payload));
 }
 
@@ -259,12 +261,13 @@ int feb_cluster_decode_scan_config_set(const feb_cluster_frame_t *frame,
     if (frame == NULL || out == NULL) {
         return 0;
     }
-    if (frame->msg_type != (uint8_t)FEB_CLUSTER_MSG_SCAN_CONFIG_SET || frame->payload_len != 3u) {
+    if (frame->msg_type != (uint8_t)FEB_CLUSTER_MSG_SCAN_CONFIG_SET || frame->payload_len != 5u) {
         return 0;
     }
     out->mode = frame->payload[0];
     out->dwell_mode = frame->payload[1];
     out->band_filter = frame->payload[2];
+    out->interval_ms = (uint16_t)(frame->payload[3] | ((uint16_t)frame->payload[4] << 8));
     return 1;
 }
 

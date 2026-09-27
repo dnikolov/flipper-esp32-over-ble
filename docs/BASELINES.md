@@ -31,6 +31,62 @@ Second ESP32 target board for display and LoRa capabilities (see `docs/PLAN.md` 
 
 Do not carry forward C6 pin mappings to this board — see `docs/hardware/esp32-c6-devkitc-1/README.md`, which already documents this distinction.
 
+**Hardware verification pass 2026-09-27 (second physical unit, MAC `a4:cf:12:03:b1:74`, board_id
+`heltec-a4cf1203b174` — see `docs/hardware/heltec-wifi-lora-32-v2/README.md`'s "Second physical
+unit" section, not the Phase 4 unit above):** read-only `esptool flash_id` on COM10 reconfirmed
+ESP32-D0WDQ6 rev v1.0, 8 MB Winbond flash. A clean `idf.py build` from a fresh `build/` directory
+(current tree: `mesh_log`/`meshtastic_scan`/`lora_shared_radio` all present) succeeded — project
+binary 47% free of the 2 MB factory partition, bootloader 8% free. `idf.py size` reports DRAM
+124500/124580 bytes used, **80 bytes free** (previously reported as 72 bytes by the implementing
+session; a small, unexplained drift, not investigated further — treat both as "essentially zero,
+razor-thin" rather than reconciling the exact delta). The build does emit ~67 "`RADIOLIB_EXCLUDE_
+STM32WLX` redefined" preprocessor warnings from the pinned `jgromes/radiolib` managed component
+(scoped to that component's own compile units via `heltec/CMakeLists.txt`'s `target_compile_
+definitions`) — pre-existing since `meshcore_scan` was added 2026-09-26, not introduced by this
+session, and harmless (RadioLib's own `BuildOpt.h` apparently already default-defines this symbol
+for non-STM32 targets), but a real deviation from a literal "0 warnings" build worth noting.
+
+Flashed and boot-logged (COM10, ~90s captured via the `ESP_IDF_MONITOR_TEST=1` workaround, with
+`PYTHONIOENCODING=utf-8`/`PYTHONUTF8=1` also needed — without them `idf_monitor` crashed with a
+`UnicodeEncodeError` decoding the classic ESP32's 74880-baud ROM boot preamble against this
+machine's cp1251 console codepage, a quirk specific to classic-ESP32's ROM UART bootstrap, not
+seen on the C6/C5's native-USB boot path). Boot was clean for the full ~90s capture: no crash,
+no reset loop, no Guru Meditation/backtrace. `mesh_log_init()` logged "mesh log resumed: active
+sector 0 (gen 1), 0 pending record(s)" (not a fresh-init message, meaning this partition already
+had valid state from an earlier flash of this same unit — not a partition-not-found/sector-count
+error either way). `lora_shared_radio_init()` logged a successful SX127x identify (SX1276/SX1279-
+class silicon) and `begin()`/`startReceive()` succeeding at 869.525 MHz/250 kHz BW/SF11/CR4/5;
+the mode-switch multiplexer fired exactly once at ~60.7s uptime ("switched listen mode ->
+meshtastic"), confirming the 60-second dwell timer runs correctly. NimBLE started its central
+scan and logged ~200-240 scan reports per 10-second window throughout, with no reconnect churn.
+No MeshCore/Meshtastic sighting was logged (expected — no real node in range).
+
+**The real number this session existed to get:** `esp_get_free_heap_size()` logged **121808
+bytes** free. Important caveat found while reading `main.c`: this log line runs *before*
+`start_wifi_subsystem()`/`nimble_port_init()` (Wi-Fi/BLE stack init happens afterward in
+`app_main()`), not after, despite the code comment beside it claiming "Wi-Fi+BLE+LoRa+GPS all
+already initialized" — so 121808 bytes is an upper bound on steady-state free heap, not the true
+number with the Wi-Fi+BLE stacks (which reserve a nontrivial chunk of heap themselves) also
+running. Still directly useful for BL24's open question (a heap-allocated `mesh_log` dedup table
+is clearly not constrained by DRAM the way `.dram0.bss` is — even a few hundred bytes would be
+trivial against 121 KB), but a true worst-case reading (a second `esp_get_free_heap_size()` log
+placed after both stacks are up) is still open for a future session. See `docs/BACKLOG.md` BL24.
+
+**Same day, second pass: `mesh_log` dedup switched from flash-scan to a heap-allocated table**
+against that measurement (128 entries, ~2.2 KB, `malloc()`'d once in `mesh_log_init()` —
+`heltec/main/mesh_log.c`'s top comment has the full rationale). `idf.py build` clean; `idf.py
+size` DRAM headroom moved from 80 to **72 bytes** (the predicted ~8-byte cost of the new
+pointer/count/flag statics — the bulk table itself lives on the heap, not `.bss`). Host-native
+`tests/esp32/build.ps1` suite reconfirmed passing (no shared-codec files touched). Re-flashed to
+the same physical unit (COM10) and re-captured ~51s of boot log: clean boot, no crash/reset
+loop, `mesh_log_init()`/`lora_shared_radio_init()`/wardriving_log/NimBLE scan all still succeed.
+`esp_get_free_heap_size()` at the same log point now reads **119500 bytes** (down ~2.3 KB from
+121808, consistent with the new table's ~2.2 KB allocation plus small heap-allocator overhead —
+confirms the `malloc()` succeeded and is costing roughly what was predicted). No "dedup table
+allocation failed" or "dedup table full" warning appeared (expected — no real MeshCore/
+Meshtastic traffic was in range to populate the table). See `docs/BACKLOG.md` BL24 for the full
+eviction-policy/reboot-caveat writeup.
+
 Full hardware reference (pinout, board-revision ambiguity, per-vendor-documentation caveats): [docs/hardware/heltec-wifi-lora-32-v2/README.md](hardware/heltec-wifi-lora-32-v2/README.md). Phase 4 design and step-by-step status (architecture decision confirmed, gate-override decision, step tracking): `docs/PLAN.md`'s "Phase 4: Heltec WiFi LoRa 32 V2 board support" section.
 
 ## OLIMEX MOD-ESP32-C5 (started 2026-09-25)

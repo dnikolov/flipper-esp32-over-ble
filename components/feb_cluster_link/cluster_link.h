@@ -100,6 +100,13 @@ typedef struct {
     uint8_t mode;        /* feb_cluster_scan_mode_t */
     uint8_t dwell_mode;   /* feb_cluster_dwell_mode_t */
     uint8_t band_filter;  /* feb_cluster_band_filter_t */
+    /* Added 2026-09-26 for wardriving cluster delegation: the worker's own inter-pass
+       delay in `mode == FEB_CLUSTER_SCAN_MODE_CONTINUOUS`, wire-identical in meaning to
+       the BLE-facing protocol's `wifi_interval_ms` (docs/PROTOCOL.md's `wardriving`
+       command) -- `0` means back-to-back/no delay, matching that field's own convention.
+       Meaningless in IDLE/MANUAL mode (a manual pass is always exactly one sweep). Encoded
+       little-endian, same convention as payload_len and scan_batch_done's count field. */
+    uint16_t interval_ms;
 } feb_cluster_scan_config_t;
 
 /* ---- 0x03 SCAN_RESULT ---- worker -> coordinator, one per discovered AP. */

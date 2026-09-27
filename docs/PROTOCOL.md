@@ -514,6 +514,165 @@ transmits), which is lower risk than the bidirectional, duty-cycled traffic
 sweep between the two radios has been run for this capability. See
 [docs/BACKLOG.md](BACKLOG.md).
 
+### `meshtastic_scan` command and status payloads
+
+**Heltec WiFi LoRa 32 V2 only**, added 2026-09-27, build-verified only — no Meshtastic hardware
+was available this session, so the parser's correctness is confirmed only against synthetic
+host-native tests (`tests/esp32/test_meshtastic_proto.c`), including this project's own
+from-scratch AES-128-CTR encryption of synthetic protobuf bytes to build a "decryptable" test
+vector, not a live capture. Meshtastic is a third-party open LoRa mesh-network firmware/
+protocol, unrelated to both this project's own BLE wire protocol and to `meshcore_scan`. Same
+poll-only shape as `meshcore_scan`: a single `status` action, no start/stop, no busy/
+exclusivity concept.
+
+- `command` for `meshtastic_scan`: `capability = "meshtastic_scan"`, `arguments = {}` (always
+  an empty map — a non-empty `arguments` map is rejected `invalid_command`).
+- `status` for `meshtastic_scan`: `state` is always `"ok"`; `result` is always present. Same
+  conventions as `meshcore_scan`.
+
+`result` = `{ "nodes": [ <meshtastic-node>, ... ], "total_known_nodes": unsigned integer }`,
+same no-partial/complete-streaming, `total_known_nodes`-signals-truncation design as
+`meshcore_scan`'s own `result`. `nodes` is capped at `FEB_MESHTASTIC_MAX_NODES_PER_RESULT`,
+currently **2** — much smaller than `meshcore_scan`'s own cap (3) purely because of this
+board's DRAM budget (see below), not a wire-size constraint (a larger value would still fit
+well under the 512-byte `FEB_CBOR_MAX_PAYLOAD` cap given this capability's smaller per-node
+encoding).
+
+`<meshtastic-node>` field order: `node_id`, `name` (optional), `rssi_offset`, `last_seen_ms`.
+Deliberately smaller than `<meshcore-node>` — no `role`, no `lat_e7_offset`/`lon_e7_offset` —
+because Meshtastic's raw packet header carries neither, and decoding a `POSITION_APP` payload
+for location is out of Phase 1 scope.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node_id` | text string, exactly 8 characters | The sending node's 32-bit NodeNum, lowercase hex, matching the Meshtastic app's own on-screen `!<8 hex>` convention minus the `!`. Derived from the packet's cleartext header — always present, never requires decryption. Used as this board's own dedup key. |
+| `name` | text string, optional | Meshtastic's `NodeInfo.short_name` (a compact, conventionally <=4-character per-node tag — an emoji or short callsign, not the longer free-form `long_name`), present only if this board could decrypt the packet (default "LongFast" channel only) and it carried a `NODEINFO_APP` payload with a non-empty, fully printable-ASCII `short_name`. Omitted from the wire entirely when absent, not an empty string, same convention as `<meshcore-node>.name`. Capped at `FEB_MESHTASTIC_NAME_MAX_LEN` (8). |
+| `rssi_offset` | unsigned integer | `rssi_dbm + 128`, same convention as every other RSSI-bearing field in this protocol — sourced from the LoRa radio's own per-frame RSSI reading. |
+| `last_seen_ms` | unsigned integer | Milliseconds since the board's own boot, same boot-relative convention as `<meshcore-node>.last_seen_ms` (no RTC on this board). |
+
+**Radio-sharing with `meshcore_scan`.** This board has one physical SX1276, and both
+capabilities need continuous receive. MeshCore's fixed EU-868 preset and Meshtastic's EU_868
+"LongFast" default preset use *identical* RF modem parameters (869.525 MHz, 250 kHz bandwidth,
+SF11, CR4/5) — the only per-protocol radio setting that differs is the SX1276's one-byte
+sync-word register (MeshCore: RadioLib's own default, 0x12; Meshtastic: 0x2B). The shared RX
+task therefore time-multiplexes: it alternates the sync-word register (a cheap `setSyncWord()`
++ `startReceive()` call, not a full re-tune) between the two values on a fixed 60-second-per-side
+interval, dispatching each received frame to whichever protocol's parser matches the
+currently-active listen mode. This interval is an engineering guess, not a measured bound — see
+`docs/BACKLOG.md`. Whichever protocol is not the active listen mode simply cannot receive at
+all during the other's window; a broadcast arriving then is missed outright, not delayed. A
+runtime mode-select command (letting the Flipper/user pick one protocol at a time) was
+considered and rejected in favor of time-multiplexing, specifically because the identical RF
+parameters make switching this cheap.
+
+**Default-channel name decryption.** Meshtastic's raw packet header (`to`/`from`/`id`/`flags`/
+`channel`/`next_hop`/`relay_node`, 16 bytes) is always sent unencrypted by design (so relaying
+nodes without a channel's key can still forward what they can't read) — this is what makes
+`node_id`/`rssi_offset`/`last_seen_ms` available for *any* heard Meshtastic packet, regardless
+of channel. Only the default "LongFast" channel's well-known single-byte pre-shared key (index
+1, unmodified) is known to this board, so only packets whose header `channel` byte matches that
+channel's hash (computed at runtime from the channel name and PSK, not a hardcoded literal —
+see `meshtastic_proto.c`) are decrypted (AES-128-CTR) and walked for a `NODEINFO_APP` payload's
+`short_name`. A decrypt/parse failure, a non-`NODEINFO_APP` payload, or a decrypted `short_name`
+containing any non-printable-ASCII byte all result in `name` simply being omitted — never a
+garbage or misleading value.
+
+**No radio-coexistence validation** — same accepted gap as `meshcore_scan`, see
+[docs/BACKLOG.md](BACKLOG.md).
+
+**Severe DRAM constraint.** This board's classic-ESP32 DRAM budget was already mostly consumed
+by `meshcore_scan`'s own tables/scratch before `meshtastic_scan` was added; fitting a clean
+`idf.py build` required cutting `FEB_MESHTASTIC_NAME_MAX_LEN`/the node table size/
+`FEB_MESHTASTIC_MAX_NODES_PER_RESULT` well below `meshcore_scan`'s equivalents (see
+`heltec/main/meshtastic_table.h`'s sizing note for the exact measured numbers) and sharing one
+512-byte CBOR result-encode scratch buffer between the two capabilities' command handlers
+(`main.c`'s `lora_capability_result_buf`) instead of each having its own. Any future capability
+work on this board should expect very little DRAM margin left to spend.
+
+### `mesh_log` command and status payloads
+
+**Heltec WiFi LoRa 32 V2 only**, ESP32 side implemented 2026-09-27, build/host-test-verified
+only (no hardware available this session) — [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)'s
+"Mesh node publishing" section is the frozen design; this section is the wire contract itself.
+`mesh_log` is the missing capture/accumulate/drain layer feeding wdgwars.pl's mesh-node upload,
+separate from `meshcore_scan`/`meshtastic_scan` (both unchanged by this capability).
+
+**No `command` shape exists for this capability at all.** Every other capability in this
+protocol has some `command`/`status` request-reply shape (even the simplest poll-only ones,
+`gps`/`meshcore_scan`/`meshtastic_scan`, accept an explicit empty-arguments `command`) —
+`mesh_log` does not: the Flipper never sends `capability = "mesh_log"`, and the ESP32 never
+defines a decode shape for one. The only wire traffic this capability ever produces is the
+unsolicited push described below. (A board receiving `capability = "mesh_log"` regardless —
+which no known Flipper implementation ever sends — falls through to the normal
+`unsupported_capability` handling like any capability string the board doesn't recognize.)
+
+**Unsolicited push, mirroring `wardriving`'s own unsolicited backlog drain.** On every
+authenticated session establishment, if the ESP32's dedicated mesh-log flash partition holds
+any buffered (undrained) records, it proactively begins draining them via
+`status(state="mesh_data")` records, using the same reserved sentinel `request_id = 0`
+convention `wardriving`'s own unsolicited drain uses (see "Unsolicited backlog drain" above).
+**Unlike `wardriving`, this drain is not also re-kicked by any later event while a session
+stays open** — `wardriving`'s own drain re-triggers after every completed wifi/ble scan cycle
+because that capture and the BLE session state machine both run on the same task (the NimBLE
+host task); `mesh_log`'s capture instead runs on a separate task (the LoRa RX task,
+`lora_shared_radio.cpp`), and signalling across to the NimBLE host task promptly would need a
+new cross-task mechanism this pass deliberately didn't add (see `heltec/main/mesh_log.h`'s top
+comment). A node captured while a session is already open and fully drained therefore waits
+for the next reconnect to reach the Flipper — accepted as a scope cut for this pass, not
+unnoticed; mesh nodes are sparse and sessions reconnect periodically in practice.
+
+**Global state-string uniqueness — a wire-shape fact this design didn't originally spell out.**
+The Flipper routes an inbound `status` record to the correct capability handler by peeking only
+its `state` text (`status` carries no `capability`/discriminator field of its own at all) — so
+every capability's `status.state` value(s) must be unique across the *whole* protocol, not
+merely within that one capability. `wardriving` already occupies `"data"`; `mesh_log` therefore
+uses a distinct state, `"mesh_data"`, for its own always-`request_id=0`, always-`result`-present
+status records. See [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)'s "corrected" note on
+this same point.
+
+`result` = `{ "records": [ <mesh-log-record>, ... ], "backlog_remaining": unsigned integer }` —
+field names and meaning both copied verbatim from `wardriving`'s own
+`status(state="data").result` shape. **`records` never holds more than
+`FEB_MESH_LOG_MAX_RECORDS_PER_BATCH` (1) entry** — unlike `wardriving`'s dynamic
+pack-as-many-as-fit-under-the-payload-cap batching, this board's severe classic-ESP32 DRAM
+budget (already exhausted by `meshcore_scan`/`meshtastic_scan`'s own tables/scratch before this
+capability existed — see `docs/BACKLOG.md` BL23) forced the ESP32 side to push its buffered
+backlog one record per reply, chained via `backlog_remaining` exactly like `wardriving` chains
+multiple dynamically-sized batches, just at batch size 1. This is a permanent wire-format
+constraint on both firmwares, not merely this build's own sending choice. `backlog_remaining`
+is the count of buffered records still undrained after this reply, `0` once caught up —
+identical meaning to `wardriving`'s own field.
+
+`<mesh-log-record>` fixed field order: `node_id`, `network`, `lat_e7_offset`, `lon_e7_offset` —
+all four always present (unlike `<meshcore-node>`'s optional lat/lon pair): a sighting is only
+ever recorded here once it already carries a position, so there is no positionless case to
+represent on the wire.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `node_id` | text string, 1-16 characters | Stable node identity, same value/meaning as `meshcore_scan`'s or `meshtastic_scan`'s own `node_id` field for that network — 16 lowercase hex characters for a MeshCore node, 8 for a Meshtastic node. Unlike `<meshcore-node>.node_id` (always exactly 16), this field's length varies by `network`, so it is bounded (non-empty, at most 16), not fixed. |
+| `network` | text string | `"meshcore"` or `"meshtastic"` — caller-owned text, same convention as `source`/`role` elsewhere in this protocol; this codec does not restrict the value. |
+| `lat_e7_offset` | unsigned integer | Same `(int32_t)(lat * 1e7) + 900000000` encoding as every other lat/lon pair in this protocol (`wardriving`, `gps`, `meshcore_scan`). |
+| `lon_e7_offset` | unsigned integer | Same treatment, longitude, `+ 1800000000` offset. |
+
+**No Meshtastic sightings exist yet.** `meshtastic_scan`'s Phase 1 parser does not decode
+Meshtastic's `POSITION_APP` payload at all (out of that capability's own stated Phase 1 scope,
+see its section above) — so today, every `<mesh-log-record>` this board ever produces has
+`network = "meshcore"`. The `network = "meshtastic"` value is real (part of the wire contract,
+exercised by this codec's own host-native test vectors) but currently unreachable in practice
+until a future phase adds Meshtastic position decoding.
+
+**Dedup.** A given `node_id` is recorded into the flash log at most once, ever (matching
+wdgwars.pl's own "existence, not frequency" server-side semantics) — gating what the ESP32
+appends, not a wire-visible behavior. See `heltec/main/mesh_log.c`'s top comment for this
+build's dedup strategy (a flash scan, not a heap-allocated table) and the reasoning behind that
+choice.
+
+**No radio-coexistence concern of its own** — this capability captures via the same always-on
+LoRa RX task `meshcore_scan`/`meshtastic_scan` already run continuously; it adds a flash-log
+write per sighting, not a new radio access pattern, so `docs/BACKLOG.md`'s existing
+LoRa/Wi-Fi-BT coexistence gap for those two capabilities is the only relevant one here too.
+
 ## Reliability and reconnect behavior
 
 - BLE delivery is treated as ordered within an active connection; protocol records are not retransmitted automatically.
