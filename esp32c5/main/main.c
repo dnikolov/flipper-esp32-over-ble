@@ -261,6 +261,16 @@ static uint32_t wardriving_wifi_interval_ms;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
 
+/* Backlog-flush gate state: a rolling window over the last FEB_WARDRIVING_FLUSH_WINDOW_SCANS
+   passes' new-appended-record counts (see wardriving_validate.h), plus the bookkeeping to
+   derive each pass's delta from wardriving_dedup_appended_total()'s monotonic counter and to
+   sub-sample BLE-only runs down to one push per FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE
+   window closes. Declared here (used by wifi_scan_done_cb()/ble_scan_window_close_cb() further
+   up the file than wardriving_maybe_kick_send() itself) rather than next to that function. */
+static wardriving_flush_window_t wardriving_flush_window;
+static uint16_t wardriving_flush_last_appended;
+static uint8_t wardriving_flush_ble_windows;
+
 /* WiFi per-channel scan dwell-time ("swelling") control and regulatory country code
    (docs/WARDRIVING_REDESIGN.md) -- set once at wardriving_start_internal() and read back by
    wardriving_wifi_interval_cb() on every re-arm. Ported unchanged from esp32/main/main.c. */
@@ -320,11 +330,6 @@ static size_t wardriving_pending_drain_count;
 static uint8_t wardriving_flash_failure_count;
 static bool wardriving_wifi_self_stop_pending;
 static bool wardriving_ble_self_stop_pending;
-/* wardriving_maybe_kick_send()'s stopped-hysteresis: 0 means "not currently stopped"; set to
-   the esp_timer_get_time()-derived ms timestamp of the first below-threshold speed reading,
-   held until a reading at/above FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX resets it back
-   to 0. Same 0-as-sentinel idiom as pair_reply_wait_start_ms/hello_ack_start_ms above. */
-static uint32_t wardriving_flush_stopped_since_ms;
 /* wardriving_send_backlog_count_update()'s dedup tracker, reset to UINT64_MAX (an impossible
    pending count, forcing a fresh report) on every new connection in BLE_GAP_EVENT_DISCONNECT's
    per-connection state reset -- the Flipper resets its own displayed count to 0 on every
@@ -448,6 +453,7 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev);
 static void handle_wardriving_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wardriving_send_next_batch(uint16_t conn_handle);
 static void wardriving_maybe_kick_send(uint16_t conn_handle);
+static void wardriving_flush_window_start(void);
 static void wardriving_self_stop(const char *error_code);
 static void wardriving_apply_wifi_swelling(wifi_scan_config_t *scan_cfg);
 static void wardriving_apply_wifi_band(wifi_scan_config_t *scan_cfg);
@@ -1260,6 +1266,14 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
                path already cleared wifi_scan_in_progress; nothing else to do. */
             return;
         }
+        {
+            /* One flush-window sample per Wi-Fi pass, whether or not it had a fix. */
+            uint16_t now_total = wardriving_dedup_appended_total();
+
+            wardriving_flush_window_push(&wardriving_flush_window,
+                                          (uint16_t)(now_total - wardriving_flush_last_appended));
+            wardriving_flush_last_appended = now_total;
+        }
         wardriving_maybe_kick_send(connection_handle);
         ble_npl_callout_reset(&wardriving_wifi_interval_co,
                               ble_npl_time_ms_to_ticks32(wardriving_wifi_interval_ms));
@@ -1597,6 +1611,17 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
             /* A stop() raced this window's completion -- handle_wardriving_command()'s stop
                path already cleared ble_scan_in_progress; nothing else to do. */
             return;
+        }
+        /* BLE-only runs have no Wi-Fi pass to sample the flush window from -- sub-sample
+           every FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE window closes instead. */
+        if (!wardriving_wifi_active &&
+            ++wardriving_flush_ble_windows >= FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE) {
+            uint16_t now_total = wardriving_dedup_appended_total();
+
+            wardriving_flush_window_push(&wardriving_flush_window,
+                                          (uint16_t)(now_total - wardriving_flush_last_appended));
+            wardriving_flush_last_appended = now_total;
+            wardriving_flush_ble_windows = 0;
         }
         wardriving_maybe_kick_send(connection_handle);
         {
@@ -2047,6 +2072,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
             return false;
         }
         wardriving_wifi_active = true;
+        wardriving_flush_window_start();
         wardriving_sync_status_led();
     }
 
@@ -2080,10 +2106,22 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
         }
         ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
         wardriving_ble_active = true;
+        wardriving_flush_window_start();
         wardriving_sync_status_led();
     }
 
     return true;
+}
+
+/* Called once per start command (both source starts in the same command may each call this;
+   harmless) so a fresh run doesn't inherit the previous run's window state. Statics declared
+   near wardriving_wifi_active/wardriving_ble_active above (used earlier in the file by
+   wifi_scan_done_cb()/ble_scan_window_close_cb() than this function itself). */
+static void wardriving_flush_window_start(void)
+{
+    wardriving_flush_window_reset(&wardriving_flush_window);
+    wardriving_flush_last_appended = wardriving_dedup_appended_total();
+    wardriving_flush_ble_windows = 0;
 }
 
 /* Stops whichever wardriving source(s) are active and, if connected+authenticated, sends
@@ -2175,47 +2213,29 @@ static bool wardriving_send_backlog_count_update(uint16_t conn_handle, size_t pe
 
 /* Kicks off a wardriving status(state="data") send if a session is connected+authenticated,
    there is buffered data to send, and no batch is already in flight. Ported unchanged from
-   esp32/main/main.c, plus a radio-sharing gate: a flush is only allowed to *start* while
-   actively driving+scanning (as opposed to being merely called, which happens every scan/
-   window cycle regardless of whether anything new was appended) if there is no GPS fix, the
-   backlog is large enough to be urgent, or the vehicle has been stopped long enough that BLE
-   batch-send no longer competes with useful WiFi/BLE scanning. Once wardriving_send_next_batch()
-   below is reached, the drain-to-completion chain runs via TX_DONE_CONTINUE_WARDRIVING calling
-   wardriving_send_next_batch() directly (see its switch in the GATT-write completion handler)
-   -- that path bypasses this function entirely, so an in-progress drain is never re-gated
-   mid-flush.
-
-   This gate was tried without the count-update above on 2026-09-27 and removed the same day:
-   under ordinary continuous driving it stayed permanently closed, and with nothing else
-   updating the Flipper's displayed backlog count, live wardriving results looked like they'd
-   vanished entirely. Re-added with wardriving_send_backlog_count_update() so the gate now only
-   pauses when raw record *data* reaches the Flipper, not whether the count on screen moves. */
+   esp32/main/main.c, plus a radio-sharing gate: a flush is only allowed to *start* if there is
+   no GPS fix, the backlog is large enough to be urgent, wardriving isn't actually scanning on
+   either source, or wardriving_flush_window (fed once per pass, see wardriving_flush_window_t)
+   says the last FEB_WARDRIVING_FLUSH_WINDOW_SCANS passes were quiet. Once wardriving_send_next_
+   batch() below is reached, the drain-to-completion chain runs via TX_DONE_CONTINUE_WARDRIVING
+   calling wardriving_send_next_batch() directly (see its switch in the GATT-write completion
+   handler) -- that path bypasses this function entirely, so an in-progress drain is never
+   re-gated mid-flush. */
 static void wardriving_maybe_kick_send(uint16_t conn_handle)
 {
     feb_location_t fix;
     feb_location_state_t loc_state;
-    uint32_t now_ms;
     bool gate_open;
     size_t pending;
     const char *bail_reason = NULL;
     static const char *last_bail_reason = "";
 
     loc_state = location_get_fix(&fix);
-    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (loc_state == FEB_LOCATION_FIX) {
-        if (fix.speed_e1_kmh >= FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) {
-            wardriving_flush_stopped_since_ms = 0;
-        } else if (wardriving_flush_stopped_since_ms == 0) {
-            wardriving_flush_stopped_since_ms = now_ms;
-        }
-    }
-
     pending = wardriving_log_pending_count();
     gate_open = (loc_state != FEB_LOCATION_FIX) ||
                 (pending > FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD) ||
-                (wardriving_flush_stopped_since_ms != 0 &&
-                 (uint32_t)(now_ms - wardriving_flush_stopped_since_ms) >=
-                     FEB_WARDRIVING_FLUSH_STOPPED_SECONDS * 1000u);
+                (!wardriving_wifi_active && !wardriving_ble_active) ||
+                wardriving_flush_window.open;
 
     /* Diagnostic instrumentation added 2026-09-27 while chasing a live "wardriving results
        never show up" report: this function was previously silent about which of its several
@@ -2237,11 +2257,10 @@ static void wardriving_maybe_kick_send(uint16_t conn_handle)
     if (bail_reason != last_bail_reason) {
         if (bail_reason != NULL) {
             ESP_LOGI(TAG, "wardriving: flush not started (%s) -- loc_state=%d pending=%u "
-                          "tx_in_flight=%d has_conn=%d auth_state=%d stopped_since_ms=%lu now_ms=%lu",
+                          "tx_in_flight=%d has_conn=%d auth_state=%d window_open=%d",
                      bail_reason, (int)loc_state, (unsigned)pending,
                      (int)wardriving_tx_in_flight, (int)(conn_handle != BLE_HS_CONN_HANDLE_NONE),
-                     (int)runtime_auth_state, (unsigned long)wardriving_flush_stopped_since_ms,
-                     (unsigned long)now_ms);
+                     (int)runtime_auth_state, (int)wardriving_flush_window.open);
         } else {
             ESP_LOGI(TAG, "wardriving: flush starting (pending=%u)", (unsigned)pending);
         }

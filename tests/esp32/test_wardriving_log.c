@@ -281,6 +281,68 @@ static void test_start_interval_resolution(void)
           "start intervals: ble params present but ble not requested -> rejected");
 }
 
+/* docs/plans/2026-09-28-wardriving-count-flush-meshdedup.md Part B: the flush-window
+   backlog gate replacing the stopped/speed timer. Window capacity is
+   FEB_WARDRIVING_FLUSH_WINDOW_SCANS (3); sum < 100 opens, sum > 100 closes, == 100 leaves
+   the prior state unchanged; a single pass saturates at 255. */
+static void test_flush_window(void)
+{
+    wardriving_flush_window_t w;
+
+    wardriving_flush_window_reset(&w);
+    check(!w.open, "flush window: reset starts closed");
+    check(!wardriving_flush_window_push(&w, 1), "flush window: push 1 of 3 -> no change (not full)");
+    check(!wardriving_flush_window_push(&w, 2), "flush window: push 2 of 3 -> no change (not full)");
+    check(wardriving_flush_window_push(&w, 10), "flush window: {1,2,10}=13 < 100 -> open");
+    check(wardriving_flush_window_push(&w, 10), "flush window: {10,2,10}=22 < 100 -> open");
+    check(wardriving_flush_window_push(&w, 10), "flush window: {10,10,10}=30 < 100 -> open");
+
+    check(wardriving_flush_window_push(&w, 60), "flush window: {10,10,60}=80 < 100 -> still open");
+    check(!wardriving_flush_window_push(&w, 60), "flush window: {60,10,60}=130 > 100 -> closed");
+
+    check(!wardriving_flush_window_push(&w, 0), "flush window: {60,0,60}=120 > 100 -> still closed");
+    check(wardriving_flush_window_push(&w, 0), "flush window: {60,0,0}=60 < 100 -> open");
+
+    /* Exactly 100: state is left unchanged, whichever way it was previously. */
+    {
+        wardriving_flush_window_t open_w;
+
+        wardriving_flush_window_reset(&open_w);
+        wardriving_flush_window_push(&open_w, 10);
+        wardriving_flush_window_push(&open_w, 10);
+        check(wardriving_flush_window_push(&open_w, 10), "flush window: {10,10,10}=30 primes open");
+        wardriving_flush_window_push(&open_w, 40);
+        wardriving_flush_window_push(&open_w, 30);
+        check(wardriving_flush_window_push(&open_w, 30),
+              "flush window: {40,30,30}=100 exactly, was open -> stays open");
+    }
+    {
+        wardriving_flush_window_t closed_w;
+
+        wardriving_flush_window_reset(&closed_w);
+        wardriving_flush_window_push(&closed_w, 60);
+        wardriving_flush_window_push(&closed_w, 60);
+        check(!wardriving_flush_window_push(&closed_w, 60), "flush window: {60,60,60}=180 primes closed");
+        wardriving_flush_window_push(&closed_w, 40);
+        wardriving_flush_window_push(&closed_w, 30);
+        check(!wardriving_flush_window_push(&closed_w, 30),
+              "flush window: {40,30,30}=100 exactly, was closed -> stays closed");
+    }
+
+    /* Saturation: a single pass's count clamps to 255 (already well past the 100 "busy"
+       threshold on its own), never wraps or overflows into a smaller stored value. */
+    {
+        wardriving_flush_window_t sat_w;
+
+        wardriving_flush_window_reset(&sat_w);
+        wardriving_flush_window_push(&sat_w, 1000u);
+        check(sat_w.counts[0] == 255u, "flush window: push(1000) saturates the stored count at 255");
+        wardriving_flush_window_push(&sat_w, 1000u);
+        check(!wardriving_flush_window_push(&sat_w, 1000u),
+              "flush window: {255,255,255}=765 (saturated) -> closed");
+    }
+}
+
 int main(void)
 {
     test_crc32_known_vector();
@@ -290,6 +352,7 @@ int main(void)
     test_crc_detects_corruption();
     test_eviction_ordering();
     test_start_interval_resolution();
+    test_flush_window();
 
     if (g_failures == 0) {
         printf("\nAll wardriving_record_format tests passed.\n");

@@ -1,6 +1,7 @@
 #include "wardriving_validate.h"
 
 #include <stddef.h>
+#include <string.h>
 
 bool wardriving_resolve_start_intervals(const wardriving_start_request_t *req,
                                         wardriving_resolved_intervals_t *out)
@@ -48,4 +49,32 @@ bool wardriving_resolve_start_intervals(const wardriving_start_request_t *req,
     out->ble_window_ms = ble_window_ms;
     out->ble_interval_ms = ble_interval_ms;
     return true;
+}
+
+void wardriving_flush_window_reset(wardriving_flush_window_t *w)
+{
+    memset(w, 0, sizeof(*w));
+}
+
+bool wardriving_flush_window_push(wardriving_flush_window_t *w, uint32_t new_records)
+{
+    uint32_t sum = 0;
+    uint8_t i;
+
+    w->counts[w->next] = (uint8_t)(new_records > 255u ? 255u : new_records);
+    w->next = (uint8_t)((w->next + 1u) % FEB_WARDRIVING_FLUSH_WINDOW_SCANS);
+    if (w->filled < FEB_WARDRIVING_FLUSH_WINDOW_SCANS) {
+        w->filled++;
+    }
+    if (w->filled == FEB_WARDRIVING_FLUSH_WINDOW_SCANS) {
+        for (i = 0; i < FEB_WARDRIVING_FLUSH_WINDOW_SCANS; i++) {
+            sum += w->counts[i];
+        }
+        if (sum < FEB_WARDRIVING_FLUSH_BUSY_RECORDS) {
+            w->open = true;
+        } else if (sum > FEB_WARDRIVING_FLUSH_BUSY_RECORDS) {
+            w->open = false;
+        }
+    }
+    return w->open;
 }

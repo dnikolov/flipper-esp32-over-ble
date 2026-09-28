@@ -191,11 +191,20 @@ Flipper's current knowledge of run state (`wardriving_running_known && wardrivin
 the existing start/stop-ack handling flips between them exactly as it already flips the
 single screen's displayed state today.
 
-**Running screen** — unchanged content from today's running-state rendering: state text,
+**Running screen** — unchanged layout from today's running-state rendering: state text,
 "Recs: N Backlog: M" or "Recs: N Live" line, GPS fix suffix, and the existing single
 "Last WiFi: ..." / "Last BLE: ..." lines (last-seen only, not a history — confirmed with the
 user, no new scrollable multi-row list). Footer action is "Stop" (already effectively true
 today); OK sends the stop command as now.
+
+`Recs` (changed 2026-09-28, see `docs/plans/2026-09-28-wardriving-count-flush-meshdedup.md`
+Part A): the number of data rows actually present in `wardriving_current.csv`, not a
+per-session received-record counter. It survives a restart/disconnect within the same CSV
+file's lifetime and only drops to 0 when that file is archived or removed (a completed
+Publish). Seeded cheaply from a persisted `(rows, size)` pair in `wardriving_settings.txt`
+via one `storage_common_stat()` at app launch and again after a publish transfer completes;
+a full chunked recount only runs when the file's real size doesn't match what was saved at
+last close (crash, hand edit, or an upgrade from a build without the saved pair).
 
 **Stopped screen** — new scrollable settings list. Up/Down moves the highlighted row;
 Left/Right changes that row's value; OK triggers start (the existing `gps_delayed`-derived

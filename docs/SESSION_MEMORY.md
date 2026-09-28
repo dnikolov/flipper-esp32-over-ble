@@ -215,11 +215,13 @@ measured `esp_get_free_heap_size()` at **121808 bytes free** (logged before Wi-F
 init, so an upper bound rather than the true steady-state figure) and reconfirmed `idf.py size`
 still showed a razor-thin 80 bytes of `.dram0.bss` headroom. Given that free-heap number, the
 dedup mechanism was switched from the flash-scan fallback to a **heap-allocated 128-entry
-table** (`ml_dedup_entry_t`, 17 bytes each, ~2.2 KB total, `malloc()`'d once in
-`mesh_log_init()`, never `static`) — the frozen design's originally-preferred option. Only a
-pointer + count + one-time-warned-flag (8 bytes) were added to `.bss`; `idf.py size`
-re-confirmed **72 bytes DRAM headroom** after the switch (down from 80, exactly the predicted
-8-byte cost). **Eviction policy**: none — once full, further new node_ids simply aren't
+table**, `malloc()`'d once in `mesh_log_init()`, never `static` — the frozen design's
+originally-preferred option. Only a pointer + count + one-time-warned-flag (8 bytes) were added
+to `.bss`; `idf.py size` re-confirmed **72 bytes DRAM headroom** after the switch (down from 80,
+exactly the predicted 8-byte cost). **Table entry shrunk 2026-09-28** from the full node-id
+string (`ml_dedup_entry_t`, 17 bytes each, ~2.2 KB total) to a 4-byte FNV-1a hash (~512 B total,
+same 128-entry capacity, `.bss` unaffected since it's a heap change) — see PROJECT_HISTORY.md.
+**Eviction policy**: none — once full, further new node_ids simply aren't
 deduped (a one-time warning logs this), accepted given mesh nodes are expected sparse and
 wdgwars.pl already tolerates duplicate uploads server-side. `ml_scan_contains_node_id()` (the old
 flash-scan function) was deleted as dead code. Re-flashed and re-verified: clean ~60s boot

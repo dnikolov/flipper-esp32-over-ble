@@ -50,4 +50,9 @@ void wardriving_dedup_reset(void);
    dedup filtered a record. */
 bool wardriving_dedup_and_maybe_append(const feb_wardriving_record_t *record);
 
+/* Monotonic count of records actually appended to flash since boot (never reset by
+   wardriving_dedup_reset()). Callers derive a per-pass delta as
+   (uint16_t)(now - last), which wraps safely since per-pass counts stay far below 65535. */
+uint16_t wardriving_dedup_appended_total(void);
+
 #endif /* FEB_WARDRIVING_DEDUP_H */

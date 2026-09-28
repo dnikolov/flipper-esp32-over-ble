@@ -2670,6 +2670,47 @@ was flashed; everything is build- and host-test-verified only. Root causes worth
 Still open from the plan: H01's "connect in flight" flag, G25, and hardware verification of
 everything above.
 
+## 2026-09-28: CSV row count, flush-gate window redesign, mesh-dedup hash shrink (plan in docs/plans/)
+
+Three independent changes from a written implementation plan, each built and host-tested,
+none flashed:
+
+- **Flipper "Recs" now counts real CSV rows.** Previously it showed records received this BLE
+  session (reset on every reconnect). It now shows `wardriving_current.csv`'s actual row count,
+  persisted across restarts/disconnects and reset to 0 only when the file is archived (publish)
+  or deleted. Cost: one `storage_common_stat()` at startup in the common case; a full chunked
+  newline recount only when the persisted size doesn't match the file (crash, hand edit, or an
+  upgrade from a build without the new settings keys). Net `.bss`: −256 B (two settings buffers
+  merged into one, reused by the recount).
+- **Backlog-flush start gate replaced the speed/stopped rule with a 3-scan window.** The gate
+  (see PROTOCOL.md "Backlog-flush start gate") now opens/closes on the sum of new
+  post-dedup-appended records over the last 3 Wi-Fi passes (BLE-only runs sample every 10 BLE
+  window closes instead), rather than 10 continuous seconds below 5 km/h. The no-fix and
+  backlog>2000 rules, and "gate stays open while wardriving isn't running", are unchanged. Reason
+  for the change: the speed rule depended on raw NMEA speed-over-ground, which stays noisy near
+  any fixed threshold; the new rule reacts directly to what it's trying to protect (radio
+  contention from active scanning) instead of a proxy for it. Landed identically across
+  `esp32/`, `esp32c5/`, `heltec/` (`wardriving_validate.c` is BOARD_IDENTICAL,
+  `wardriving_dedup.c` gained a `wardriving_dedup_appended_total()` counter, both other boards
+  copied byte-identical from the `esp32/` reference implementation). Heltec's pre-existing gate
+  state (`wardriving_stopped_since_ms`, a `uint32_t`) was 4 bytes, not the 8-byte `int64_t` on
+  the other two boards, so its net `.bss` change is +16 B rather than the ~+1 B the other boards
+  saw — taking Heltec's DRAM headroom from 364 B to **348 B** (see BASELINES.md). Still a
+  comfortable margin, not the sub-50-B figures in BACKLOG.md BL25/BL27, which predate the
+  2026-09-28 hardening pass that fixed the link failure those cite.
+- **Heltec mesh-log dedup table shrunk from 2,176 B to 512 B of heap.** Dedup entries went from
+  storing the full node-id string (17 B: 1-byte length + 16-byte buffer) to a 4-byte FNV-1a hash,
+  same 128-node capacity. Collision odds are ~2×10⁻⁶ at 128 nodes, acceptable because
+  wdgwars.pl only tracks seen-vs-not-seen per node. Heap only — `.dram0.bss` unchanged (still a
+  pointer) — and no wire/flash format change (flash records still store the full node id).
+
+Implementation was split across four subagents (flipper-developer for the CSV count;
+esp32-developer for the shared window/counter code plus the `esp32/` board and host tests;
+esp32c5-developer and heltec-developer for their boards' `main.c`; heltec-developer also did the
+mesh-dedup shrink), run in parallel where the plan's dependency order allowed. All four board
+builds and both host test suites (`tests/flipper/build.ps1`, `tests/esp32/build_wardriving.ps1`)
+passed; `tools/check_shared_headers.py` reports no mismatch.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

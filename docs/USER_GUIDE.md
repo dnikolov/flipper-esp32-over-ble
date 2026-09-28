@@ -170,7 +170,7 @@ Press **OK** to start wardriving with the current settings. The footer shows `OK
 
 **Running screen** — shown when wardriving is actively recording. Displays:
 - **Header** — `Wardriving: RUNNING`.
-- **Records/backlog line** — a running count of records received this connected session, plus either `Backlog: N` (still draining previously-buffered results from the ESP32's flash log) or `Live` (caught up).
+- **Records/backlog line** — the count of records in `wardriving_current.csv` on the SD card (all captures since last publish) — persists through reconnects and restarts, resets to 0 only after archive (successful publish) or deletion.
 - **Last result line** — the most recently received record's kind (WiFi/BLE) and a short summary (SSID or BLE address).
 - **GPS fix indicator** — the Flipper polls the board's `gps` status every 2 seconds and shows it appended as `GPS:Fix`, `GPS:Acq` (acquiring), `GPS:No sig` (no signal), or `GPS:?` (not polled yet this session). Only shown if the board advertises the `gps` capability.
 - **Error line** — appears only when something needs attention (e.g. the board reports it's already running, or a CSV write failed).

@@ -155,6 +155,7 @@ After the 2026-09-28 hardening pass ([HARDENING_PLAN.md](HARDENING_PLAN.md)) the
 | C6 `esp32/cluster_worker/` total image | 865,212 B | 796,792 B (DIRAM −8,540 B) |
 | C5 `esp32c5/` total image | 1,329,234 B | 1,239,486 B (HP SRAM +10,026 B free; app partition 41% free) |
 | Heltec DRAM / IRAM headroom | tree didn't link (−16 B DRAM) / — | **364 B / 7,309 B** (supersedes BACKLOG.md BL27's 8 B / 45 B) |
+| Heltec DRAM headroom, after flush-window gate (2026-09-28, see PROJECT_HISTORY.md) | 364 B | **348 B / 7,309 B** (−16 B net; the mesh-dedup hash shrink in the same pass is heap-only, 0 B DRAM change) |
 
 The ESP32 baseline build completed successfully with ESP-IDF v5.5.2. Verified artifacts are `esp32/build/flipper_esp32_over_ble.elf` (3,590,924 bytes), `esp32/build/flipper_esp32_over_ble.bin` (161,888 bytes), `esp32/build/flipper_esp32_over_ble.map` (2,828,886 bytes), `esp32/build/flasher_args.json` (959 bytes), and `esp32/build/project_description.json` (195,509 bytes).
 

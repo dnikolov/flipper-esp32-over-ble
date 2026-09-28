@@ -43,15 +43,11 @@
      `meshtastic_table_entry_t` narrowed their own fields (see those structs' comments).
    - Dedup: a given `node_id` is recorded at most once, ever, gating what
      `mesh_log_record_sighting()` actually appends (docs/WARDRIVING_PUBLISH.md's "revised
-     2026-09-27" note). **This build uses a heap-allocated table** (128 entries, ~2.2 KB,
-     `malloc()`'d once in `mesh_log_init()`), the frozen design's originally-preferred option --
-     see mesh_log.c's top comment for the real `esp_get_free_heap_size()` measurement (121808
-     bytes free, taken on real hardware 2026-09-27) that sizing was based against. **Survives a
-     reboot**: `mesh_log_init()` seeds this table from the existing flash log once at boot
-     (every still-present record, drained or not), so this is not a RAM-only table that forgets
-     everything on restart -- see mesh_log.c's top comment for how that seed pass reuses the
-     init-time record walk that already existed for other bookkeeping, at no recurring runtime
-     cost.
+     2026-09-27" note), via a heap-allocated table of 128 4-byte FNV-1a hashes (~512 bytes,
+     `malloc()`'d once in `mesh_log_init()`) -- collisions are an accepted ~2e-6-at-n=128
+     tradeoff since wdgwars.pl only cares seen-vs-not-seen. **Survives a reboot**:
+     `mesh_log_init()` seeds this table from the existing flash log once at boot (every
+     still-present record, drained or not) -- see mesh_log.c's top comment for details.
 
    Call mesh_log_init() once at boot (after nvs_flash_init(), matching wardriving_log_init()'s
    own convention -- no actual dependency on NVS). Every other function here is only safe to

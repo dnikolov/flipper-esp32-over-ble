@@ -19,6 +19,10 @@ typedef struct {
 static dedup_entry_t wifi_table[FEB_WARDRIVING_DEDUP_WIFI_TABLE_SIZE];
 static dedup_entry_t ble_table[FEB_WARDRIVING_DEDUP_BLE_TABLE_SIZE];
 
+/* Monotonic count of records actually appended to flash (never reset), so callers can
+   derive a per-pass delta for the backlog-flush window (wardriving_validate.h). */
+static uint16_t wd_appended_total;
+
 /* FNV-1a over the 6 address bytes, mod the table size (a power of two, so this
    is a plain AND under the hood). Mixes better than a byte-order-independent
    XOR-fold and, combined with linear probing below, keeps same-type collisions
@@ -130,6 +134,7 @@ bool wardriving_dedup_and_maybe_append(const feb_wardriving_record_t *record)
     if (!wardriving_log_append(record)) {
         return false;  /* Real append failure */
     }
+    wd_appended_total++;
 
     memcpy(entry->address, address, 6);
     entry->in_use = true;
@@ -138,4 +143,9 @@ bool wardriving_dedup_and_maybe_append(const feb_wardriving_record_t *record)
     entry->last_lon_e7_offset = record->lon_e7_offset;
 
     return true;
+}
+
+uint16_t wardriving_dedup_appended_total(void)
+{
+    return wd_appended_total;
 }

@@ -324,6 +324,15 @@ static bool wardriving_ble_passive;
 static uint32_t wardriving_wifi_interval_ms;
 static uint32_t wardriving_ble_window_ms;
 static uint32_t wardriving_ble_interval_ms;
+
+/* Backlog-flush gate state: a rolling window over the last FEB_WARDRIVING_FLUSH_WINDOW_SCANS
+   passes' new-appended-record counts (see wardriving_validate.h). Declared here (used by
+   wifi_scan_done_cb()/ble_scan_window_close_cb() further up the file than
+   wardriving_maybe_kick_send() itself), same placement as esp32/main/main.c. */
+static wardriving_flush_window_t wardriving_flush_window;
+static uint16_t wardriving_flush_last_appended;
+static uint8_t wardriving_flush_ble_windows;
+
 /* Phase 9 cluster delegation: true when wardriving's Wi-Fi source is streaming from a
    present 2.4GHz cluster worker instead of this board's own local radio. Decided once, at
    wardriving_start_internal() time (cluster_worker_is_present() is a point-in-time check,
@@ -538,6 +547,7 @@ static void start_wifi_subsystem(void);
 static void handle_wardriving_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wardriving_send_next_batch(uint16_t conn_handle);
 static void wardriving_maybe_kick_send(uint16_t conn_handle);
+static void wardriving_flush_window_start(void);
 static void mesh_log_maybe_kick_send(uint16_t conn_handle);
 static void mesh_log_send_next_batch(uint16_t conn_handle);
 static void wardriving_self_stop(const char *error_code);
@@ -1424,6 +1434,14 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
                path already cleared wifi_scan_in_progress; nothing else to do. */
             return;
         }
+        {
+            /* One flush-window sample per Wi-Fi pass, whether or not it had a fix. */
+            uint16_t now_total = wardriving_dedup_appended_total();
+
+            wardriving_flush_window_push(&wardriving_flush_window,
+                                          (uint16_t)(now_total - wardriving_flush_last_appended));
+            wardriving_flush_last_appended = now_total;
+        }
         wardriving_maybe_kick_send(connection_handle);
         ble_npl_callout_reset(&wardriving_wifi_interval_co,
                               ble_npl_time_ms_to_ticks32(wardriving_wifi_interval_ms));
@@ -2036,6 +2054,17 @@ static void ble_scan_window_close_cb(struct ble_npl_event *ev)
             /* A stop() raced this window's completion -- handle_wardriving_command()'s stop
                path already cleared ble_scan_in_progress; nothing else to do. */
             return;
+        }
+        /* BLE-only runs have no Wi-Fi pass to sample the flush window from -- sub-sample
+           every FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE window closes instead. */
+        if (!wardriving_wifi_active &&
+            ++wardriving_flush_ble_windows >= FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE) {
+            uint16_t now_total = wardriving_dedup_appended_total();
+
+            wardriving_flush_window_push(&wardriving_flush_window,
+                                          (uint16_t)(now_total - wardriving_flush_last_appended));
+            wardriving_flush_last_appended = now_total;
+            wardriving_flush_ble_windows = 0;
         }
         wardriving_maybe_kick_send(connection_handle);
         {
@@ -2703,6 +2732,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
             cluster_link_send_scan_config((uint8_t)FEB_CLUSTER_SCAN_MODE_CONTINUOUS,
                                           (uint8_t)wifi_swelling, (uint16_t)wifi_interval_ms);
             wardriving_wifi_active = true;
+            wardriving_flush_window_start();
             wardriving_sync_status_led();
             ble_npl_callout_reset(&wardriving_wifi_interval_co,
                                   ble_npl_time_ms_to_ticks32(wifi_interval_ms));
@@ -2738,6 +2768,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
                 return false;
             }
             wardriving_wifi_active = true;
+            wardriving_flush_window_start();
             wardriving_sync_status_led();
         }
     }
@@ -2780,6 +2811,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
         }
         ble_npl_callout_reset(&ble_scan_done_co, ble_npl_time_ms_to_ticks32(wardriving_ble_window_ms));
         wardriving_ble_active = true;
+        wardriving_flush_window_start();
         wardriving_sync_status_led();
     }
 
@@ -2894,11 +2926,16 @@ void feb_factory_reset_request(void)
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &factory_reset_ev);
 }
 
-/* wardriving_maybe_kick_send()'s stopped-timer: 0 sentinel means "not currently stopped" (same
-   0-as-sentinel idiom as cluster_worker_last_hello_ms above), set to the ms timestamp of the
-   first below-threshold speed reading and cleared the instant a reading comes back at/above
-   threshold. Persists across calls; not reset by an early return. */
-static uint32_t wardriving_stopped_since_ms;
+/* Called once per start command (both source starts in the same command may each call this;
+   harmless) so a fresh run doesn't inherit the previous run's window state. Statics declared
+   near wardriving_wifi_active/wardriving_ble_active above (used earlier in the file by
+   wifi_scan_done_cb()/ble_scan_window_close_cb() than this function itself). */
+static void wardriving_flush_window_start(void)
+{
+    wardriving_flush_window_reset(&wardriving_flush_window);
+    wardriving_flush_last_appended = wardriving_dedup_appended_total();
+    wardriving_flush_ble_windows = 0;
+}
 /* wardriving_send_backlog_count_update()'s dedup tracker, reset to UINT64_MAX (an impossible
    pending count, forcing a fresh report) on every new connection -- the Flipper resets its own
    displayed count to 0 on every disconnect/reconnect (flipper_esp32_over_ble.c's
@@ -2968,20 +3005,17 @@ static bool wardriving_send_backlog_count_update(uint16_t conn_handle, size_t pe
    is never interrupted here.
 
    Gate: avoids the BLE batch-send of raw record *data* competing with active Wi-Fi scanning on
-   the shared radio while driving -- requires no GPS fix, backlog above
-   FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD, or the vehicle stopped (speed under
-   FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) for at least
-   FEB_WARDRIVING_FLUSH_STOPPED_SECONDS. wardriving_send_backlog_count_update() above keeps the
-   Flipper's displayed backlog count current regardless of this gate, so pausing the data flush
-   doesn't also freeze the on-screen number (2026-09-27: an earlier version of this gate
-   without that count-update made live wardriving results look like they'd vanished entirely
-   during ordinary driving — confirmed on hardware, esp32c5). */
+   the shared radio while driving -- open whenever there's no GPS fix, the backlog has grown
+   past FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD, wardriving isn't actually scanning on either
+   source, or wardriving_flush_window (fed once per pass, see wardriving_flush_window_t) says
+   the last FEB_WARDRIVING_FLUSH_WINDOW_SCANS passes were quiet. wardriving_send_backlog_count_
+   update() above keeps the Flipper's displayed backlog count current regardless of this gate,
+   so pausing the data flush doesn't also freeze the on-screen number. */
 static void wardriving_maybe_kick_send(uint16_t conn_handle)
 {
     feb_location_t fix;
     feb_location_state_t loc_state;
     size_t pending;
-    uint32_t now_ms;
     bool gate_open;
 
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE || runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
@@ -2990,19 +3024,10 @@ static void wardriving_maybe_kick_send(uint16_t conn_handle)
     pending = wardriving_log_pending_count();
 
     loc_state = location_get_fix(&fix);
-    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (loc_state == FEB_LOCATION_FIX) {
-        if (fix.speed_e1_kmh >= FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) {
-            wardriving_stopped_since_ms = 0;
-        } else if (wardriving_stopped_since_ms == 0) {
-            wardriving_stopped_since_ms = now_ms;
-        }
-    }
     gate_open = (loc_state != FEB_LOCATION_FIX) ||
                 (pending > FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD) ||
-                (wardriving_stopped_since_ms != 0 &&
-                 (uint32_t)(now_ms - wardriving_stopped_since_ms) >=
-                     FEB_WARDRIVING_FLUSH_STOPPED_SECONDS * 1000u);
+                (!wardriving_wifi_active && !wardriving_ble_active) ||
+                wardriving_flush_window.open;
 
     if (!gate_open || wardriving_tx_in_flight || pending == 0) {
         if (!wardriving_tx_in_flight && (uint64_t)pending != wardriving_last_reported_backlog) {

@@ -397,28 +397,18 @@ counters begin at `1`, so `0` is never a genuine value) — a Flipper implementa
 a `status` record whose `request_id` is `0` as this unsolicited case, not as a malformed or
 unmatched reply.
 
-**Backlog-flush start gate (added 2026-09-27, all three boards; revised same day).** Starting a
-flush of raw record *data* — whether triggered by the unsolicited drain above or by a live
-capture appending a new record — is gated on one of three fixed conditions, checked in
-`wardriving_maybe_kick_send()`: no GPS fix, the buffered backlog exceeds
-`FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD` (2000 records), or GPS speed has read continuously
-below `FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX` (5.0 km/h) for at least
-`FEB_WARDRIVING_FLUSH_STOPPED_SECONDS` (10 seconds). This avoids the BLE batch-send competing
-with active WiFi scanning on the shared 2.4GHz radio while driving. All three thresholds are
-fixed firmware constants (`wardriving_validate.h`), not wire-configurable. The gate only governs
-whether a data flush *starts*: once records begin sending, the existing `backlog_remaining`
-batch-chaining below continues to completion even if the gate would no longer be open.
-
-An initial version of this gate (with a 1.0 km/h stopped-speed threshold and no count-update
-below) was found on hardware (esp32c5) to leave live wardriving results looking like they'd
-vanished entirely during ordinary driving — the gate almost never opened, and the 1.0 km/h
-threshold was itself fragile: `speed_e1_kmh` is raw, unsmoothed NMEA speed-over-ground, and
-ordinary GPS noise near that threshold could repeatedly reset the stopped-hysteresis timer
-before it ever accumulated 10 continuous seconds, even while genuinely stationary. Both are
-addressed now: the threshold moved to 5.0 km/h, and a separate, ungated `status(state="data")`
-update with an empty `records` array (just `backlog_remaining`) keeps the Flipper's displayed
-backlog count moving whenever it changes, regardless of whether the gate is open — pausing the
-data flush no longer also freezes the on-screen number. See docs/PROJECT_HISTORY.md.
+**Backlog-flush start gate (added 2026-09-27, revised 2026-09-28, all three boards).** Starting a
+flush of raw record *data* is gated in `wardriving_maybe_kick_send()` on any of: no GPS fix, the
+buffered backlog exceeds `FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD` (2000 records), wardriving isn't
+running (no radio contention, so the unsolicited drain can proceed), or a sliding window over the
+last `FEB_WARDRIVING_FLUSH_WINDOW_SCANS` (3) passes is "quiet": the sum of new records actually
+appended (post-dedup) across those passes is `< FEB_WARDRIVING_FLUSH_BUSY_RECORDS` (100) to open,
+`>` to close, unchanged at exactly 100. A pass is one Wi-Fi scan; BLE-only runs sample once every
+`FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE` (10) BLE window closes instead. The speed/stopped
+rule this replaced is gone. All thresholds are fixed firmware constants (`wardriving_validate.h`),
+not wire-configurable. The gate only governs whether a data flush *starts*: once records begin
+sending, the existing `backlog_remaining` batch-chaining below continues to completion even if the
+gate would no longer be open. See docs/PROJECT_HISTORY.md for the superseded speed/stopped design.
 
 `<wardriving-record>` fixed field order:
 

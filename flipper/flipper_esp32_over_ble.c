@@ -459,7 +459,7 @@ typedef struct {
         } wardriving_run_state; /* AppEventWardrivingRunState */
         struct {
             uint64_t backlog_remaining;
-            uint32_t batch_count;
+            uint32_t csv_rows;
             char last_wifi_summary[APP_EVENT_WARDRIVING_SUMMARY_LEN];
             char last_ble_summary[APP_EVENT_WARDRIVING_SUMMARY_LEN];
         } wardriving_batch; /* AppEventWardrivingBatch */
@@ -522,7 +522,8 @@ typedef struct {
        ways (docs/LESSONS.md "UI must derive from real state"). */
     bool wardriving_running_known;
     bool wardriving_running;
-    uint32_t wardriving_records_this_session;
+    uint32_t wardriving_csv_rows; /* file-backed CSV row count, not a per-session counter --
+                                     see wardriving_csv_count_refresh() */
     uint64_t wardriving_backlog_remaining;
     char wardriving_last_wifi_summary[40];
     char wardriving_last_ble_summary[40];
@@ -1318,14 +1319,33 @@ static bool capability_storage_load(
     return ok;
 }
 
+/* Forward declaration: defined with the rest of the publish result parsing further down,
+   needed here for the csv_rows/csv_size settings keys below. */
+static uint32_t publish_parse_uint(const char* value, size_t value_len);
+
+/* Shared by wardriving_settings_load()/_save() (never nested, both main-thread-only) and by
+   wardriving_csv_count_rows()'s recount loop further down. */
+static char wardriving_settings_buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
+
+/* wardriving_csv_row_count/_saved_rows/_saved_size back the Running-screen "Recs" count
+   (docs/WARDRIVING_REDESIGN.md) -- declared here, ahead of wardriving_csv_file's own section
+   further down, because wardriving_settings_load()/_save() need the saved pair before that
+   point in the file. wardriving_csv_row_count is the live count, guarded by
+   wardriving_state_mutex like the rest of the CSV export state; the saved pair is settings-
+   file content, touched only on the main thread. */
+static uint32_t wardriving_csv_row_count;
+static uint32_t wardriving_csv_saved_rows;
+static uint32_t wardriving_csv_saved_size;
+
 /* Sets app's six wardriving settings fields to today's defaults (docs/WARDRIVING_REDESIGN.md
    "Persistence": "Default to today's old defaults if the file doesn't exist yet" -- matches
    the pre-redesign WardrivingSourceMode default, WardrivingSourceWifi2Ble: WiFi+BLE source,
    normal dwell, 2000ms cooldown, active BLE, world-safe (RoW) country, 2.4GHz-only band --
    the last per this project's "faster/safer default" bias, docs/PROTOCOL.md's `wifi_band`
-   row, added 2026-09-26). Called before attempting to load the persisted file, so a
-   missing/corrupt/partially-readable file always leaves every field at a sane value rather
-   than zero-initialized garbage. */
+   row, added 2026-09-26). Also seeds the saved CSV row-count pair to "unknown", which forces
+   one recount on first refresh for a file predating these two keys. Called before attempting
+   to load the persisted file, so a missing/corrupt/partially-readable file always leaves
+   every field at a sane value rather than zero-initialized garbage. */
 static void wardriving_settings_set_defaults(Esp32App* app) {
     app->wardriving_mode = WardrivingModeWifiBle;
     app->wardriving_swelling = WardrivingSwellingNormal;
@@ -1333,6 +1353,8 @@ static void wardriving_settings_set_defaults(Esp32App* app) {
     app->wardriving_ble_mode = WardrivingBleModeActive;
     app->wardriving_country = WardrivingCountryRoW;
     app->wardriving_wifi_band = WardrivingWifiBand24Ghz;
+    wardriving_csv_saved_rows = 0;
+    wardriving_csv_saved_size = UINT32_MAX;
 }
 
 /* Loads wardriving_settings.txt (flat `key=value` lines, same shape/parse style as
@@ -1349,12 +1371,12 @@ static void wardriving_settings_load(Esp32App* app) {
     }
     File* file = storage_file_alloc(app->storage);
     bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
-    static char buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
     size_t read_len = 0;
     if(ok) {
         uint64_t size = storage_file_size(file);
-        size_t cap = size > sizeof(buf) ? sizeof(buf) : (size_t)size;
-        read_len = storage_file_read(file, buf, cap);
+        size_t cap = size > sizeof(wardriving_settings_buf) ? sizeof(wardriving_settings_buf) :
+                                                               (size_t)size;
+        read_len = storage_file_read(file, wardriving_settings_buf, cap);
     }
     storage_file_close(file);
     storage_file_free(file);
@@ -1365,17 +1387,19 @@ static void wardriving_settings_load(Esp32App* app) {
     size_t pos = 0;
     while(pos < read_len) {
         size_t line_start = pos;
-        while(pos < read_len && buf[pos] != '\n' && buf[pos] != '\r') {
+        while(pos < read_len && wardriving_settings_buf[pos] != '\n' &&
+              wardriving_settings_buf[pos] != '\r') {
             pos++;
         }
         size_t line_len = pos - line_start;
-        while(pos < read_len && (buf[pos] == '\n' || buf[pos] == '\r')) {
+        while(pos < read_len &&
+              (wardriving_settings_buf[pos] == '\n' || wardriving_settings_buf[pos] == '\r')) {
             pos++;
         }
         if(line_len == 0) {
             continue;
         }
-        const char* line = buf + line_start;
+        const char* line = wardriving_settings_buf + line_start;
         const char* eq = memchr(line, '=', line_len);
         if(!eq) {
             continue;
@@ -1396,6 +1420,10 @@ static void wardriving_settings_load(Esp32App* app) {
             app->wardriving_country = wardriving_country_from_token(value, value_len);
         } else if(text_matches(line, key_len, "wifi_band")) {
             app->wardriving_wifi_band = wardriving_wifi_band_from_token(value, value_len);
+        } else if(text_matches(line, key_len, "csv_rows")) {
+            wardriving_csv_saved_rows = publish_parse_uint(value, value_len);
+        } else if(text_matches(line, key_len, "csv_size")) {
+            wardriving_csv_saved_size = publish_parse_uint(value, value_len);
         }
     }
 }
@@ -1416,18 +1444,20 @@ static void wardriving_settings_save(const Esp32App* app) {
         return;
     }
 
-    static char buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
     int written = snprintf(
-        buf,
-        sizeof(buf),
-        "mode=%s\nwifi_swelling=%s\nwifi_cooldown_ms=%lu\nble_mode=%s\ncountry=%s\nwifi_band=%s\n",
+        wardriving_settings_buf,
+        sizeof(wardriving_settings_buf),
+        "mode=%s\nwifi_swelling=%s\nwifi_cooldown_ms=%lu\nble_mode=%s\ncountry=%s\nwifi_band=%s\n"
+        "csv_rows=%lu\ncsv_size=%lu\n",
         wardriving_mode_token(app->wardriving_mode),
         wardriving_swelling_wire_value(app->wardriving_swelling),
         (unsigned long)app->wardriving_cooldown_ms,
         wardriving_ble_mode_token(app->wardriving_ble_mode),
         wardriving_country_wire_value(app->wardriving_country),
-        wardriving_wifi_band_wire_value(app->wardriving_wifi_band));
-    if(written <= 0 || (size_t)written >= sizeof(buf)) {
+        wardriving_wifi_band_wire_value(app->wardriving_wifi_band),
+        (unsigned long)wardriving_csv_saved_rows,
+        (unsigned long)wardriving_csv_saved_size);
+    if(written <= 0 || (size_t)written >= sizeof(wardriving_settings_buf)) {
         FURI_LOG_E(TAG, "wardriving_settings_save: buffer too small");
         return;
     }
@@ -1436,7 +1466,7 @@ static void wardriving_settings_save(const Esp32App* app) {
     File* file = storage_file_alloc(app->storage);
     bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
     if(ok) {
-        size_t out_written = storage_file_write(file, buf, buf_len);
+        size_t out_written = storage_file_write(file, wardriving_settings_buf, buf_len);
         ok = (out_written == buf_len) && storage_file_sync(file);
     }
     storage_file_close(file);
@@ -2684,14 +2714,14 @@ static void post_wardriving_run_state(Esp32App* app, bool running, bool is_fresh
 
 static void post_wardriving_batch(
     Esp32App* app,
-    uint32_t batch_count,
+    uint32_t csv_rows,
     uint64_t backlog_remaining,
     const char* last_wifi_summary,
     const char* last_ble_summary) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWardrivingBatch;
-    event->u.wardriving_batch.batch_count = batch_count;
+    event->u.wardriving_batch.csv_rows = csv_rows;
     event->u.wardriving_batch.backlog_remaining = backlog_remaining;
     strncpy(
         event->u.wardriving_batch.last_wifi_summary,
@@ -2781,16 +2811,23 @@ static void wardriving_csv_reset_state(void) {
     feb_wardriving_dedup_reset(&wardriving_dedup_table);
 }
 
-static void wardriving_csv_close(void) {
+/* Snapshots the live row count/file size into the saved settings pair before closing, so the
+   next launch's wardriving_csv_count_refresh() can skip a full recount. */
+static void wardriving_csv_close(Esp32App* app) {
+    bool persist = false;
     furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
     if(wardriving_csv_file) {
         storage_file_sync(wardriving_csv_file);
+        wardriving_csv_saved_size = (uint32_t)storage_file_size(wardriving_csv_file);
+        wardriving_csv_saved_rows = wardriving_csv_row_count;
+        persist = true;
         storage_file_close(wardriving_csv_file);
         storage_file_free(wardriving_csv_file);
         wardriving_csv_file = NULL;
     }
     wardriving_csv_reset_state();
     furi_mutex_release(wardriving_state_mutex);
+    if(persist) wardriving_settings_save(app);
 }
 
 /* Fixed filename (docs/WARDRIVING_PUBLISH.md "Capture-side change"): one "current" file that
@@ -2823,6 +2860,9 @@ static WardrivingCsvOpenResult wardriving_csv_ensure_open(Storage* storage) {
             static char header_buf[FEB_WARDRIVING_CSV_HEADER_MAX_LEN];
             size_t header_len = feb_wardriving_csv_format_header(header_buf, sizeof(header_buf));
             ok = header_len > 0 && storage_file_write(file, header_buf, header_len) == header_len;
+            if(ok) {
+                wardriving_csv_row_count = 0;
+            }
         }
     }
     if(!ok) {
@@ -2834,6 +2874,66 @@ static WardrivingCsvOpenResult wardriving_csv_ensure_open(Storage* storage) {
     wardriving_csv_file = file;
     FURI_LOG_I(TAG, "wardriving CSV: writing to '%s'", wardriving_csv_path);
     return WardrivingCsvOpenOk;
+}
+
+/* Full chunked recount, only reached when the saved size doesn't match the real file -- the
+   CSV is guaranteed closed here (main thread only, called before any BLE session can open it),
+   so reusing wardriving_settings_buf as a scratch read buffer is safe. */
+static uint32_t wardriving_csv_count_rows(Storage* storage, const char* path) {
+    static bool low_heap_logged;
+    uint32_t newlines = 0;
+    if(!storage_open_heap_margin_ok("wardriving CSV count", &low_heap_logged)) return 0;
+    uint32_t start = furi_get_tick();
+    File* file = storage_file_alloc(storage);
+    if(storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        size_t n;
+        while((n = storage_file_read(
+                   file, wardriving_settings_buf, sizeof(wardriving_settings_buf))) > 0) {
+            for(size_t i = 0; i < n; i++) newlines += (wardriving_settings_buf[i] == '\n');
+        }
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    FURI_LOG_I(
+        TAG,
+        "wardriving CSV: recounted %lu rows in %lu ms",
+        (unsigned long)(newlines > 2 ? newlines - 2 : 0),
+        (unsigned long)(furi_get_tick() - start));
+    return newlines > 2 ? newlines - 2 : 0;
+}
+
+/* Seeds wardriving_csv_row_count cheaply from the saved settings pair, falling back to a full
+   recount only when the file's real size doesn't match what was saved at last close. */
+static void wardriving_csv_count_refresh(Esp32App* app) {
+    if(!build_wardriving_path(
+           wardriving_csv_path, sizeof(wardriving_csv_path), FEB_WARDRIVING_CSV_FILENAME)) {
+        return;
+    }
+    FileInfo info;
+    FS_Error err = storage_common_stat(app->storage, wardriving_csv_path, &info);
+    uint32_t rows;
+    bool changed = false;
+    if(err == FSE_NOT_EXIST) {
+        rows = 0;
+        changed = wardriving_csv_saved_rows != 0 || wardriving_csv_saved_size != 0;
+        wardriving_csv_saved_rows = 0;
+        wardriving_csv_saved_size = 0;
+    } else if(err != FSE_OK) {
+        FURI_LOG_W(TAG, "wardriving CSV: stat failed: %d", err);
+        rows = wardriving_csv_saved_rows;
+    } else if((uint32_t)info.size == wardriving_csv_saved_size) {
+        rows = wardriving_csv_saved_rows;
+    } else {
+        rows = wardriving_csv_count_rows(app->storage, wardriving_csv_path);
+        wardriving_csv_saved_rows = rows;
+        wardriving_csv_saved_size = (uint32_t)info.size;
+        changed = true;
+    }
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    wardriving_csv_row_count = rows;
+    furi_mutex_release(wardriving_state_mutex);
+    app->wardriving_csv_rows = rows;
+    if(changed) wardriving_settings_save(app);
 }
 
 /* FirstSeen (docs/CAPABILITIES.md, docs/PROTOCOL.md's `utc_timestamp_s` wardriving-record
@@ -2876,6 +2976,7 @@ static bool wardriving_csv_write_record(const feb_wardriving_record_t* record) {
     if(row_len == 0 || storage_file_write(wardriving_csv_file, row_buf, row_len) != row_len) {
         return false;
     }
+    wardriving_csv_row_count++;
     wardriving_csv_records_since_sync++;
     if(wardriving_csv_records_since_sync >= FEB_WARDRIVING_CSV_SYNC_EVERY_N_RECORDS) {
         storage_file_sync(wardriving_csv_file);
@@ -3055,8 +3156,12 @@ static void
         }
     }
 
-    post_wardriving_batch(
-        app, (uint32_t)result->record_count, result->backlog_remaining, last_wifi_summary, last_ble_summary);
+    /* Report the file-backed count, not this batch's record_count -- Recs must reflect rows
+       actually written to the CSV, including the dedup skips above. */
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    uint32_t csv_rows = wardriving_csv_row_count;
+    furi_mutex_release(wardriving_state_mutex);
+    post_wardriving_batch(app, csv_rows, result->backlog_remaining, last_wifi_summary, last_ble_summary);
 
     if(wardriving_flush_led_active && result->backlog_remaining == 0 && app->notifications) {
         notification_message(app->notifications, &sequence_set_only_blue_255);
@@ -4336,6 +4441,9 @@ static void publish_finish_waiting(Esp32App* app) {
     furi_timer_stop(publish_poll_timer);
     app->publish_waiting = false;
     if(app->publish_bt_stopped) {
+        /* CSV is still closed at this point (HP-09) -- catches a host-script archive/rename
+           that just happened during the transfer. */
+        wardriving_csv_count_refresh(app);
         start_profile(app);
         app->publish_bt_stopped = false;
     }
@@ -4422,7 +4530,7 @@ static void publish_start(Esp32App* app) {
     /* Both close functions take wardriving_state_mutex internally. Without this, the CSV/
        mesh-log FatFS handles stay open across the whole publish transfer, and the host
        script's CLI `storage` calls on the same paths block forever (HP-09). */
-    wardriving_csv_close();
+    wardriving_csv_close(app);
     mesh_log_close();
 
     app->publish_waiting = true;
@@ -4974,7 +5082,7 @@ static void draw_wardriving_running_screen(Canvas* canvas, const Esp32App* app) 
             line,
             sizeof(line),
             "Recs: %lu  Backlog: %llu%s",
-            (unsigned long)app->wardriving_records_this_session,
+            (unsigned long)app->wardriving_csv_rows,
             (unsigned long long)app->wardriving_backlog_remaining,
             gps_suffix);
     } else {
@@ -4982,7 +5090,7 @@ static void draw_wardriving_running_screen(Canvas* canvas, const Esp32App* app) 
             line,
             sizeof(line),
             "Recs: %lu  Live%s",
-            (unsigned long)app->wardriving_records_this_session,
+            (unsigned long)app->wardriving_csv_rows,
             gps_suffix);
     }
     canvas_draw_str(canvas, 2, 22, line);
@@ -5834,7 +5942,6 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     ble_scan_device_count_reset();
     app->wardriving_running_known = false;
     app->wardriving_running = false;
-    app->wardriving_records_this_session = 0;
     app->wardriving_backlog_remaining = 0;
     app->wardriving_last_wifi_summary[0] = '\0';
     app->wardriving_last_ble_summary[0] = '\0';
@@ -5848,7 +5955,7 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
         notification_message(app->notifications, &sequence_blink_stop);
         notification_message(app->notifications, &sequence_set_only_blue_255);
     }
-    wardriving_csv_close();
+    wardriving_csv_close(app);
     mesh_log_close();
     /* This Flipper's knowledge of the ESP32's gps status does not survive a lost session
        either (same "UI must derive from real state" argument as wardriving_running_known
@@ -5960,6 +6067,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     furi_check(reassembly_mutex);
     wardriving_state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(wardriving_state_mutex);
+    wardriving_csv_count_refresh(&app);
     bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
     reassembly_timeout_timer = furi_timer_alloc(
         reassembly_timeout_timer_callback, FuriTimerTypePeriodic, NULL);
@@ -6129,8 +6237,9 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             if(event.u.wardriving_run_state.is_fresh_start) {
                 /* A genuine new "started" ack -- reset this session's own counters, distinct
                    from a `busy`-error-inferred "it was already running" correction (which
-                   must NOT reset counts we may already be accumulating this connection). */
-                app.wardriving_records_this_session = 0;
+                   must NOT reset counts we may already be accumulating this connection).
+                   wardriving_csv_rows is file-backed, not a session counter, so it is NOT
+                   reset here -- see wardriving_csv_count_refresh(). */
                 app.wardriving_backlog_remaining = 0;
                 app.wardriving_last_wifi_summary[0] = '\0';
                 app.wardriving_last_ble_summary[0] = '\0';
@@ -6147,7 +6256,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.wardriving_settings_scroll_offset = 0;
             }
         } else if(event.type == AppEventWardrivingBatch) {
-            app.wardriving_records_this_session += event.u.wardriving_batch.batch_count;
+            app.wardriving_csv_rows = event.u.wardriving_batch.csv_rows;
             app.wardriving_backlog_remaining = event.u.wardriving_batch.backlog_remaining;
             if(event.u.wardriving_batch.last_wifi_summary[0] != '\0') {
                 strncpy(

@@ -363,7 +363,8 @@ section for the full wire contract these produced):
   reading this design called for; a same-day hardware session then measured it (**121808 bytes
   free**, taken before Wi-Fi/BLE stack init, so an upper bound rather than the true steady-state
   figure — see `docs/BACKLOG.md` BL24), and the dedup mechanism was switched to a heap-allocated
-  128-entry table (~2.2 KB, `malloc()`'d once in `mesh_log_init()`) against that real number —
+  128-entry table, `malloc()`'d once in `mesh_log_init()`, against that real number — shrunk
+2026-09-28 to ~512 B (4-byte hash per entry, was ~2.2 KB) —
   see `heltec/main/mesh_log.c`'s top comment for the full sizing/eviction-policy rationale.
   **The reboot-resets-the-table caveat this first raised is now closed, not just accepted**
   (same day, third pass): `mesh_log_init()` seeds `ml_dedup_entries` from the existing flash log

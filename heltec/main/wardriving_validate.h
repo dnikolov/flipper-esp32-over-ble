@@ -72,29 +72,25 @@
 
 /* wardriving_maybe_kick_send()'s (main.c) backlog-flush gate: avoids starting/continuing a BLE
    batch-send of raw record *data* while actively driving and scanning on the same shared
-   radio -- wardriving_send_backlog_count_update() (main.c) still keeps the Flipper's displayed
-   backlog count current while this gate is closed, so pausing the data flush doesn't also
-   freeze the on-screen number. Speed threshold set to 5.0 km/h (rather than an initial
-   1.0 km/h): speed_e1_kmh is raw, unsmoothed NMEA speed-over-ground, and ordinary GPS noise
-   near 1.0 km/h was found to repeatedly reset the stopped-hysteresis timer before it could
-   ever accumulate FEB_WARDRIVING_FLUSH_STOPPED_SECONDS continuously, even when the vehicle was
-   genuinely stationary. Fixed firmware constants, no wire-configurability. */
-#define FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX 50u
-#define FEB_WARDRIVING_FLUSH_STOPPED_SECONDS 10u
+   radio. Gate state now comes from a rolling window over the last
+   FEB_WARDRIVING_FLUSH_WINDOW_SCANS passes' new-record counts (see wardriving_flush_window_t
+   below) rather than a stopped/speed timer. */
 #define FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD 2000u
+#define FEB_WARDRIVING_FLUSH_WINDOW_SCANS 3u
+#define FEB_WARDRIVING_FLUSH_BUSY_RECORDS 100u
+#define FEB_WARDRIVING_FLUSH_BLE_WINDOWS_PER_SAMPLE 10u
 
 /* Floor for the no-GPS-fix retry re-arm in wardriving_wifi_interval_cb() (main.c): that cycle
    skips starting a scan and just re-checks for a fix next time, so it doesn't need to run at
    the configured scan cadence -- which can legitimately be 0 ("aggressive"/continuous, no gap,
    see FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS's comment above). Re-arming with the raw
    interval at 0ms produces a zero-delay refire loop on the NimBLE host task that starves CPU0's
-   IDLE task and trips the task watchdog -- reproduced on the ESP32-C5 hardware 2026-09-27
-   (board autostarted wardriving from a persisted 0ms wifi_interval_ms with no GPS fix present).
+   IDLE task and trips the task watchdog -- reproduced on hardware 2026-09-27 (C5 board
+   autostarted wardriving from a persisted 0ms wifi_interval_ms with no GPS fix present).
    Clamp to this floor instead of the configured interval whenever retrying due to no fix.
-   wardriving_ble_interval_cb() does not have a no-fix skip at all (that discovery procedure is
-   shared with start_scan()'s Flipper reconnect scan, so skipping it whenever there's no fix
-   would stall reconnect indefinitely), so this floor is Wi-Fi-only. Ported from
-   esp32c5/main/wardriving_validate.h. */
+   wardriving_ble_interval_cb() does not have a no-fix skip at all (it shares the discovery
+   procedure start_scan() uses for Flipper reconnect, so skipping it whenever there's no fix
+   stalls reconnect indefinitely), so this floor is Wi-Fi-only. */
 #define FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS 1000u
 
 typedef struct {
@@ -122,5 +118,15 @@ typedef struct {
    handle_wardriving_command()'s validation. */
 bool wardriving_resolve_start_intervals(const wardriving_start_request_t *req,
                                         wardriving_resolved_intervals_t *out);
+
+typedef struct {
+    uint8_t counts[FEB_WARDRIVING_FLUSH_WINDOW_SCANS]; /* per-pass new records, saturated at 255 */
+    uint8_t next;
+    uint8_t filled;
+    bool open;
+} wardriving_flush_window_t;
+
+void wardriving_flush_window_reset(wardriving_flush_window_t *w);
+bool wardriving_flush_window_push(wardriving_flush_window_t *w, uint32_t new_records);
 
 #endif /* FEB_WARDRIVING_VALIDATE_H */

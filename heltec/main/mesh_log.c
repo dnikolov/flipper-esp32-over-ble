@@ -1,71 +1,17 @@
 /* See mesh_log.h's top comment for this module's overall shape/rationale.
 
-   Dedup strategy actually used in this build: a **heap-allocated** table
-   (ml_dedup_entries below), the frozen design's originally-preferred option, switched to from
-   an earlier flash-scan fallback once a real hardware session (2026-09-27) finally measured
-   `esp_get_free_heap_size()` at boot: **121808 bytes free** (before Wi-Fi/BLE stack init, so
-   an upper bound on steady-state, not the true worst case -- see docs/BACKLOG.md BL24) --
-   comfortably enough to size a generous dedup table without touching this board's exhausted
-   `.dram0.bss` budget at all (docs/BACKLOG.md BL23). `ml_dedup_entries` is allocated once via
-   `malloc()` in `mesh_log_init()`, never `static` -- only the pointer to it and a small
-   count/flag (a handful of bytes total, see their own declarations below) live in `.bss`, so
-   this change does not materially move BL24's own headroom number. Capacity is
-   `ML_DEDUP_CAPACITY` (128) entries of `ml_dedup_entry_t` (17 bytes each: a 1-byte length plus
-   up to `FEB_MESH_LOG_NODE_ID_MAX_LEN` (16) raw id bytes, no NUL terminator) -- about 2.2 KB
-   total, trivial against the measured 121 KB free, and generous above the "dozens, not
-   hundreds/thousands" mesh-node population docs/WARDRIVING_PUBLISH.md expects. If `malloc()`
-   ever fails (essentially unreachable given the measured margin, but checked anyway per this
-   codebase's "check every esp_err_t/allocation" discipline), dedup is simply disabled --
-   `mesh_log_record_sighting()` still stores every sighting, just without ever suppressing a
-   repeat, rather than treating an allocation failure as fatal to the whole capability.
-
-   **Eviction policy once the table is full**: none -- new, not-yet-seen node_ids are simply
-   no longer deduped once `ML_DEDUP_CAPACITY` entries are populated (a one-time warning is
-   logged the first time this happens). No LRU/oldest-eviction scheme was built: mesh nodes are
-   expected sparse enough that 128 distinct nodes in one board's lifetime-before-reboot is
-   already an unlikely ceiling to reach, and wdgwars.pl's own server-side dedup ("what counts is
-   that the node exists, not how many times you've seen it" -- docs/WARDRIVING_PUBLISH.md)
-   already tolerates an occasional duplicate upload without penalty, so silently allowing
-   through the rare overflow case is an acceptable simplification, not a hidden bug.
-
-   **Reboot caveat, closed (not merely accepted)**: an earlier version of this switch left the
-   heap table starting empty on every boot, reopening the persistence property the flash-scan
-   fallback it replaced had incidentally provided. Fixed the same day: `mesh_log_init()` now
-   seeds `ml_dedup_entries` from the existing flash log once, at boot, before creating
-   `ml_mutex` -- see the record-walking block inside `mesh_log_init()`'s resumed-partition path,
-   which decodes every still-present record (drained or not, not just undrained ones -- a node
-   logged once, drained, and later re-heard must still not re-append) and calls
-   `ml_dedup_insert()` for each distinct `node_id` found, up to `ML_DEDUP_CAPACITY`. This reuses
-   the same walk that already existed there for `ml_undrained_in_sector`/oldest-cursor
-   bookkeeping rather than adding a second pass over the same sectors, so it costs no extra
-   flash reads beyond what init already did -- purely a one-time boot-time cost bounded by this
-   partition's small size (4 sectors), not a recurring one, and adds no new `.bss`. A boot log
-   line ("mesh log dedup table seeded with N entries from existing log") reports how many
-   entries this pass populated, for future hardware sessions to sanity-check. If the log ever
-   holds more distinct node_ids than `ML_DEDUP_CAPACITY` at boot, the same "warn once, stop
-   deduping new ones past capacity" policy above applies -- no separate eviction scheme needed
-   for the seed pass. Net effect: this heap table now gets both the fast O(1)-ish runtime lookup
-   the switch to heap storage was for, and the flash log's own persistence across reboots the
-   original flash-scan fallback had -- not a trade-off between the two.
-
-   Every static byte in this file was fought for against this board's ~120-byte (pre-existing)
-   `.dram0.bss` headroom (docs/BACKLOG.md BL23), which turned out to have essentially zero
-   room left once this capability's other tables/scratch buffers were already accounted for --
-   getting a clean `idf.py build` needed real structural cuts, not just narrower field widths:
-   sector/offset bookkeeping fields are `uint8_t`/`uint16_t`, not `size_t`; `ML_MAX_SECTORS` is
-   a fixed compile-time constant used directly in arithmetic rather than a discovered-at-init
-   field (this partition, unlike wardriving's, is entirely this capability's own and sized to
-   match exactly -- see that constant's own comment); there is no persisted pending-count or
-   per-sector "generation" field beyond what's genuinely needed across calls
-   (ml_compute_pending_count() sums on demand instead); the init-only sector-occupied/
-   generation scan arrays are plain function locals inside mesh_log_init() (stack, not `.bss`);
-   mesh_log_peek_pending() takes a caller-supplied scratch buffer (mesh_log.h's top comment);
-   and mesh_log_record_sighting()'s own CBOR-encode scratch buffer is a stack local too (that
-   function's own comment justifies this specific, narrow exception to this codebase's usual
-   static-buffer convention for radio/BLE-callback-path code). The new heap-allocated dedup
-   table above adds only a pointer plus a small count/flag to this file's own `.bss` footprint
-   (see this file's dedup-strategy comment above) -- its actual entry storage lives on the
-   heap, outside this budget entirely. */
+   Dedup strategy: a heap-allocated table (`ml_dedup_hashes`, `malloc()`'d once in
+   `mesh_log_init()`, never `static`) of `ML_DEDUP_CAPACITY` (128) 4-byte FNV-1a hashes of each
+   distinct `node_id`, about 512 bytes of heap -- collisions are theoretically possible (about
+   2e-6 at n=128) but silently acceptable since wdgwars.pl only cares whether a node has been
+   seen at all, not how many times. Seeded from the existing flash log at boot (every
+   still-present record, drained or not) so dedup survives a reboot; see the resumed-partition
+   walk inside `mesh_log_init()`. No eviction once full -- new node_ids past capacity are simply
+   not deduped, logged once via `ml_dedup_table_full_warned`. `malloc()` failure disables dedup
+   only (every sighting is then stored unconditionally), not the rest of this capability. Full
+   history (heap-vs-bss tradeoff, the free-heap measurement it was sized against, the reboot-
+   persistence fix, and the `.bss`-budget fight elsewhere in this file) is in
+   docs/PROJECT_HISTORY.md. */
 #include "mesh_log.h"
 
 #include <stdlib.h>
@@ -139,31 +85,37 @@ static uint8_t ml_peek_sector;
 static bool ml_active_sector_closed;
 static bool ml_peek_valid;
 
-/* Heap-allocated dedup table (see this file's top comment for the full rationale/sizing/
-   eviction-policy discussion). Only these three symbols live in `.bss`; ML_DEDUP_CAPACITY *
-   sizeof(ml_dedup_entry_t) bytes of actual entry storage is malloc()'d once in
-   mesh_log_init() and never touches the static budget BL23/BL24 track. */
+/* Heap-allocated dedup table (see this file's top comment). Only these three symbols live in
+   `.bss`; ML_DEDUP_CAPACITY * sizeof(uint32_t) bytes of actual hash storage is malloc()'d once
+   in mesh_log_init() and never touches the static budget BL23/BL24 track. */
 #define ML_DEDUP_CAPACITY 128u
 
-typedef struct {
-    uint8_t len; /* 1..FEB_MESH_LOG_NODE_ID_MAX_LEN; 0 means this slot is unused */
-    char id[FEB_MESH_LOG_NODE_ID_MAX_LEN]; /* raw id bytes, not NUL-terminated */
-} ml_dedup_entry_t;
-
-static ml_dedup_entry_t *ml_dedup_entries; /* NULL if malloc() failed at init -- dedup then a no-op */
+static uint32_t *ml_dedup_hashes; /* NULL if malloc() failed at init -- dedup then a no-op */
 static uint16_t ml_dedup_count;
 static bool ml_dedup_table_full_warned;
 
-static bool ml_dedup_contains(const char *node_id, size_t node_id_len)
+static uint32_t ml_node_hash(const char *id, size_t len)
 {
+    uint32_t h = 2166136261u;
     size_t i;
 
-    if (ml_dedup_entries == NULL) {
+    for (i = 0; i < len; i++) {
+        h = (h ^ (uint8_t)id[i]) * 16777619u;
+    }
+    return h;
+}
+
+static bool ml_dedup_contains(const char *node_id, size_t node_id_len)
+{
+    uint32_t h;
+    size_t i;
+
+    if (ml_dedup_hashes == NULL) {
         return false;
     }
+    h = ml_node_hash(node_id, node_id_len);
     for (i = 0; i < ml_dedup_count; i++) {
-        if (ml_dedup_entries[i].len == node_id_len &&
-            memcmp(ml_dedup_entries[i].id, node_id, node_id_len) == 0) {
+        if (ml_dedup_hashes[i] == h) {
             return true;
         }
     }
@@ -177,7 +129,7 @@ static bool ml_dedup_contains(const char *node_id, size_t node_id_len)
    duplicate entry here. */
 static void ml_dedup_insert(const char *node_id, size_t node_id_len)
 {
-    if (ml_dedup_entries == NULL) {
+    if (ml_dedup_hashes == NULL) {
         return;
     }
     if (ml_dedup_count >= ML_DEDUP_CAPACITY) {
@@ -188,9 +140,7 @@ static void ml_dedup_insert(const char *node_id, size_t node_id_len)
         }
         return;
     }
-    ml_dedup_entries[ml_dedup_count].len = (uint8_t)node_id_len;
-    memcpy(ml_dedup_entries[ml_dedup_count].id, node_id, node_id_len);
-    ml_dedup_count++;
+    ml_dedup_hashes[ml_dedup_count++] = ml_node_hash(node_id, node_id_len);
 }
 
 static size_t ml_compute_pending_count(void)
@@ -350,13 +300,13 @@ void mesh_log_init(void)
        budget. A malloc() failure here does not disable mesh_log itself (the partition/mutex
        setup below is unaffected either way) -- it only disables dedup, which then degrades to
        "every sighting is appended, never suppressed" rather than being treated as fatal. */
-    ml_dedup_entries = (ml_dedup_entry_t *)malloc(ML_DEDUP_CAPACITY * sizeof(ml_dedup_entry_t));
+    ml_dedup_hashes = (uint32_t *)malloc(ML_DEDUP_CAPACITY * sizeof(uint32_t));
     ml_dedup_count = 0;
     ml_dedup_table_full_warned = false;
-    if (ml_dedup_entries == NULL) {
+    if (ml_dedup_hashes == NULL) {
         ESP_LOGW(TAG, "mesh log dedup table allocation failed (%u bytes); dedup disabled, "
                       "sightings will not be deduped",
-                 (unsigned)(ML_DEDUP_CAPACITY * sizeof(ml_dedup_entry_t)));
+                 (unsigned)(ML_DEDUP_CAPACITY * sizeof(uint32_t)));
     }
 
     /* No separate `ml_ready` flag (an earlier version of this file had one) -- every public
