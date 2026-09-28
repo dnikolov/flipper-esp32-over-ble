@@ -1251,6 +1251,87 @@ static void test_mesh_log_status_result_payload(void)
     }
 }
 
+/* HP-25/HP-26/HP-38 shared-layer strictness (tests/vectors/vectors.h). Same expected status
+   on both firmwares, independent of size_t width. */
+static void test_shared_strictness_vectors(void)
+{
+    feb_unencrypted_record_t rec;
+    feb_command_payload_t cmd;
+    feb_status_payload_t stp;
+    feb_cbor_status_t st = FEB_CBOR_OK;
+    size_t count = 0;
+    size_t n;
+    const uint8_t *span;
+    size_t span_len;
+    static const uint8_t map_head_u32_max[] = {0xBA, 0xFF, 0xFF, 0xFF, 0xFF};
+    static const char name32[] = "0123456789abcdef0123456789abcdef";
+
+    check(feb_cbor_decode_unencrypted(FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD,
+                                         FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD_LEN, &rec) ==
+                 FEB_CBOR_ERR_TOO_LARGE,
+             "HP-25: record with 9-byte map count 2^32+5 rejected FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_map_header(FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD,
+                                   FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD_LEN, &count, &st);
+    check(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: map header count 2^32+5 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_array_header(FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1,
+                                     FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1_LEN, &count, &st);
+    check(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: array header count 2^32+1 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_skip_value(FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1, FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1_LEN, 0,
+                            &span, &span_len, &st);
+    check(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: skip_value array count 2^32+1 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_map_header(map_head_u32_max, sizeof(map_head_u32_max), &count, &st);
+    check(n == 5 && st == FEB_CBOR_OK && count == 0xFFFFFFFFu, "HP-25: map header count UINT32_MAX still decodes");
+    check(feb_cbor_decode_unencrypted(FEB_VEC_RECORD_VERSION_2POW32_PLUS_2, FEB_VEC_RECORD_VERSION_2POW32_PLUS_2_LEN,
+                                         &rec) == FEB_CBOR_ERR_TOO_LARGE,
+             "HP-25: record version 2^32+2 rejected FEB_CBOR_ERR_TOO_LARGE");
+
+    check(feb_cbor_decode_command_payload(FEB_VEC_COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD,
+                                             FEB_VEC_COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD_LEN, &cmd) ==
+                 FEB_CBOR_ERR_UNEXPECTED_TYPE,
+             "HP-26: command.arguments not a map rejected FEB_CBOR_ERR_UNEXPECTED_TYPE");
+    check(feb_cbor_decode_status_payload(FEB_VEC_STATUS_RESULT_NOT_MAP_PAYLOAD,
+                                            FEB_VEC_STATUS_RESULT_NOT_MAP_PAYLOAD_LEN, &stp) ==
+                 FEB_CBOR_ERR_UNEXPECTED_TYPE,
+             "HP-26: status.result not a map rejected FEB_CBOR_ERR_UNEXPECTED_TYPE");
+
+    {
+        feb_ble_scan_device_t dev;
+        feb_wardriving_record_t wr;
+        uint8_t out[256];
+
+        memset(&dev, 0, sizeof(dev));
+        dev.has_name = 1;
+        dev.name = name32;
+        dev.name_len = FEB_BLE_SCAN_NAME_MAX_LEN;
+        dev.rssi_offset = 100;
+        dev.addr_type = "public";
+        dev.addr_type_len = 6;
+        check(feb_cbor_encode_ble_scan_device(out, sizeof(out), &dev) > 0,
+                 "HP-38: ble_scan device name of FEB_BLE_SCAN_NAME_MAX_LEN encodes");
+        dev.name_len = FEB_BLE_SCAN_NAME_MAX_LEN + 1u;
+        check(feb_cbor_encode_ble_scan_device(out, sizeof(out), &dev) == 0,
+                 "HP-38: ble_scan device name of FEB_BLE_SCAN_NAME_MAX_LEN + 1 refused");
+
+        memset(&wr, 0, sizeof(wr));
+        wr.timestamp_ms = 1;
+        wr.utc_timestamp_s = 1;
+        wr.lat_e7_offset = 900000000u;
+        wr.lon_e7_offset = 1800000000u;
+        wr.source = "ble";
+        wr.source_len = 3;
+        wr.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+        wr.payload.ble.has_name = 1;
+        wr.payload.ble.name = name32;
+        wr.payload.ble.name_len = FEB_WARDRIVING_BLE_NAME_MAX_LEN;
+        wr.payload.ble.rssi_offset = 100;
+        check(feb_cbor_encode_wardriving_record(out, sizeof(out), &wr) > 0,
+                 "HP-38: wardriving ble name of FEB_WARDRIVING_BLE_NAME_MAX_LEN encodes");
+        wr.payload.ble.name_len = FEB_WARDRIVING_BLE_NAME_MAX_LEN + 1u;
+        check(feb_cbor_encode_wardriving_record(out, sizeof(out), &wr) == 0,
+                 "HP-38: wardriving ble name of FEB_WARDRIVING_BLE_NAME_MAX_LEN + 1 refused");
+    }
+}
+
 int main(void)
 {
     test_fragment_record(23, FEB_VEC_FRAGS_MTU23, FEB_VEC_FRAGS_MTU23_LENS,
@@ -1380,6 +1461,7 @@ int main(void)
 
     test_mesh_log_record_roundtrip();
     test_mesh_log_status_result_payload();
+    test_shared_strictness_vectors();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

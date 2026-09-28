@@ -536,6 +536,61 @@ void feb_session_build_nonce(
     out[FEB_SESSION_ID_LEN + 3] = (uint8_t)(sequence & 0xFFu);
 }
 
+/* docs/PROTOCOL.md "Trailing bytes": an authenticated plaintext must be exactly one
+   well-formed CBOR value. Iterative (an outstanding-item counter, no recursion or depth
+   limit) because the schema decoders that run next own nesting depth and entry counts --
+   feb_cbor_skip_value()'s depth budget would reject e.g. wardriving's valid 5-level result. */
+static feb_cbor_status_t feb_session_check_single_value(const uint8_t *in, size_t len)
+{
+    size_t pos = 0;
+    uint64_t pending = 1;
+
+    while (pending > 0) {
+        feb_cbor_status_t status = FEB_CBOR_ERR_TRUNCATED;
+        size_t n;
+        size_t count;
+        uint64_t value;
+        const uint8_t *data;
+        const char *text;
+        size_t data_len;
+
+        if (pos >= len) {
+            return FEB_CBOR_ERR_TRUNCATED;
+        }
+        switch (in[pos] >> 5) {
+        case 0:
+            n = feb_cbor_decode_uint(in + pos, len - pos, &value, &status);
+            break;
+        case 2:
+            n = feb_cbor_decode_bytes(in + pos, len - pos, &data, &data_len, len, &status);
+            break;
+        case 3:
+            n = feb_cbor_decode_text(in + pos, len - pos, &text, &data_len, len, &status);
+            break;
+        case 4:
+            n = feb_cbor_decode_array_header(in + pos, len - pos, &count, &status);
+            if (n != 0) {
+                pending += count;
+            }
+            break;
+        case 5:
+            n = feb_cbor_decode_map_header(in + pos, len - pos, &count, &status);
+            if (n != 0) {
+                pending += 2u * (uint64_t)count;
+            }
+            break;
+        default:
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        if (n == 0) {
+            return status;
+        }
+        pos += n;
+        pending--;
+    }
+    return pos == len ? FEB_CBOR_OK : FEB_CBOR_ERR_UNEXPECTED_TYPE;
+}
+
 size_t feb_session_encrypt_record(
     const uint8_t session_key[FEB_SESSION_KEY_LEN],
     uint32_t version,
@@ -557,6 +612,9 @@ size_t feb_session_encrypt_record(
 
     if (session_key == NULL || type == NULL || session_id == NULL || board_id == NULL ||
         out == NULL) {
+        return 0;
+    }
+    if (sequence >= FEB_SESSION_SEQUENCE_MAX) {
         return 0;
     }
     if (payload_len > FEB_CBOR_MAX_PAYLOAD) {
@@ -647,6 +705,11 @@ feb_cbor_status_t feb_session_decrypt_record(
                          decoded.ciphertext, decoded.ciphertext_len,
                          decoded.tag, plaintext_out)) {
         return FEB_CBOR_ERR_AUTH_FAILED;
+    }
+    status = feb_session_check_single_value(plaintext_out, decoded.ciphertext_len);
+    if (status != FEB_CBOR_OK) {
+        feb_secure_zero(plaintext_out, decoded.ciphertext_len);
+        return status;
     }
 
     record->version = decoded.version;

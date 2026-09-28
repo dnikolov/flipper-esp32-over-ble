@@ -491,6 +491,16 @@ static void test_error_code_strings(void) {
         "error code string: FEB_PAIRING_ERR_FAILED");
 }
 
+/* HP-25: pairing envelope `version` 2^32+2 must not truncate to 2. */
+static void test_pairing_envelope_version_too_large(void) {
+    feb_pairing_envelope_t env;
+
+    CHECK(feb_cbor_decode_pairing_envelope(FEB_VEC_PAIR_CONFIRM_RECORD_VERSION_2POW32_PLUS_2,
+                                              FEB_VEC_PAIR_CONFIRM_RECORD_VERSION_2POW32_PLUS_2_LEN, &env) ==
+                 FEB_CBOR_ERR_TOO_LARGE,
+             "HP-25: pairing envelope version 2^32+2 rejected FEB_CBOR_ERR_TOO_LARGE");
+}
+
 int main(void) {
     test_x25519_rfc7748_tc();
     test_x25519_diffie_hellman();
@@ -510,6 +520,7 @@ int main(void) {
     test_pair_error_codec();
     test_envelope_rejects_short_board_id_bytes();
     test_error_code_strings();
+    test_pairing_envelope_version_too_large();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

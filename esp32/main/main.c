@@ -400,9 +400,13 @@ static feb_wardriving_persisted_state_t wardriving_persisted;
    at 0ms delay, i.e. "run on the host task ASAP"), so a raw event -- drawn from the much
    larger BLE_HOST_EV_COUNT (19) pool instead -- is the correct fix, not a workaround. */
 static struct ble_npl_event wardriving_button_toggle_ev;
+/* Same rationale as wardriving_button_toggle_ev above (raw event, not a callout) -- posted
+   by feb_factory_reset_request() (HP-13) so the NVS erase runs on the NimBLE host task,
+   serialized with persist_pairing_secret()/wardriving_persist_save(). */
+static struct ble_npl_event factory_reset_ev;
 /* Set once host_synced() has initialized wardriving_button_toggle_ev -- guards
    feb_wardriving_request_button_toggle() against a boot-button press landing before the
-   NimBLE host task has finished starting up. */
+   NimBLE host task has finished starting up. Also guards feb_factory_reset_request(). */
 static volatile bool wardriving_control_ready;
 /* Count of button presses not yet applied, incremented by
    feb_wardriving_request_button_toggle() (any task) and drained by
@@ -589,6 +593,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
                                       wardriving_country_t country);
 static void wardriving_stop_internal(void);
 static void wardriving_button_toggle_cb(struct ble_npl_event *ev);
+static void factory_reset_perform_cb(struct ble_npl_event *ev);
 
 static void compute_board_id(void)
 {
@@ -2032,21 +2037,35 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 {
     wifi_scan_config_t scan_cfg;
     esp_err_t err;
+    feb_location_t fix;
+    feb_location_state_t loc_state;
 
     (void)ev;
     if (!wardriving_wifi_active) {
         return;
     }
-    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
-        feb_location_t fix;
-        feb_location_state_t loc_state = location_get_fix(&fix);
+    loc_state = location_get_fix(&fix);
+    if (loc_state != FEB_LOCATION_FIX) {
+        /* No fix this cycle -- skip starting a new scan, but still re-arm so scanning
+           resumes once a fix comes back. Clamped to FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS
+           rather than the raw configured interval: that interval can legitimately be 0
+           ("aggressive"/continuous), and re-arming at 0ms here produced a zero-delay refire
+           loop that starved CPU0's IDLE task and tripped the task watchdog (HP-02,
+           hardware-reproduced on the C5 2026-09-27). */
+        uint32_t retry_ms = (wardriving_wifi_interval_ms < FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS) ?
+                             FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS : wardriving_wifi_interval_ms;
 
-        if (loc_state == FEB_LOCATION_FIX) {
-            if (fix.speed_e1_kmh >= 100u) {
-                wardriving_swelling_aggressive_active = true;
-            } else if (fix.speed_e1_kmh < 80u) {
-                wardriving_swelling_aggressive_active = false;
-            }
+        ESP_LOGW(TAG, "wardriving: skipping wifi scan start, no GPS fix yet");
+        wardriving_maybe_kick_send(connection_handle);
+        ble_npl_callout_reset(&wardriving_wifi_interval_co,
+                              ble_npl_time_ms_to_ticks32(retry_ms));
+        return;
+    }
+    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
+        if (fix.speed_e1_kmh >= 100u) {
+            wardriving_swelling_aggressive_active = true;
+        } else if (fix.speed_e1_kmh < 80u) {
+            wardriving_swelling_aggressive_active = false;
         }
     }
     memset(&scan_cfg, 0, sizeof(scan_cfg));
@@ -2060,7 +2079,16 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 
 /* Same re-arming role as wardriving_wifi_interval_cb() above, for the BLE source: opens the
    next discovery window after the configured gap (ble_interval_ms - ble_window_ms, or 0 for
-   back-to-back per docs/PROTOCOL.md's window<=interval invariant). */
+   back-to-back per docs/PROTOCOL.md's window<=interval invariant).
+
+   Unlike the Wi-Fi side, this discovery window is not skipped when there's no GPS fix (HP-03):
+   it is the same NimBLE discovery procedure gap_event()'s BLE_GAP_EVENT_DISC handler uses to
+   find the Flipper's advertisement for reconnect (start_scan() piggybacks on whichever
+   discovery is already running rather than starting a second one), so skipping it here stalls
+   reconnect for as long as there's no fix -- reproduced live on the C5 2026-09-27 (autostarted
+   wardriving, no GPS fix, Flipper never found/connected for the rest of the session).
+   ble_scan_window_close_cb() still discards results with no fix to attach them to at window
+   close; only the scan itself is unconditional. */
 static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
 {
     struct ble_gap_disc_params params = {0};
@@ -2363,23 +2391,172 @@ void feb_wardriving_request_button_toggle(void)
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &wardriving_button_toggle_ev);
 }
 
+/* Runs on the NimBLE host task (posted via factory_reset_ev) -- armed via
+   feb_factory_reset_request() from factory_reset_task(), a different FreeRTOS task, so this
+   is where the actual erase happens, serialized with persist_pairing_secret()/
+   wardriving_persist_save() (HP-13; both of those also only ever run on this task). Never
+   returns in practice: esp_restart() ends the process. */
+static void factory_reset_perform_cb(struct ble_npl_event *ev)
+{
+    esp_err_t err;
+
+    (void)ev;
+    ESP_LOGW(TAG, "factory-reset: erasing NVS and restarting");
+    err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_flash_erase failed: %s", esp_err_to_name(err));
+    }
+    err = nvs_flash_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_flash_init after erase failed: %s", esp_err_to_name(err));
+    }
+    feb_wipe_pairing_secrets();
+    /* No new post-erase path (docs/PLAN.md): esp_restart() falls straight into the existing
+       app_main() boot logic, which finds no stored pairing_secret and opens a pairing
+       window, reused verbatim. */
+    esp_restart();
+}
+
+/* Declared in factory_reset.h, defined here since it needs factory_reset_ev/
+   wardriving_control_ready, file-scope state owned by this translation unit. Safe to call
+   from any task. Before the NimBLE host task has finished starting up there is nothing to
+   serialize with yet (no other task can be mid-NVS-write that early in boot), so this falls
+   back to performing the erase inline rather than posting an event nobody will ever drain. */
+void feb_factory_reset_request(void)
+{
+    if (!wardriving_control_ready) {
+        ESP_LOGW(TAG, "factory-reset requested before host task ready; erasing NVS directly");
+        factory_reset_perform_cb(NULL);
+        return;
+    }
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &factory_reset_ev);
+}
+
+/* Tracks how long the most recent GPS reading has stayed below
+   FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX, in the same esp_timer_get_time() epoch used
+   elsewhere in this file -- -1 means "not currently in a stopped run". Reset to -1 only on an
+   actual at/above-threshold reading (see wardriving_maybe_kick_send()); persists across calls,
+   including calls that return early, since it must reflect how long the vehicle has really
+   been stopped, not how often this function happens to run. */
+static int64_t wardriving_flush_stopped_since_us = -1;
+/* wardriving_send_backlog_count_update()'s dedup tracker, reset to UINT64_MAX (an impossible
+   pending count, forcing a fresh report) on every new connection -- the Flipper resets its own
+   displayed count to 0 on every disconnect/reconnect (flipper_esp32_over_ble.c's
+   reset_scan_ui_state_impl()), so this must not persist a stale "already reported this count"
+   memory across a session boundary, or a reconnect where the pending count happens to match
+   what was last reported before the disconnect would leave the Flipper stuck showing 0
+   indefinitely. */
+static uint64_t wardriving_last_reported_backlog = UINT64_MAX;
+
+/* Shared scratch for both wardriving_send_backlog_count_update() and wardriving_send_next_batch()
+   below -- static, not stack-local, for the same NimBLE-host-task stack-budget reason those
+   functions' own comments explain (2026-09-10 stack-overflow bug). A second full-size
+   feb_wardriving_status_result_payload_t (~3.6 KB, dominated by its 32-entry records array)
+   would not fit in DRAM on every board (hardware-confirmed: overflowed the Heltec build by
+   3392 bytes 2026-09-27) even though the count-update path only ever touches two scalar
+   fields. Sharing is safe because the two functions are mutually exclusive in time:
+   wardriving_send_backlog_count_update() only runs while !wardriving_tx_in_flight, and
+   wardriving_send_next_batch() is the only thing that sets wardriving_tx_in_flight true. */
+static feb_wardriving_status_result_payload_t wardriving_result_scratch;
+static feb_status_payload_t wardriving_status_payload_scratch;
+static uint8_t wardriving_result_buf_scratch[FEB_CBOR_MAX_PAYLOAD];
+
+/* Sends a lightweight status(state="data") update with an empty records array -- just enough
+   to move the Flipper's displayed backlog count, without actually draining anything. Used by
+   wardriving_maybe_kick_send() below while the real flush is gated off, so pausing the flush
+   doesn't also freeze the on-screen number. record_count=0 + backlog_remaining=pending encodes
+   and decodes cleanly (an empty records array is not a special case on either side of the
+   wire). Returns whether the update actually reached the wire (HP-22); the caller must not
+   advance wardriving_last_reported_backlog on a false return, or a dropped update (encode
+   failure, or the fragment queue being full) leaves the Flipper's displayed count stale with
+   no way to notice, since the dedup check would then treat that pending value as "already
+   reported". */
+static bool wardriving_send_backlog_count_update(uint16_t conn_handle, size_t pending)
+{
+    size_t result_len;
+    size_t payload_len;
+
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
+    wardriving_result_scratch.backlog_remaining = pending;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
+    if (result_len == 0) {
+        return false;
+    }
+
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0;
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
+    if (payload_len == 0) {
+        return false;
+    }
+    return send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len);
+}
+
 /* Kicks off a wardriving status(state="data") send if a session is connected+authenticated,
    there is buffered data to send, and no batch is already in flight -- called both right
    after a live capture pass appends new records and once at session-establish time to start
    draining any pre-existing backlog (docs/PROTOCOL.md's "Unsolicited backlog drain"). Once
    started, wardriving_send_next_batch()'s own TX_DONE_CONTINUE_WARDRIVING chaining picks up
-   anything appended later without needing another call here. */
+   anything appended later without needing another call here -- that chain re-enters
+   wardriving_send_next_batch() directly, never this function, so the gate below never
+   interrupts a drain already in flight.
+
+   Gate: avoids the BLE batch-send of raw record *data* competing with active WiFi scanning on
+   the shared 2.4GHz radio while driving -- closed (no data send, regardless of what's pending)
+   unless the vehicle has no GPS fix, the backlog has grown past
+   FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD, or it has been continuously stopped for
+   FEB_WARDRIVING_FLUSH_STOPPED_SECONDS. This is an additional early-out layered in front of
+   the checks below, not a replacement for them. wardriving_send_backlog_count_update() above
+   keeps the Flipper's displayed backlog count current regardless of this gate, so pausing the
+   data flush doesn't also freeze the on-screen number (2026-09-27: an earlier version of this
+   gate without that count-update made live wardriving results look like they'd vanished
+   entirely during ordinary driving — confirmed on hardware, esp32c5). */
 static void wardriving_maybe_kick_send(uint16_t conn_handle)
 {
+    feb_location_t fix;
+    feb_location_state_t loc_state;
+    int64_t now_us;
+    bool gate_open;
+    size_t pending;
+
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE || runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
         return;
     }
-    if (wardriving_tx_in_flight) {
+
+    pending = wardriving_log_pending_count();
+    loc_state = location_get_fix(&fix);
+    now_us = esp_timer_get_time();
+    if (loc_state == FEB_LOCATION_FIX) {
+        if (fix.speed_e1_kmh >= FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) {
+            wardriving_flush_stopped_since_us = -1;
+        } else if (wardriving_flush_stopped_since_us < 0) {
+            wardriving_flush_stopped_since_us = now_us;
+        }
+    }
+    gate_open = (loc_state != FEB_LOCATION_FIX) ||
+                (pending > FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD) ||
+                (wardriving_flush_stopped_since_us >= 0 &&
+                 (now_us - wardriving_flush_stopped_since_us) >=
+                     (int64_t)FEB_WARDRIVING_FLUSH_STOPPED_SECONDS * 1000000LL);
+
+    if (!gate_open || wardriving_tx_in_flight || pending == 0) {
+        if (!wardriving_tx_in_flight && (uint64_t)pending != wardriving_last_reported_backlog) {
+            if (wardriving_send_backlog_count_update(conn_handle, pending)) {
+                wardriving_last_reported_backlog = pending;
+            }
+        }
         return;
     }
-    if (wardriving_log_pending_count() == 0) {
-        return;
-    }
+
     wardriving_tx_in_flight = true;
     feb_status_led_set(FEB_STATUS_LED_FLUSHING);
     wardriving_send_next_batch(conn_handle);
@@ -2388,30 +2565,28 @@ static void wardriving_maybe_kick_send(uint16_t conn_handle)
 /* Builds and sends one wardriving status(state="data") record from the oldest still-pending
    flash-log records, mirroring wifi_scan_send_next_batch()/ble_scan_send_next_batch()'s
    trial-encode-and-back-off packing exactly (see that function's comment for why
-   peeked/peek_scratch/result/status_payload/result_buf are static, not stack-local -- same
-   NimBLE host task, same reasoning). Unlike wifi_scan/ble_scan's own chaining, this always
-   chains through TX_DONE_CONTINUE_WARDRIVING -- even for the batch that drains the last
-   pending record -- rather than only while backlog_remaining > 0: the re-entry this produces
-   is what confirms full delivery of the batch before marking it drained from the flash log
-   and clearing wardriving_tx_in_flight (see wardriving_pending_drain_count's comment; fixes
-   the 2026-09-10 GATT-write-flood bug in docs/LESSONS.md). */
+   peeked/peek_scratch/trial are static, not stack-local -- same NimBLE host task, same
+   reasoning). Shares wardriving_result_scratch/wardriving_status_payload_scratch/
+   wardriving_result_buf_scratch with wardriving_send_backlog_count_update() above -- see that
+   pair's declaration comment. Unlike wifi_scan/ble_scan's own chaining, this always chains
+   through TX_DONE_CONTINUE_WARDRIVING -- even for the batch that drains the last pending
+   record -- rather than only while backlog_remaining > 0: the re-entry this produces is what
+   confirms full delivery of the batch before marking it drained from the flash log and
+   clearing wardriving_tx_in_flight (see wardriving_pending_drain_count's comment; fixes the
+   2026-09-10 GATT-write-flood bug in docs/LESSONS.md). */
 static void wardriving_send_next_batch(uint16_t conn_handle)
 {
     static feb_wardriving_record_t peeked[FEB_WARDRIVING_MAX_RECORDS_PER_BATCH];
     static uint8_t peek_scratch[FEB_WARDRIVING_PEEK_SCRATCH_LEN];
-    static feb_wardriving_status_result_payload_t result;
-    /* Same reasoning as peeked/result/status_payload/result_buf above (and
-       ble_scan_send_next_batch()'s own `trial`) -- this holds a full
-       feb_wardriving_status_result_payload_t (a 32-entry feb_wardriving_record_t array,
-       ~2.6 KB) per trial-encode iteration. Originally declared as a loop-local, which
-       measured at -fstack-usage's 2608 bytes for this whole function -- nearly 2/3 of the
-       nimble_host task's 4096-byte budget in one frame, on top of the CBOR-encode/GATT-write
-       call chain this function itself makes. Root cause of the 2026-09-10 hardware
-       stack-overflow crash (docs/LESSONS.md); moved to static to match the sibling
-       function's already-correct pattern. */
+    /* Same reasoning as wardriving_result_scratch above (and ble_scan_send_next_batch()'s own
+       `trial`) -- this holds a full feb_wardriving_status_result_payload_t (a 32-entry
+       feb_wardriving_record_t array, ~2.6 KB) per trial-encode iteration. Originally declared
+       as a loop-local, which measured at -fstack-usage's 2608 bytes for this whole function --
+       nearly 2/3 of the nimble_host task's 4096-byte budget in one frame, on top of the
+       CBOR-encode/GATT-write call chain this function itself makes. Root cause of the
+       2026-09-10 hardware stack-overflow crash (docs/LESSONS.md); moved to static to match the
+       sibling function's already-correct pattern. */
     static feb_wardriving_status_result_payload_t trial;
-    static feb_status_payload_t status_payload;
-    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
     size_t peeked_count;
     size_t include_count;
     size_t remaining_after;
@@ -2436,20 +2611,21 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
         return;
     }
 
-    memset(&result, 0, sizeof(result));
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
     include_count = 0;
     pending_now = wardriving_log_pending_count();
     while (include_count < peeked_count) {
         size_t trial_len;
 
-        trial = result;
+        trial = wardriving_result_scratch;
         trial.records[trial.record_count] = peeked[include_count];
         trial.record_count++;
         trial.backlog_remaining = (pending_now >= trial.record_count) ?
                                   (pending_now - trial.record_count) : 0;
-        trial_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &trial);
+        trial_len = feb_cbor_encode_wardriving_status_result_payload(
+            wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &trial);
         if (trial_len == 0 || trial_len + FEB_WARDRIVING_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
-            if (result.record_count == 0) {
+            if (wardriving_result_scratch.record_count == 0) {
                 /* A single record's own encoding is already too large to ever fit -- should
                    be unreachable given WD_RECORD_MAX_PAYLOAD's derivation, but drop it rather
                    than spin forever re-peeking the same record every batch. Still counted in
@@ -2461,29 +2637,31 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
             }
             break;
         }
-        result = trial;
+        wardriving_result_scratch = trial;
         include_count++;
     }
 
     remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
-    result.backlog_remaining = remaining_after;
-    result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
+    wardriving_result_scratch.backlog_remaining = remaining_after;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
 
-    memset(&status_payload, 0, sizeof(status_payload));
-    status_payload.request_id = 0; /* unsolicited/live sentinel -- docs/PROTOCOL.md: no wire
-                                       distinction from a backlog-drain batch; backlog_remaining
-                                       is how a receiver tells them apart */
-    status_payload.state = "data";
-    status_payload.state_len = strlen("data");
-    status_payload.result_span = result_buf;
-    status_payload.result_span_len = result_len;
-    status_payload.has_result = 1;
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0; /* unsolicited/live sentinel --
+        docs/PROTOCOL.md: no wire distinction from a backlog-drain batch; backlog_remaining is
+        how a receiver tells them apart */
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
 
     payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
-                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
     if (result_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) result encode failed (records=%u, peeked=%u)",
-                 (unsigned)result.record_count, (unsigned)peeked_count);
+                 (unsigned)wardriving_result_scratch.record_count, (unsigned)peeked_count);
     } else if (payload_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) wrapper encode failed (result_len=%u)",
                  (unsigned)result_len);
@@ -2506,14 +2684,13 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
                                   TX_DONE_CONTINUE_WARDRIVING)) {
         ESP_LOGE(TAG, "failed to queue wardriving status(data) record (payload_len=%u)",
                  (unsigned)payload_len);
-        ESP_LOGE(TAG, "failed to build wardriving status(data) record");
         wardriving_tx_in_flight = false;
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
     wardriving_pending_drain_count = include_count;
     ESP_LOGI(TAG, "sending wardriving status(data) (%u record(s), backlog_remaining=%u)",
-             (unsigned)result.record_count, (unsigned)remaining_after);
+             (unsigned)wardriving_result_scratch.record_count, (unsigned)remaining_after);
 }
 
 static bool wardriving_source_requested(const feb_wardriving_command_payload_t *payload, const char *name)
@@ -3354,6 +3531,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
                                              deliberately persist across connect/disconnect */
         wardriving_pending_drain_count = 0;
+        wardriving_last_reported_backlog = UINT64_MAX; /* force a fresh count report on the new
+            session -- the Flipper resets its own displayed count to 0 on every reconnect */
         rc = ble_gap_set_prefered_le_phy(connection_handle, BLE_GAP_LE_PHY_2M_MASK,
                                          BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
         if (rc != 0) {
@@ -3774,6 +3953,7 @@ static void host_synced(void)
        existing 6 callouts above already sit at ESP-IDF's hard NimBLE host callout-pool
        ceiling once NimBLE's own internal host procedures are counted in). */
     ble_npl_event_init(&wardriving_button_toggle_ev, wardriving_button_toggle_cb, NULL);
+    ble_npl_event_init(&factory_reset_ev, factory_reset_perform_cb, NULL);
 
     /* docs/BACKLOG.md "Per-board wardriving autostart setting": resume before start_scan()
        below, so its existing "never run a second reconnect scan while wardriving's BLE

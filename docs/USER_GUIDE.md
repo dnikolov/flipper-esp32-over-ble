@@ -21,7 +21,7 @@ Step 7 (board identity and capability registry) was hardware-verified on 2026-09
 
 Build/flash commands are in the project's top-level `CLAUDE.md`. In short: source
 ESP-IDF's `export.ps1`, then `idf.py build` (and `idf.py -p COMx flash` when you actually
-want to write the board) from `esp32/`; `fbt.cmd fap_flipper_esp32_over_ble` for the FAP
+want to write the board) from `esp32/`; `fbt.cmd DEBUG=0 fap_flipper_esp32_over_ble` for the FAP
 from the pinned Unleashed checkout. **Do not flash, erase, or write either physical board
 unless you mean to** — read-only queries (`flash_id`, log monitoring) are always safe.
 
@@ -192,15 +192,15 @@ The Flipper's accumulated wardriving CSV (`wardriving_current.csv` on its SD car
 
 **How to start:** From the Flipper's Home menu, select **Publish** (it appears right after **Wardriving** in the menu). This does not require an active BLE session with the ESP32; it is a Flipper+PC-only flow.
 
-**What happens:** When you select Publish, the Flipper's screen shows idle/waiting/outcome states. The Flipper switches its USB personality to a BadUSB HID keyboard and types a short keystroke sequence (`Win+R` → `powershell` → Enter) to open a fresh PowerShell window on the connected Windows PC. A bootstrap command in that window fetches and runs a publish script (from this project's repo, pinned to a specific commit) that reads your wardriving CSV from the Flipper over its CLI-over-USB-serial channel, prompts once for a wdgwars.pl API key if you haven't already saved one (paste your 64-character hex key from your wdgwars.pl account's API Keys page), uploads the CSV to wdgwars.pl, and reports the outcome back to the Flipper's screen. The Flipper shows the result: success with import/duplicate/capture counts, or a failure message.
+**What happens:** When you select Publish, the Flipper's screen shows idle/waiting/outcome states. The Flipper switches its USB personality to a BadUSB HID keyboard and types a short keystroke sequence (`Win+R` → `powershell -NoProfile -ExecutionPolicy Bypass` → Enter) to open a fresh PowerShell window on the connected Windows PC. A bootstrap command in that window deletes any stale local copy of the publish script, downloads it fresh (from this project's repo, pinned to a specific commit), and runs it only if the download succeeded. The script reads your wardriving CSV from the Flipper over its CLI-over-USB-serial channel. The script prompts once for a wdgwars.pl API key if you haven't already saved one — the prompt does not echo what you type. The key must be exactly 64 hexadecimal characters from your wdgwars.pl account's API Keys page. Once you provide a key, the script validates it with the server; a new key is saved to the Flipper only if wdgwars.pl accepts it, and rejected keys are removed from the device so you'll be prompted again on the next publish. The script then uploads the CSV to wdgwars.pl and reports the outcome back to the Flipper's screen. The Flipper shows the result: success with import/duplicate/capture counts, a timeout (after up to 10 minutes of waiting), or a failure message. Press **Back** at any time to cancel.
 
-**Requirements:** Windows only (no macOS/Linux support in this version); the Flipper must be connected to the PC via USB; the PC needs internet access.
+**Requirements:** Windows only (no macOS/Linux support in this version); the Flipper must be connected to the PC via USB; the PC needs internet access. BadUSB keystroke typing assumes a US keyboard layout is active on the PC at publish time.
 
-**Credentials and portability:** The upload key is stored in plain text on the Flipper's SD card (same risk class as the pairing secret — the Flipper is not treated as a hardware-backed secret vault). Once entered on one Windows machine, it persists on the device and travels with it; you won't need to re-enter it on a different PC later.
+**Credentials and portability:** The upload key is stored in plain text on the Flipper's SD card (same risk class as the pairing secret — the Flipper is not treated as a hardware-backed secret vault). Once accepted by wdgwars.pl on one Windows machine, it persists on the device and travels with it; you won't need to re-enter it on a different PC later.
 
-**Upload verification:** The CSV is only renamed to a timestamped archive (freeing `wardriving_current.csv` to accumulate fresh data again) after a confirmed successful upload. A failed or ambiguous publish leaves the CSV untouched so no data is lost — you can simply try publishing again later.
+**Upload verification:** After a confirmed successful upload, the script archives the CSV only if the file on the Flipper is still exactly what was uploaded. If new rows arrived during the publish, or the run ran out of time, the upload still counts as successful but the CSV is kept (not archived), and the Flipper's success screen shows a short note line saying so — the next publish re-sends those rows, and wdgwars.pl skips duplicates. A failed or ambiguous publish leaves the CSV untouched so no data is lost — you can simply try publishing again later. (These publish changes are build-verified but not yet hardware-verified.)
 
-**Known friction:** Windows Defender or SmartScreen may flag the downloaded-and-run publish script as suspicious the first time — this is expected and not a sign of a problem, since you control exactly which pinned commit is fetched and run.
+**Known friction:** Windows Defender or SmartScreen may flag the downloaded-and-run publish script as suspicious the first time — this is expected and not a sign of a problem, since you control exactly which pinned commit is fetched and run. The host script only communicates with the Flipper's USB serial port and does not open other COM ports, so other boards (like an ESP32 or Heltec) plugged into the same PC are not reset during publish.
 
 ## Factory-resetting the ESP32 without a PC
 

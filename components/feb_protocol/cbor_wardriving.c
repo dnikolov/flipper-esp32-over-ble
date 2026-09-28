@@ -490,6 +490,9 @@ static size_t encode_wardriving_ble_payload(uint8_t *out, size_t out_cap, const 
     size_t n;
     size_t count = 2;
 
+    if (ble->has_name && (ble->name == NULL || ble->name_len > FEB_WARDRIVING_BLE_NAME_MAX_LEN)) {
+        return 0;
+    }
     if (ble->rssi_offset > 255u) {
         return 0;
     }

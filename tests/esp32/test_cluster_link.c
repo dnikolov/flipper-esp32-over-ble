@@ -352,6 +352,152 @@ static void test_max_payload_boundary(void)
     }
 }
 
+/* HP-30: a UART overrun drops one byte out of frame A, so A's declared length reaches into
+   the next frame and A's CRC fails there. Every byte after A's SOF0 must be re-scanned, so
+   B and C (whose SOF bytes were consumed as part of A's candidate) are still recovered. */
+static void test_resync_after_dropped_byte_recovers_following_frames(void)
+{
+    uint8_t stream[256];
+    size_t pos = 0;
+    uint8_t frame_buf[FEB_CLUSTER_MAX_FRAME_SIZE];
+    size_t frame_len;
+    feb_cluster_scan_result_t result_msg;
+    feb_cluster_worker_hello_t hello_msg;
+    feb_cluster_scan_batch_done_t done_msg;
+    feb_cluster_decoder_t dec;
+    feb_cluster_frame_t frames[4];
+    size_t produced;
+    feb_cluster_worker_hello_t hello_out;
+    feb_cluster_scan_batch_done_t done_out;
+
+    memset(&result_msg, 0, sizeof(result_msg));
+    memcpy(result_msg.ssid, "overrun", 7);
+    result_msg.ssid_len = 7;
+    result_msg.channel = 6;
+    frame_len = feb_cluster_encode_scan_result(frame_buf, sizeof(frame_buf), &result_msg);
+    memcpy(stream + pos, frame_buf, 8);
+    memcpy(stream + pos + 8, frame_buf + 9, frame_len - 9);
+    pos += frame_len - 1;
+
+    hello_msg.band = FEB_CLUSTER_BAND_24GHZ;
+    frame_len = feb_cluster_encode_worker_hello(frame_buf, sizeof(frame_buf), &hello_msg);
+    memcpy(stream + pos, frame_buf, frame_len);
+    pos += frame_len;
+
+    done_msg.count = 42;
+    frame_len = feb_cluster_encode_scan_batch_done(frame_buf, sizeof(frame_buf), &done_msg);
+    memcpy(stream + pos, frame_buf, frame_len);
+    pos += frame_len;
+
+    feb_cluster_decoder_init(&dec);
+    produced = feb_cluster_decoder_feed(&dec, stream, pos, frames, 4);
+    check(produced == 2, "dropped byte: both following frames recovered");
+    check(produced == 2 && feb_cluster_decode_worker_hello(&frames[0], &hello_out) == 1 &&
+              hello_out.band == FEB_CLUSTER_BAND_24GHZ,
+          "dropped byte: first following frame intact");
+    check(produced == 2 && feb_cluster_decode_scan_batch_done(&frames[1], &done_out) == 1 &&
+              done_out.count == 42,
+          "dropped byte: second following frame intact");
+}
+
+/* HP-30: a corrupted (but <= max) length makes the candidate swallow several whole frames
+   before its CRC fails. All of them must come back, both through the chunk wrapper and
+   through feed_byte() + poll() (the byte-at-a-time path the firmwares use). */
+static void test_resync_after_corrupted_length_recovers_swallowed_frames(void)
+{
+    uint8_t stream[400];
+    size_t pos = 0;
+    uint8_t frame_buf[FEB_CLUSTER_MAX_FRAME_SIZE];
+    size_t frame_len;
+    static const uint8_t junk_payload[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    feb_cluster_scan_batch_done_t done_msg;
+    feb_cluster_decoder_t dec;
+    feb_cluster_frame_t frames[8];
+    feb_cluster_frame_t frame;
+    size_t produced;
+    size_t i;
+    int ok = 1;
+    uint16_t k;
+
+    frame_len = build_raw_frame(stream, (uint8_t)FEB_CLUSTER_MSG_SCAN_RESULT, 300u,
+                                 junk_payload, sizeof(junk_payload), 0);
+    pos += frame_len;
+    for (k = 1; k <= 3; k++) {
+        done_msg.count = k;
+        frame_len = feb_cluster_encode_scan_batch_done(frame_buf, sizeof(frame_buf), &done_msg);
+        memcpy(stream + pos, frame_buf, frame_len);
+        pos += frame_len;
+    }
+    memset(stream + pos, 0x00, 300);
+    pos += 300;
+
+    feb_cluster_decoder_init(&dec);
+    produced = feb_cluster_decoder_feed(&dec, stream, pos, frames, 8);
+    check(produced == 3, "corrupted length: all three swallowed frames recovered (feed)");
+    for (i = 0; i < produced; i++) {
+        feb_cluster_scan_batch_done_t out;
+
+        if (!feb_cluster_decode_scan_batch_done(&frames[i], &out) || out.count != i + 1) {
+            ok = 0;
+        }
+    }
+    check(ok && produced == 3, "corrupted length: recovered frames intact and in order (feed)");
+
+    feb_cluster_decoder_init(&dec);
+    produced = 0;
+    ok = 1;
+    for (i = 0; i < pos; i++) {
+        feb_cluster_decode_result_t r = feb_cluster_decoder_feed_byte(&dec, stream[i], &frame);
+
+        while (r == FEB_CLUSTER_DECODE_FRAME_READY) {
+            feb_cluster_scan_batch_done_t out;
+
+            produced++;
+            if (!feb_cluster_decode_scan_batch_done(&frame, &out) || out.count != produced) {
+                ok = 0;
+            }
+            r = feb_cluster_decoder_poll(&dec, &frame);
+        }
+    }
+    check(produced == 3 && ok, "corrupted length: all three recovered via feed_byte + poll");
+}
+
+/* The pending-byte buffer must never overflow on sustained noise that keeps looking like
+   frame starts (every candidate declares the maximum length). */
+static void test_sustained_sof_noise_is_bounded(void)
+{
+    feb_cluster_decoder_t dec;
+    feb_cluster_frame_t frame;
+    uint8_t frame_buf[FEB_CLUSTER_MAX_FRAME_SIZE];
+    size_t frame_len;
+    feb_cluster_worker_hello_t hello_msg;
+    size_t i;
+    int got = 0;
+    static const uint8_t noise[] = {FEB_CLUSTER_SOF0, FEB_CLUSTER_SOF1, 0x03, 0x00, 0x02};
+
+    feb_cluster_decoder_init(&dec);
+    for (i = 0; i < 20000; i++) {
+        (void)feb_cluster_decoder_feed_byte(&dec, noise[i % sizeof(noise)], &frame);
+        if (dec.len > sizeof(dec.buf) || dec.start > dec.len) {
+            break;
+        }
+    }
+    check(i == 20000, "sustained SOF noise: pending buffer stays within bounds");
+
+    for (i = 0; i < FEB_CLUSTER_MAX_FRAME_SIZE; i++) {
+        (void)feb_cluster_decoder_feed_byte(&dec, 0x00, &frame);
+    }
+    hello_msg.band = FEB_CLUSTER_BAND_5GHZ;
+    frame_len = feb_cluster_encode_worker_hello(frame_buf, sizeof(frame_buf), &hello_msg);
+    for (i = 0; i < frame_len; i++) {
+        if (feb_cluster_decoder_feed_byte(&dec, frame_buf[i], &frame) == FEB_CLUSTER_DECODE_FRAME_READY) {
+            got = 1;
+        }
+    }
+    check(got && frame.msg_type == (uint8_t)FEB_CLUSTER_MSG_WORKER_HELLO,
+          "sustained SOF noise: a valid frame afterwards is still decoded");
+}
+
 int main(void)
 {
     test_crc16_known_vector();
@@ -364,6 +510,9 @@ int main(void)
     test_resync_after_garbage_bytes();
     test_resync_after_oversized_length();
     test_max_payload_boundary();
+    test_resync_after_dropped_byte_recovers_following_frames();
+    test_resync_after_corrupted_length_recovers_swallowed_frames();
+    test_sustained_sof_noise_is_bounded();
 
     if (g_failures == 0) {
         printf("\nAll tests passed.\n");

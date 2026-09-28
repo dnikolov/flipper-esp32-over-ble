@@ -272,6 +272,18 @@ bool nmea_parse_rmc(const char *line, size_t line_len, nmea_rmc_t *out)
     out->hour = (uint8_t)((f[0] - '0') * 10 + (f[1] - '0'));
     out->minute = (uint8_t)((f[2] - '0') * 10 + (f[3] - '0'));
     out->second = (uint8_t)((f[4] - '0') * 10 + (f[5] - '0'));
+    /* HP-23: a checksum-valid sentence can still carry a digit-shape-correct but
+       out-of-range time (a bit flip inside the XOR-covered span that happens to still XOR
+       to the transmitted checksum byte is astronomically unlikely, but a partially-corrupt
+       receiver/wire glitch that both mangles a digit and still passes the 8-bit checksum is
+       not). An insane hh/mm/ss otherwise gets baked into utc_timestamp_s and shipped in every
+       wardriving record until the next valid RMC. 60 is accepted for seconds (not just <60)
+       to tolerate a leap-second broadcast some receivers may emit; nmea_rmc_to_unix_time()'s
+       plain seconds-since-epoch arithmetic already treats :60 as one second past :59 rather
+       than losing it, so no special-casing is needed downstream. */
+    if (out->hour >= 24 || out->minute >= 60 || out->second > 60) {
+        return false;
+    }
 
     if (!nmea_field(line, line_len, 1, &f, &flen) || flen != 1 ||
         (f[0] != 'A' && f[0] != 'V')) {
@@ -287,6 +299,15 @@ bool nmea_parse_rmc(const char *line, size_t line_len, nmea_rmc_t *out)
     out->day = (uint8_t)((f[0] - '0') * 10 + (f[1] - '0'));
     out->month = (uint8_t)((f[2] - '0') * 10 + (f[3] - '0'));
     out->year_2digit = (uint8_t)((f[4] - '0') * 10 + (f[5] - '0'));
+    /* HP-23: same rationale as the hh/mm/ss check above. Only a coarse 1..31/1..12 range
+       check, not full calendar validity (e.g. day 31 in a 30-day month, or Feb 29/30) --
+       days_from_civil() (below) is a proleptic-Gregorian formula that produces *some*
+       definite date for any day/month pair, so an uncaught invalid combination degrades to
+       a wrong-but-bounded timestamp rather than propagating a wildly out-of-range one; the
+       exact bound this plan item asked for is day/month only. */
+    if (out->day < 1 || out->day > 31 || out->month < 1 || out->month > 12) {
+        return false;
+    }
 
     out->speed_knots_e1 = 0;
     if (nmea_field(line, line_len, 6, &f, &flen)) { /* speed over ground, knots */

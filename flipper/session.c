@@ -305,7 +305,10 @@ size_t feb_session_encode_transcript(uint8_t* out, size_t out_cap, const feb_ses
 /* Computes HMAC-SHA-256(pairing_secret, label || s), truncated to FEB_SESSION_PROOF_LEN
    bytes. `s` is S as produced by feb_session_encode_transcript(), so label_len + s_len is
    always within this function's fixed-size local buffer given FEB_SESSION_LABEL_MAX_LEN
-   and FEB_SESSION_MAX_TRANSCRIPT_LEN; both are clamped defensively regardless. */
+   and FEB_SESSION_MAX_TRANSCRIPT_LEN; an over-length input zeroes `out` instead of being
+   clamped, matching the ESP32's feb_session_hmac_label() (docs/CODE_REVIEW_FIX_PLAN.md D4,
+   HP-37) -- a wrong-but-plausible truncated-input proof would present as an unexplained
+   mismatch, whereas an all-zero proof fails verification immediately and visibly. */
 static void session_proof_tag(
     const uint8_t pairing_secret[FEB_PAIRING_SECRET_LEN],
     const char* label,
@@ -323,11 +326,9 @@ static void session_proof_tag(
     static uint8_t mac[FEB_HMAC_SHA256_LEN];
     size_t total;
 
-    if(label_len > FEB_SESSION_LABEL_MAX_LEN) {
-        label_len = FEB_SESSION_LABEL_MAX_LEN;
-    }
-    if(s_len > FEB_SESSION_MAX_TRANSCRIPT_LEN) {
-        s_len = FEB_SESSION_MAX_TRANSCRIPT_LEN;
+    if(label_len > FEB_SESSION_LABEL_MAX_LEN || s_len > FEB_SESSION_MAX_TRANSCRIPT_LEN) {
+        feb_secure_zero(out, FEB_SESSION_PROOF_LEN);
+        return;
     }
 
     memcpy(buf, label, label_len);
@@ -476,14 +477,81 @@ void feb_session_build_nonce(
 }
 
 /* ---- protected-record encrypt/decrypt ----
-   session_aad_buf/session_nonce_buf/session_tag_buf are shared scratch across both
-   directions (static, not stack-local -- see this file's top comment): only one BLE event
-   is ever in flight at a time, and a protected record is never simultaneously being
-   encrypted and decrypted, so one set of buffers is sufficient. */
+   session_aad_buf/session_nonce_buf/session_tag_buf are shared scratch across both directions
+   (static, not stack-local -- see this file's top comment). This file's premise used to be
+   "only one BLE event is ever in flight, so a record is never simultaneously being encrypted
+   and decrypted" -- that was false (HP-06, docs/HARDENING_PLAN.md): the Flipper app calls
+   feb_session_encrypt_record() from its own main thread (e.g. periodic gps/wardriving
+   commands) while feb_session_decrypt_record() runs on BleEventWorker for unsolicited
+   ESP32-pushed records, and those two threads really do run concurrently -- interleaving on
+   this shared scratch mid-call risks building a ciphertext under the peer's own
+   already-used {session_id, direction, sequence} nonce (nonce reuse under AES-GCM, a real key-
+   recovery-adjacent bug, not just corrupted output). Safe again today, but only because of an
+   invariant this file cannot see or enforce itself: every call site of both functions in
+   flipper_esp32_over_ble.c is serialized under one shared FuriMutex (protocol_mutex), so two
+   calls into this pair of functions can never actually be in flight at once, on any thread.
+   If a future caller (or a port of this file) ever calls either function without holding that
+   same mutex, this sharing becomes unsafe again -- per-direction buffers would be the
+   self-contained alternative if that guarantee ever gets harder to maintain. */
 
 static uint8_t session_aad_buf[FEB_SESSION_MAX_AAD_LEN];
 static uint8_t session_nonce_buf[FEB_SESSION_NONCE_LEN];
 static uint8_t session_tag_buf[FEB_SESSION_GCM_TAG_LEN];
+
+/* docs/PROTOCOL.md "Trailing bytes": an authenticated plaintext must be exactly one
+   well-formed CBOR value. Iterative (an outstanding-item counter, no recursion or depth
+   limit, so no BleEventWorker stack cost) because the schema decoders that run next own
+   nesting depth and entry counts -- feb_cbor_skip_value()'s depth budget would reject e.g.
+   wardriving's valid 5-level result. Mirrors components/feb_protocol/session.c exactly. */
+static feb_cbor_status_t feb_session_check_single_value(const uint8_t* in, size_t len) {
+    size_t pos = 0;
+    uint64_t pending = 1;
+
+    while(pending > 0) {
+        feb_cbor_status_t status = FEB_CBOR_ERR_TRUNCATED;
+        size_t n;
+        size_t count;
+        uint64_t value;
+        const uint8_t* data;
+        const char* text;
+        size_t data_len;
+
+        if(pos >= len) {
+            return FEB_CBOR_ERR_TRUNCATED;
+        }
+        switch(in[pos] >> 5) {
+        case 0:
+            n = feb_cbor_decode_uint(in + pos, len - pos, &value, &status);
+            break;
+        case 2:
+            n = feb_cbor_decode_bytes(in + pos, len - pos, &data, &data_len, len, &status);
+            break;
+        case 3:
+            n = feb_cbor_decode_text(in + pos, len - pos, &text, &data_len, len, &status);
+            break;
+        case 4:
+            n = feb_cbor_decode_array_header(in + pos, len - pos, &count, &status);
+            if(n != 0) {
+                pending += count;
+            }
+            break;
+        case 5:
+            n = feb_cbor_decode_map_header(in + pos, len - pos, &count, &status);
+            if(n != 0) {
+                pending += 2u * (uint64_t)count;
+            }
+            break;
+        default:
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
+        if(n == 0) {
+            return status;
+        }
+        pos += n;
+        pending--;
+    }
+    return pos == len ? FEB_CBOR_OK : FEB_CBOR_ERR_UNEXPECTED_TYPE;
+}
 
 size_t feb_session_encrypt_record(
     const uint8_t session_key[FEB_SESSION_KEY_LEN],
@@ -501,6 +569,9 @@ size_t feb_session_encrypt_record(
     size_t ciphertext_scratch_cap,
     uint8_t* out,
     size_t out_cap) {
+    if(sequence >= FEB_SESSION_SEQUENCE_MAX) {
+        return 0;
+    }
     if(payload_len > FEB_CBOR_MAX_PAYLOAD || ciphertext_scratch_cap < payload_len) {
         return 0;
     }
@@ -613,6 +684,11 @@ feb_cbor_status_t feb_session_decrypt_record(
         plaintext_out);
     if(!ok) {
         return FEB_CBOR_ERR_AUTH_FAILED;
+    }
+    status = feb_session_check_single_value(plaintext_out, protected_record.ciphertext_len);
+    if(status != FEB_CBOR_OK) {
+        feb_secure_zero(plaintext_out, protected_record.ciphertext_len);
+        return status;
     }
 
     record->version = protected_record.version;

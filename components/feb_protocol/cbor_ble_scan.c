@@ -12,6 +12,9 @@ size_t feb_cbor_encode_ble_scan_device(uint8_t *out, size_t out_cap, const feb_b
     if (out == NULL || device == NULL) {
         return 0;
     }
+    if (device->has_name && (device->name == NULL || device->name_len > FEB_BLE_SCAN_NAME_MAX_LEN)) {
+        return 0;
+    }
     if (device->rssi_offset > 255u) {
         return 0;
     }

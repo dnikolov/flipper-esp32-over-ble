@@ -89,6 +89,8 @@ size_t feb_cbor_decode_meshcore_node(
     size_t in_len,
     feb_meshcore_node_t* node,
     feb_cbor_status_t* status) {
+    static const char* const names[7] = {
+        "node_id", "name", "role", "rssi_offset", "last_seen_ms", "lat_e7_offset", "lon_e7_offset"};
     if(in == NULL || node == NULL || status == NULL) {
         if(status != NULL) *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
         return 0;
@@ -99,112 +101,76 @@ size_t feb_cbor_decode_meshcore_node(
     if(pos == 0) {
         return 0;
     }
-    if(count < 4) {
-        *status = FEB_CBOR_ERR_MISSING_FIELD;
-        return 0;
-    }
     if(count > 7) {
         *status = FEB_CBOR_ERR_TOO_MANY_ENTRIES;
         return 0;
     }
-    /* extra == count - 4 uniquely identifies which optional groups are present: 0 = neither,
-       1 = name only, 2 = location only, 3 = both -- since name is a single field and
-       lat_e7_offset/lon_e7_offset are always present together (never just one), these four
-       counts cannot collide. */
-    size_t extra = count - 4;
-    int expect_name = (extra == 1 || extra == 3);
-    int expect_location = (extra == 2 || extra == 3);
 
-    const uint8_t* seen_ptrs[7];
-    size_t seen_lens[7];
-    size_t n;
-    size_t next_index = 0;
-
-    n = feb_cbor_i_decode_expected_key(
-        in + pos, in_len - pos, "node_id", seen_ptrs, seen_lens, next_index, status);
-    if(n == 0) return 0;
-    pos += n;
-    next_index++;
-    {
-        const char* data;
-        size_t len;
-        n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len, FEB_MESHCORE_NODE_ID_LEN, status);
+    uint32_t seen = 0;
+    size_t next_min = 0;
+    for(size_t i = 0; i < count; i++) {
+        size_t field;
+        size_t n = feb_cbor_i_decode_table_key(
+            in + pos, in_len - pos, names, 7, seen, next_min, &field, status);
         if(n == 0) return 0;
-        if(len != FEB_MESHCORE_NODE_ID_LEN) {
-            *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
-            return 0;
+        pos += n;
+        switch(field) {
+        case 0: {
+            const char* data;
+            size_t len;
+            n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len, FEB_MESHCORE_NODE_ID_LEN, status);
+            if(n == 0) return 0;
+            if(len != FEB_MESHCORE_NODE_ID_LEN) {
+                *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+                return 0;
+            }
+            node->node_id = data;
+            node->node_id_len = len;
+            break;
         }
-        node->node_id = data;
-        node->node_id_len = len;
+        case 1:
+            n = feb_cbor_decode_text(
+                in + pos, in_len - pos, &node->name, &node->name_len, FEB_MESHCORE_NAME_MAX_LEN, status);
+            if(n == 0) return 0;
+            node->has_name = 1;
+            break;
+        case 2:
+            n = feb_cbor_decode_text(
+                in + pos, in_len - pos, &node->role, &node->role_len, FEB_CBOR_MAX_TEXT_LEN, status);
+            if(n == 0) return 0;
+            break;
+        case 3:
+            n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->rssi_offset, status);
+            if(n == 0) return 0;
+            if(node->rssi_offset > 255u) {
+                *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+                return 0;
+            }
+            break;
+        case 4:
+            n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->last_seen_ms, status);
+            if(n == 0) return 0;
+            break;
+        default:
+            n = feb_cbor_decode_uint(
+                in + pos,
+                in_len - pos,
+                field == 5 ? &node->lat_e7_offset : &node->lon_e7_offset,
+                status);
+            if(n == 0) return 0;
+            break;
+        }
         pos += n;
+        seen |= 1u << field;
+        next_min = field + 1;
     }
 
-    if(expect_name) {
-        n = feb_cbor_i_decode_expected_key(
-            in + pos, in_len - pos, "name", seen_ptrs, seen_lens, next_index, status);
-        if(n == 0) return 0;
-        pos += n;
-        next_index++;
-        n = feb_cbor_decode_text(
-            in + pos, in_len - pos, &node->name, &node->name_len, FEB_MESHCORE_NAME_MAX_LEN, status);
-        if(n == 0) return 0;
-        pos += n;
-        node->has_name = 1;
-    }
-
-    n = feb_cbor_i_decode_expected_key(
-        in + pos, in_len - pos, "role", seen_ptrs, seen_lens, next_index, status);
-    if(n == 0) return 0;
-    pos += n;
-    next_index++;
-    n = feb_cbor_decode_text(
-        in + pos, in_len - pos, &node->role, &node->role_len, FEB_CBOR_MAX_TEXT_LEN, status);
-    if(n == 0) return 0;
-    pos += n;
-
-    n = feb_cbor_i_decode_expected_key(
-        in + pos, in_len - pos, "rssi_offset", seen_ptrs, seen_lens, next_index, status);
-    if(n == 0) return 0;
-    pos += n;
-    next_index++;
-    n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->rssi_offset, status);
-    if(n == 0) return 0;
-    if(node->rssi_offset > 255u) {
-        *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    /* node_id, role, rssi_offset, last_seen_ms are required; lat/lon only as a pair. */
+    if((seen & 0x1Du) != 0x1Du || ((seen >> 5) & 1u) != ((seen >> 6) & 1u)) {
+        *status = FEB_CBOR_ERR_MISSING_FIELD;
         return 0;
     }
-    pos += n;
-
-    n = feb_cbor_i_decode_expected_key(
-        in + pos, in_len - pos, "last_seen_ms", seen_ptrs, seen_lens, next_index, status);
-    if(n == 0) return 0;
-    pos += n;
-    next_index++;
-    n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->last_seen_ms, status);
-    if(n == 0) return 0;
-    pos += n;
-
-    if(expect_location) {
-        n = feb_cbor_i_decode_expected_key(
-            in + pos, in_len - pos, "lat_e7_offset", seen_ptrs, seen_lens, next_index, status);
-        if(n == 0) return 0;
-        pos += n;
-        next_index++;
-        n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->lat_e7_offset, status);
-        if(n == 0) return 0;
-        pos += n;
-
-        n = feb_cbor_i_decode_expected_key(
-            in + pos, in_len - pos, "lon_e7_offset", seen_ptrs, seen_lens, next_index, status);
-        if(n == 0) return 0;
-        pos += n;
-        next_index++;
-        n = feb_cbor_decode_uint(in + pos, in_len - pos, &node->lon_e7_offset, status);
-        if(n == 0) return 0;
-        pos += n;
-        node->has_location = 1;
-    }
-
+    node->has_location = (seen & 0x20u) ? 1 : 0;
     *status = FEB_CBOR_OK;
     return pos;
 }

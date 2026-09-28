@@ -3,12 +3,9 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs.h"
-#include "nvs_flash.h"
 
 #include "factory_reset.h"
 #include "status_led.h"
@@ -30,32 +27,11 @@ static const char *TAG = "feb_factory_reset";
 #define FEB_WARDRIVING_TOGGLE_MIN_MS (2u * FEB_FACTORY_RESET_POLL_MS)
 #define FEB_WARDRIVING_TOGGLE_MAX_MS 1000u
 
-static void perform_factory_reset(void)
-{
-    esp_err_t err;
-
-    ESP_LOGW(TAG, "factory-reset gesture confirmed (BOOT held %u ms); erasing NVS and restarting",
-             (unsigned)FEB_FACTORY_RESET_HOLD_MS);
-    feb_ws2812_set(0, 0, 0);
-    err = nvs_flash_erase();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_flash_erase failed: %s", esp_err_to_name(err));
-    }
-    err = nvs_flash_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_flash_init after erase failed: %s", esp_err_to_name(err));
-    }
-    feb_wipe_pairing_secrets();
-    /* No new post-erase path (docs/PLAN.md): esp_restart() falls straight into the existing
-       app_main() boot logic, which finds no stored pairing_secret and opens a pairing
-       window, reused verbatim. */
-    esp_restart();
-}
-
 static void factory_reset_task(void *arg)
 {
     bool held = false;
     bool led_on = false;
+    bool reset_requested = false;
     uint32_t hold_start_ms = 0;
     uint32_t last_blink_ms = 0;
 
@@ -72,9 +48,18 @@ static void factory_reset_task(void *arg)
                 led_on = true;
                 feb_status_led_factory_reset_begin();
                 feb_ws2812_set(32, 0, 0);
-            } else if (now_ms - hold_start_ms >= FEB_FACTORY_RESET_HOLD_MS) {
-                perform_factory_reset();
-            } else if (now_ms - last_blink_ms >= FEB_FACTORY_RESET_BLINK_MS) {
+            } else if (!reset_requested && now_ms - hold_start_ms >= FEB_FACTORY_RESET_HOLD_MS) {
+                /* Hands the actual NVS erase off to the NimBLE host task (HP-13) --
+                   feb_factory_reset_request() never returns in practice (it always ends in
+                   esp_restart(), whether performed here-and-now or on the host task), but
+                   reset_requested guards this branch anyway in case the queued event is
+                   delayed behind other host-task work for a poll tick or two. */
+                reset_requested = true;
+                ESP_LOGW(TAG, "factory-reset gesture confirmed (BOOT held %u ms)",
+                         (unsigned)FEB_FACTORY_RESET_HOLD_MS);
+                feb_ws2812_set(0, 0, 0);
+                feb_factory_reset_request();
+            } else if (!reset_requested && now_ms - last_blink_ms >= FEB_FACTORY_RESET_BLINK_MS) {
                 last_blink_ms = now_ms;
                 led_on = !led_on;
                 feb_ws2812_set(led_on ? 32 : 0, 0, 0);
@@ -84,7 +69,8 @@ static void factory_reset_task(void *arg)
                to the real connection-status state (docs/PLAN.md). Only a release inside
                [FEB_WARDRIVING_TOGGLE_MIN_MS, FEB_WARDRIVING_TOGGLE_MAX_MS) is treated as a
                deliberate short press that toggles wardriving; a bounce-length blip or a
-               long-but-aborted reset hold does nothing (see those constants' comment). */
+               long-but-aborted reset hold does nothing (see those constants' comment). Never
+               reached once reset_requested is set, since the board restarts shortly after. */
             uint32_t press_ms = now_ms - hold_start_ms;
 
             held = false;

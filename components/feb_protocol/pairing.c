@@ -135,6 +135,7 @@ feb_cbor_status_t feb_cbor_decode_pairing_envelope(const uint8_t *in, size_t in_
             size_t n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &status);
 
             if (n == 0) return status;
+            if (value > UINT32_MAX) return FEB_CBOR_ERR_TOO_LARGE;
             record->version = (uint32_t)value;
             pos += n;
             break;

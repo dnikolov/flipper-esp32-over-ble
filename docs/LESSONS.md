@@ -529,3 +529,33 @@ resident `.bss` on a device where RAM is genuinely tight. Size each static to th
 actually reachable, not to the largest convenient `FEB_*` constant; keep them file-local
 (`static`, never exported); and as this set grows, consider whether mutually-exclusive buffers
 can share one arena rather than each reserving its own worst case.
+
+### wardriving-ble-discovery-is-the-reconnect-scan
+
+While wardriving's BLE source is active, the `ble_gap_disc()` re-arm in
+`wardriving_ble_interval_cb()` *is* the reconnect scan. `start_scan()` returns early on
+`wardriving_ble_active`, and every advert, the Flipper's included, reaches the same
+`BLE_GAP_EVENT_DISC` reconnect-match handler. That creates two rules that must hold together on
+every board:
+
+- `start_scan()` must keep the centralized `wardriving_ble_active` guard (2026-09-10 root cause,
+  H01/G36). The C5 port silently dropped it (commit `9519a60`; HARDENING_PLAN.md HP-01).
+- The BLE interval callback must **never** skip discovery for "no GPS fix". Discard no-fix
+  results at window close instead. A no-fix skip stalls reconnect for as long as there's no
+  fix (reproduced live on the C5 2026-09-27; re-introduced in parallel on the C6 and Heltec,
+  caught in review, HP-03).
+
+### no-fix-retry-needs-a-floor
+
+A timer re-arm that uses a user-configurable interval must be clamped when that interval can
+legitimately be `0`. The no-fix branch of `wardriving_wifi_interval_cb()` skips the scan, so the
+scan-done callback that would normally pace the next cycle never fires. Re-arming at a raw 0 ms
+turns the callout into a busy loop on the NimBLE host task that starves IDLE and trips the task
+watchdog (C5, hardware-reproduced 2026-09-27). Use `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS`
+(HP-02).
+
+The broader lesson from HP-01..03: **a fix whose rationale lives only in one board's code
+comment will be lost the next time another board is ported or edited in parallel.** Put the
+rule here and in each board's developer-agent definition in the same pass, and let
+`tools/check_shared_headers.py` enforce what it can. It now also diffs the per-board module
+copies (HP-19).

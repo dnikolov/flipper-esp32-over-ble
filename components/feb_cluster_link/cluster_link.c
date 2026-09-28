@@ -110,24 +110,84 @@ size_t feb_cluster_encode_scan_batch_done(uint8_t *out, size_t out_cap,
     return build_frame(out, out_cap, (uint8_t)FEB_CLUSTER_MSG_SCAN_BATCH_DONE, payload, sizeof(payload));
 }
 
-/* ---- Streaming decoder ---- */
-
-static void decoder_reset_to_scan(feb_cluster_decoder_t *dec)
-{
-    dec->state = FEB_CLUSTER_DECODE_STATE_SEEK_SOF0;
-    dec->msg_type = 0;
-    dec->payload_len = 0;
-    dec->payload_pos = 0;
-    dec->crc_running = FEB_CLUSTER_CRC16_INIT;
-    dec->crc_lo = 0;
-}
+/* ---- Streaming decoder ----
+   dec->buf[start..len) holds the not-yet-consumed bytes. process() either discards them up
+   to the next SOF0, waits on an incomplete frame, or validates a complete one. A rejected
+   candidate drops only its SOF0 byte, so every byte after it is re-scanned. Invariant after
+   each process() that is not FRAME_READY: the pending bytes are empty or an incomplete
+   frame prefix (< FEB_CLUSTER_MAX_FRAME_SIZE bytes); after FRAME_READY at most
+   FEB_CLUSTER_MAX_FRAME_SIZE - 7 bytes remain. Either way one more byte always fits once
+   buf is compacted. */
 
 void feb_cluster_decoder_init(feb_cluster_decoder_t *dec)
 {
     if (dec == NULL) {
         return;
     }
-    decoder_reset_to_scan(dec);
+    dec->start = 0;
+    dec->len = 0;
+}
+
+static feb_cluster_decode_result_t decoder_process(feb_cluster_decoder_t *dec,
+                                                   feb_cluster_frame_t *out_frame)
+{
+    int rejected = 0;
+
+    for (;;) {
+        const uint8_t *p = dec->buf + dec->start;
+        size_t avail = (size_t)dec->len - dec->start;
+        size_t payload_len;
+        uint16_t received_crc;
+
+        if (avail == 0) {
+            dec->start = 0;
+            dec->len = 0;
+            break;
+        }
+        if (p[0] != FEB_CLUSTER_SOF0) {
+            dec->start++;
+            continue;
+        }
+        if (avail < 2) {
+            break;
+        }
+        if (p[1] != FEB_CLUSTER_SOF1) {
+            dec->start++;
+            continue;
+        }
+        if (avail < 5) {
+            break;
+        }
+        payload_len = (size_t)p[3] | ((size_t)p[4] << 8);
+        if (payload_len > FEB_CLUSTER_MAX_PAYLOAD) {
+            dec->start++;
+            rejected = 1;
+            continue;
+        }
+        if (avail < 7u + payload_len) {
+            break;
+        }
+        received_crc = (uint16_t)(p[5 + payload_len] | ((uint16_t)p[6 + payload_len] << 8));
+        if (received_crc != feb_cluster_crc16(p + 2, 3u + payload_len)) {
+            dec->start++;
+            rejected = 1;
+            continue;
+        }
+        if (out_frame != NULL) {
+            out_frame->msg_type = p[2];
+            out_frame->payload_len = (uint16_t)payload_len;
+            if (payload_len > 0) {
+                memcpy(out_frame->payload, p + 5, payload_len);
+            }
+        }
+        dec->start = (uint16_t)(dec->start + 7u + payload_len);
+        if (dec->start == dec->len) {
+            dec->start = 0;
+            dec->len = 0;
+        }
+        return FEB_CLUSTER_DECODE_FRAME_READY;
+    }
+    return rejected ? FEB_CLUSTER_DECODE_RESYNC : FEB_CLUSTER_DECODE_NEED_MORE;
 }
 
 feb_cluster_decode_result_t feb_cluster_decoder_feed_byte(feb_cluster_decoder_t *dec,
@@ -137,86 +197,25 @@ feb_cluster_decode_result_t feb_cluster_decoder_feed_byte(feb_cluster_decoder_t 
     if (dec == NULL) {
         return FEB_CLUSTER_DECODE_NEED_MORE;
     }
-
-    switch (dec->state) {
-    case FEB_CLUSTER_DECODE_STATE_SEEK_SOF0:
-        if (byte == FEB_CLUSTER_SOF0) {
-            dec->state = FEB_CLUSTER_DECODE_STATE_SEEK_SOF1;
+    if (dec->len >= sizeof(dec->buf)) {
+        if (dec->start == 0) {
+            dec->start = 1;
         }
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_SEEK_SOF1:
-        if (byte == FEB_CLUSTER_SOF1) {
-            dec->state = FEB_CLUSTER_DECODE_STATE_MSG_TYPE;
-        } else if (byte != FEB_CLUSTER_SOF0) {
-            /* Not a second SOF0 candidate either -- back to scratch. */
-            dec->state = FEB_CLUSTER_DECODE_STATE_SEEK_SOF0;
-        }
-        /* else: byte == SOF0 again, stay here (this byte is the new SOF0 candidate). */
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_MSG_TYPE:
-        dec->msg_type = byte;
-        dec->crc_running = feb_cluster_crc16_update(FEB_CLUSTER_CRC16_INIT, byte);
-        dec->state = FEB_CLUSTER_DECODE_STATE_LEN_LO;
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_LEN_LO:
-        dec->payload_len = byte;
-        dec->crc_running = feb_cluster_crc16_update(dec->crc_running, byte);
-        dec->state = FEB_CLUSTER_DECODE_STATE_LEN_HI;
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_LEN_HI:
-        dec->payload_len = (uint16_t)(dec->payload_len | ((uint16_t)byte << 8));
-        dec->crc_running = feb_cluster_crc16_update(dec->crc_running, byte);
-        if (dec->payload_len > FEB_CLUSTER_MAX_PAYLOAD) {
-            /* Reject before consuming a single payload byte -- never trust a corrupted
-               length field enough to skip that many bytes (docs/CLUSTER.md). */
-            decoder_reset_to_scan(dec);
-            return FEB_CLUSTER_DECODE_RESYNC;
-        }
-        dec->payload_pos = 0;
-        dec->state = (dec->payload_len == 0) ? FEB_CLUSTER_DECODE_STATE_CRC_LO
-                                              : FEB_CLUSTER_DECODE_STATE_PAYLOAD;
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_PAYLOAD:
-        dec->payload[dec->payload_pos] = byte;
-        dec->payload_pos++;
-        dec->crc_running = feb_cluster_crc16_update(dec->crc_running, byte);
-        if (dec->payload_pos >= dec->payload_len) {
-            dec->state = FEB_CLUSTER_DECODE_STATE_CRC_LO;
-        }
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_CRC_LO:
-        dec->crc_lo = byte;
-        dec->state = FEB_CLUSTER_DECODE_STATE_CRC_HI;
-        return FEB_CLUSTER_DECODE_NEED_MORE;
-
-    case FEB_CLUSTER_DECODE_STATE_CRC_HI: {
-        uint16_t received_crc = (uint16_t)(dec->crc_lo | ((uint16_t)byte << 8));
-
-        if (received_crc != dec->crc_running) {
-            decoder_reset_to_scan(dec);
-            return FEB_CLUSTER_DECODE_RESYNC;
-        }
-        if (out_frame != NULL) {
-            out_frame->msg_type = dec->msg_type;
-            out_frame->payload_len = dec->payload_len;
-            if (dec->payload_len > 0) {
-                memcpy(out_frame->payload, dec->payload, dec->payload_len);
-            }
-        }
-        decoder_reset_to_scan(dec);
-        return FEB_CLUSTER_DECODE_FRAME_READY;
+        memmove(dec->buf, dec->buf + dec->start, (size_t)dec->len - dec->start);
+        dec->len = (uint16_t)(dec->len - dec->start);
+        dec->start = 0;
     }
+    dec->buf[dec->len++] = byte;
+    return decoder_process(dec, out_frame);
+}
 
-    default:
-        decoder_reset_to_scan(dec);
-        return FEB_CLUSTER_DECODE_RESYNC;
+feb_cluster_decode_result_t feb_cluster_decoder_poll(feb_cluster_decoder_t *dec,
+                                                      feb_cluster_frame_t *out_frame)
+{
+    if (dec == NULL) {
+        return FEB_CLUSTER_DECODE_NEED_MORE;
     }
+    return decoder_process(dec, out_frame);
 }
 
 size_t feb_cluster_decoder_feed(feb_cluster_decoder_t *dec, const uint8_t *data, size_t len,
@@ -233,8 +232,12 @@ size_t feb_cluster_decoder_feed(feb_cluster_decoder_t *dec, const uint8_t *data,
         feb_cluster_frame_t *slot = (produced < max_frames) ? &frames[produced] : NULL;
         feb_cluster_decode_result_t result = feb_cluster_decoder_feed_byte(dec, data[i], slot);
 
-        if (result == FEB_CLUSTER_DECODE_FRAME_READY && slot != NULL) {
-            produced++;
+        while (result == FEB_CLUSTER_DECODE_FRAME_READY) {
+            if (slot != NULL) {
+                produced++;
+            }
+            slot = (produced < max_frames) ? &frames[produced] : NULL;
+            result = feb_cluster_decoder_poll(dec, slot);
         }
     }
     return produced;

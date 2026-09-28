@@ -25,7 +25,9 @@ static const char *TAG = "feb_factory_reset";
 #define FEB_WARDRIVING_TOGGLE_MIN_MS (2u * FEB_FACTORY_RESET_POLL_MS)
 #define FEB_WARDRIVING_TOGGLE_MAX_MS 1000u
 
-static void perform_factory_reset(void)
+/* Declared in factory_reset.h; not static -- feb_factory_reset_request() is the entry point
+   every caller (factory_reset_task() below) should actually use (HARDENING_PLAN.md HP-13). */
+void feb_factory_reset_perform(void)
 {
     esp_err_t err;
 
@@ -68,7 +70,7 @@ static void factory_reset_task(void *arg)
                 feb_status_led_factory_reset_begin();
                 feb_led_set(true);
             } else if (now_ms - hold_start_ms >= FEB_FACTORY_RESET_HOLD_MS) {
-                perform_factory_reset();
+                feb_factory_reset_request();
             } else if (now_ms - last_blink_ms >= FEB_FACTORY_RESET_BLINK_MS) {
                 last_blink_ms = now_ms;
                 led_on = !led_on;

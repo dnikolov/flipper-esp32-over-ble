@@ -36,6 +36,7 @@
 #include "meshtastic_table.h"
 #include "pairing.h"
 #include "pairing_crypto.h"
+#include "radio_killswitch.h"
 #include "session.h"
 #include "session_crypto.h"
 #include "status_display.h"
@@ -205,6 +206,16 @@ static uint32_t scan_report_window_count;
 static uint32_t scan_report_lifetime_total;
 static uint32_t scan_summary_elapsed_ms;
 
+/* Touch-pad (GPIO2) radio kill-switch: radio_kill_switch_enabled gates start_scan() (and is
+   checked before any BLE reconnect/scan attempt) so a shutdown-in-progress cannot race a
+   fresh scan being armed; it doubles as "nimble_port_init() currently owns the BLE stack"
+   (only ever set true right after a successful nimble_port_freertos_init(), in app_main() or
+   feb_radio_kill_switch_toggle()'s own "enable" branch -- see that function for why a single
+   flag is safe to reuse for both meanings, and for why its own shutdown-cleanup runs directly
+   on the touch task rather than being handed off to the NimBLE host task the way
+   wardriving_button_toggle_ev does -- a DRAM-budget trade-off, not an oversight). */
+static volatile bool radio_kill_switch_enabled;
+
 static feb_reassembly_t rx_reassembly;
 static struct ble_npl_callout reassembly_timeout_co;
 static struct ble_npl_callout reconnect_co;
@@ -342,6 +353,12 @@ static feb_wardriving_persisted_state_t wardriving_persisted;
    slots, already close to exhausted by this file's other callouts once wardriving_wifi/
    ble_interval_co are added). */
 static struct ble_npl_event wardriving_button_toggle_ev;
+/* Same "raw event, not a callout" shape as wardriving_button_toggle_ev, same reason (host-side
+   callout pool budget) -- HARDENING_PLAN.md HP-13: serializes the factory-reset gesture's NVS
+   erase against every other NVS writer in this firmware (persist_pairing_secret(),
+   wardriving_persist_save(), the radio kill-switch's own persist), which previously ran
+   uncoordinated on factory_reset_task()'s own polling task. */
+static struct ble_npl_event factory_reset_ev;
 static volatile bool wardriving_control_ready;
 static volatile uint32_t wardriving_button_toggle_pending;
 static bool wardriving_autostart_attempted;
@@ -388,6 +405,11 @@ static uint16_t wifi_scan_raw_count;
    permanently resident -- this board's heap has ample room by comparison, per those same
    comments. */
 static wifi_ap_record_t *wardriving_cluster_flush_records;
+/* HP-04: wifi_scan_done_cb() (host task) sets busy under cluster_link_spinlock while it
+   iterates the flush buffer; a release from another task (kill-switch) while busy only NULLs
+   the pointer and sets free_pending, handing the free() to the reader when it finishes. */
+static bool cluster_flush_busy;
+static bool cluster_flush_free_pending;
 static feb_wifi_scan_ap_t wifi_scan_selected[FEB_WIFI_SCAN_MAX_APS_PER_RECORD];
 static uint16_t wifi_scan_found_count;
 static uint16_t wifi_scan_send_next_index;
@@ -510,6 +532,8 @@ static void cluster_scan_timeout_cb(struct ble_npl_event *ev);
 static void ble_scan_catalog_advertisement(const struct ble_gap_disc_desc *disc);
 static void ble_scan_send_next_batch(uint16_t conn_handle);
 static void ble_scan_window_close_cb(struct ble_npl_event *ev);
+static void start_wifi_subsystem_init(void);
+static esp_err_t start_wifi_subsystem_start(void);
 static void start_wifi_subsystem(void);
 static void handle_wardriving_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
 static void wardriving_send_next_batch(uint16_t conn_handle);
@@ -527,6 +551,7 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
                                       wardriving_country_t country);
 static void wardriving_stop_internal(void);
 static void wardriving_button_toggle_cb(struct ble_npl_event *ev);
+static void factory_reset_cb(struct ble_npl_event *ev);
 
 static void compute_board_id(void)
 {
@@ -674,6 +699,9 @@ static void start_scan(void)
     struct ble_gap_disc_params params = {0};
     int rc;
 
+    if (!radio_kill_switch_enabled) {
+        return;
+    }
     if (connection_handle != BLE_HS_CONN_HANDLE_NONE) {
         return;
     }
@@ -1305,17 +1333,29 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
         wifi_ap_record_t *raw;
         uint16_t raw_count;
         uint16_t k;
+        bool flush_held = false;
 
         if (wardriving_wifi_delegated) {
+            /* HARDENING_PLAN.md HP-04: take the flush-buffer pointer and mark it busy under the
+               lock that guards it -- feb_radio_kill_switch_toggle() (a different task) can
+               release it via wardriving_stop_internal() at any time; while busy that release
+               defers the free() to the end of this flush (cluster_flush_records_release()).
+               A NULL read (the release landed first) means nothing to flush. */
             portENTER_CRITICAL(&cluster_link_spinlock);
+            raw = wardriving_cluster_flush_records;
             raw_count = wifi_scan_raw_count;
-            if (raw_count > 0) {
-                memcpy(wardriving_cluster_flush_records, wifi_scan_raw_records,
+            if (raw != NULL) {
+                cluster_flush_busy = true;
+                flush_held = true;
+            }
+            if (raw != NULL && raw_count > 0) {
+                memcpy(raw, wifi_scan_raw_records,
                        (size_t)raw_count * sizeof(wifi_scan_raw_records[0]));
+            } else {
+                raw_count = 0;
             }
             wifi_scan_raw_count = 0;
             portEXIT_CRITICAL(&cluster_link_spinlock);
-            raw = wardriving_cluster_flush_records;
         } else {
             raw_count = wifi_scan_raw_count;
             raw = wifi_scan_raw_records;
@@ -1357,6 +1397,21 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
                     wardriving_flash_failure_count = 0;
                 }
             }
+        }
+
+        /* Must clear busy before wardriving_self_stop() below, which releases the buffer on
+           this same task. */
+        if (flush_held) {
+            wifi_ap_record_t *to_free = NULL;
+
+            portENTER_CRITICAL(&cluster_link_spinlock);
+            cluster_flush_busy = false;
+            if (cluster_flush_free_pending) {
+                cluster_flush_free_pending = false;
+                to_free = raw;
+            }
+            portEXIT_CRITICAL(&cluster_link_spinlock);
+            free(to_free);
         }
 
         if (wardriving_wifi_self_stop_pending) {
@@ -1514,13 +1569,20 @@ static void cluster_link_rx_task(void *arg)
         int read = uart_read_bytes(FEB_CLUSTER_UART_PORT, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
         int i;
 
-        if (read <= 0) {
-            continue;
+        if (read < 0) {
+            read = 0;
         }
-        for (i = 0; i < read; i++) {
-            feb_cluster_decode_result_t result = feb_cluster_decoder_feed_byte(&decoder, chunk[i], &frame);
+        /* Past the last input byte, keep polling: a resync can leave further complete frames
+           buffered in the decoder (HP-30). */
+        for (i = 0;; i++) {
+            feb_cluster_decode_result_t result =
+                (i < read) ? feb_cluster_decoder_feed_byte(&decoder, chunk[i], &frame)
+                           : feb_cluster_decoder_poll(&decoder, &frame);
 
             if (result != FEB_CLUSTER_DECODE_FRAME_READY) {
+                if (i >= read) {
+                    break;
+                }
                 continue;
             }
             switch (frame.msg_type) {
@@ -2395,7 +2457,10 @@ static void handle_meshtastic_command(uint16_t conn_handle, const feb_command_pa
    set once at wardriving_start_internal()) -- so this callout's job becomes periodically
    flushing whatever scan_result frames cluster_link_rx_task() has appended since the last
    flush, by re-triggering wifi_scan_done_co (the same handoff wifi_scan_done_handler() uses
-   for the local-radio source). */
+   for the local-radio source). No-fix skip (below, non-delegated path only): checked every
+   cycle with no debounce, distinct from the speed-based swelling hysteresis just below it --
+   still re-arms this same callout at the unchanged cadence, and kicks a backlog-flush
+   re-check since a skipped cycle appends nothing new to flush from. */
 static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 {
     wifi_scan_config_t scan_cfg;
@@ -2409,11 +2474,25 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
         ble_npl_callout_reset(&wifi_scan_done_co, 0);
         return;
     }
-    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
+    {
         feb_location_t fix;
         feb_location_state_t loc_state = location_get_fix(&fix);
 
-        if (loc_state == FEB_LOCATION_FIX) {
+        if (loc_state != FEB_LOCATION_FIX) {
+            /* Re-arm clamped to FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS, not the raw configured
+               interval: that interval can legitimately be 0 ("aggressive"/continuous), and
+               re-arming at 0ms here produces a zero-delay refire loop that starves CPU0's IDLE
+               task and trips the task watchdog (HARDENING_PLAN.md HP-02, hardware-reproduced
+               on the ESP32-C5 2026-09-27). */
+            uint32_t retry_ms = (wardriving_wifi_interval_ms < FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS) ?
+                                 FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS : wardriving_wifi_interval_ms;
+
+            wardriving_maybe_kick_send(connection_handle);
+            ble_npl_callout_reset(&wardriving_wifi_interval_co,
+                                  ble_npl_time_ms_to_ticks32(retry_ms));
+            return;
+        }
+        if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
             if (fix.speed_e1_kmh >= 100u) {
                 wardriving_swelling_aggressive_active = true;
             } else if (fix.speed_e1_kmh < 80u) {
@@ -2432,7 +2511,16 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 
 /* Same re-arming role as wardriving_wifi_interval_cb() above, for the BLE source. Ported
    unchanged from esp32/main/main.c -- see that file's fuller comment, including why the
-   merged reconnect-scan pass must use active (not passive) discovery. */
+   merged reconnect-scan pass must use active (not passive) discovery. Unlike the Wi-Fi side,
+   this discovery window is NOT skipped when there's no GPS fix (HARDENING_PLAN.md HP-03,
+   reverting a since-removed no-fix skip): it is the same NimBLE discovery procedure
+   gap_event()'s BLE_GAP_EVENT_DISC handler uses to find the Flipper's advertisement for
+   reconnect (start_scan() piggybacks on whichever discovery is already running rather than
+   starting a second one), so skipping it here would stall reconnect for as long as there's no
+   fix -- reproduced live on the ESP32-C5 2026-09-27 (autostarted wardriving, no GPS fix,
+   Flipper never found/connected for the rest of the session). Recording still discards
+   results with no fix to attach them to, at window-close in ble_scan_window_close_cb(); only
+   the scan itself is unconditional. */
 static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
 {
     struct ble_gap_disc_params params = {0};
@@ -2471,7 +2559,40 @@ static void wardriving_sync_status_led(void)
    from esp32/main/main.c -- see that file's fuller comment. Phase 9 addition (2026-09-26):
    if the Wi-Fi source was delegated to a cluster worker, tell it to go idle instead of
    stopping a local scan that was never running -- mirrors the manual wifi_scan path's own
-   disconnect-handling teardown. Runs on the NimBLE host task only. */
+   disconnect-handling teardown.
+
+   NOT host-task-only (correcting this comment's prior claim, HARDENING_PLAN.md HP-04): every
+   other call site (wardriving_self_stop(), wardriving_button_toggle_cb(),
+   handle_wardriving_command()'s stop path) does run on the NimBLE host task, but
+   feb_radio_kill_switch_toggle()'s disable branch (radio_killswitch.c's touch task) calls this
+   directly too, by BL27's own deliberate design (no DRAM budget for a host-task handoff). The
+   free()/NULL of wardriving_cluster_flush_records below used to run unlocked, racing
+   wifi_scan_done_cb() (host task) reading that same pointer and iterating the buffer it points
+   to outside cluster_link_spinlock -- a real UAF, not just a raced plain flag (see this
+   function's own audit note below and radio_killswitch.c's/feb_radio_kill_switch_toggle()'s
+   comments, both corrected in the same pass: this is a real counter-example to "only bool/
+   uint32 globals are raced here"). Fixed by moving the pointer read+NULL under the lock and
+   only calling free() on a local copy after releasing it (HP-04's preferred 0-DRAM-cost fix).
+   This narrows the window to the pointer/snapshot handoff itself; it does not add a "busy"
+   wait for wifi_scan_done_cb()'s own (potentially slow, flash-writing) iteration of the
+   buffer contents; cluster_flush_records_release() closes that remaining window with the
+   cluster_flush_busy/cluster_flush_free_pending handoff (2 B .bss). */
+static void cluster_flush_records_release(void)
+{
+    wifi_ap_record_t *to_free;
+
+    portENTER_CRITICAL(&cluster_link_spinlock);
+    cluster_scan_collecting = false;
+    to_free = wardriving_cluster_flush_records;
+    wardriving_cluster_flush_records = NULL;
+    if (cluster_flush_busy) {
+        cluster_flush_free_pending = true;
+        to_free = NULL;
+    }
+    portEXIT_CRITICAL(&cluster_link_spinlock);
+    free(to_free);
+}
+
 static void wardriving_stop_internal(void)
 {
     if (wardriving_wifi_active) {
@@ -2480,13 +2601,16 @@ static void wardriving_stop_internal(void)
         ble_npl_callout_stop(&wardriving_wifi_interval_co);
         if (wardriving_wifi_delegated) {
             wardriving_wifi_delegated = false;
-            portENTER_CRITICAL(&cluster_link_spinlock);
-            cluster_scan_collecting = false;
-            portEXIT_CRITICAL(&cluster_link_spinlock);
+            cluster_flush_records_release();
+            /* uart_write_bytes() holds the UART driver's own internal TX mutex for the whole
+               call, so this can't corrupt/interleave bytes with a concurrent host-task send on
+               the same port -- but a scan_config_set from this call site (touch task) can still
+               land in either order relative to one this same session's host task might be
+               sending at the same time (e.g. a fresh `start` reusing this UART right after a
+               stop), which is a soft protocol-level race, not a memory-safety one. Accepted,
+               same tradeoff class as this function's own comment above. */
             cluster_link_send_scan_config((uint8_t)FEB_CLUSTER_SCAN_MODE_IDLE,
                                           (uint8_t)FEB_CLUSTER_DWELL_NORMAL, 0);
-            free(wardriving_cluster_flush_records);
-            wardriving_cluster_flush_records = NULL;
         } else {
             esp_err_t serr = esp_wifi_scan_stop();
 
@@ -2561,12 +2685,15 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
         wardriving_wifi_swelling = wifi_swelling;
         wardriving_swelling_aggressive_active = false;
 
-        if (cluster_worker_is_present() &&
-            (wardriving_cluster_flush_records = malloc(FEB_WIFI_SCAN_RAW_MAX *
-                                                        sizeof(wifi_ap_record_t))) != NULL) {
+        wifi_ap_record_t *flush_buf = cluster_worker_is_present() ?
+                                      malloc(FEB_WIFI_SCAN_RAW_MAX * sizeof(wifi_ap_record_t)) :
+                                      NULL;
+
+        if (flush_buf != NULL) {
             wardriving_wifi_delegated = true;
             wifi_scan_raw_count = 0;
             portENTER_CRITICAL(&cluster_link_spinlock);
+            wardriving_cluster_flush_records = flush_buf;
             cluster_scan_collecting = true;
             portEXIT_CRITICAL(&cluster_link_spinlock);
             /* wifi_swelling's numeric value is a direct 1:1 cast to feb_cluster_dwell_mode_t
@@ -2641,13 +2768,9 @@ static bool wardriving_start_internal(bool want_wifi, bool want_ble, bool want_b
                 ble_npl_callout_stop(&wardriving_wifi_interval_co);
                 if (wardriving_wifi_delegated) {
                     wardriving_wifi_delegated = false;
-                    portENTER_CRITICAL(&cluster_link_spinlock);
-                    cluster_scan_collecting = false;
-                    portEXIT_CRITICAL(&cluster_link_spinlock);
+                    cluster_flush_records_release();
                     cluster_link_send_scan_config((uint8_t)FEB_CLUSTER_SCAN_MODE_IDLE,
                                                   (uint8_t)FEB_CLUSTER_DWELL_NORMAL, 0);
-                    free(wardriving_cluster_flush_records);
-                    wardriving_cluster_flush_records = NULL;
                 } else {
                     esp_wifi_scan_stop();
                 }
@@ -2744,35 +2867,168 @@ void feb_wardriving_request_button_toggle(void)
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &wardriving_button_toggle_ev);
 }
 
-/* Ported unchanged from esp32/main/main.c -- see that file's fuller comment. */
+/* Runs on the NimBLE host task (posted via factory_reset_ev). HARDENING_PLAN.md HP-13. */
+static void factory_reset_cb(struct ble_npl_event *ev)
+{
+    (void)ev;
+    feb_factory_reset_perform();
+}
+
+/* Declared in factory_reset.h. HARDENING_PLAN.md HP-13: factory_reset_task() used to call
+   feb_factory_reset_perform() (nvs_flash_erase()+nvs_flash_init()) directly from its own
+   polling task, uncoordinated with persist_pairing_secret()/wardriving_persist_save()/the
+   radio kill-switch's own NVS persist, all of which run on the NimBLE host task (or, for the
+   kill-switch, radio_ks -- see feb_radio_kill_switch_persist()'s call sites). Serialized the
+   same way wardriving's own boot-button toggle already is: hand off to the host task via a raw
+   ble_npl_event, so the erase can never interleave with another NVS writer's own
+   nvs_open()/nvs_set_*()/nvs_commit() sequence. Falls back to performing the reset inline when
+   the host task isn't currently running its event loop (radio kill-switch persisted off, or
+   still early in boot) -- there is no concurrent NVS writer to race in that state, and NVS
+   itself has no reason to remain reachable only through the host task. */
+void feb_factory_reset_request(void)
+{
+    if (!wardriving_control_ready) {
+        feb_factory_reset_perform();
+        return;
+    }
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &factory_reset_ev);
+}
+
+/* wardriving_maybe_kick_send()'s stopped-timer: 0 sentinel means "not currently stopped" (same
+   0-as-sentinel idiom as cluster_worker_last_hello_ms above), set to the ms timestamp of the
+   first below-threshold speed reading and cleared the instant a reading comes back at/above
+   threshold. Persists across calls; not reset by an early return. */
+static uint32_t wardriving_stopped_since_ms;
+/* wardriving_send_backlog_count_update()'s dedup tracker, reset to UINT64_MAX (an impossible
+   pending count, forcing a fresh report) on every new connection -- the Flipper resets its own
+   displayed count to 0 on every disconnect/reconnect (flipper_esp32_over_ble.c's
+   reset_scan_ui_state_impl()), so this must not persist a stale "already reported this count"
+   memory across a session boundary, or a reconnect where the pending count happens to match
+   what was last reported before the disconnect would leave the Flipper stuck showing 0
+   indefinitely. */
+static uint64_t wardriving_last_reported_backlog = UINT64_MAX;
+
+/* Shared scratch for both wardriving_send_backlog_count_update() and wardriving_send_next_batch()
+   below -- static, not stack-local, for the same NimBLE-host-task stack-budget reason those
+   functions' own comments explain (2026-09-10 stack-overflow bug). A second full-size
+   feb_wardriving_status_result_payload_t (~3.6 KB, dominated by its 32-entry records array)
+   overflowed this board's DRAM by 3392 bytes when first tried as its own separate static
+   (2026-09-27; this board has near-zero DRAM headroom, see
+   docs/hardware/heltec-wifi-lora-32-v2/README.md) even though the count-update path only ever
+   touches two scalar fields. Sharing is safe because the two functions are mutually exclusive
+   in time: wardriving_send_backlog_count_update() only runs while !wardriving_tx_in_flight, and
+   wardriving_send_next_batch() is the only thing that sets wardriving_tx_in_flight true. */
+static feb_wardriving_status_result_payload_t wardriving_result_scratch;
+static feb_status_payload_t wardriving_status_payload_scratch;
+static uint8_t wardriving_result_buf_scratch[FEB_CBOR_MAX_PAYLOAD];
+
+/* Sends a lightweight status(state="data") update with an empty records array -- just enough
+   to move the Flipper's displayed backlog count, without actually draining anything. Used by
+   wardriving_maybe_kick_send() below while the real flush is gated off, so pausing the flush
+   doesn't also freeze the on-screen number. record_count=0 + backlog_remaining=pending encodes
+   and decodes cleanly (an empty records array is not a special case on either side of the
+   wire). Returns whether the update was actually sent (HARDENING_PLAN.md HP-22): the caller
+   only advances wardriving_last_reported_backlog on success, so an encode or
+   send_protected() failure (e.g. the protected-TX FIFO was full) doesn't get treated as
+   "already reported this count" -- which previously left the Flipper's displayed backlog
+   stuck at a stale value until the pending count happened to change again. */
+static bool wardriving_send_backlog_count_update(uint16_t conn_handle, size_t pending)
+{
+    size_t result_len;
+    size_t payload_len;
+
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
+    wardriving_result_scratch.backlog_remaining = pending;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
+    if (result_len == 0) {
+        return false;
+    }
+
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0;
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
+    if (payload_len == 0) {
+        return false;
+    }
+    return send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf, payload_len);
+}
+
+/* Kicks off a wardriving status(state="data") send if a session is connected+authenticated,
+   there is buffered data to send, and no batch is already in flight. TX_DONE_CONTINUE_WARDRIVING
+   re-enters wardriving_send_next_batch() directly, not this function, so an in-progress drain
+   is never interrupted here.
+
+   Gate: avoids the BLE batch-send of raw record *data* competing with active Wi-Fi scanning on
+   the shared radio while driving -- requires no GPS fix, backlog above
+   FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD, or the vehicle stopped (speed under
+   FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) for at least
+   FEB_WARDRIVING_FLUSH_STOPPED_SECONDS. wardriving_send_backlog_count_update() above keeps the
+   Flipper's displayed backlog count current regardless of this gate, so pausing the data flush
+   doesn't also freeze the on-screen number (2026-09-27: an earlier version of this gate
+   without that count-update made live wardriving results look like they'd vanished entirely
+   during ordinary driving — confirmed on hardware, esp32c5). */
 static void wardriving_maybe_kick_send(uint16_t conn_handle)
 {
+    feb_location_t fix;
+    feb_location_state_t loc_state;
+    size_t pending;
+    uint32_t now_ms;
+    bool gate_open;
+
     if (conn_handle == BLE_HS_CONN_HANDLE_NONE || runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
         return;
     }
-    if (wardriving_tx_in_flight) {
+    pending = wardriving_log_pending_count();
+
+    loc_state = location_get_fix(&fix);
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (loc_state == FEB_LOCATION_FIX) {
+        if (fix.speed_e1_kmh >= FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) {
+            wardriving_stopped_since_ms = 0;
+        } else if (wardriving_stopped_since_ms == 0) {
+            wardriving_stopped_since_ms = now_ms;
+        }
+    }
+    gate_open = (loc_state != FEB_LOCATION_FIX) ||
+                (pending > FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD) ||
+                (wardriving_stopped_since_ms != 0 &&
+                 (uint32_t)(now_ms - wardriving_stopped_since_ms) >=
+                     FEB_WARDRIVING_FLUSH_STOPPED_SECONDS * 1000u);
+
+    if (!gate_open || wardriving_tx_in_flight || pending == 0) {
+        if (!wardriving_tx_in_flight && (uint64_t)pending != wardriving_last_reported_backlog) {
+            if (wardriving_send_backlog_count_update(conn_handle, pending)) {
+                wardriving_last_reported_backlog = pending;
+            }
+        }
         return;
     }
-    if (wardriving_log_pending_count() == 0) {
-        return;
-    }
+
     wardriving_tx_in_flight = true;
     feb_status_led_set(FEB_STATUS_LED_FLUSHING);
     wardriving_send_next_batch(conn_handle);
 }
 
 /* Builds and sends one wardriving status(state="data") record. Ported unchanged from
-   esp32/main/main.c -- see that file's fuller comment on why peeked/peek_scratch/result/
-   trial/status_payload/result_buf are static, not stack-local (the same nimble_host task
-   stack-budget argument applies unchanged on this board's classic-ESP32 NimBLE host task). */
+   esp32/main/main.c -- see that file's fuller comment on why peeked/peek_scratch/trial are
+   static, not stack-local (the same nimble_host task stack-budget argument applies unchanged
+   on this board's classic-ESP32 NimBLE host task). Shares wardriving_result_scratch/
+   wardriving_status_payload_scratch/wardriving_result_buf_scratch with
+   wardriving_send_backlog_count_update() above -- see that pair's declaration comment. */
 static void wardriving_send_next_batch(uint16_t conn_handle)
 {
     static feb_wardriving_record_t peeked[FEB_WARDRIVING_MAX_RECORDS_PER_BATCH];
     static uint8_t peek_scratch[FEB_WARDRIVING_PEEK_SCRATCH_LEN];
-    static feb_wardriving_status_result_payload_t result;
     static feb_wardriving_status_result_payload_t trial;
-    static feb_status_payload_t status_payload;
-    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
     size_t peeked_count;
     size_t include_count;
     size_t remaining_after;
@@ -2793,47 +3049,50 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
         return;
     }
 
-    memset(&result, 0, sizeof(result));
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
     include_count = 0;
     pending_now = wardriving_log_pending_count();
     while (include_count < peeked_count) {
         size_t trial_len;
 
-        trial = result;
+        trial = wardriving_result_scratch;
         trial.records[trial.record_count] = peeked[include_count];
         trial.record_count++;
         trial.backlog_remaining = (pending_now >= trial.record_count) ?
                                   (pending_now - trial.record_count) : 0;
-        trial_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &trial);
+        trial_len = feb_cbor_encode_wardriving_status_result_payload(
+            wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &trial);
         if (trial_len == 0 || trial_len + FEB_WARDRIVING_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
-            if (result.record_count == 0) {
+            if (wardriving_result_scratch.record_count == 0) {
                 ESP_LOGE(TAG, "wardriving: single record too large to encode; dropping it");
                 include_count++;
                 continue;
             }
             break;
         }
-        result = trial;
+        wardriving_result_scratch = trial;
         include_count++;
     }
 
     remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
-    result.backlog_remaining = remaining_after;
-    result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
+    wardriving_result_scratch.backlog_remaining = remaining_after;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
 
-    memset(&status_payload, 0, sizeof(status_payload));
-    status_payload.request_id = 0;
-    status_payload.state = "data";
-    status_payload.state_len = strlen("data");
-    status_payload.result_span = result_buf;
-    status_payload.result_span_len = result_len;
-    status_payload.has_result = 1;
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0;
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
 
     payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
-                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
     if (result_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) result encode failed (records=%u, peeked=%u)",
-                 (unsigned)result.record_count, (unsigned)peeked_count);
+                 (unsigned)wardriving_result_scratch.record_count, (unsigned)peeked_count);
     } else if (payload_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) wrapper encode failed (result_len=%u)",
                  (unsigned)result_len);
@@ -2855,7 +3114,7 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
     }
     wardriving_pending_drain_count = include_count;
     ESP_LOGI(TAG, "sending wardriving status(data) (%u record(s), backlog_remaining=%u)",
-             (unsigned)result.record_count, (unsigned)remaining_after);
+             (unsigned)wardriving_result_scratch.record_count, (unsigned)remaining_after);
 }
 
 /* `mesh_log` backlog drain, mirroring wardriving_maybe_kick_send()/wardriving_send_next_batch()
@@ -3742,6 +4001,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
                                              deliberately persist across connect/disconnect */
         wardriving_pending_drain_count = 0;
+        wardriving_last_reported_backlog = UINT64_MAX; /* force a fresh count report on the new
+            session -- the Flipper resets its own displayed count to 0 on every reconnect */
         mesh_log_tx_in_flight = false; /* per-connection only, mirroring wardriving_tx_in_flight
                                            above -- mesh_log's own capture keeps running
                                            regardless of connection state */
@@ -4146,17 +4407,33 @@ static void reassembly_timeout_cb(struct ble_npl_event *ev)
 /* docs/PROTOCOL.md "`wifi_scan` command and status payloads": esp_netif/default event
    loop/esp_wifi initialize once at boot, STA mode, never connecting to anything, and stay
    resident for the device's whole lifetime. Not lazy-initialized on first wifi_scan command.
-   Ported unchanged from esp32/main/main.c -- see this file's top-of-file comment and
-   docs/BASELINES.md/.claude/agents/heltec-developer.md for this board's untested-versus-
-   validated coexistence status: unlike the C6 (whose Wi-Fi 6 + BLE 5 + 802.15.4 radio had
-   its concurrent-scan behavior validated in an earlier step), this board's Wi-Fi 4 + BT
-   Classic/BLE 4.2 combo radio has never been exercised running a Wi-Fi scan concurrently
-   with an active BLE connection to the Flipper -- that is a real, currently-untested gap for
-   this port, not a borrowed-and-verified number. */
-static void start_wifi_subsystem(void)
-{
-    esp_err_t err = esp_netif_init();
+   See this file's top-of-file comment and docs/BASELINES.md/.claude/agents/heltec-developer.md
+   for this board's untested-versus-validated coexistence status: unlike the C6 (whose Wi-Fi 6
+   + BLE 5 + 802.15.4 radio had its concurrent-scan behavior validated in an earlier step), this
+   board's Wi-Fi 4 + BT Classic/BLE 4.2 combo radio has never been exercised running a Wi-Fi
+   scan concurrently with an active BLE connection to the Flipper -- that is a real,
+   currently-untested gap for this port, not a borrowed-and-verified number.
 
+   Split into an idempotent one-time init half and a restartable start half
+   (HARDENING_PLAN.md HP-05/HP-29): esp_event_loop_create_default()/esp_wifi_init() are not
+   safe to call a second time (the former returns ESP_ERR_INVALID_STATE), but the original
+   single function re-ran both of them on every radio kill-switch OFF->ON cycle -- the second
+   call always failed and returned before ever reaching esp_wifi_start(), so Wi-Fi stayed dead
+   after a kill-switch re-enable until a power cycle, silently (nothing on the OLED or the wire
+   showed it). wifi_subsystem_init_done guards the init half so it runs at most once per boot,
+   regardless of whether that first call comes from app_main() (radio persisted on) or from
+   feb_radio_kill_switch_toggle()'s enable branch (radio persisted off at boot, so the very
+   first touch-to-enable is this device's first-ever Wi-Fi init). */
+static bool wifi_subsystem_init_done = false;
+
+static void start_wifi_subsystem_init(void)
+{
+    esp_err_t err;
+
+    if (wifi_subsystem_init_done) {
+        return;
+    }
+    err = esp_netif_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
         return;
@@ -4183,15 +4460,36 @@ static void start_wifi_subsystem(void)
         ESP_LOGE(TAG, "wifi scan-done handler registration failed: %s", esp_err_to_name(err));
         return;
     }
-    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    wifi_subsystem_init_done = true;
+}
+
+/* Restartable half: esp_wifi_set_mode()/esp_wifi_start() are designed to be called again
+   after a matching esp_wifi_stop(), unlike start_wifi_subsystem_init()'s steps above. Returns
+   esp_err_t (HP-05) so a caller can detect and report failure instead of the original void
+   function's silent "logged and returns", which let feb_radio_kill_switch_toggle() persist
+   enabled=true and log "restarting" even when Wi-Fi never actually came back. */
+static esp_err_t start_wifi_subsystem_start(void)
+{
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
-        return;
+        return err;
     }
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
     }
+    return err;
+}
+
+/* Boot-time convenience: full bring-up in one call, used only by app_main(). The kill-switch's
+   re-enable path calls start_wifi_subsystem_init()/start_wifi_subsystem_start() directly
+   instead, so it can react to start()'s failure (see feb_radio_kill_switch_toggle()). */
+static void start_wifi_subsystem(void)
+{
+    start_wifi_subsystem_init();
+    (void)start_wifi_subsystem_start();
 }
 
 static void host_synced(void)
@@ -4219,6 +4517,7 @@ static void host_synced(void)
     /* A raw event, not a 7th callout -- see wardriving_button_toggle_ev's comment and
        esp32/main/main.c's fuller one on the same mechanism. */
     ble_npl_event_init(&wardriving_button_toggle_ev, wardriving_button_toggle_cb, NULL);
+    ble_npl_event_init(&factory_reset_ev, factory_reset_cb, NULL);
 
     /* docs/BACKLOG.md "Per-board wardriving autostart setting", ported unchanged from
        esp32/main/main.c -- see that file's fuller comment (resume before start_scan() below,
@@ -4246,6 +4545,142 @@ static void host_synced(void)
     start_scan();
 }
 
+/* Declared in radio_killswitch.h. Called only from the touch debounce task, never the NimBLE
+   host task -- nimble_port_stop() blocks waiting for the host task's own event loop to reach
+   and process a stop event it posts, so calling it from the host task would deadlock (see
+   radio_kill_switch_enabled's comment above). Handles both boot-time states: a boot with the
+   persisted flag "off" never calls nimble_port_init()/start_wifi_subsystem() at all (see
+   app_main()), so radio_kill_switch_enabled starts false and the very first touch-to-enable
+   takes the "enable" branch directly, with no stack to stop first -- radio_kill_switch_enabled
+   is only ever set true right after a nimble_port_init()/nimble_port_freertos_init() call
+   actually succeeds (here or in app_main()), so its old value at entry doubles as "is the BLE
+   stack currently up", with no separate flag needed.
+
+   The shutdown-side cleanup below (cancel discovery, terminate any live connection, stop a
+   manual/wardriving scan in flight) runs directly on this task rather than being handed off to
+   the NimBLE host task the way wardriving's own boot-button toggle does its equivalent work --
+   a deliberate trade-off, not an oversight: this board's DRAM budget is already down to a
+   double-digit number of free bytes (docs/BACKLOG.md BL23/BL24), and the raw ble_npl_event +
+   semaphore this would otherwise need to hand off to the host task safely pushed a real
+   idf.py build over budget. radio_kill_switch_enabled is still flipped first (so start_scan()
+   and any other radio_kill_switch_enabled-gated code cannot re-arm a scan mid-teardown), and
+   ble_gap_disc_cancel()/ble_gap_terminate() are NimBLE APIs that are safe to call from any
+   task (they take ble_hs's own internal lock) -- most of what's raced against the host task
+   here is this file's own plain bool/uint32 globals (wifi_scan_in_progress,
+   wardriving_wifi_active, etc.), for the brief window between a touch gesture and
+   nimble_port_stop() actually halting the host task. A physical touch is a rare, operator-paced
+   event, not a hot path, and every one of those globals is a simple flag with no invariant that
+   a stale read could corrupt (worst case: one redundant or skipped stop call, already tolerated
+   elsewhere via ESP_ERR_WIFI_NOT_STARTED/BLE_HS_EALREADY handling) -- an accepted, explicitly
+   flagged risk given the hard memory ceiling, not a silent shortcut.
+
+   One exception, corrected here (HARDENING_PLAN.md HP-04, was previously claimed not to
+   exist): wardriving_stop_internal()'s cluster-delegated branch frees a malloc'd buffer
+   (wardriving_cluster_flush_records) that wifi_scan_done_cb() (host task) can be
+   concurrently reading -- not a "stale flag read", a real use-after-free. Narrowed (not
+   perfectly closed, see wardriving_stop_internal()'s own comment) by moving the pointer
+   read/NULL under cluster_link_spinlock and freeing only a local copy after releasing it. */
+void feb_radio_kill_switch_toggle(void)
+{
+    bool enable = !radio_kill_switch_enabled;
+
+    if (!enable) {
+        radio_kill_switch_enabled = false;
+
+        if (wardriving_wifi_active || wardriving_ble_active) {
+            wardriving_stop_internal();
+        }
+        if (wifi_scan_in_progress) {
+            esp_err_t serr = esp_wifi_scan_stop();
+
+            if (serr != ESP_OK && serr != ESP_ERR_WIFI_NOT_STARTED) {
+                ESP_LOGW(TAG, "esp_wifi_scan_stop failed during radio kill-switch shutdown: %s",
+                         esp_err_to_name(serr));
+            }
+            wifi_scan_in_progress = false;
+        }
+        {
+            int derr = ble_gap_disc_cancel();
+
+            if (derr != 0 && derr != BLE_HS_EALREADY) {
+                ESP_LOGW(TAG, "ble_gap_disc_cancel failed during radio kill-switch shutdown: %d",
+                         derr);
+            }
+        }
+        ble_scan_in_progress = false;
+        if (connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+            ble_gap_terminate(connection_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+        wardriving_control_ready = false;
+        /* Every callout host_synced() (re-)initializes against nimble_port_get_dflt_eventq()
+           -- stopped explicitly rather than relying on nimble_port_deinit()'s own teardown,
+           since a still-pending timer posting to a queue about to be deinitialized/
+           reinitialized from under it is not a risk worth taking. */
+        ble_npl_callout_stop(&reassembly_timeout_co);
+        ble_npl_callout_stop(&wifi_scan_done_co);
+        ble_npl_callout_stop(&cluster_scan_done_co);
+        ble_npl_callout_stop(&cluster_scan_timeout_co);
+        ble_npl_callout_stop(&ble_scan_done_co);
+        ble_npl_callout_stop(&wardriving_wifi_interval_co);
+        ble_npl_callout_stop(&wardriving_ble_interval_co);
+        ble_npl_callout_stop(&reconnect_co);
+
+        {
+            int rc = nimble_port_stop();
+
+            if (rc != 0) {
+                ESP_LOGE(TAG, "radio kill-switch: nimble_port_stop failed: %d", rc);
+            } else {
+                esp_err_t derr = nimble_port_deinit();
+
+                if (derr != ESP_OK) {
+                    ESP_LOGE(TAG, "radio kill-switch: nimble_port_deinit failed: %s",
+                             esp_err_to_name(derr));
+                }
+            }
+        }
+        {
+            esp_err_t werr = esp_wifi_stop();
+
+            if (werr != ESP_OK && werr != ESP_ERR_WIFI_NOT_STARTED) {
+                ESP_LOGW(TAG, "radio kill-switch: esp_wifi_stop failed: %s", esp_err_to_name(werr));
+            }
+        }
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_RADIO_OFF);
+        ESP_LOGW(TAG, "radio kill-switch: Wi-Fi/BLE stopped");
+    } else {
+        esp_err_t werr;
+
+        /* HP-05: calls the init half (a no-op after its first-ever successful run, whether
+           that was app_main() at boot or an earlier kill-switch cycle) and the restartable
+           start half separately, so a failure here is visible instead of the previous single
+           start_wifi_subsystem() silently returning before esp_wifi_start() on every re-enable. */
+        start_wifi_subsystem_init();
+        werr = start_wifi_subsystem_start();
+        if (werr != ESP_OK) {
+            ESP_LOGE(TAG, "radio kill-switch: Wi-Fi restart failed (%s); BLE will still be "
+                          "restarted below, but Wi-Fi scanning/wardriving remain unavailable "
+                          "until the next kill-switch cycle or reboot", esp_err_to_name(werr));
+            feb_status_display_set_ble_state(FEB_DISPLAY_BLE_WIFI_RESTART_FAILED);
+        }
+        {
+            esp_err_t nerr = nimble_port_init();
+
+            if (nerr != ESP_OK) {
+                ESP_LOGE(TAG, "radio kill-switch: nimble_port_init failed: %s",
+                         esp_err_to_name(nerr));
+                feb_radio_kill_switch_persist(false);
+                return;
+            }
+        }
+        ble_hs_cfg.sync_cb = host_synced;
+        nimble_port_freertos_init(nimble_host_task);
+        radio_kill_switch_enabled = true;
+        ESP_LOGI(TAG, "radio kill-switch: Wi-Fi/BLE restarting");
+    }
+    feb_radio_kill_switch_persist(enable);
+}
+
 static void nimble_host_task(void *arg)
 {
     nimble_port_run();
@@ -4256,6 +4691,7 @@ static void nimble_host_task(void *arg)
 void app_main(void)
 {
     esp_err_t err;
+    bool radio_on;
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -4267,9 +4703,20 @@ void app_main(void)
         return;
     }
 
+    /* Loaded here, before start_wifi_subsystem()/nimble_port_init() below, so a reboot with
+       the touch-pad kill-switch persisted "off" comes up with Wi-Fi/BLE already suppressed
+       rather than started-then-stopped. */
+    radio_on = feb_radio_kill_switch_load_persisted();
+    /* Left false here regardless of radio_on -- only set true below once
+       nimble_port_freertos_init() has actually been called, so it always accurately reflects
+       "the BLE stack is up" (see feb_radio_kill_switch_toggle()'s own comment on why that
+       invariant matters). */
+    radio_kill_switch_enabled = false;
+
     feb_status_led_init();
     feb_factory_reset_start();
     feb_status_display_start();
+    feb_radio_kill_switch_start();
 
     location_init();
     cluster_link_init();
@@ -4305,13 +4752,19 @@ void app_main(void)
                  board_id_buf, (unsigned)FEB_PAIRING_WINDOW_MS);
     }
 
-    start_wifi_subsystem();
+    if (radio_on) {
+        start_wifi_subsystem();
 
-    err = nimble_port_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "NimBLE initialization failed: %s", esp_err_to_name(err));
-        return;
+        err = nimble_port_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "NimBLE initialization failed: %s", esp_err_to_name(err));
+            return;
+        }
+        ble_hs_cfg.sync_cb = host_synced;
+        nimble_port_freertos_init(nimble_host_task);
+        radio_kill_switch_enabled = true;
+    } else {
+        feb_status_display_set_ble_state(FEB_DISPLAY_BLE_RADIO_OFF);
+        ESP_LOGW(TAG, "radio kill-switch: booting with Wi-Fi/BLE suppressed (persisted off)");
     }
-    ble_hs_cfg.sync_cb = host_synced;
-    nimble_port_freertos_init(nimble_host_task);
 }

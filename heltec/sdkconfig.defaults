@@ -1,4 +1,9 @@
 CONFIG_IDF_TARGET="esp32"
+# docs/HARDENING_PLAN.md HP-14 (2026-09-28): -Og was a debug-speed default never revisited for
+# production. -Os shrinks .text/.rodata/.data directly and is the cheapest available way to
+# claw back headroom against this board's near-zero IRAM/DRAM ceiling (see BL25/BL27) before
+# any of HP-04/HP-05/HP-12/HP-13's own byte costs land. Assertions stay enabled (see below).
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
@@ -30,3 +35,24 @@ CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
 # once-a-second OLED refresh from ordinary task context, so the perf cost of leaving the ISR
 # handler in flash is irrelevant here.
 CONFIG_I2C_MASTER_ISR_HANDLER_IN_IRAM=n
+
+# radio_killswitch.c (GPIO2 touch kill-switch, 2026-09-27) uses classic ESP32's only touch
+# driver available for this IDF version's esp32 target -- the legacy driver/touch_pad.h API
+# (the newer touch_sens component is S2/S3/P4-only). That legacy header self-deprecates with a
+# #warning pointing at a component this target can't use; suppressed here rather than left to
+# trip -Werror, per the header's own documented Kconfig escape hatch.
+CONFIG_TOUCH_SUPPRESS_DEPRECATE_WARN=y
+
+# docs/HARDENING_PLAN.md HP-12/HP-27 (2026-09-28): this project's most repeated bug class is
+# task stack overflow (SESSION_MEMORY "steps 3, 5, 7, wifi_scan"), yet
+# CONFIG_COMPILER_STACK_CHECK_MODE_NONE was the (implicit) default on every target. NORM adds
+# -fstack-protector (return-address canary on functions with large/array locals) at a real but
+# modest .text/performance cost; STRONG/ALL were not tried given this board's tight IRAM.
+# CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY is pinned explicitly even though it was already
+# this IDF version's effective default (confirmed in a from-scratch sdkconfig) -- listed here so
+# it can't silently drift if a future IDF upgrade changes that default. CONFIG_ESP_TASK_WDT_PANIC
+# turns a starved task (e.g. the exact HP-02 zero-delay-refire class) into a clean panic/reboot
+# instead of a silent, indefinitely-wedged board.
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+CONFIG_ESP_TASK_WDT_PANIC=y

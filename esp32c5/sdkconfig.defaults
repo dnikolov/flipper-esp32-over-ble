@@ -6,6 +6,17 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_MBEDTLS_HKDF_C=y
 
+# docs/HARDENING_PLAN.md HP-12/HP-14/HP-27 (2026-09-28): this project's most repeated bug
+# class is task stack overflow (SESSION_MEMORY "steps 3, 5, 7, wifi_scan"; HP-15) -- without a
+# compiler-inserted canary it shows up as silent corruption instead of a clean abort.
+# -Os also frees flash/IRAM the same way it did for the Flipper's -Og->-Os move (see CLAUDE.md).
+# CONFIG_ESP_TASK_WDT_PANIC makes genuine task starvation (e.g. HP-02's class of bug) panic
+# instead of only logging.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+
 # docs/PLAN.md Phase 8 Step 3 (2026-09-25): wardriving is now ported, needing its own
 # dedicated raw-flash "wardrive" data partition (wardriving_log.c) -- the stock single-app
 # table used during the step-2 transport+capability port (no wardrive partition) is replaced

@@ -43,6 +43,13 @@ over the hardware doc's pre-acquisition framing):
   the classic esptool DTR/RTS auto-reset sequence, not the C6's native-USB reset handling.
   Known port from recent sessions: `COM10` — reconfirm every session, not stable across
   reboots/replugs.
+- **A plain `idf_monitor.py` connection also triggers this same DTR/RTS reset on open** — it is
+  not exempt just because the intent is passive observation. This wiped live RAM-only state
+  (`meshcore_table`/`meshtastic_table`) mid-investigation on 2026-09-27, destroying the exact
+  sightings being diagnosed, and the user explicitly said not to let that happen again. Always
+  pass `--no-reset` (or use a raw serial connection that never asserts/deasserts DTR or RTS at
+  all) for any read-only log capture on this board — verify the connection method won't reset
+  before running it, never discover it after the fact.
 
 Key facts worth internalizing rather than re-deriving each time (vendor-doc-sourced, see the
 hardware README for citations):
@@ -149,6 +156,15 @@ shared): [docs/LESSONS.md](../../docs/LESSONS.md).
   the C6 side (steps 3, 5, 7, and `wifi_scan`). Any new BLE-callback-path code here should
   default to file-scope `static` storage for non-trivial buffers, and get a real
   `-fstack-usage` check before being trusted at a tight budget.
+- **Wardriving BLE discovery doubles as the reconnect scan.** Keep `start_scan()`'s centralized
+  `wardriving_ble_active` guard. Never skip the BLE interval callback's discovery for "no GPS
+  fix"; discard no-fix results at window close instead. Clamp any no-fix Wi-Fi re-arm with
+  `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS`. See
+  `docs/LESSONS.md#wardriving-ble-discovery-is-the-reconnect-scan` and `#no-fix-retry-needs-a-floor`.
+- **Any code path the touch kill-switch (`radio_ks` task) reaches runs off the NimBLE host
+  task.** Heap pointers shared with host-task callbacks need a lock plus a deferred-free
+  handoff, not just a flag (HP-04, `cluster_flush_records_release()`). The Wi-Fi subsystem
+  splits into a once-only init and a restartable start (HP-05).
 
 ## Build and validate
 

@@ -47,6 +47,24 @@ int main(void)
        but structurally identical otherwise; checksum computed (not hand-derived) since XOR
        of "12.3" happens to equal XOR of "0.00", so it's unchanged from rmc_fix's *72. */
     static const char rmc_speed[] = "$GNRMC,091010.000,A,4242.30373,N,02742.79804,E,12.3,0.00,120926,,,A*72";
+    /* HP-23: checksum-valid but out-of-range hh/mm/ss/day/month fields -- each digit-shape
+       correct (would parse fine before the range check) but semantically impossible, the
+       failure mode a corrupt-but-checksum-passing byte can produce. Checksums hand-computed
+       (not copied from rmc_fix) since the payload bytes differ. */
+    static const char rmc_hour_25[] =
+        "$GNRMC,251010.000,A,4242.30373,N,02742.79804,E,0.00,0.00,120926,,,A*7C";
+    static const char rmc_minute_60[] =
+        "$GNRMC,096010.000,A,4242.30373,N,02742.79804,E,0.00,0.00,120926,,,A*75";
+    static const char rmc_second_61[] =
+        "$GNRMC,091061.000,A,4242.30373,N,02742.79804,E,0.00,0.00,120926,,,A*74";
+    /* :60 is accepted (leap second tolerance, see nmea_parse_rmc()'s comment), unlike the
+       three above. */
+    static const char rmc_second_60[] =
+        "$GNRMC,091060.000,A,4242.30373,N,02742.79804,E,0.00,0.00,120926,,,A*75";
+    static const char rmc_day_32[] =
+        "$GNRMC,091010.000,A,4242.30373,N,02742.79804,E,0.00,0.00,320926,,,A*70";
+    static const char rmc_month_13[] =
+        "$GNRMC,091010.000,A,4242.30373,N,02742.79804,E,0.00,0.00,121326,,,A*79";
 
     nmea_gga_t gga;
     nmea_rmc_t rmc;
@@ -94,6 +112,20 @@ int main(void)
     check(!nmea_parse_rmc(gga_fix, strlen(gga_fix), &rmc), "RMC parser rejects a GGA sentence");
     check(!nmea_parse_gga(gga_bad_checksum, strlen(gga_bad_checksum), &gga),
           "GGA parser rejects a checksum failure");
+
+    check(!nmea_parse_rmc(rmc_hour_25, strlen(rmc_hour_25), &rmc),
+          "RMC parser rejects hour 25 (checksum-valid, out of range)");
+    check(!nmea_parse_rmc(rmc_minute_60, strlen(rmc_minute_60), &rmc),
+          "RMC parser rejects minute 60 (checksum-valid, out of range)");
+    check(!nmea_parse_rmc(rmc_second_61, strlen(rmc_second_61), &rmc),
+          "RMC parser rejects second 61 (checksum-valid, out of range)");
+    ok = nmea_parse_rmc(rmc_second_60, strlen(rmc_second_60), &rmc);
+    ok = ok && rmc.second == 60;
+    check(ok, "RMC parser accepts second 60 (leap-second tolerance)");
+    check(!nmea_parse_rmc(rmc_day_32, strlen(rmc_day_32), &rmc),
+          "RMC parser rejects day 32 (checksum-valid, out of range)");
+    check(!nmea_parse_rmc(rmc_month_13, strlen(rmc_month_13), &rmc),
+          "RMC parser rejects month 13 (checksum-valid, out of range)");
 
     printf("\n%s\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return g_failures == 0 ? 0 : 1;

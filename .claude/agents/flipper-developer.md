@@ -170,11 +170,48 @@ resolves `APPSRC` from a recognized `applications_user/` subdirectory, so sync t
 source into a temp copy there first):
 
 ```powershell
-fbt.cmd fap_flipper_esp32_over_ble
+fbt.cmd DEBUG=0 fap_flipper_esp32_over_ble
 ```
 
-Artifact: `build/f7-firmware-D/.extapps/flipper_esp32_over_ble.fap` inside that checkout.
-Report the exact artifact path and size after a build. For a generic standalone-FAP repo
+Artifact: `build/f7-firmware/.extapps/flipper_esp32_over_ble.fap` inside that checkout.
+Report the exact artifact path and size after a build.
+
+**`DEBUG=0` is not optional here, and the artifact is the release directory, not
+`f7-firmware-D/`** (changed 2026-09-28; every session before that built and flashed the debug
+artifact). See the memory-budget rule below for why. `tools/build_flipper.ps1` already does this
+by default — prefer it over calling `fbt.cmd` yourself; `-DebugBuild` gets the `-Og` artifact
+back if you genuinely need a debugger session.
+
+## Memory budget — read before adding any buffer
+
+An external FAP is not linked into a fixed memory map like normal firmware. Every allocatable
+section — `.text`, `.rodata`, `.data`, **and `.bss`** — gets its own `aligned_malloc()` from the
+*live Flipper system heap* at launch (`lib/flipper_application/elf/elf_file.c`) and stays
+resident for the app's whole lifetime. Three consequences this project has learned the hard way
+(`docs/HARDENING_BACKLOG.md` H04; a real "out of memory" device reboot mid-wardriving-flush on
+2026-09-28):
+
+- **A `static` buffer is not free storage — it is a permanent bite out of the heap the rest of
+  the firmware shares.** This app's `.bss` reached 36 KB before it was cut back. Before adding a
+  `static`, ask whether a `union` with an existing one, a narrower field width, or an on-demand
+  `malloc()`/`free()` would do. The project's "any buffer >=100 bytes reachable from
+  `BleEventWorker` must be `static`" rule (`docs/LESSONS.md`) is about keeping buffers off that
+  1280-byte stack — **the heap satisfies it just as well as `.bss` does**, and that third option
+  was missed once already.
+- **Compiler optimization level is a memory decision on this target, not a build-speed one.**
+  `-Og` -> `-Os` was worth 11,799 bytes on this app. Hence `DEBUG=0` above.
+- **Measure, do not estimate.** After any change that adds or moves storage, report real numbers
+  from the built ELF:
+  ```
+  arm-none-eabi-size -A build/f7-firmware/.extapps/flipper_esp32_over_ble_d.elf
+  arm-none-eabi-nm -S --size-sort -td <same elf> | grep -iE ' [bB] ' | tail -20
+  ```
+  (toolchain at `<unleashed-checkout>/toolchain/x86_64-windows/bin/`).
+- **When you fold scattered `static` arrays into a struct, grep every folded name for
+  `sizeof(<name>)` first.** `static limb a[19]` -> `limb *a = ctx->a` silently turns
+  `memset(a, 0, sizeof(a))` into a 4-byte clear via array-to-pointer decay, and `static`'s
+  zero-init masks it until the second call. This shipped once in `pairing_crypto.c` and was
+  caught only by the RFC 7748 host vectors, not by reading the diff. For a generic standalone-FAP repo
 (not this pinned setup) the general path is `ufbt` — see
 [.github/agents/flipper-developer.agent.md](../../.github/agents/flipper-developer.agent.md)
 for that flow, but this project builds against the pinned checkout above, not a floating

@@ -249,10 +249,29 @@ static void wardriving_dedup_record_address(const feb_wardriving_record_t *recor
     }
 }
 
+/* cbor_wardriving.c's decoder already rejects any wire `rssi_offset > 255` before a record
+   reaches here, so `rssi_offset - 128` is always exactly in [-128, 127] -- this clamp is
+   belt-and-suspenders against a future caller that builds a feb_wardriving_record_t some
+   other way (a test, a future in-process path), not evidence the decoder needs the same
+   guard duplicated. Returned widened to int32_t so callers can subtract it from another
+   int32_t without re-deriving the promotion themselves; the caller-side entry storage is
+   the narrower int8_t (see wardriving_csv.h). */
 static int32_t wardriving_dedup_record_rssi_dbm(const feb_wardriving_record_t *record) {
     uint64_t rssi_offset = (record->payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI) ?
         record->payload.wifi.rssi_offset : record->payload.ble.rssi_offset;
+    if (rssi_offset > 255u) {
+        rssi_offset = 255u;
+    }
     return (int32_t)rssi_offset - 128;
+}
+
+/* Defensive clamp for a lat/lon e7-offset on its way into the narrowed uint32_t entry
+   fields -- cbor_wardriving.c's decoder does not itself bound lat_e7_offset/lon_e7_offset
+   (they're plain uint64_t on the wire), so a malformed/oversized value must not silently
+   truncate when narrowed. Real encoded values top out at 3600000000 (lon), comfortably
+   inside uint32_t's 4294967295 max. */
+static uint32_t wardriving_dedup_clamp_u32(uint64_t value) {
+    return (value > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)value;
 }
 
 /* Flat-earth approximation -- adequate at the ~30m scale FEB_WARDRIVING_DEDUP_MOVE_METERS
@@ -283,11 +302,18 @@ void feb_wardriving_dedup_reset(feb_wardriving_dedup_table_t *table) {
 static bool wardriving_dedup_table_should_write(
     feb_wardriving_dedup_entry_t *entries,
     size_t capacity,
-    uint32_t *next_evict_index,
+    uint8_t *next_evict_index,
     const uint8_t address[6],
     int32_t rssi_dbm,
     uint64_t lat_e7_offset,
     uint64_t lon_e7_offset) {
+    /* Clamped once here, not inside the loop/insert branches below -- both consumers (the
+       refresh-in-place compare/update and the new-slot insert) want the same clamped value,
+       and entry->last_lat_e7_offset/last_lon_e7_offset (uint32_t) can only ever hold the
+       clamped range anyway. */
+    uint32_t clamped_lat = wardriving_dedup_clamp_u32(lat_e7_offset);
+    uint32_t clamped_lon = wardriving_dedup_clamp_u32(lon_e7_offset);
+
     for (size_t i = 0; i < capacity; i++) {
         feb_wardriving_dedup_entry_t *entry = &entries[i];
 
@@ -296,15 +322,15 @@ static bool wardriving_dedup_table_should_write(
             bool moved = wardriving_dedup_distance_meters(
                              entry->last_lat_e7_offset,
                              entry->last_lon_e7_offset,
-                             lat_e7_offset,
-                             lon_e7_offset) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
+                             clamped_lat,
+                             clamped_lon) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
 
             if (!stronger && !moved) {
                 return false;
             }
-            entry->last_rssi_dbm = rssi_dbm;
-            entry->last_lat_e7_offset = lat_e7_offset;
-            entry->last_lon_e7_offset = lon_e7_offset;
+            entry->last_rssi_dbm = (int8_t)rssi_dbm;
+            entry->last_lat_e7_offset = clamped_lat;
+            entry->last_lon_e7_offset = clamped_lon;
             return true;
         }
     }
@@ -314,10 +340,10 @@ static bool wardriving_dedup_table_should_write(
 
         memcpy(slot->address, address, 6);
         slot->occupied = true;
-        slot->last_rssi_dbm = rssi_dbm;
-        slot->last_lat_e7_offset = lat_e7_offset;
-        slot->last_lon_e7_offset = lon_e7_offset;
-        *next_evict_index = (*next_evict_index + 1) % capacity;
+        slot->last_rssi_dbm = (int8_t)rssi_dbm;
+        slot->last_lat_e7_offset = clamped_lat;
+        slot->last_lon_e7_offset = clamped_lon;
+        *next_evict_index = (uint8_t)((*next_evict_index + 1) % capacity);
     }
     return true;
 }

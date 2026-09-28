@@ -51,4 +51,45 @@ static inline size_t feb_cbor_i_decode_expected_key(
     return n;
 }
 
+/* Decodes one map key and resolves it against a fixed field-name table, with the same
+   classification as the ESP32's name-table decoders (components/feb_protocol): a key not in
+   `names` is FEB_CBOR_ERR_UNEXPECTED_TYPE, one already in `seen_mask` is
+   FEB_CBOR_ERR_DUPLICATE_KEY, and one listed before `next_min` is FEB_CBOR_ERR_OUT_OF_ORDER.
+   Used where optional fields make the field set count-dependent, so both firmwares report
+   the same status for the same malformed map. */
+static inline size_t feb_cbor_i_decode_table_key(
+    const uint8_t* in,
+    size_t in_len,
+    const char* const* names,
+    size_t names_count,
+    uint32_t seen_mask,
+    size_t next_min,
+    size_t* field_index,
+    feb_cbor_status_t* status) {
+    const char* key_data;
+    size_t key_len;
+    size_t n =
+        feb_cbor_decode_text(in, in_len, &key_data, &key_len, FEB_CBOR_MAX_TEXT_LEN, status);
+    if(n == 0) {
+        return 0;
+    }
+    for(size_t j = 0; j < names_count; j++) {
+        if(feb_cbor_i_text_matches(key_data, key_len, names[j])) {
+            if(seen_mask & (1u << j)) {
+                *status = FEB_CBOR_ERR_DUPLICATE_KEY;
+                return 0;
+            }
+            if(j < next_min) {
+                *status = FEB_CBOR_ERR_OUT_OF_ORDER;
+                return 0;
+            }
+            *field_index = j;
+            *status = FEB_CBOR_OK;
+            return n;
+        }
+    }
+    *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    return 0;
+}
+
 #endif /* FEB_CBOR_INTERNAL_H */

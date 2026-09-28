@@ -143,6 +143,7 @@ feb_cbor_status_t
         uint64_t v;
         n = feb_cbor_decode_uint(in + pos, in_len - pos, &v, &status);
         if(n == 0) return status;
+        if(v > UINT32_MAX) return FEB_CBOR_ERR_TOO_LARGE;
         record->version = (uint32_t)v;
         pos += n;
     }
@@ -230,6 +231,7 @@ feb_cbor_status_t
         uint64_t v;
         n = feb_cbor_decode_uint(in + pos, in_len - pos, &v, &status);
         if(n == 0) return status;
+        if(v > UINT32_MAX) return FEB_CBOR_ERR_TOO_LARGE;
         record->version = (uint32_t)v;
         pos += n;
     }
@@ -693,6 +695,9 @@ feb_cbor_status_t
        representation, but both firmwares must apply it identically or one will accept a
        record the other rejects -- see the matching `result` comment in
        feb_cbor_decode_status_payload() below for the full accounting. */
+    if(pos >= in_len || (uint8_t)(in[pos] >> 5) != 5) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
     n = feb_cbor_skip_value(
         in + pos, in_len - pos, 0, &payload->arguments_span, &payload->arguments_span_len, &status);
     if(n == 0) return status;
@@ -797,6 +802,9 @@ feb_cbor_status_t
            from `status`. This is a decoder-internal bookkeeping convention with no wire
            representation, but must match the ESP32 side's decoder exactly -- confirmed
            against PROTOCOL.md's now-updated wording rather than invented independently. */
+        if(pos >= in_len || (uint8_t)(in[pos] >> 5) != 5) {
+            return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+        }
         n = feb_cbor_skip_value(
             in + pos, in_len - pos, 0, &payload->result_span, &payload->result_span_len, &status);
         if(n == 0) return status;

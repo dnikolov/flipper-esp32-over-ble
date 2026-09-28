@@ -6,6 +6,7 @@
 #include "framing.h"
 #include "cbor_codec.h"
 #include "wardriving_csv.h"
+#include "mesh_nodes.h"
 #include "vectors.h"
 
 static int g_total = 0;
@@ -1761,6 +1762,426 @@ static void test_wardriving_dedup_wifi_survives_ble_eviction(void) {
         "DEDUP_CROSS: the Wi-Fi entry survives BLE sub-table churn, still recognized as a repeat");
 }
 
+/* Regression test for the 2026-09-28 entry-narrowing pass (32 -> 16 bytes/entry): pins the
+   max-valid wire offset round-tripping without precision loss through the narrower uint32_t
+   storage, and that an out-of-range/malformed offset clamps rather than wraps -- and does not
+   corrupt an unrelated entry's own dedup comparison. */
+static void test_wardriving_dedup_offset_bounds(void) {
+    static const uint8_t addr_max[6] = {0x20, 0x00, 0x00, 0x00, 0x00, 0x01};
+    static const uint8_t addr_oversized[6] = {0x20, 0x00, 0x00, 0x00, 0x00, 0x02};
+
+    CHECK(
+        sizeof(feb_wardriving_dedup_entry_t) == 16,
+        "DEDUP_SIZE: entry narrowed to exactly 16 bytes");
+    CHECK(
+        sizeof(feb_wardriving_dedup_table_t) == 2312,
+        "DEDUP_SIZE: table narrowed to exactly 2312 bytes (was 4624)");
+
+    feb_wardriving_dedup_table_t table;
+    feb_wardriving_dedup_reset(&table);
+
+    /* Max valid wire lat/lon offsets (lat=+90, lon=+180 per docs/PROTOCOL.md's encoding) fit
+       uint32_t exactly -- 3600000000 < UINT32_MAX (4294967295). */
+    uint64_t max_lat = 1800000000u;
+    uint64_t max_lon = 3600000000u;
+    feb_wardriving_record_t r1 = make_dedup_wifi_record(addr_max, -60, max_lat, max_lon);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r1),
+        "DEDUP_BOUNDS: max valid lat/lon offset is written as new");
+    feb_wardriving_record_t r2 = make_dedup_wifi_record(addr_max, -60, max_lat, max_lon);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r2),
+        "DEDUP_BOUNDS: identical repeat at the max valid offset is still recognized (no "
+        "precision lost narrowing the wire's uint64_t down to the entry's uint32_t)");
+
+    /* A malformed wire value far past any real encoding's range must clamp, not wrap, when
+       narrowed -- and must not disturb an unrelated, validly-ranged entry already in the
+       table (a naive truncating cast could alias two very different oversized values onto
+       the same stored bit pattern; clamping instead just pins both at the ceiling). */
+    uint64_t oversized = (uint64_t)UINT32_MAX + 12345u;
+    feb_wardriving_record_t r3 =
+        make_dedup_wifi_record(addr_oversized, -60, oversized, oversized);
+    CHECK(
+        feb_wardriving_dedup_should_write(&table, &r3),
+        "DEDUP_BOUNDS: an oversized malformed offset is still written (clamped, not rejected)");
+
+    feb_wardriving_record_t r4 = make_dedup_wifi_record(addr_max, -60, max_lat, max_lon);
+    CHECK(
+        !feb_wardriving_dedup_should_write(&table, &r4),
+        "DEDUP_BOUNDS: the unrelated max-valid-offset entry is unaffected by another "
+        "address's oversized clamp");
+}
+
+/* ---- meshcore_scan codec vectors (HP-20; docs/PROTOCOL.md "`meshcore_scan` command and
+   status payloads"). Mirrors tests/esp32/test_framing_cbor.c's own meshcore tests -- same
+   vectors, same expected field values -- since flipper/cbor_meshcore.c is an independently
+   written decoder for the same wire shapes (SESSION_MEMORY.md's "parallel-codec drift"
+   pattern), not a shared component with the ESP32 side. */
+static void test_meshcore_node_vectors(void) {
+    feb_meshcore_node_t node;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+
+    encoded_len =
+        feb_cbor_decode_meshcore_node(FEB_VEC_MESHCORE_NODE1, FEB_VEC_MESHCORE_NODE1_LEN, &node, &status);
+    CHECK(
+        encoded_len == FEB_VEC_MESHCORE_NODE1_LEN && status == FEB_CBOR_OK &&
+            node.node_id_len == 16 && memcmp(node.node_id, "aabbccddeeff0011", 16) == 0 &&
+            node.has_name && node.name_len == strlen("Bob's Node") &&
+            memcmp(node.name, "Bob's Node", node.name_len) == 0 &&
+            node.role_len == strlen("repeater") && memcmp(node.role, "repeater", node.role_len) == 0 &&
+            node.rssi_offset == 58 /* -70 + 128 */ && node.last_seen_ms == 12345 && !node.has_location,
+        "MESHCORE_NODE1: decodes node_id/name/role/rssi_offset/last_seen_ms, no location");
+
+    encoded_len = feb_cbor_encode_meshcore_node(encode_buf, sizeof(encode_buf), &node);
+    CHECK(
+        bytes_equal(encode_buf, encoded_len, FEB_VEC_MESHCORE_NODE1, FEB_VEC_MESHCORE_NODE1_LEN),
+        "MESHCORE_NODE1: encode round-trip byte-identical");
+
+    encoded_len =
+        feb_cbor_decode_meshcore_node(FEB_VEC_MESHCORE_NODE2, FEB_VEC_MESHCORE_NODE2_LEN, &node, &status);
+    CHECK(
+        encoded_len == FEB_VEC_MESHCORE_NODE2_LEN && status == FEB_CBOR_OK && !node.has_name &&
+            node.rssi_offset == 0 /* -128 + 128, low extreme */ && node.has_location &&
+            node.lat_e7_offset == (uint64_t)(423601000 + 900000000) &&
+            node.lon_e7_offset == (uint64_t)(1800000000 - 710589000),
+        "MESHCORE_NODE2: no name (optional omission), has location, rssi at low extreme");
+
+    encoded_len = feb_cbor_encode_meshcore_node(encode_buf, sizeof(encode_buf), &node);
+    CHECK(
+        bytes_equal(encode_buf, encoded_len, FEB_VEC_MESHCORE_NODE2, FEB_VEC_MESHCORE_NODE2_LEN),
+        "MESHCORE_NODE2: encode round-trip byte-identical");
+
+    /* Shared expected code with tests/esp32/test_framing_cbor.c: lat_e7_offset without
+       lon_e7_offset is a missing field on both firmwares (both decoders resolve keys
+       against the same field-name table). */
+    encoded_len = feb_cbor_decode_meshcore_node(
+        FEB_VEC_MESHCORE_NODE_BAD_LOCATION_PAIR, FEB_VEC_MESHCORE_NODE_BAD_LOCATION_PAIR_LEN, &node, &status);
+    CHECK(
+        encoded_len == 0 && status == FEB_CBOR_ERR_MISSING_FIELD,
+        "MESHCORE_NODE_BAD_LOCATION_PAIR: rejected FEB_CBOR_ERR_MISSING_FIELD (same as ESP32)");
+}
+
+static void test_meshcore_command_and_status_vectors(void) {
+    {
+        feb_command_payload_t cmd;
+        size_t arg_count;
+        feb_cbor_status_t status;
+        uint8_t encode_buf[128];
+        size_t encoded_len;
+
+        feb_cbor_status_t cmd_status = feb_cbor_decode_command_payload(
+            FEB_VEC_MESHCORE_COMMAND_PAYLOAD, FEB_VEC_MESHCORE_COMMAND_PAYLOAD_LEN, &cmd);
+        CHECK(
+            cmd_status == FEB_CBOR_OK && cmd.capability_len == strlen("meshcore_scan") &&
+                memcmp(cmd.capability, "meshcore_scan", cmd.capability_len) == 0 &&
+                cmd.request_id == 701 &&
+                feb_cbor_decode_map_header(cmd.arguments_span, cmd.arguments_span_len, &arg_count, &status) >
+                    0 &&
+                arg_count == 0,
+            "MESHCORE_COMMAND: decodes capability/request_id/empty arguments");
+
+        encoded_len = feb_cbor_encode_command_payload(encode_buf, sizeof(encode_buf), &cmd);
+        CHECK(
+            bytes_equal(
+                encode_buf, encoded_len, FEB_VEC_MESHCORE_COMMAND_PAYLOAD, FEB_VEC_MESHCORE_COMMAND_PAYLOAD_LEN),
+            "MESHCORE_COMMAND: encode round-trip byte-identical");
+    }
+
+    {
+        feb_status_payload_t st;
+        feb_meshcore_status_result_payload_t result;
+        uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+        size_t encoded_len;
+
+        feb_cbor_status_t status = feb_cbor_decode_status_payload(
+            FEB_VEC_MESHCORE_STATUS_PAYLOAD, FEB_VEC_MESHCORE_STATUS_PAYLOAD_LEN, &st);
+        CHECK(
+            status == FEB_CBOR_OK && st.request_id == 701 && st.has_result &&
+                st.state_len == strlen("ok") && memcmp(st.state, "ok", st.state_len) == 0,
+            "MESHCORE_STATUS: decodes request_id/state(\"ok\")/result");
+
+        feb_cbor_status_t result_status =
+            feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        CHECK(
+            result_status == FEB_CBOR_OK && result.node_count == 2 && result.total_known_nodes == 5,
+            "MESHCORE_STATUS: result decodes nodes[]/total_known_nodes (total_known_nodes > "
+            "nodes.length signals a truncated listing)");
+
+        encoded_len =
+            feb_cbor_encode_meshcore_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+        CHECK(
+            bytes_equal(
+                encode_buf, encoded_len, FEB_VEC_MESHCORE_RESULT_MULTI, FEB_VEC_MESHCORE_RESULT_MULTI_LEN),
+            "MESHCORE_STATUS: result encode round-trip byte-identical");
+
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        CHECK(
+            bytes_equal(
+                encode_buf, encoded_len, FEB_VEC_MESHCORE_STATUS_PAYLOAD, FEB_VEC_MESHCORE_STATUS_PAYLOAD_LEN),
+            "MESHCORE_STATUS: full status payload encode round-trip byte-identical");
+
+        status = feb_cbor_decode_status_payload(
+            FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD, FEB_VEC_MESHCORE_STATUS_EMPTY_PAYLOAD_LEN, &st);
+        CHECK(status == FEB_CBOR_OK && st.has_result, "MESHCORE_STATUS_EMPTY: decodes has_result");
+        result_status =
+            feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        CHECK(
+            result_status == FEB_CBOR_OK && result.node_count == 0 && result.total_known_nodes == 0,
+            "MESHCORE_STATUS_EMPTY: result decodes node_count=0/total_known_nodes=0");
+
+        CHECK(
+            FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN <= FEB_CBOR_MAX_PAYLOAD,
+            "MESHCORE_STATUS_WORST_CASE: frozen vector itself fits FEB_CBOR_MAX_PAYLOAD");
+        status = feb_cbor_decode_status_payload(
+            FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD, FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN, &st);
+        CHECK(status == FEB_CBOR_OK && st.has_result, "MESHCORE_STATUS_WORST_CASE: decodes has_result");
+        result_status =
+            feb_cbor_decode_meshcore_status_result_payload(st.result_span, st.result_span_len, &result);
+        CHECK(
+            result_status == FEB_CBOR_OK && result.node_count == FEB_MESHCORE_MAX_NODES_PER_RESULT,
+            "MESHCORE_STATUS_WORST_CASE: decodes a full FEB_MESHCORE_MAX_NODES_PER_RESULT batch");
+        encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+        CHECK(
+            encoded_len > 0 && encoded_len <= FEB_CBOR_MAX_PAYLOAD &&
+                bytes_equal(
+                    encode_buf,
+                    encoded_len,
+                    FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD,
+                    FEB_VEC_MESHCORE_STATUS_WORST_CASE_PAYLOAD_LEN),
+            "MESHCORE_STATUS_WORST_CASE: re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+    }
+}
+
+/* ---- mesh_log codec vectors (HP-20; docs/PROTOCOL.md "`mesh_log` command and status
+   payloads"). Mirrors tests/esp32/test_framing_cbor.c's own mesh_log tests -- same reasoning
+   as the meshcore vectors above. */
+static void test_mesh_log_record_vectors(void) {
+    feb_mesh_log_record_t record;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[256];
+    size_t encoded_len;
+
+    encoded_len = feb_cbor_decode_mesh_log_record(
+        FEB_VEC_MESH_LOG_RECORD1, FEB_VEC_MESH_LOG_RECORD1_LEN, &record, &status);
+    CHECK(
+        encoded_len == FEB_VEC_MESH_LOG_RECORD1_LEN && status == FEB_CBOR_OK &&
+            record.node_id_len == 16 && memcmp(record.node_id, "aabbccddeeff0011", 16) == 0 &&
+            record.network_len == strlen("meshcore") &&
+            memcmp(record.network, "meshcore", record.network_len) == 0 &&
+            record.lat_e7_offset == (uint64_t)(423601000 + 900000000) &&
+            record.lon_e7_offset == (uint64_t)(1800000000 - 710589000),
+        "MESH_LOG_RECORD1: decodes node_id/network/lat_e7_offset/lon_e7_offset (MeshCore-shaped)");
+
+    encoded_len = feb_cbor_encode_mesh_log_record(encode_buf, sizeof(encode_buf), &record);
+    CHECK(
+        bytes_equal(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RECORD1, FEB_VEC_MESH_LOG_RECORD1_LEN),
+        "MESH_LOG_RECORD1: encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_decode_mesh_log_record(
+        FEB_VEC_MESH_LOG_RECORD2, FEB_VEC_MESH_LOG_RECORD2_LEN, &record, &status);
+    CHECK(
+        encoded_len == FEB_VEC_MESH_LOG_RECORD2_LEN && status == FEB_CBOR_OK && record.node_id_len == 8 &&
+            memcmp(record.node_id, "433d2b1c", 8) == 0 && record.network_len == strlen("meshtastic") &&
+            memcmp(record.network, "meshtastic", record.network_len) == 0,
+        "MESH_LOG_RECORD2: decodes a shorter Meshtastic-shaped 8-hex node_id");
+
+    encoded_len = feb_cbor_encode_mesh_log_record(encode_buf, sizeof(encode_buf), &record);
+    CHECK(
+        bytes_equal(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RECORD2, FEB_VEC_MESH_LOG_RECORD2_LEN),
+        "MESH_LOG_RECORD2: encode round-trip byte-identical");
+
+    /* Shared expected code with tests/esp32/test_framing_cbor.c: an unrecognized key is
+       FEB_CBOR_ERR_UNEXPECTED_TYPE on both firmwares. */
+    encoded_len = feb_cbor_decode_mesh_log_record(
+        FEB_VEC_MESH_LOG_RECORD_BAD_FIELD, FEB_VEC_MESH_LOG_RECORD_BAD_FIELD_LEN, &record, &status);
+    CHECK(
+        encoded_len == 0 && status == FEB_CBOR_ERR_UNEXPECTED_TYPE,
+        "MESH_LOG_RECORD_BAD_FIELD: rejected FEB_CBOR_ERR_UNEXPECTED_TYPE (same as ESP32)");
+}
+
+static void test_mesh_log_status_vectors(void) {
+    feb_status_payload_t st;
+    feb_mesh_log_status_result_payload_t result;
+    feb_cbor_status_t status;
+    uint8_t encode_buf[FEB_CBOR_MAX_PAYLOAD];
+    size_t encoded_len;
+
+    status = feb_cbor_decode_status_payload(
+        FEB_VEC_MESH_LOG_STATUS_PAYLOAD, FEB_VEC_MESH_LOG_STATUS_PAYLOAD_LEN, &st);
+    CHECK(
+        status == FEB_CBOR_OK && st.request_id == 0 && st.has_result &&
+            st.state_len == strlen("mesh_data") && memcmp(st.state, "mesh_data", st.state_len) == 0,
+        "MESH_LOG_STATUS: decodes request_id(0)/state(\"mesh_data\")/result");
+
+    status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+    CHECK(
+        status == FEB_CBOR_OK && result.record_count == 1 && result.backlog_remaining == 0,
+        "MESH_LOG_STATUS: result decodes records[]/backlog_remaining (caught up to live)");
+
+    encoded_len = feb_cbor_encode_mesh_log_status_result_payload(encode_buf, sizeof(encode_buf), &result);
+    CHECK(
+        bytes_equal(encode_buf, encoded_len, FEB_VEC_MESH_LOG_RESULT_ONE, FEB_VEC_MESH_LOG_RESULT_ONE_LEN),
+        "MESH_LOG_STATUS: result encode round-trip byte-identical");
+
+    encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+    CHECK(
+        bytes_equal(
+            encode_buf, encoded_len, FEB_VEC_MESH_LOG_STATUS_PAYLOAD, FEB_VEC_MESH_LOG_STATUS_PAYLOAD_LEN),
+        "MESH_LOG_STATUS: full status payload encode round-trip byte-identical");
+
+    status = feb_cbor_decode_status_payload(
+        FEB_VEC_MESH_LOG_STATUS_MORE_PENDING_PAYLOAD,
+        FEB_VEC_MESH_LOG_STATUS_MORE_PENDING_PAYLOAD_LEN,
+        &st);
+    CHECK(status == FEB_CBOR_OK && st.has_result, "MESH_LOG_STATUS_MORE_PENDING: decodes has_result");
+    status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+    CHECK(
+        status == FEB_CBOR_OK && result.record_count == 1 && result.backlog_remaining == 3,
+        "MESH_LOG_STATUS_MORE_PENDING: backlog_remaining > 0 with only one record in this reply");
+
+    status = feb_cbor_decode_status_payload(
+        FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD, FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD_LEN, &st);
+    CHECK(status == FEB_CBOR_OK && st.has_result, "MESH_LOG_STATUS_EMPTY: decodes has_result");
+    status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+    CHECK(
+        status == FEB_CBOR_OK && result.record_count == 0 && result.backlog_remaining == 0,
+        "MESH_LOG_STATUS_EMPTY: result decodes record_count=0/backlog_remaining=0");
+
+    CHECK(
+        FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN <= FEB_CBOR_MAX_PAYLOAD,
+        "MESH_LOG_STATUS_WORST_CASE: frozen vector itself fits FEB_CBOR_MAX_PAYLOAD");
+    status = feb_cbor_decode_status_payload(
+        FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD, FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN, &st);
+    CHECK(status == FEB_CBOR_OK && st.has_result, "MESH_LOG_STATUS_WORST_CASE: decodes has_result");
+    status = feb_cbor_decode_mesh_log_status_result_payload(st.result_span, st.result_span_len, &result);
+    CHECK(
+        status == FEB_CBOR_OK && result.record_count == FEB_MESH_LOG_MAX_RECORDS_PER_BATCH,
+        "MESH_LOG_STATUS_WORST_CASE: decodes a full FEB_MESH_LOG_MAX_RECORDS_PER_BATCH batch");
+    encoded_len = feb_cbor_encode_status_payload(encode_buf, sizeof(encode_buf), &st);
+    CHECK(
+        encoded_len > 0 && encoded_len <= FEB_CBOR_MAX_PAYLOAD &&
+            bytes_equal(
+                encode_buf,
+                encoded_len,
+                FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD,
+                FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD_LEN),
+        "MESH_LOG_STATUS_WORST_CASE: re-encodes byte-identical and fits FEB_CBOR_MAX_PAYLOAD");
+}
+
+/* ---- mesh_nodes.c line format round-trip (HP-20) -- the exact "node_id|network|lat|lon"
+   format scripts/publish_wardriving.ps1's Get-MeshNodesFromLines parses (see that function's
+   own comment, and mesh_nodes.h's top comment for the wire-vs-flat-file distinction: this is
+   the Flipper's own on-SD-card accumulator format, not a CBOR wire shape, so it has no
+   tests/vectors/vectors.h entry -- there is nothing shared to diverge from, only this format
+   function and its own parser to check against each other). */
+static void test_mesh_nodes_line_roundtrip(void) {
+    char line[FEB_MESH_LOG_LINE_MAX_LEN];
+    size_t line_len;
+    feb_mesh_node_entry_t entry;
+
+    line_len = feb_mesh_log_format_line(
+        line, sizeof(line), "aabbccddeeff0011", 16, "meshcore", strlen("meshcore"), 42.3601, -7.1058929);
+    CHECK(line_len > 0 && line[line_len - 1] == '\n', "MESH_NODES_LINE: formats with trailing newline");
+    CHECK(
+        line_len > 0 &&
+            memcmp(line, "aabbccddeeff0011|meshcore|42.3601000|-7.1058929", line_len - 1) == 0,
+        "MESH_NODES_LINE: exact \"node_id|network|lat|lon\" format with %.7f precision");
+
+    /* feb_mesh_log_parse_line() expects the line WITHOUT the trailing '\n' -- same
+       caller-strips-it convention as wardriving_settings_load()'s own line splitting. */
+    CHECK(
+        line_len > 0 && feb_mesh_log_parse_line(line, line_len - 1, &entry) &&
+            strcmp(entry.node_id, "aabbccddeeff0011") == 0 && strcmp(entry.network, "meshcore") == 0 &&
+            entry.lat > 42.36009 && entry.lat < 42.36011 && entry.lon > -7.10590 && entry.lon < -7.10588,
+        "MESH_NODES_LINE: parses back node_id/network/lat/lon within float round-trip tolerance");
+
+    CHECK(
+        !feb_mesh_log_parse_line("only_two|fields", strlen("only_two|fields"), &entry),
+        "MESH_NODES_LINE: a line with fewer than 4 pipe-delimited fields is rejected");
+}
+
+/* HP-25/HP-26/HP-38 shared-layer strictness (tests/vectors/vectors.h). Same expected status
+   on both firmwares, independent of size_t width. */
+static void test_shared_strictness_vectors(void) {
+    feb_unencrypted_record_t rec;
+    feb_command_payload_t cmd;
+    feb_status_payload_t stp;
+    feb_cbor_status_t st = FEB_CBOR_OK;
+    size_t count = 0;
+    size_t n;
+    const uint8_t *span;
+    size_t span_len;
+    static const uint8_t map_head_u32_max[] = {0xBA, 0xFF, 0xFF, 0xFF, 0xFF};
+    static const char name32[] = "0123456789abcdef0123456789abcdef";
+
+    CHECK(feb_cbor_decode_unencrypted(FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD,
+                                         FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD_LEN, &rec) ==
+                 FEB_CBOR_ERR_TOO_LARGE,
+             "HP-25: record with 9-byte map count 2^32+5 rejected FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_map_header(FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD,
+                                   FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD_LEN, &count, &st);
+    CHECK(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: map header count 2^32+5 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_array_header(FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1,
+                                     FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1_LEN, &count, &st);
+    CHECK(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: array header count 2^32+1 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_skip_value(FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1, FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1_LEN, 0,
+                            &span, &span_len, &st);
+    CHECK(n == 0 && st == FEB_CBOR_ERR_TOO_LARGE, "HP-25: skip_value array count 2^32+1 -> FEB_CBOR_ERR_TOO_LARGE");
+    n = feb_cbor_decode_map_header(map_head_u32_max, sizeof(map_head_u32_max), &count, &st);
+    CHECK(n == 5 && st == FEB_CBOR_OK && count == 0xFFFFFFFFu, "HP-25: map header count UINT32_MAX still decodes");
+    CHECK(feb_cbor_decode_unencrypted(FEB_VEC_RECORD_VERSION_2POW32_PLUS_2, FEB_VEC_RECORD_VERSION_2POW32_PLUS_2_LEN,
+                                         &rec) == FEB_CBOR_ERR_TOO_LARGE,
+             "HP-25: record version 2^32+2 rejected FEB_CBOR_ERR_TOO_LARGE");
+
+    CHECK(feb_cbor_decode_command_payload(FEB_VEC_COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD,
+                                             FEB_VEC_COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD_LEN, &cmd) ==
+                 FEB_CBOR_ERR_UNEXPECTED_TYPE,
+             "HP-26: command.arguments not a map rejected FEB_CBOR_ERR_UNEXPECTED_TYPE");
+    CHECK(feb_cbor_decode_status_payload(FEB_VEC_STATUS_RESULT_NOT_MAP_PAYLOAD,
+                                            FEB_VEC_STATUS_RESULT_NOT_MAP_PAYLOAD_LEN, &stp) ==
+                 FEB_CBOR_ERR_UNEXPECTED_TYPE,
+             "HP-26: status.result not a map rejected FEB_CBOR_ERR_UNEXPECTED_TYPE");
+
+    {
+        feb_ble_scan_device_t dev;
+        feb_wardriving_record_t wr;
+        uint8_t out[256];
+
+        memset(&dev, 0, sizeof(dev));
+        dev.has_name = 1;
+        dev.name = name32;
+        dev.name_len = FEB_BLE_SCAN_NAME_MAX_LEN;
+        dev.rssi_offset = 100;
+        dev.addr_type = "public";
+        dev.addr_type_len = 6;
+        CHECK(feb_cbor_encode_ble_scan_device(out, sizeof(out), &dev) > 0,
+                 "HP-38: ble_scan device name of FEB_BLE_SCAN_NAME_MAX_LEN encodes");
+        dev.name_len = FEB_BLE_SCAN_NAME_MAX_LEN + 1u;
+        CHECK(feb_cbor_encode_ble_scan_device(out, sizeof(out), &dev) == 0,
+                 "HP-38: ble_scan device name of FEB_BLE_SCAN_NAME_MAX_LEN + 1 refused");
+
+        memset(&wr, 0, sizeof(wr));
+        wr.timestamp_ms = 1;
+        wr.utc_timestamp_s = 1;
+        wr.lat_e7_offset = 900000000u;
+        wr.lon_e7_offset = 1800000000u;
+        wr.source = "ble";
+        wr.source_len = 3;
+        wr.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+        wr.payload.ble.has_name = 1;
+        wr.payload.ble.name = name32;
+        wr.payload.ble.name_len = FEB_WARDRIVING_BLE_NAME_MAX_LEN;
+        wr.payload.ble.rssi_offset = 100;
+        CHECK(feb_cbor_encode_wardriving_record(out, sizeof(out), &wr) > 0,
+                 "HP-38: wardriving ble name of FEB_WARDRIVING_BLE_NAME_MAX_LEN encodes");
+        wr.payload.ble.name_len = FEB_WARDRIVING_BLE_NAME_MAX_LEN + 1u;
+        CHECK(feb_cbor_encode_wardriving_record(out, sizeof(out), &wr) == 0,
+                 "HP-38: wardriving ble name of FEB_WARDRIVING_BLE_NAME_MAX_LEN + 1 refused");
+    }
+}
+
 int main(void) {
     test_fragmentation_at_mtu(
         23,
@@ -1859,6 +2280,14 @@ int main(void) {
     test_wardriving_dedup();
     test_wardriving_dedup_eviction();
     test_wardriving_dedup_wifi_survives_ble_eviction();
+    test_wardriving_dedup_offset_bounds();
+
+    test_meshcore_node_vectors();
+    test_meshcore_command_and_status_vectors();
+    test_mesh_log_record_vectors();
+    test_mesh_log_status_vectors();
+    test_mesh_nodes_line_roundtrip();
+    test_shared_strictness_vectors();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;

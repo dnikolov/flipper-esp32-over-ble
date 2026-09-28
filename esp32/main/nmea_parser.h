@@ -53,11 +53,14 @@ typedef struct {
                                 empty-field convention, same as GGA's hdop_e1) */
 } nmea_rmc_t;
 
-/* Parses one RMC sentence. Returns false for a checksum failure, a non-RMC sentence, or a
-   malformed status/time/date field -- true otherwise (including status_active == false,
-   "void" fix). RMC's course field is structurally present on the wire but never extracted
-   here (docs/PLAN.md's scope boundary); speed-over-ground (field index 6) is parsed into
-   speed_knots_e1. */
+/* Parses one RMC sentence. Returns false for a checksum failure, a non-RMC sentence, a
+   malformed status/time/date field, or a structurally-well-formed but out-of-range time/date
+   field (hour>=24, minute/second>60, second>60, day outside 1..31, month outside 1..12 --
+   HP-23: a checksum-valid sentence is not proof the covered bytes weren't corrupted in a way
+   that still XORs to the same checksum byte) -- true otherwise (including status_active ==
+   false, "void" fix). second==60 is accepted (leap-second tolerance). RMC's course field is
+   structurally present on the wire but never extracted here (docs/PLAN.md's scope boundary);
+   speed-over-ground (field index 6) is parsed into speed_knots_e1. */
 bool nmea_parse_rmc(const char *line, size_t line_len, nmea_rmc_t *out);
 
 /* Unix epoch seconds for an RMC sentence's date+time fields, treated as UTC (NMEA's own

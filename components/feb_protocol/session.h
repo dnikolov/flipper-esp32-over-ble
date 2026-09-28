@@ -57,6 +57,10 @@
 #define FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32 0x00u
 #define FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER 0x01u
 
+/* docs/PROTOCOL.md: the nonce carries only the low 24 bits of `sequence`, so a sequence at or
+   above this cap would alias an earlier nonce. feb_session_encrypt_record() refuses it. */
+#define FEB_SESSION_SEQUENCE_MAX 0xFFFFFFu
+
 #define FEB_HELLO_TYPE "hello"
 #define FEB_HELLO_ACK_TYPE "hello_ack"
 #define FEB_CLIENT_AUTH_TYPE "client_auth"
@@ -165,8 +169,8 @@ void feb_session_build_nonce(
    (capacity `out_cap`). `ciphertext_scratch` (capacity `ciphertext_scratch_cap`, must be >=
    payload_len) receives the intermediate ciphertext bytes before feb_cbor_encode_protected()
    copies them into `out`. `direction` is the direction this record is being sent in.
-   Returns bytes written to `out`, or 0 on failure (oversized payload/output, or
-   ciphertext_scratch_cap < payload_len). */
+   Returns bytes written to `out`, or 0 on failure (oversized payload/output,
+   ciphertext_scratch_cap < payload_len, or sequence >= FEB_SESSION_SEQUENCE_MAX). */
 size_t feb_session_encrypt_record(
     const uint8_t session_key[FEB_SESSION_KEY_LEN],
     uint32_t version,
@@ -199,7 +203,9 @@ typedef struct {
    record actually travelled (the sender's direction, not the local role -- e.g. the ESP32
    passes FEB_SESSION_DIRECTION_FLIPPER_TO_ESP32 when decoding a record it received).
    Returns FEB_CBOR_OK with `record` fully populated on success; a feb_cbor_status_t decode
-   failure for malformed CBOR; or FEB_CBOR_ERR_AUTH_FAILED if the GCM tag does not verify.
+   failure for malformed CBOR, including an authenticated plaintext that is not exactly one
+   well-formed CBOR value (plaintext zeroized; trailing bytes -> FEB_CBOR_ERR_UNEXPECTED_TYPE);
+   or FEB_CBOR_ERR_AUTH_FAILED if the GCM tag does not verify.
    Every failure is fatal per docs/PROTOCOL.md ("discard the record and close the BLE
    connection without replying") -- this function does not itself close the connection,
    only reports the failure. Does NOT check `sequence` continuity, `board_id` against the

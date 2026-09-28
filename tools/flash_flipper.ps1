@@ -23,7 +23,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $FapPath) {
-    $FapPath = Join-Path $UnleashedRoot "build\f7-firmware-D\.extapps\$AppName.fap"
+    # Release build dir (build\f7-firmware\), matching tools\build_flipper.ps1's own default
+    # since 2026-09-28 -- see that script's header for why this app is now built -Os rather
+    # than fbt's default -Og. Pass -FapPath explicitly to flash a -DebugBuild artifact.
+    $FapPath = Join-Path $UnleashedRoot "build\f7-firmware\.extapps\$AppName.fap"
 }
 if (-not (Test-Path $FapPath)) {
     Write-Error "FAP not found at $FapPath -- build it first (tools/build_flipper.ps1)"
@@ -42,10 +45,15 @@ if ($Port -ne "auto") {
 }
 
 Push-Location $UnleashedRoot
+$savedEap = $ErrorActionPreference
 try {
+    # runfap.py logs to stderr; keep that from becoming a terminating error under "Stop" in
+    # hosts that wrap native stderr as ErrorRecords, and rely on the exit code instead.
+    $ErrorActionPreference = "Continue"
     python scripts/runfap.py -p $Port -s $FapPath -t $Target
     $transferExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $savedEap
     Pop-Location
 }
 if ($transferExit -ne 0) {

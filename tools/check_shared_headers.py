@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Compares the API surface of the shared esp32/flipper headers listed in HEADER_PAIRS.
+"""Compares the shared esp32/flipper headers (HEADER_PAIRS) and the per-board module copies
+(BOARD_MODULES) that esp32/, esp32c5/ and heltec/ each carry.
 
 Convention (stated in both docs/*-developer.md agent files): these headers' actual API
 surface -- function signatures, struct/enum layouts, macro names and values -- must stay
@@ -15,10 +16,21 @@ feb_wardriving_record_t: a tagged union on one side, two always-present named fi
 other -- same macros, same prototypes, invisible to this script's regexes). Treat a clean run
 as "no macro/prototype drift found", not "the two headers are proven equivalent".
 
+Per-board copies (HP-19): BOARD_IDENTICAL files must be byte-identical across all three
+boards (compared after CRLF->LF only). BOARD_EQUIVALENT files may differ in comments and
+whitespace only: their #define names/values are diffed (reported individually), and the rest of
+the comment-stripped, whitespace-collapsed code must match too, which also catches struct-body
+drift the flipper-pair check can't. BOARD_ALLOWED_MACRO_DIFFS lists the only intended
+per-board differences (GPS pins); their values are masked before the code comparison and
+printed as INFO. Multi-line #define continuations are joined before extraction everywhere.
+Longer term these modules belong in a shared component (docs/HARDENING_PLAN.md HP-19).
+
 Usage: python tools/check_shared_headers.py
-Exit code 0 if every pair matches, 1 if any pair has a macro or prototype-level mismatch.
+Exit code 0 if every pair and every per-board module matches, 1 on any mismatch or a missing
+per-board file.
 """
 
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -42,11 +54,43 @@ HEADER_PAIRS = [
     ("components/feb_protocol/session_crypto.h", "flipper/session_crypto.h"),
 ]
 
+BOARDS = ["esp32", "esp32c5", "heltec"]
+
+BOARD_IDENTICAL = [
+    "wardriving_validate.c",
+    "wardriving_dedup.c",
+    "wardriving_log.c",
+    "wardriving_record_format.c",
+    "wardriving_persist.c",
+    "nmea_parser.c",
+]
+
+BOARD_EQUIVALENT = [
+    "wardriving_validate.h",
+    "wardriving_dedup.h",
+    "wardriving_log.h",
+    "wardriving_record_format.h",
+    "wardriving_persist.h",
+    "nmea_parser.h",
+    "location.h",
+    "location.c",
+]
+
+# Intended per-board differences, derived by diffing the current copies (2026-09-28): only the
+# GPS UART pins differ (C6 RX18/TX19, C5 RX4/TX5, Heltec RX17/TX23).
+BOARD_ALLOWED_MACRO_DIFFS = {
+    "location.c": {"FEB_GPS_UART_RX_GPIO", "FEB_GPS_UART_TX_GPIO"},
+}
+
+
+def join_continuations(text):
+    return re.sub(r"\\[ \t]*\r?\n", " ", text)
+
 
 def strip_comments(text):
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     text = re.sub(r"//[^\n]*", "", text)
-    return text
+    return join_continuations(text)
 
 
 def extract_macros(text):
@@ -105,6 +149,68 @@ def compare(path_a, path_b):
     return problems
 
 
+def read_board_file(board, name):
+    path = ROOT / board / "main" / name
+    if not path.is_file():
+        return None
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
+def normalized_code(text, masked_macros):
+    def mask(m):
+        return f"#define {m.group(1)} <per-board>" if m.group(1) in masked_macros else m.group(0)
+
+    text = re.sub(r"^[ \t]*#define[ \t]+(\w+)\b.*$", mask, text, flags=re.M)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def compare_board_module(name, identical):
+    problems, info = [], []
+    raw = {b: read_board_file(b, name) for b in BOARDS}
+    missing = [b for b in BOARDS if raw[b] is None]
+    if missing:
+        problems.append(f"  missing in: {missing}")
+        return problems, info
+    ref = BOARDS[0]
+
+    if identical:
+        digests = {b: hashlib.sha256(raw[b]).hexdigest()[:12] for b in BOARDS}
+        if len(set(digests.values())) != 1:
+            problems.append("  not byte-identical: " + ", ".join(f"{b}={d}" for b, d in digests.items()))
+        return problems, info
+
+    allowed = BOARD_ALLOWED_MACRO_DIFFS.get(name, set())
+    texts = {b: strip_comments(raw[b].decode("utf-8", "replace")) for b in BOARDS}
+    macros = {b: extract_macros(texts[b]) for b in BOARDS}
+    all_names = sorted(set().union(*(set(m) for m in macros.values())))
+    for macro in all_names:
+        present = [b for b in BOARDS if macro in macros[b]]
+        if len(present) != len(BOARDS):
+            absent = [b for b in BOARDS if b not in present]
+            problems.append(f"  macro {macro} only in {present} (missing in {absent})")
+            continue
+        values = {b: macros[b][macro] for b in BOARDS}
+        if len(set(values.values())) != 1:
+            rendered = ", ".join(f"{b}={v!r}" for b, v in values.items())
+            if macro in allowed:
+                info.append(f"  INFO allowed per-board macro {macro}: {rendered}")
+            else:
+                problems.append(f"  macro {macro} differs: {rendered}")
+
+    if not problems:
+        codes = {b: normalized_code(texts[b], allowed) for b in BOARDS}
+        for b in BOARDS[1:]:
+            if codes[b] != codes[ref]:
+                a_code, b_code = codes[ref], codes[b]
+                i = next((k for k in range(min(len(a_code), len(b_code))) if a_code[k] != b_code[k]),
+                         min(len(a_code), len(b_code)))
+                problems.append(
+                    f"  code differs (outside comments/macros) {ref} vs {b} near: "
+                    f"{a_code[max(0, i - 40):i + 40]!r} / {b_code[max(0, i - 40):i + 40]!r}"
+                )
+    return problems, info
+
+
 def main():
     any_problems = False
     for path_a, path_b in HEADER_PAIRS:
@@ -116,6 +222,20 @@ def main():
                 print(p)
         else:
             print(f"OK: {path_a} <-> {path_b}")
+
+    for names, identical in ((BOARD_IDENTICAL, True), (BOARD_EQUIVALENT, False)):
+        for name in names:
+            problems, info = compare_board_module(name, identical)
+            label = f"{'/'.join(BOARDS)} main/{name}" + (" [byte-identical]" if identical else "")
+            if problems:
+                any_problems = True
+                print(f"MISMATCH: {label}")
+                for p in problems:
+                    print(p)
+            else:
+                print(f"OK: {label}")
+            for line in info:
+                print(line)
 
     if any_problems:
         print(

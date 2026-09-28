@@ -122,6 +122,12 @@ shared): [docs/LESSONS.md](../../docs/LESSONS.md).
 - `esptool` read commands are not reset-free by default (most use `--after hard_reset`). Pin
   `--before default_reset --after no_reset` for a true read-only snapshot. See
   `docs/LESSONS.md#esptool-read-commands-are-not-reset-free`.
+- **Wardriving BLE discovery doubles as the reconnect scan.** Keep `start_scan()`'s centralized
+  `wardriving_ble_active` guard (this board's Phase 8 port lost it once, HARDENING_PLAN.md
+  HP-01). Never skip the BLE interval callback's discovery for "no GPS fix"; discard no-fix
+  results at window close instead. Clamp any no-fix Wi-Fi re-arm with
+  `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS`. See
+  `docs/LESSONS.md#wardriving-ble-discovery-is-the-reconnect-scan` and `#no-fix-retry-needs-a-floor`.
 
 ## Build and validate
 

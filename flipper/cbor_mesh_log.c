@@ -57,6 +57,7 @@ size_t feb_cbor_decode_mesh_log_record(
     size_t in_len,
     feb_mesh_log_record_t* record,
     feb_cbor_status_t* status) {
+    static const char* const names[4] = {"node_id", "network", "lat_e7_offset", "lon_e7_offset"};
     if(in == NULL || record == NULL || status == NULL) {
         if(status != NULL) *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
         return 0;
@@ -67,67 +68,63 @@ size_t feb_cbor_decode_mesh_log_record(
     if(pos == 0) {
         return 0;
     }
-    if(count < 4) {
-        *status = FEB_CBOR_ERR_MISSING_FIELD;
-        return 0;
-    }
     if(count > 4) {
         *status = FEB_CBOR_ERR_TOO_MANY_ENTRIES;
         return 0;
     }
 
-    const uint8_t* seen_ptrs[4];
-    size_t seen_lens[4];
-    size_t n;
-
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "node_id", seen_ptrs, seen_lens, 0, status);
-    if(n == 0) return 0;
-    pos += n;
-    {
-        const char* data;
-        size_t len;
-        n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len, FEB_MESH_LOG_NODE_ID_MAX_LEN, status);
+    uint32_t seen = 0;
+    size_t next_min = 0;
+    for(size_t i = 0; i < count; i++) {
+        size_t field;
+        size_t n = feb_cbor_i_decode_table_key(
+            in + pos, in_len - pos, names, 4, seen, next_min, &field, status);
         if(n == 0) return 0;
-        if(len == 0) {
-            *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
-            return 0;
-        }
-        record->node_id = data;
-        record->node_id_len = len;
         pos += n;
+        switch(field) {
+        case 0:
+        case 1: {
+            const char* data;
+            size_t len;
+            n = feb_cbor_decode_text(
+                in + pos,
+                in_len - pos,
+                &data,
+                &len,
+                field == 0 ? FEB_MESH_LOG_NODE_ID_MAX_LEN : FEB_MESH_LOG_NETWORK_MAX_LEN,
+                status);
+            if(n == 0) return 0;
+            if(len == 0) {
+                *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
+                return 0;
+            }
+            if(field == 0) {
+                record->node_id = data;
+                record->node_id_len = len;
+            } else {
+                record->network = data;
+                record->network_len = len;
+            }
+            break;
+        }
+        default:
+            n = feb_cbor_decode_uint(
+                in + pos,
+                in_len - pos,
+                field == 2 ? &record->lat_e7_offset : &record->lon_e7_offset,
+                status);
+            if(n == 0) return 0;
+            break;
+        }
+        pos += n;
+        seen |= 1u << field;
+        next_min = field + 1;
     }
 
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "network", seen_ptrs, seen_lens, 1, status);
-    if(n == 0) return 0;
-    pos += n;
-    {
-        const char* data;
-        size_t len;
-        n = feb_cbor_decode_text(in + pos, in_len - pos, &data, &len, FEB_MESH_LOG_NETWORK_MAX_LEN, status);
-        if(n == 0) return 0;
-        if(len == 0) {
-            *status = FEB_CBOR_ERR_UNEXPECTED_TYPE;
-            return 0;
-        }
-        record->network = data;
-        record->network_len = len;
-        pos += n;
+    if(seen != 0xFu) {
+        *status = FEB_CBOR_ERR_MISSING_FIELD;
+        return 0;
     }
-
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lat_e7_offset", seen_ptrs, seen_lens, 2, status);
-    if(n == 0) return 0;
-    pos += n;
-    n = feb_cbor_decode_uint(in + pos, in_len - pos, &record->lat_e7_offset, status);
-    if(n == 0) return 0;
-    pos += n;
-
-    n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "lon_e7_offset", seen_ptrs, seen_lens, 3, status);
-    if(n == 0) return 0;
-    pos += n;
-    n = feb_cbor_decode_uint(in + pos, in_len - pos, &record->lon_e7_offset, status);
-    if(n == 0) return 0;
-    pos += n;
-
     *status = FEB_CBOR_OK;
     return pos;
 }

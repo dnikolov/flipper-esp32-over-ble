@@ -327,6 +327,12 @@ size_t feb_cbor_decode_map_header(const uint8_t *in, size_t in_len, size_t *coun
         }
         return 0;
     }
+    if (value > UINT32_MAX) {
+        if (status != NULL) {
+            *status = FEB_CBOR_ERR_TOO_LARGE;
+        }
+        return 0;
+    }
     *count = (size_t)value;
     if (status != NULL) {
         *status = FEB_CBOR_OK;
@@ -351,6 +357,12 @@ size_t feb_cbor_decode_array_header(const uint8_t *in, size_t in_len, size_t *co
     if (consumed == 0) {
         if (status != NULL) {
             *status = local_status;
+        }
+        return 0;
+    }
+    if (value > UINT32_MAX) {
+        if (status != NULL) {
+            *status = FEB_CBOR_ERR_TOO_LARGE;
         }
         return 0;
     }

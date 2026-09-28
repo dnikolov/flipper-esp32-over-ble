@@ -17,24 +17,17 @@
    byte 3-4: payload_len uint16, little-endian, max FEB_CLUSTER_MAX_PAYLOAD (512)
    byte 5..: payload    payload_len bytes, shape depends on msg_type
    last 2:   crc16      CCITT-FALSE (poly 0x1021, init 0xFFFF), over
-                        [msg_type, payload_len, payload] -- not the SOF bytes
-
-   docs/CLUSTER.md does not pin the CRC field's own transmission byte order. This
-   implementation sends/expects it little-endian (crc_lo, crc_hi), for consistency with
-   payload_len's explicitly-stated little-endian convention on the same frame. Flag this
-   for an explicit line in docs/CLUSTER.md before the Heltec/C6 sides are wired to two
-   independently-written decoders that could each guess differently.
+                        [msg_type, payload_len, payload] -- not the SOF bytes --
+                        transmitted little-endian (crc_lo, crc_hi), as docs/CLUSTER.md pins
 
    ---- Streaming decoder resync behavior (docs/CLUSTER.md) ----
-   Byte-at-a-time state machine: scan for 0xFE 0xED, then msg_type, then payload_len
-   (reject/resync immediately if it exceeds FEB_CLUSTER_MAX_PAYLOAD -- before consuming any
-   payload bytes, since a corrupted length field is exactly the case this must not trust),
-   then that many payload bytes, then the 2-byte CRC. On any validation failure (bad CRC or
-   oversized length), the decoder drops back to FEB_CLUSTER_DECODE_STATE_SEEK_SOF0 and the
-   *next* fed byte begins a fresh one-byte-at-a-time SOF scan -- it never skips a
-   declared-but-untrusted frame length's worth of bytes. The byte that triggered the
-   failure itself is consumed as part of the rejected frame, not re-examined as a
-   candidate SOF byte; only bytes fed after it are considered for the next resync scan. */
+   Scan for 0xFE 0xED, then msg_type, then payload_len (rejected as soon as it is read if it
+   exceeds FEB_CLUSTER_MAX_PAYLOAD, without waiting for any payload bytes), then that many
+   payload bytes, then the CRC. The decoder keeps every byte of an in-progress frame in its
+   own FEB_CLUSTER_MAX_FRAME_SIZE buffer, so on any validation failure (bad CRC or oversized
+   length) only the rejected frame's SOF0 byte is discarded and every byte after it is
+   re-scanned for the next SOF. A corrupted length field therefore cannot swallow the
+   frames that follow it: they are recovered from the buffered bytes (HP-30). */
 #ifndef FEB_CLUSTER_LINK_H
 #define FEB_CLUSTER_LINK_H
 
@@ -204,25 +197,10 @@ typedef struct {
     uint8_t payload[FEB_CLUSTER_MAX_PAYLOAD];
 } feb_cluster_frame_t;
 
-typedef enum {
-    FEB_CLUSTER_DECODE_STATE_SEEK_SOF0 = 0,
-    FEB_CLUSTER_DECODE_STATE_SEEK_SOF1,
-    FEB_CLUSTER_DECODE_STATE_MSG_TYPE,
-    FEB_CLUSTER_DECODE_STATE_LEN_LO,
-    FEB_CLUSTER_DECODE_STATE_LEN_HI,
-    FEB_CLUSTER_DECODE_STATE_PAYLOAD,
-    FEB_CLUSTER_DECODE_STATE_CRC_LO,
-    FEB_CLUSTER_DECODE_STATE_CRC_HI,
-} feb_cluster_decode_state_t;
-
 typedef struct {
-    feb_cluster_decode_state_t state;
-    uint8_t msg_type;
-    uint16_t payload_len;   /* declared length, validated <= FEB_CLUSTER_MAX_PAYLOAD */
-    uint16_t payload_pos;   /* payload bytes received so far in the current frame */
-    uint16_t crc_running;   /* CRC over msg_type/payload_len/payload received so far */
-    uint8_t crc_lo;         /* received CRC low byte, held while awaiting the high byte */
-    uint8_t payload[FEB_CLUSTER_MAX_PAYLOAD];
+    uint16_t start; /* first pending byte in buf */
+    uint16_t len;   /* one past the last pending byte in buf */
+    uint8_t buf[FEB_CLUSTER_MAX_FRAME_SIZE];
 } feb_cluster_decoder_t;
 
 void feb_cluster_decoder_init(feb_cluster_decoder_t *dec);
@@ -230,20 +208,26 @@ void feb_cluster_decoder_init(feb_cluster_decoder_t *dec);
 typedef enum {
     FEB_CLUSTER_DECODE_NEED_MORE = 0, /* byte consumed, no complete frame yet */
     FEB_CLUSTER_DECODE_FRAME_READY,    /* byte consumed, *out_frame is valid */
-    FEB_CLUSTER_DECODE_RESYNC,         /* byte consumed; an in-progress frame was dropped
-                                          (bad CRC or oversized payload_len) and the
-                                          decoder is scanning for the next SOF */
+    FEB_CLUSTER_DECODE_RESYNC,         /* byte consumed; a candidate frame was dropped
+                                          (bad CRC or oversized payload_len) and the bytes
+                                          after its SOF0 were re-scanned for the next SOF */
 } feb_cluster_decode_result_t;
 
-/* Feeds exactly one received byte into the decoder's state machine. Returns
-   FEB_CLUSTER_DECODE_FRAME_READY (and fills *out_frame) when that byte completed a
-   validated frame, FEB_CLUSTER_DECODE_RESYNC when that byte's frame failed validation
-   (dec has already reset to scan for the next SOF; *out_frame is untouched), or
-   FEB_CLUSTER_DECODE_NEED_MORE otherwise. `out_frame` may be NULL if the caller only
-   cares about the result code (e.g. tests exercising resync behavior). */
+/* Feeds exactly one received byte into the decoder. Returns FEB_CLUSTER_DECODE_FRAME_READY
+   (and fills *out_frame) when a validated frame is available, FEB_CLUSTER_DECODE_RESYNC when
+   a candidate frame was rejected during this call and no frame is ready (*out_frame is
+   untouched), or FEB_CLUSTER_DECODE_NEED_MORE otherwise. At most one frame is returned per
+   call; after a resync more complete frames may already be buffered, and the caller drains
+   them with feb_cluster_decoder_poll() (they are otherwise returned by later feed_byte()
+   calls). `out_frame` may be NULL if the caller only cares about the result code. */
 feb_cluster_decode_result_t feb_cluster_decoder_feed_byte(feb_cluster_decoder_t *dec,
                                                            uint8_t byte,
                                                            feb_cluster_frame_t *out_frame);
+
+/* Same as feb_cluster_decoder_feed_byte() without feeding a new byte: returns the next
+   already-buffered complete frame, if any. Call until it stops returning FRAME_READY. */
+feb_cluster_decode_result_t feb_cluster_decoder_poll(feb_cluster_decoder_t *dec,
+                                                      feb_cluster_frame_t *out_frame);
 
 /* Convenience wrapper over feb_cluster_decoder_feed_byte() for a chunk of `len` bytes.
    Every completed frame is appended to `frames` (capacity `max_frames`); frames beyond

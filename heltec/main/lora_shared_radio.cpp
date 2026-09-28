@@ -1,7 +1,5 @@
 #include "lora_shared_radio.h"
 
-#include <cstdio>
-
 #include <RadioLib.h>
 
 #include "meshcore_esp_hal.h"
@@ -168,70 +166,34 @@ static void IRAM_ATTR meshcore_on_packet(void)
     meshcore_packet_flag = true;
 }
 
-/* Temporary diagnostic logging -- remove once real-world MeshCore/Meshtastic reception is
-   confirmed working (see docs/BACKLOG.md's BL21). */
-#define LORA_RADIO_DIAG_HEX_BYTES 16u
-
-static void lora_radio_diag_hex(const uint8_t *frame, size_t len, char *out, size_t out_size)
-{
-    size_t dump_len = len < LORA_RADIO_DIAG_HEX_BYTES ? len : LORA_RADIO_DIAG_HEX_BYTES;
-    size_t pos = 0;
-
-    out[0] = '\0';
-    for (size_t i = 0; i < dump_len && pos + 3 < out_size; i++) {
-        int written = snprintf(out + pos, out_size - pos, "%02x ", (unsigned)frame[i]);
-        if (written <= 0) {
-            break;
-        }
-        pos += (size_t)written;
-    }
-}
-
 static void lora_handle_meshcore_frame(size_t len)
 {
     meshcore_advert_t advert;
-    char hex_buf[LORA_RADIO_DIAG_HEX_BYTES * 3u + 1u];
-
-    lora_radio_diag_hex(lora_frame_buf, len, hex_buf, sizeof(hex_buf));
-    ESP_LOGI(TAG, "diag: [meshcore] readData() ok, len=%u, rssi=%d dBm, bytes: %s",
-              (unsigned)len, (int)meshcore_radio->getRSSI(), hex_buf);
 
     if (meshcore_proto_parse(lora_frame_buf, len, &advert)) {
         int32_t rssi_dbm = (int32_t)meshcore_radio->getRSSI();
         uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
 
-        ESP_LOGI(TAG, "diag: [meshcore] meshcore_proto_parse() succeeded (valid ADVERT)");
         meshcore_table_upsert(&advert, rssi_dbm, now_ms);
-        ESP_LOGI(TAG, "diag: [meshcore] meshcore_table_upsert() done, node_id=%s",
-                  advert.node_id_hex);
         /* docs/WARDRIVING_PUBLISH.md "Mesh node publishing": only a sighting that carries a
            position is ever recorded here -- wdgwars.pl rejects positionless nodes anyway
            (`no_gps`), and this is the same has_location gate cbor_meshcore.h's own
            lat_e7_offset/lon_e7_offset optionality already documents. */
         if (advert.has_location) {
-            mesh_log_record_sighting(advert.node_id_hex, strlen(advert.node_id_hex),
+            (void)mesh_log_record_sighting(advert.node_id_hex, strlen(advert.node_id_hex),
                                      MESH_LOG_NETWORK_MESHCORE, advert.lat_e7, advert.lon_e7);
         }
-    } else {
-        ESP_LOGI(TAG, "diag: [meshcore] meshcore_proto_parse() failed (not a valid ADVERT)");
     }
 }
 
 static void lora_handle_meshtastic_frame(size_t len)
 {
     meshtastic_advert_t advert;
-    char hex_buf[LORA_RADIO_DIAG_HEX_BYTES * 3u + 1u];
-
-    lora_radio_diag_hex(lora_frame_buf, len, hex_buf, sizeof(hex_buf));
-    ESP_LOGI(TAG, "diag: [meshtastic] readData() ok, len=%u, rssi=%d dBm, bytes: %s",
-              (unsigned)len, (int)meshcore_radio->getRSSI(), hex_buf);
 
     if (meshtastic_proto_parse(lora_frame_buf, len, &advert)) {
         int32_t rssi_dbm = (int32_t)meshcore_radio->getRSSI();
         uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000);
 
-        ESP_LOGI(TAG, "diag: [meshtastic] meshtastic_proto_parse() succeeded, node_id=%s, has_name=%d",
-                  advert.node_id_hex, (int)advert.has_name);
         meshtastic_table_upsert(&advert, rssi_dbm, now_ms);
         /* docs/WARDRIVING_PUBLISH.md "Mesh node publishing": same has_location gate as the
            MeshCore call above -- a Meshtastic node only ever carries a position when it
@@ -240,11 +202,9 @@ static void lora_handle_meshtastic_frame(size_t len)
            called mesh_log_record_sighting() for Meshtastic at all because
            meshtastic_advert_t had no lat/lon field. */
         if (advert.has_location) {
-            mesh_log_record_sighting(advert.node_id_hex, strlen(advert.node_id_hex),
+            (void)mesh_log_record_sighting(advert.node_id_hex, strlen(advert.node_id_hex),
                                      MESH_LOG_NETWORK_MESHTASTIC, advert.lat_e7, advert.lon_e7);
         }
-    } else {
-        ESP_LOGI(TAG, "diag: [meshtastic] meshtastic_proto_parse() failed (frame shorter than a header)");
     }
 }
 
@@ -275,6 +235,24 @@ static void lora_shared_radio_switch_mode(void)
     ESP_LOGI(TAG, "switched listen mode -> %s", next_mode == LORA_MODE_MESHTASTIC ? "meshtastic" : "meshcore");
 }
 
+/* HARDENING_PLAN.md HP-15: this task's stack (MESHCORE_RADIO_TASK_STACK_SIZE) has never been
+   measured on hardware since the Meshtastic AES+protobuf decode path was added to its call
+   chain. Logged only on a new minimum (self-rate-limiting, no separate frame counter needed) --
+   0 extra .bss beyond this one word, since uxTaskGetStackHighWaterMark(NULL) needs no stored
+   task handle when called from the task being measured. */
+static UBaseType_t lora_rx_stack_min_words = (UBaseType_t)-1;
+
+static void lora_rx_log_stack_headroom(void)
+{
+    UBaseType_t words = uxTaskGetStackHighWaterMark(NULL);
+
+    if (words < lora_rx_stack_min_words) {
+        lora_rx_stack_min_words = words;
+        ESP_LOGI(TAG, "lora_shared_rx stack high-water mark: %u words (%u bytes) free",
+                  (unsigned)words, (unsigned)(words * sizeof(StackType_t)));
+    }
+}
+
 static void lora_shared_radio_task(void *arg)
 {
     uint64_t last_switch_ms = (uint64_t)(esp_timer_get_time() / 1000);
@@ -288,9 +266,6 @@ static void lora_shared_radio_task(void *arg)
             meshcore_packet_flag = false;
             len = meshcore_radio->getPacketLength();
 
-            ESP_LOGI(TAG, "diag: RX IRQ fired (mode=%s), getPacketLength()=%u",
-                      mode == LORA_MODE_MESHTASTIC ? "meshtastic" : "meshcore", (unsigned)len);
-
             if (len > 0 && len <= sizeof(lora_frame_buf)) {
                 int state = meshcore_radio->readData(lora_frame_buf, len);
 
@@ -300,13 +275,12 @@ static void lora_shared_radio_task(void *arg)
                     } else {
                         lora_handle_meshcore_frame(len);
                     }
-                } else {
-                    ESP_LOGW(TAG, "readData() failed: %d", state);
                 }
             } else if (len > 0) {
                 meshcore_radio->readData(lora_frame_buf, sizeof(lora_frame_buf));
                 ESP_LOGW(TAG, "dropped oversized frame (%u bytes)", (unsigned)len);
             }
+            lora_rx_log_stack_headroom();
         }
 
         {

@@ -108,7 +108,9 @@ This is a deliberate simplification over general canonical CBOR (RFC 8949 §4.2.
 
 **Nesting depth.** `FEB_CBOR_MAX_NESTING` (4) bounds the chain outer map → payload map → array/map → element. The payload span itself is validated at depth `2` (the outer record's own map decode is depth 0, the pairing/session envelope's outer map is not itself passed through the generic validator, and the payload span starts one level in at depth `2`); one further container level (depth `3`) and its own elements (depth `4`) are the deepest structure a payload may contain before rejection. This budget applies specifically to a field whose content is validated/captured *generically* via `feb_cbor_skip_value()` because its schema is still opaque at that call site (e.g. the top-level `payload` map itself, or `capability_query`'s currently-unused `requested` array). A field with its own dedicated, schema-aware decoder — one that knows its exact fixed field order rather than generically skipping it — is its own self-contained span and gets a **fresh depth budget starting at 0** when recursing into `feb_cbor_skip_value()` for any sub-piece of it that is still generically validated, rather than continuing to add to the depth already accumulated by whatever positioned it. `command.arguments` and `status.result` (see "`wifi_scan` command and status payloads" below) are both examples: `result`'s own real structure (`result` map → `aps` array → `<ap-result>` map → scalar fields) is 3 container levels deep, which would exceed `FEB_CBOR_MAX_NESTING` if it inherited depth `2` from being a field inside `payload` — but since `status`'s decoder is schema-aware down to the `<ap-result>` field level, `result` is validated as its own fresh span, not as continued generic descent from `payload`. This is a decoder-internal bookkeeping choice with no wire representation, but both firmwares' decoders must apply it identically or one will reject a record the other accepts.
 
-**Trailing bytes.** The three record-level decoders (`feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, `feb_cbor_decode_pairing_envelope`) must reject any input where decoding the fixed field set does not consume the entire buffer — decoding must end exactly at the buffer's length, with no unconsumed trailing bytes. This is not applied to the payload-specific decoders (`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`): those are always handed the exact `payload_span`/`payload_span_len` that `feb_cbor_skip_value()` already computed as the payload's own precise extent, so trailing bytes there are structurally impossible by construction, and a redundant check would add no coverage.
+**Trailing bytes.** The three record-level decoders (`feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, `feb_cbor_decode_pairing_envelope`) must reject any input where decoding the fixed field set does not consume the entire buffer — decoding must end exactly at the buffer's length, with no unconsumed trailing bytes. The payload decoders for unencrypted and pairing records (`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`) do not repeat the check. They are handed the exact `payload_span`/`payload_span_len` that `feb_cbor_skip_value()` already computed as the payload's own extent, so trailing bytes cannot occur there. That argument does not hold for a protected record: its payload decoders receive the whole decrypted plaintext, whose length is the ciphertext length the sender chose. So `feb_session_decrypt_record()` itself must require the authenticated plaintext to be exactly one well-formed CBOR value spanning all `plaintext_len` bytes, after the tag verifies and before it returns. Otherwise it zeroizes the plaintext and fails, with `FEB_CBOR_ERR_UNEXPECTED_TYPE` for trailing bytes or the failing head's own status for a malformed or truncated value. This one check covers every protected-record type on each firmware. It is structural only: an iterative item count with no nesting-depth or entry-count limit, because the schema-aware payload decoders that run next enforce those. A depth-limited `feb_cbor_skip_value()` walk would wrongly reject `wardriving`'s valid 5-level `status` payload.
+
+**Head value bounds.** A map or array count, and the record-level `version` field, must be at most 2^32 − 1 (`UINT32_MAX`). A larger value, which needs a 9-byte head, is rejected with `FEB_CBOR_ERR_TOO_LARGE`. The bound is `UINT32_MAX`, not the platform's `SIZE_MAX`, so a 32-bit device and a 64-bit host test build reject exactly the same inputs. Before this rule, a 32-bit decoder silently kept only the low 32 bits of such a count or `version`, so it accepted a non-canonical re-encoding that the AAD check does not catch.
 
 ## Session establishment
 
@@ -395,6 +397,29 @@ counters begin at `1`, so `0` is never a genuine value) — a Flipper implementa
 a `status` record whose `request_id` is `0` as this unsolicited case, not as a malformed or
 unmatched reply.
 
+**Backlog-flush start gate (added 2026-09-27, all three boards; revised same day).** Starting a
+flush of raw record *data* — whether triggered by the unsolicited drain above or by a live
+capture appending a new record — is gated on one of three fixed conditions, checked in
+`wardriving_maybe_kick_send()`: no GPS fix, the buffered backlog exceeds
+`FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD` (2000 records), or GPS speed has read continuously
+below `FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX` (5.0 km/h) for at least
+`FEB_WARDRIVING_FLUSH_STOPPED_SECONDS` (10 seconds). This avoids the BLE batch-send competing
+with active WiFi scanning on the shared 2.4GHz radio while driving. All three thresholds are
+fixed firmware constants (`wardriving_validate.h`), not wire-configurable. The gate only governs
+whether a data flush *starts*: once records begin sending, the existing `backlog_remaining`
+batch-chaining below continues to completion even if the gate would no longer be open.
+
+An initial version of this gate (with a 1.0 km/h stopped-speed threshold and no count-update
+below) was found on hardware (esp32c5) to leave live wardriving results looking like they'd
+vanished entirely during ordinary driving — the gate almost never opened, and the 1.0 km/h
+threshold was itself fragile: `speed_e1_kmh` is raw, unsmoothed NMEA speed-over-ground, and
+ordinary GPS noise near that threshold could repeatedly reset the stopped-hysteresis timer
+before it ever accumulated 10 continuous seconds, even while genuinely stationary. Both are
+addressed now: the threshold moved to 5.0 km/h, and a separate, ungated `status(state="data")`
+update with an empty `records` array (just `backlog_remaining`) keeps the Flipper's displayed
+backlog count moving whenever it changes, regardless of whether the gate is open — pausing the
+data flush no longer also freezes the on-screen number. See docs/PROJECT_HISTORY.md.
+
 `<wardriving-record>` fixed field order:
 
 | Field | Type | Meaning |
@@ -412,11 +437,20 @@ hardcoded coordinate stub behind a swappable location-source interface (see [PLA
 stub is designed (not yet implemented) in [PLAN.md](PLAN.md)'s "Real GPS driver, wardriving
 fix-dependency, and real wardriving-record timestamps" section — confirming the original framing
 here: the swap needs no change to `lat_e7_offset`/`lon_e7_offset`'s wire encoding, only to what
-populates them. **Fix-dependency (new in that design):** once implemented, a record is discarded
-— never logged to flash, never streamed — unless the location driver reports a real fix (`GGA`
-fix quality > 0 and `RMC` status `A`) at capture time; this applies continuously, so a fix lost
-mid-capture pauses logging until it returns, and is not limited to "before the first fix." This
-does not apply today since the stub always reports a fix.
+populates them. **Fix-dependency.** A record is discarded — never logged to flash, never streamed — unless the
+location driver reports a real fix (`GGA` fix quality > 0 and `RMC` status `A`) at capture time;
+this applies continuously, so a fix lost mid-capture pauses logging until it returns, and is not
+limited to "before the first fix." Live since the real NMEA GPS driver replaced the coordinate
+stub (see "Location source" above).
+
+**No-fix scan suppression (added 2026-09-27, all three boards).** The above discard is
+post-capture defense-in-depth; as of this date, the WiFi and BLE wardriving scan loops
+(`wardriving_wifi_interval_cb()` and its BLE counterpart in each board's `main.c`) also check
+the fix state *before* starting a scan at all, skipping the scan/discovery window entirely for
+that cycle when there's no fix — avoiding spending shared-radio airtime on a scan whose results
+would be discarded anyway. The recurring timer still re-arms at its normal cadence regardless
+(no debounce on the fix check, no backoff/self-stop for a prolonged no-fix period — wardriving
+simply idles and resumes scanning the instant a fix returns).
 
 **Nesting depth.** This shape is `result` (depth 0) -> `records` array (depth 1) ->
 `<wardriving-record>` map (depth 2) -> `payload` map (depth 3) -> `payload`'s own scalar fields

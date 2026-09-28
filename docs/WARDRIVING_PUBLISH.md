@@ -193,7 +193,8 @@ implementation, and `applications/services/storage/storage_cli.c`'s command tabl
 
 - Prompt is literal `>: `, line ending is `\r\n`. After opening the port, wait ~0.5s, read until
   the first prompt, then flush.
-- `storage stat "<path>"\r` → one EOL-terminated line (`File, size: N`, `Directory`, or
+- `storage stat "<path>"\r` → one EOL-terminated line (`File, size: Nb` — note the trailing
+  `b` unit, confirmed against the firmware source 2026-09-28 —, `Directory`, or
   `Storage error: <msg>`), then the prompt.
 - `storage read_chunks "<path>" <buffer_size>\r` → one line `Size: N` (or an error line); then,
   until `read_size >= N`: read a line `\r\nReady?\r\n`, write a single unterminated `y` byte (no
@@ -245,6 +246,33 @@ Instead:
 
 ### 4. Result handling
 
+- **Implementation update, 2026-09-28 (HARDENING_PLAN.md HP-09/10/11/17; build-verified and
+  offline-harness-verified, not yet hardware-verified).** The archive step is no longer a plain
+  `storage rename`. The firmware's rename copies the live file *as it is at rename time* and then
+  deletes it, and blocks indefinitely while the FAP holds the file open. That meant it could
+  archive rows that were never uploaded, and it overran its 10 s timeout on multi-MB CSVs.
+  `Complete-FlipperArchive` now works like this:
+  1. `stat` the live file and continue only if its size equals the uploaded size.
+  2. If the estimated serial copy (≈30 s + size/20 KB, an unmeasured assumption) fits the
+     remaining run budget, write the archive from the exact uploaded bytes (`write_chunk`),
+     verify its size, re-`stat`, and `remove` the live file only if it's still unchanged.
+     `remove` fails fast with "already open" if the FAP has reopened it.
+  3. Otherwise, fall back to an on-device `storage rename` with a size-scaled timeout
+     (≈30 s + size/100 KB, also unmeasured). The outcome is then worked out by `stat`-ing both
+     paths, not assumed.
+
+  The whole run has a 450 s budget (`-BudgetSec`), below the FAP's wait, which is now 600 s.
+  If the budget runs out, the script skips archiving rather than deleting anything. The FAP
+  now closes the CSV and mesh files before publishing (HP-09), so no CLI `storage` call
+  blocks on them. A kept-not-archived outcome is still `status=ok`, with a short note in
+  `message=` that the Publish Ok screen now displays.
+
+  **Residual risk:** on the rename fallback, if the user presses Back mid-run the FAP restarts
+  BLE and can reopen the CSV. A rename that then resumes could archive rows added after the
+  upload. The script detects this (the archive is larger than the uploaded size) and reports it
+  rather than hiding it. The result file is now `[ordered]` (`status`, `message`, `mesh_status`,
+  `mesh_message` first), CR/LF-stripped, messages capped at 90 characters, and under 500 bytes
+  in one `write_chunk`, since the FAP reads only 512 bytes.
 - **Rename the CSV to an archived, timestamped name (e.g. `2026-09-17_13-31-05.csv`, using hyphens
   rather than the originally-proposed colons — colons aren't valid in a FAT32 filename, which is
   what the Flipper's SD card uses) only on a confirmed successful response** (`ok: true` in the

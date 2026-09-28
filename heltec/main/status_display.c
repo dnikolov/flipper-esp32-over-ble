@@ -128,6 +128,10 @@ static const char *ble_state_text(feb_display_ble_state_t state)
         return "LINK: AUTHENTICATING";
     case FEB_DISPLAY_BLE_AUTHENTICATED:
         return "LINK: AUTHENTICATED";
+    case FEB_DISPLAY_BLE_RADIO_OFF:
+        return "PAIR MODE: RADIO OFF";
+    case FEB_DISPLAY_BLE_WIFI_RESTART_FAILED:
+        return "WIFI RESTART FAILED";
     case FEB_DISPLAY_BLE_DISCONNECTED:
     default:
         return "FLIPPER: DISCONNECTED";
@@ -163,7 +167,8 @@ static void render_meshcore(char lines[8][32], uint32_t now_ms)
     }
     (void)snprintf(lines[3], sizeof(lines[3]), "NAME: %.15s", entry.has_name ? entry.name : "UNKNOWN");
     (void)snprintf(lines[4], sizeof(lines[4]), "ID: %s", entry.node_id_hex);
-    (void)snprintf(lines[5], sizeof(lines[5]), "RSSI: %ld DBM", (long)entry.rssi_dbm);
+    (void)snprintf(lines[5], sizeof(lines[5]), "RSSI: %ld DBM LOC:%c",
+                   (long)entry.rssi_dbm, entry.has_location ? 'Y' : 'N');
     format_seen_age(entry.last_seen_ms, now_ms, lines[6], sizeof(lines[6]));
 }
 
@@ -185,7 +190,10 @@ static void render_meshtastic(char lines[8][32], uint32_t now_ms)
     }
     (void)snprintf(lines[3], sizeof(lines[3]), "NAME: %.15s", entry.has_name ? entry.name : "UNKNOWN");
     (void)snprintf(lines[4], sizeof(lines[4]), "ID: %s", entry.node_id_hex);
-    (void)snprintf(lines[5], sizeof(lines[5]), "RSSI: %ld DBM", (long)entry.rssi_dbm);
+    /* Always LOC:N -- meshtastic_table_entry_t has no location field yet, since Meshtastic
+       POSITION_APP decode is still out of scope (meshtastic_table.h's own header comment);
+       not a placeholder bug. */
+    (void)snprintf(lines[5], sizeof(lines[5]), "RSSI: %ld DBM LOC:N", (long)entry.rssi_dbm);
     format_seen_age(entry.last_seen_ms, now_ms, lines[6], sizeof(lines[6]));
 }
 

@@ -92,6 +92,12 @@ of transport or peer interaction. Full incident writeups: [docs/LESSONS.md](../.
 - When a test pins a parameter to a conservative value, state which failure modes that
   pinning excludes — see `docs/LESSONS.md#att-mtu-vs-attribute-length` for how this let a
   real bug ship.
+- **Wardriving BLE discovery doubles as the reconnect scan.** Keep `start_scan()`'s centralized
+  `wardriving_ble_active` guard. Never skip the BLE interval callback's discovery for "no GPS
+  fix"; discard no-fix results at window close instead. Clamp any no-fix Wi-Fi re-arm with
+  `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS`: a 0 ms interval is a legal setting and trips the task
+  watchdog. All three boards regressed on one of these in 2026-09. See
+  `docs/LESSONS.md#wardriving-ble-discovery-is-the-reconnect-scan` and `#no-fix-retry-needs-a-floor`.
 
 ## Build and validate
 

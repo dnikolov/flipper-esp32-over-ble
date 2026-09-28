@@ -95,6 +95,12 @@ still the same H01 mechanism and not a new one, and to check whether the wardriv
 capacity was also a factor (see the new BACKLOG.md item on flash-log capacity vs. multi-day
 autostart accumulation, added the same day).
 
+**2026-09-28 review (HARDENING_PLAN.md):** still open on the C6 — only the `BLE_HS_EBUSY`
+backoff exists, not a "connect in flight" flag. Separately, the C5 had also lost the older
+centralized `wardriving_ble_active` guard in `start_scan()`; that was restored (HP-01), and
+uncommitted no-fix-skip edits that would have stalled reconnect on the C6 and Heltec were
+reverted (HP-03). See `docs/LESSONS.md#wardriving-ble-discovery-is-the-reconnect-scan`.
+
 ## H02 — Live concurrent-load test for the G30 wardriving-log race fix
 
 **Status:** fix implemented and build-verified 2026-09-13 (see `docs/BACKLOG.md` G30), not yet
@@ -918,3 +924,158 @@ duration of the publish transfer, freeing the GATT stack's heap, and restarts it
 reduces heap pressure during publish regardless of which exact allocation was losing the
 race above -- it is a mitigation, not a confirmed root-cause fix; "which allocation failed"
 remains open.
+
+**2026-09-28: second field report of the same failure class, this time mid-wardriving-CSV-flush
+("flipper is crashing with out of memory when trying to flush the csv" ... "flipper crashed and
+was rebooted out of memory"). Root-caused to the call site this entry had left open, and this
+app's total heap footprint cut by 23,035 bytes (~19%) across four independent changes. Build-
+and host-test-verified; not yet hardware-verified.**
+
+**The failing call site, identified:** "out of memory" is one specific string in the pinned
+firmware — `furi_check(pvReturn, "out of memory")` in `furi/core/memmgr_heap.c:466`, inside
+`pvPortMalloc()`. So this is a genuine runtime `malloc()` returning NULL, a *different* failure
+from the ELF loader's launch-time `memmgr_heap_get_max_free_block()` rejection that this entry's
+earlier sections are about (and different again from the `furi_check_failed` relaunch crash in
+`docs/BACKLOG.md` BL05). Matching that against the reported trigger: the wardriving CSV export
+file is opened **lazily, on the first record of a session** (`wardriving_csv_ensure_open()`), and
+`storage_ext.c`'s `storage_process_file_open()` `malloc()`s an `SDFile` wrapping a FatFS `FIL`
+that carries its own 512-byte sector buffer — roughly 600 contiguous bytes, demanded at exactly
+the moment a backlog drain starts. That is the straw, not the load: the app was already holding
+~114 KB of system heap before the flush began.
+
+**Where the 118 KB was (measured with `arm-none-eabi-size`/`-nm` against the real built ELF, not
+estimated):** `.text` 65384 + `.rodata` 12424 + `.data` 56 + `.bss` 36044 = 113,908 bytes, plus
+4,608 bytes for the 8-deep `furi_message_queue` of 576-byte `AppEvent`s = 118,516.
+
+**Four changes, each measured independently:**
+
+1. **FAP build type: debug -> release (`-Os`), 11,799 bytes.** The single largest lever, and it
+   is not a code change at all. This project had been building and flashing FBT's *default*
+   `DEBUG=1` (`-Og`) artifact from `build/f7-firmware-D/` since the beginning. Because a FAP's
+   sections are heap-resident for the app's whole lifetime (this entry's own founding
+   observation), optimization level is a runtime memory decision here, not a build-speed one.
+   `-Og` -> `-Os` on the final source tree: `.text` 65768 -> 54680, `.rodata` 12632 -> 11944.
+   Nothing is given up —
+   FBT's non-COMPACT release config still defines `LOGS_DEBUG_BUILD` so every `FURI_LOG` level
+   still compiles in, and this app contains **zero `furi_assert()` calls** (it uses
+   `furi_check()` exclusively, which survives `FURI_NDEBUG`). Release is also the configuration
+   the device's own firmware is built in, so it is the *matching* one, not a riskier one. Pinned
+   in `CLAUDE.md`, `docs/BASELINES.md`, `tools/build_flipper.ps1` (`-DebugBuild` restores `-Og`)
+   and `tools/flash_flipper.ps1`.
+
+2. **`AppEvent` flat struct -> tagged union: 576 -> 104 bytes, 5,664 bytes.** Every event type's
+   fields were resident simultaneously. Safe to union because every field was already written by
+   exactly one `post_*()` and read by exactly one branch of the main loop's `if/else` chain on
+   `type` — no field was ever shared across event types (verified by enumerating all ~138
+   accesses; each appears exactly twice, once per side). The three per-capability
+   error-message fields collapse to one for the same reason. Saving is 4 resident instances
+   (1,888 bytes of `.bss`) + the message queue's 8 copies (3,776 bytes of heap) + ~470 bytes off
+   the app's own 4 KB main-thread stack.
+
+3. **X25519 donna scratch moved from `.bss` to an on-demand heap allocation: 3,868 bytes.**
+   `pairing_crypto.o`'s `.bss` was 4,832 bytes, almost all curve25519-donna intermediates this
+   project had converted from upstream's stack locals to file-scope `static`s to honour
+   `docs/LESSONS.md`'s "any buffer >=100 bytes reachable from `BleEventWorker` must be static"
+   rule. **This entry had previously declared that scratch "explicitly out of scope, decided
+   this session, not just deferred" — that decision assumed the only alternative was the stack,
+   and was correct on that assumption.** Moving it to the heap is a third option it did not
+   consider: all 31 arrays folded into one `donna_scratch_t` (3,872 bytes) reached through a
+   single file-static pointer, `malloc()`ed at `x25519_donna_scalarmult()`'s entry and
+   `feb_secure_zero()`+`free()`d on exit. Still off `BleEventWorker`'s 1280-byte stack, so the
+   stack-overflow bug class is not reintroduced; thread-safety is unchanged (the statics were
+   equally non-reentrant). The transient is live **only during the initial pairing ceremony** —
+   `feb_x25519()` is reached from `handle_pair_init()` alone; runtime session auth is
+   HMAC/HKDF-only and never allocates it. `pairing_crypto.o` `.bss`: 4832 -> 964. Side benefit:
+   the single exit-path zeroize now covers every curve intermediate, where previously only
+   `bp`/`x`/`z`/`zmone`/`e` were zeroized and the rest sat in `.bss` until overwritten.
+   **A real regression was introduced and caught by the host tests, not by review:** converting
+   `static limb a[19]` to `limb *a = donna_sc->a` silently turned `memset(a, 0, sizeof(a))` into
+   a 4-byte clear (array-to-pointer decay), which the old `static` zero-init had been masking.
+   RFC 7748 §5.2 TC1/TC2 failed while the §6.1 DH vectors still passed — data-dependent, and
+   invisible to a diff read. Fixed with an explicit `19 * sizeof(limb)`.
+
+4. **`wardriving_dedup_table` entry narrowed 32 -> 16 bytes: 2,312 bytes.** Pure field-width
+   waste, no capacity change (48 Wi-Fi / 96 BLE entries as before): `int32_t last_rssi_dbm` ->
+   `int8_t` (the decoder already rejects `rssi_offset > 255`, so the range is exact), the two
+   `uint64_t` lat/lon e7-offsets -> `uint32_t` (wire maxima are 1800000000 and 3600000000, both
+   inside `uint32_t`), and both `uint32_t next_evict_index` cursors -> `uint8_t`. The lat/lon
+   decode path has **no wire range validation at all** (unlike `rssi_offset`), so a clamp was
+   added rather than letting a malformed value wrap into a smaller-looking coordinate and
+   corrupt the move-distance comparison. New host test pins both the exact `sizeof`s and the
+   max-valid/oversized-offset behaviour.
+
+**Net:** `.text` 65384 -> 54680, `.rodata` 12424 -> 11944, `.bss` 36044 -> 27969, message queue
+4608 -> 832. Total system heap held: **118,516 -> 95,481 bytes, -23,035 (-19.4%)**. `.fap` file
+size 138,480 -> 115,756 bytes. (The four changes sum to 23,643; the ~600-byte difference is the
+heap-guard code added below, which is a deliberate net cost.) All three Flipper host suites pass
+(441 + 67 + 57 = 565 checks) and `tools/check_shared_headers.py` is clean.
+
+**Also added, and arguably the more durable half of this fix: a low-heap guard that converts the
+crash into a recoverable app error.** `storage_open_heap_margin_ok()` checks
+`memmgr_heap_get_max_free_block()` against a 3,072-byte floor before the three file opens that
+can plausibly hit a loaded heap — the wardriving CSV, the mesh log, and the publish-result poll
+(the one open/close pair in the file that repeats on a timer). Because `pvPortMalloc()`
+`furi_check()`s, a failed open is *not* an error this app could otherwise handle — it reboots the
+whole device — so refusing early turns it into "CSV export write failed" on screen with the
+session still alive and the records still safe in the ESP32's flash backlog for a later drain.
+`memmgr_heap_get_max_free_block()` rather than `memmgr_get_free_heap()` deliberately: the
+allocation needs one *contiguous* block, which is this entry's own already-confirmed
+fragmentation mechanism — total free bytes can look healthy while no single block fits.
+**This is a heuristic, not a guarantee** (another thread can allocate between the check and the
+Storage service's own `malloc`, and nothing here protects concurrent GUI/BLE/notification
+allocations); it removes the single most likely crash point, it does not make the app OOM-proof.
+
+Three non-obvious details the guard needed to get right, none of which were in the first cut:
+
+- **A deferral must not latch.** The existing `wardriving_csv_write_failed` /
+  `mesh_log_write_failed` flags are permanent-for-the-session by design, which is right for a
+  real write failure and wrong for a transient heap dip — latching on one bad moment would throw
+  away the rest of a multi-minute capture. `wardriving_csv_ensure_open()`/`mesh_log_ensure_open()`
+  therefore return a tri-state (`Ok` / `Failed` / `Deferred`), not a bool.
+- **A deferral must not touch the dedup table either.** `feb_wardriving_dedup_should_write()`
+  *updates* the table as a side effect. Called before a write that is then deferred, it records
+  the address as already-exported for a row that never reached the file, suppressing that
+  address's next real chance until its RSSI improves or it moves. So the export file is now
+  resolved **once per batch, before the record loop**, rather than lazily inside the per-record
+  write — and `wardriving_csv_write_record()`/`mesh_log_write_record()` no longer open anything,
+  they require the caller to have done it.
+- **The guard's own log line is a heap allocation.** `FURI_LOG_*` goes through
+  `furi_log_print_format()`, which does `furi_string_alloc()` and then grows it with
+  `furi_string_vprintf()` — so logging on the path that just measured the heap as too tight is
+  the one place a log line could plausibly *be* the allocation that trips the `furi_check`. Each
+  call site therefore owns a one-shot latch: one line per session, not one per batch for
+  minutes on end.
+
+**The number this entry has been asking for since 2026-09-24 is now instrumented:** a single
+`FURI_LOG_I` at app init reports free heap and largest free block at launch. A launch that fails
+inside the ELF loader still never reaches it — that gap is unchanged — but a launch that succeeds
+and later dies mid-session now leaves a baseline in the log.
+
+**Still open, deliberately not attempted this pass** (in descending size, all in
+`flipper_esp32_over_ble.c`, whose `.bss` is 24,371 of the remaining 27,964):
+
+- `shared_status_result`, **2,832 bytes** — union of the per-capability decode-scratch structs,
+  sized by its largest member, `wardriving`'s 32-record array. The Flipper writes each wardriving
+  record to CSV and each wifi_scan/ble_scan result to the UI *one at a time*, so none of the
+  three needs the whole array resident; a streaming/incremental decode would cut this to ~100
+  bytes. Not done because the decoders live in `cbor_wardriving.c`/`cbor_wifi_scan.c`/
+  `cbor_ble_scan.c`, whose headers are in `tools/check_shared_headers.py`'s `HEADER_PAIRS` — a
+  Flipper-only entry point would break the lockstep convention, so it has to land on both
+  firmwares with host tests on both sides. Biggest remaining single win.
+- `mesh_log_display_nodes`, **3,072 bytes** (64 x 48) — `feb_mesh_node_entry_t` stores lat/lon as
+  two `double`s for a screen that renders `%.5f`. A display-only struct with `int32_t` e7
+  coordinates would be 32 bytes/entry (-1,024); halving the 64-node capacity would save another
+  ~1,000. The capacity is a documented product decision ("sparse, dozens not hundreds"), so it
+  needs the user's call, not a silent change. Note `float` is *not* a safe substitute here —
+  ~7.2 significant digits does not cover `%.5f` at three-digit longitudes.
+- `wifi_scan_aps` / `ble_scan_devices`, **4,224 bytes combined** — unchanged; this entry's
+  existing "do this one last, if at all" assessment and its traced cross-capability-corruption
+  risk both still stand. Narrowing their fields (`int32_t rssi` -> `int8_t`, `uint32_t channel`
+  -> `uint8_t`) is safe but only worth ~380 bytes; the real win would be halving the 32-entry
+  display capacity, which is a visible product change.
+- The ~15 function-local `static char path[160]` scratch buffers, **~1,900 bytes** — consolidating
+  them needs a per-function BLE-thread-vs-main-thread ownership split (`pairing_storage_*` and
+  `capability_storage_*` run on `BleEventWorker`; `wardriving_settings_*` and
+  `publish_poll_check` on the main thread), and simply shrinking `160` erodes a margin
+  `FEB_PAIRINGS_PATH_MAX_LEN`'s own comment deliberately chose against a documented ~87-byte
+  worst case. Low value, non-trivial risk.

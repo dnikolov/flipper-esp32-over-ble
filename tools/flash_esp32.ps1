@@ -26,6 +26,15 @@ $esp32Dir = Join-Path $repoRoot "esp32"
 . C:\Users\Deyan\esp\esp-idf\export.ps1 | Out-Null
 Set-Location $esp32Dir
 
+# Under "Stop", PS 5.1 turns the first native stderr line merged via 2>&1 into a terminating
+# NativeCommandError (idf.py/esptool write progress and warnings there); run native calls under
+# "Continue" and rely on the exit code instead.
+function Invoke-Native([scriptblock]$Block) {
+    $ErrorActionPreference = "Continue"
+    & $Block 2>&1 | ForEach-Object { "$_" } | Select-Object -Last $TailLines
+    return
+}
+
 if (-not $Port) {
     Write-Error "-Port is required (e.g. COM9)"
     exit 1
@@ -39,7 +48,7 @@ if ($knownPorts -notcontains $Port) {
 
 if ($BuildFirst) {
     Write-Host "Building ESP32 firmware before flashing..."
-    idf.py build 2>&1 | Select-Object -Last $TailLines
+    Invoke-Native { idf.py build }
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build failed (exit $LASTEXITCODE)"
         exit $LASTEXITCODE
@@ -47,7 +56,7 @@ if ($BuildFirst) {
 }
 
 Write-Host "Flashing ESP32 firmware to $Port..."
-idf.py -p $Port flash 2>&1 | Select-Object -Last $TailLines
+Invoke-Native { idf.py -p $Port flash }
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Flash failed (exit $LASTEXITCODE)"
     exit $LASTEXITCODE

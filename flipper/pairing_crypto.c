@@ -57,6 +57,7 @@
    C99 `inline` by default). No field-arithmetic logic was altered. */
 #include "pairing_crypto.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* ==================== curve25519-donna port begins ==================== */
@@ -68,6 +69,74 @@
 typedef uint8_t u8;
 typedef int32_t s32;
 typedef int64_t limb;
+
+/* Pooled scratch for the whole X25519 ladder below (fmonty/cmult/crecip/fmul/fsquare/
+   x25519_donna_scalarmult). Each of these fields used to be its own per-function `static`
+   local -- moved off the Flipper's 1280-byte BleEventWorker stack per docs/LESSONS.md's
+   stack-budget rule, at the cost of sitting in .bss (a permanently system-heap-resident
+   external-FAP allocation, see docs/STANDALONE_FAP.md) for the app's entire lifetime.
+   Pooling them into one struct and allocating it transiently on the heap for the duration
+   of a single x25519_donna_scalarmult() call (the sole entry point into this whole ladder,
+   reached only via feb_x25519()/feb_x25519_base()) turns ~4.8 KB of permanent .bss into a
+   transient allocation that exists only while a pairing ceremony's X25519 step runs --
+   runtime session auth (from a reconnect) uses HMAC/HKDF only and never reaches this code
+   at all. docs/HARDENING_BACKLOG.md's H04 previously declared this scratch out of scope
+   for exactly this kind of change, but that reasoning was about *stack* safety (a
+   non-static local here would reintroduce the original stack-overflow bug); it does not
+   apply to a heap allocation, which is what this is. The safety argument for treating it as
+   a single shared, non-reentrant buffer is otherwise unchanged from the static version: BLE
+   event dispatch is synchronous and single-in-flight, so there is never a concurrent or
+   reentrant call into x25519_donna_scalarmult(), and every field is fully written before
+   being read on each use -- no cross-call stale-value hazard. */
+typedef struct {
+    /* fmonty() scratch */
+    limb origx[10];
+    limb origxprime[10];
+    limb zzz[19];
+    limb xx[19];
+    limb zz[19];
+    limb xxprime[19];
+    limb zzprime[19];
+    limb zzzprime[19];
+    limb xxxprime[19];
+    /* cmult() scratch -- kept as upstream's single-letter a..h names for line-by-line
+       diffability against curve25519-donna.c */
+    limb a[19];
+    limb b[19];
+    limb c[19];
+    limb d[19];
+    limb e[19];
+    limb f[19];
+    limb g[19];
+    limb h[19];
+    /* crecip() scratch */
+    limb z2[10];
+    limb z9[10];
+    limb z11[10];
+    limb z2_5_0[10];
+    limb z2_10_0[10];
+    limb z2_20_0[10];
+    limb z2_50_0[10];
+    limb z2_100_0[10];
+    limb t0[10];
+    limb t1[10];
+    /* fmul()/fsquare() scratch -- both are named `t[19]` upstream; disambiguated here
+       since they now live side by side in one struct */
+    limb fmul_t[19];
+    limb fsquare_t[19];
+    /* x25519_donna_scalarmult() scratch (its clamped-scalar buffer `e[32]` is only 32
+       bytes, below this pass's >=100-byte/64-byte folding threshold, and stays a
+       function-local static below) */
+    limb bp[10];
+    limb x[10];
+    limb z[11];
+    limb zmone[10];
+} donna_scratch_t;
+
+/* Valid only for the duration of a single x25519_donna_scalarmult() call: allocated at
+   that function's entry, zeroized and freed on its one exit path. NULL the rest of the
+   time. Non-reentrant by construction, same as the static locals it replaces. */
+static donna_scratch_t* donna_sc;
 
 /* Sum two numbers: output += in */
 static void fsum(limb* output, const limb* in) {
@@ -254,17 +323,14 @@ static void freduce_coefficients(limb* output) {
  * output must be distinct to both inputs. The output is reduced degree
  * (indeed, one need only provide storage for 10 limbs) and |output[i]| < 2^26. */
 static void fmul(limb* output, const limb* in, const limb* in2) {
-    /* static, not stack-local: this file's whole X25519 ladder runs on the Flipper's
-       1280-byte BleEventWorker thread (see cmult()/fmonty() below for the dominant
-       offenders); every scratch buffer in the ladder is moved off that stack. Safe
-       because BLE event dispatch is synchronous/single-in-flight, so there is never a
-       concurrent or reentrant call into fmul(). Always fully written by fproduct()
-       before use, so no cross-call stale-value hazard. */
-    static limb t[19];
-    fproduct(t, in, in2);
-    freduce_degree(t);
-    freduce_coefficients(t);
-    memcpy(output, t, sizeof(limb) * 10);
+    /* Scratch lives in donna_sc (see donna_scratch_t above), not a stack local or a
+       function-static -- same off-BleEventWorker-stack rationale as before, now pooled on
+       the heap instead of in .bss. Always fully written by fproduct() before use, so no
+       cross-call stale-value hazard. */
+    fproduct(donna_sc->fmul_t, in, in2);
+    freduce_degree(donna_sc->fmul_t);
+    freduce_coefficients(donna_sc->fmul_t);
+    memcpy(output, donna_sc->fmul_t, sizeof(limb) * 10);
 }
 
 /* Square a number: output = in**2
@@ -319,13 +385,12 @@ static void fsquare_inner(limb* output, const limb* in) {
  * On exit: The |output| argument is in reduced coefficients form (indeed, one
  * need only provide storage for 10 limbs) and |out[i]| < 2^26. */
 static void fsquare(limb* output, const limb* in) {
-    /* static: see fmul()'s comment above -- same BleEventWorker stack-budget rationale,
-       same single-in-flight safety argument, always fully written before use. */
-    static limb t[19];
-    fsquare_inner(t, in);
-    freduce_degree(t);
-    freduce_coefficients(t);
-    memcpy(output, t, sizeof(limb) * 10);
+    /* Scratch lives in donna_sc: see fmul()'s comment above -- same rationale, always
+       fully written before use. */
+    fsquare_inner(donna_sc->fsquare_t, in);
+    freduce_degree(donna_sc->fsquare_t);
+    freduce_coefficients(donna_sc->fsquare_t);
+    memcpy(output, donna_sc->fsquare_t, sizeof(limb) * 10);
 }
 
 /* Take a little-endian, 32-byte number and expand it into polynomial form */
@@ -502,16 +567,25 @@ static void fmonty(
     limb* xprime,
     limb* zprime, /* input Q' */
     const limb* qmqp /* input Q - Q' */) {
-    /* static, not stack-local: this is the single largest stack-overflow offender in the
-       X25519 port -- 9 arrays (153 limbs, ~1224 bytes) in one frame, called from inside
-       cmult()'s 256-iteration ladder loop so it stacks on top of cmult()'s own ~1216-byte
-       frame (2.4 KB combined) against the Flipper's 1280-byte BleEventWorker stack
-       (docs/SESSION_MEMORY.md's stack-overflow root cause). Safe as static: BLE event
-       dispatch is synchronous/single-in-flight, fmonty() is not reentrant or recursive,
-       and every array here is fully overwritten (memcpy/fsum/fproduct/fsquare) before
-       being read on each call -- no cross-call stale-value hazard. */
-    static limb origx[10], origxprime[10], zzz[19], xx[19], zz[19], xxprime[19], zzprime[19],
-        zzzprime[19], xxxprime[19];
+    /* Scratch (9 arrays, 153 limbs, ~1224 bytes) lives in donna_sc, not a stack local or a
+       function-static -- this is the single largest offender in the ladder, called from
+       inside cmult()'s 256-iteration loop, so it used to stack on top of cmult()'s own
+       ~1216-byte frame against the Flipper's 1280-byte BleEventWorker stack
+       (docs/SESSION_MEMORY.md's stack-overflow root cause); pooling it on the heap removes
+       it from that stack accounting entirely rather than merely reducing it. Safe as a
+       shared buffer: BLE event dispatch is synchronous/single-in-flight, fmonty() is not
+       reentrant or recursive, and every field here is fully overwritten
+       (memcpy/fsum/fproduct/fsquare) before being read on each call -- no cross-call
+       stale-value hazard. */
+    limb* origx = donna_sc->origx;
+    limb* origxprime = donna_sc->origxprime;
+    limb* zzz = donna_sc->zzz;
+    limb* xx = donna_sc->xx;
+    limb* zz = donna_sc->zz;
+    limb* xxprime = donna_sc->xxprime;
+    limb* zzprime = donna_sc->zzprime;
+    limb* zzzprime = donna_sc->zzzprime;
+    limb* xxxprime = donna_sc->xxxprime;
 
     memcpy(origx, x, 10 * sizeof(limb));
     fsum(x, z);
@@ -578,34 +652,37 @@ static void swap_conditional(limb a[19], limb b[19], limb iswap) {
  *   n: a little endian, 32-byte number
  *   q: a point of the curve (short form) */
 static void cmult(limb* resultx, limb* resultz, const u8* n, const limb* q) {
-    /* static, not stack-local: the single largest offender here (8 arrays, 152 limbs,
-       ~1216 bytes in one frame) -- called once per feb_x25519()/feb_x25519_base(), and
-       calls fmonty() (also static, ~1224 bytes) 256 times from its inner loop, so the two
-       frames stack to ~2.4 KB combined against the Flipper's 1280-byte BleEventWorker
-       stack (docs/SESSION_MEMORY.md's stack-overflow root cause) -- more than the entire
-       thread stack on its own. Safe as static: BLE event dispatch is synchronous/
-       single-in-flight, cmult() is not reentrant or recursive. Unlike fmonty()'s arrays,
-       these carry an initial value (a/c/e/g = 0, b/d/f/h = 1) that a `static` initializer
-       would only apply once at startup, not on every call -- so the reset below is done
-       explicitly at the top of every call instead, preserving the original per-call
-       semantics. */
-    static limb a[19], b[19], c[19], d[19], e[19], f[19], g[19], h[19];
+    /* Scratch (8 arrays, 152 limbs, ~1216 bytes) lives in donna_sc, not a stack local or a
+       function-static -- called once per feb_x25519()/feb_x25519_base(), and calls
+       fmonty() (also donna_sc-backed) 256 times from its inner loop; the two used to stack
+       to ~2.4 KB combined against the Flipper's 1280-byte BleEventWorker stack
+       (docs/SESSION_MEMORY.md's stack-overflow root cause) -- pooling both on the heap
+       removes them from that stack accounting entirely. Safe as a shared buffer: BLE event
+       dispatch is synchronous/single-in-flight, cmult() is not reentrant or recursive. As
+       before, a/c/e/g start at 0 and b/d/f/h start at 1 -- reset explicitly below on every
+       call (never relies on a static initializer, which would only apply once). */
+    limb *a = donna_sc->a, *b = donna_sc->b, *c = donna_sc->c, *d = donna_sc->d;
+    limb *e = donna_sc->e, *f = donna_sc->f, *g = donna_sc->g, *h = donna_sc->h;
     limb *nqpqx = a, *nqpqz = b, *nqx = c, *nqz = d, *t;
     limb *nqpqx2 = e, *nqpqz2 = f, *nqx2 = g, *nqz2 = h;
 
     unsigned i, j;
 
-    memset(a, 0, sizeof(a));
-    memset(b, 0, sizeof(b));
+    /* a/b/c/d/e/f/g/h are now donna_sc-backed limb* locals, not arrays -- sizeof(a) would
+       be sizeof(limb*) here, not the 19-limb array it was before this pass, so these use
+       the explicit array size instead of sizeof(a)/.../sizeof(h) to keep clearing the
+       whole 19-limb field each still does. */
+    memset(a, 0, 19 * sizeof(limb));
+    memset(b, 0, 19 * sizeof(limb));
     b[0] = 1;
-    memset(c, 0, sizeof(c));
+    memset(c, 0, 19 * sizeof(limb));
     c[0] = 1;
-    memset(d, 0, sizeof(d));
-    memset(e, 0, sizeof(e));
-    memset(f, 0, sizeof(f));
+    memset(d, 0, 19 * sizeof(limb));
+    memset(e, 0, 19 * sizeof(limb));
+    memset(f, 0, 19 * sizeof(limb));
     f[0] = 1;
-    memset(g, 0, sizeof(g));
-    memset(h, 0, sizeof(h));
+    memset(g, 0, 19 * sizeof(limb));
+    memset(h, 0, 19 * sizeof(limb));
     h[0] = 1;
 
     memcpy(nqpqx, q, sizeof(limb) * 10);
@@ -646,20 +723,20 @@ static void cmult(limb* resultx, limb* resultz, const u8* n, const limb* q) {
  * Shamelessly copied from djb's code
  * ----------------------------------------------------------------------------- */
 static void crecip(limb* out, const limb* z) {
-    /* static, not stack-local: 10 arrays (~800 bytes in one frame) against the Flipper's
-       1280-byte BleEventWorker stack -- same rationale as fmonty()/cmult() above. Safe as
-       static: single-in-flight BLE event dispatch, not reentrant/recursive, and every
+    /* Scratch (10 arrays, ~800 bytes) lives in donna_sc, not a stack local or a
+       function-static -- same rationale as fmonty()/cmult() above. Safe as a shared
+       buffer: single-in-flight BLE event dispatch, not reentrant/recursive, and every
        array is fully written (fsquare/fmul) before being read on each call. */
-    static limb z2[10];
-    static limb z9[10];
-    static limb z11[10];
-    static limb z2_5_0[10];
-    static limb z2_10_0[10];
-    static limb z2_20_0[10];
-    static limb z2_50_0[10];
-    static limb z2_100_0[10];
-    static limb t0[10];
-    static limb t1[10];
+    limb* z2 = donna_sc->z2;
+    limb* z9 = donna_sc->z9;
+    limb* z11 = donna_sc->z11;
+    limb* z2_5_0 = donna_sc->z2_5_0;
+    limb* z2_10_0 = donna_sc->z2_10_0;
+    limb* z2_20_0 = donna_sc->z2_20_0;
+    limb* z2_50_0 = donna_sc->z2_50_0;
+    limb* z2_100_0 = donna_sc->z2_100_0;
+    limb* t0 = donna_sc->t0;
+    limb* t1 = donna_sc->t1;
     int i;
 
     /* 2 */ fsquare(z2, z);
@@ -738,32 +815,44 @@ static void crecip(limb* out, const limb* z) {
    decodeScalar25519 clamping to a local copy of `secret`; never mutates the caller's
    buffer. */
 static int x25519_donna_scalarmult(u8* mypublic, const u8* secret, const u8* basepoint) {
-    /* static, not stack-local: same BleEventWorker stack-budget rationale as
-       cmult()/fmonty()/crecip() above -- this frame (~360 bytes) is the outermost one in
-       the ladder, so it's always present underneath whichever of those is active. Safe as
-       static: single-in-flight BLE event dispatch, not reentrant/recursive; all of
-       bp/x/z/zmone are fully written by fexpand()/cmult()/crecip()/fmul() before being
-       read, and `e` is fully written by the clamping loop below before use. */
-    static limb bp[10], x[10], z[11], zmone[10];
+    /* `e` stays a small function-static (32 bytes, below this pass's folding threshold --
+       see donna_scratch_t's comment) -- same BleEventWorker stack-budget rationale as
+       cmult()/fmonty()/crecip() above, fully written by the clamping loop below before
+       use. bp/x/z/zmone (~328 bytes) now live in donna_sc instead: this is the sole entry
+       point into the whole X25519 ladder (feb_x25519()/feb_x25519_base() call nothing
+       else), so donna_sc is allocated here and freed on this function's one exit path. */
     static uint8_t e[32];
     int i;
+
+    donna_sc = (donna_scratch_t*)malloc(sizeof(donna_scratch_t));
+    if(donna_sc == NULL) {
+        /* Real Flipper malloc() never returns NULL here (the firmware furi_checks inside
+           pvPortMalloc() on OOM) -- this path only executes under the host test build's
+           real malloc(). Zero the output so callers land on the existing "reject an
+           all-zero X25519 result" contract (pairing_crypto.h) instead of using
+           uninitialized/partial key material. */
+        memset(mypublic, 0, FEB_X25519_KEY_LEN);
+        return -1;
+    }
 
     for(i = 0; i < 32; ++i) e[i] = secret[i];
     e[0] &= 248;
     e[31] &= 127;
     e[31] |= 64;
 
-    fexpand(bp, basepoint);
-    cmult(x, z, e, bp);
-    crecip(zmone, z);
-    fmul(z, x, zmone);
-    fcontract(mypublic, z);
+    fexpand(donna_sc->bp, basepoint);
+    cmult(donna_sc->x, donna_sc->z, e, donna_sc->bp);
+    crecip(donna_sc->zmone, donna_sc->z);
+    fmul(donna_sc->z, donna_sc->x, donna_sc->zmone);
+    fcontract(mypublic, donna_sc->z);
 
     feb_secure_zero(e, sizeof(e));
-    feb_secure_zero(bp, sizeof(bp));
-    feb_secure_zero(x, sizeof(x));
-    feb_secure_zero(z, sizeof(z));
-    feb_secure_zero(zmone, sizeof(zmone));
+    /* Zeroizes the entire pooled scratch in one call -- every donna_sc field used across
+       fmonty()/cmult()/crecip()/fmul()/fsquare() during this call, not just bp/x/z/zmone,
+       which is strictly more zeroization than the previous per-array static version did. */
+    feb_secure_zero(donna_sc, sizeof(*donna_sc));
+    free(donna_sc);
+    donna_sc = NULL;
     return 0;
 }
 

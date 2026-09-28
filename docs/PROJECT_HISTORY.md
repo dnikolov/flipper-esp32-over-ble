@@ -2576,6 +2576,100 @@ this session's own hunks in files those other sessions were simultaneously editi
 (`docs/BACKLOG.md`, `docs/USER_GUIDE.md`), leaving their in-progress edits untouched and
 uncommitted for them to commit separately.
 
+## 2026-09-28: Flipper runtime out-of-memory reboot during a wardriving CSV flush — root-caused, footprint cut 20%
+
+User report, live hardware: "flipper is crashing with out of memory when trying to flush the
+csv", then "flipper crashed and was rebooted out of memory". Traced the message to its one source
+in the pinned firmware — `furi_check(pvReturn, "out of memory")` in `furi/core/memmgr_heap.c:466`,
+inside `pvPortMalloc()` — which makes this a genuine runtime `malloc()` failure, distinct both
+from the ELF loader's launch-time contiguous-block rejection this project had been chasing under
+`docs/HARDENING_BACKLOG.md` H04 and from `docs/BACKLOG.md` BL05's `furi_check_failed` relaunch
+crash. The failing allocation is the lazy CSV open on the first record of a backlog drain:
+`storage_ext.c`'s `storage_process_file_open()` `malloc()`s an `SDFile` wrapping a FatFS `FIL`
+with its own 512-byte sector buffer, ~600 contiguous bytes demanded exactly when the flush starts.
+The straw, not the load — the app was already holding ~118 KB of system heap.
+
+Four independent reductions, each measured with `arm-none-eabi-size`/`-nm` against the real built
+ELF: the FAP build type switched from FBT's default debug (`-Og`) to release (`-Os`), worth 11,799
+bytes and by far the largest lever (this project had been flashing the debug artifact since the
+beginning; a FAP's sections are heap-resident for its whole lifetime, so optimization level is a
+memory decision here); `AppEvent` collapsed from a 576-byte flat struct to a 104-byte tagged
+union, worth 5,664 bytes across four `.bss` instances, the 8-deep message queue, and the main
+thread's stack; the curve25519-donna scratch moved out of `.bss` into an on-demand heap allocation
+live only during the pairing ceremony, worth 3,868 bytes; and the wardriving dedup table's entry
+narrowed from 32 to 16 bytes of pure field-width waste at unchanged capacity, worth 2,312 bytes.
+Total: 118,516 -> 95,481 bytes of system heap, **-23,035 (-19.4%)**; `.fap` 138,480 -> 115,756
+bytes. Also added a `memmgr_heap_get_max_free_block()` floor before the three file opens that can
+hit a loaded heap, so a tight heap surfaces as this app's own "CSV export write failed" with the
+session alive instead of rebooting the device, plus a one-line launch-time heap baseline in the
+log — the measurement H04 had been asking for since 2026-09-24.
+
+Two things worth carrying forward. First, H04 had previously ruled the donna scratch "explicitly
+out of scope, decided this session, not just deferred", on the grounds that un-`static`ing it
+would reintroduce this project's repeatedly-hit `BleEventWorker` stack-overflow bug class — sound
+reasoning that assumed the only alternative was the stack. The heap was a third option it did not
+consider, and it keeps the buffers off that 1280-byte stack just as effectively. Second, the
+donna rework introduced a real regression that only the host tests caught: converting
+`static limb a[19]` to `limb *a = donna_sc->a` silently turned `memset(a, 0, sizeof(a))` into a
+4-byte clear via array-to-pointer decay, previously masked by `static` zero-init. RFC 7748 §5.2
+TC1/TC2 failed while the §6.1 DH vectors still passed — data-dependent, and invisible to a diff
+read. Any future "just move these statics into a struct" pass on this codebase should grep for
+`sizeof(<name>)` on every symbol it touches before trusting the diff.
+
+Build- and host-test-verified only: all three Flipper host suites pass (441 + 67 + 57 = 565
+checks) and `tools/check_shared_headers.py` is clean. **Not hardware-verified** — nothing was
+flashed. Full mechanism, per-change detail, and the ranked list of what was deliberately left on
+the table (`shared_status_result`'s 2,832-byte decode scratch is the biggest remaining win, and
+needs a both-firmwares streaming-decode change to stay in header lockstep) are in
+`docs/HARDENING_BACKLOG.md` H04's 2026-09-28 entry.
+
+## 2026-09-28: Full-codebase hardening review and fix pass (HARDENING_PLAN.md HP-01..HP-44)
+
+A read-only review of all four firmwares, the shared protocol layer, the publish script and the
+tooling produced [HARDENING_PLAN.md](HARDENING_PLAN.md). It has 44 findings, and the reviewing
+session re-traced each P0/P1 finding itself. The same day, fixes were implemented in parallel,
+one board-owned directory per agent, then a shared-protocol lockstep pass ran last. Nothing
+was flashed; everything is build- and host-test-verified only. Root causes worth keeping:
+
+- **Port drift through code comments (HP-01..03).** The C5's Phase 8 port (`9519a60`) had
+  silently deleted `start_scan()`'s centralized `wardriving_ble_active` guard (H01 class).
+  Separately, uncommitted parallel edits on the C6 and Heltec were re-adding two bugs the C5 had
+  already hit on hardware and fixed the day before: a no-fix skip of BLE discovery (stalls
+  reconnect) and a no-fix Wi-Fi re-arm at a raw 0 ms interval (task-WDT trip). The rationale for
+  both existed only in a C5 code comment. Now recorded in LESSONS.md
+  (`wardriving-ble-discovery-is-the-reconnect-scan`, `no-fix-retry-needs-a-floor`), in all three
+  ESP agent definitions, and enforced where possible by `tools/check_shared_headers.py`, which
+  now also diffs the per-board module copies (HP-19).
+- **Heltec kill-switch (HP-04/05).** The touch task freed `wardriving_cluster_flush_records` while
+  the host task iterated it, contradicting BL27's "only flags are raced" reasoning. It's now
+  under `cluster_link_spinlock` with a busy / free-pending deferred-free handoff. OFF→ON never
+  restarted Wi-Fi, because the second `esp_event_loop_create_default()` returned
+  `ESP_ERR_INVALID_STATE` and the void init returned early. The fix splits it into a once-only
+  init and a restartable start.
+- **Flipper cross-thread state (HP-06/07/08, G10).** Session GCM nonce/AAD scratch was shared
+  between main-thread encrypts and BleEventWorker decrypts, a nonce-reuse window. Delayed
+  `BtStatusConnected` handling could wipe a session that had already authenticated, and scan
+  results posted one event per item into an 8-deep queue, unchecked. Fixed with `protocol_mutex`
+  plus a connection-generation counter, batched events, and a checked `app_queue_put()`.
+- **Publish (HP-09/10/11/16/17).** The FAP kept the CSV/mesh files open across Publish, which
+  made CLI `storage` calls block forever. The firmware's `storage rename` copies then deletes,
+  so it could archive rows added after upload. The bootstrap failed under Windows' default
+  execution policy. See WARDRIVING_PUBLISH.md §4's 2026-09-28 note for the new archive scheme.
+- **Build config (HP-12/14/27).** Every ESP target was still `-Og` with no stack canary, despite
+  this project's repeated stack-overflow history. Moving to `-Os` with the canary and WDT panic
+  shrank every image (C6 −89.6 KB) and took the Heltec from failing to link (−16 B DRAM, caused by
+  the in-flight edits) to 364 B DRAM / 7,309 B IRAM headroom. Numbers are in BASELINES.md.
+- **Shared layer (HP-25/26/28/30/38/39).** 64-bit CBOR heads were truncated on 32-bit devices, so
+  counts and `version` are now bounded at `UINT32_MAX`. Decrypted plaintext must be exactly one
+  CBOR value. The Flipper now requires `arguments`/`result` to be maps. The 24-bit sequence cap
+  is enforced in `feb_session_encrypt_record()`. The cluster-link decoder re-scans the bytes
+  after a rejected SOF instead of discarding them (callers now drain `feb_cluster_decoder_poll()`).
+  The Flipper meshcore/mesh_log decoders were rewritten table-driven, to return the ESP's error
+  codes (HP-20's new Flipper host tests found the divergence).
+
+Still open from the plan: H01's "connect in flight" flag, G25, and hardware verification of
+everything above.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

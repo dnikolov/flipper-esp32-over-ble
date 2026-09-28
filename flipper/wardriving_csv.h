@@ -119,24 +119,40 @@ size_t feb_wardriving_csv_format_row(
 #define FEB_WARDRIVING_DEDUP_MOVE_METERS ((double)30.0)
 
 /* No payload_kind field: each sub-table below only ever holds one kind, so the field
-   dropped here is redundant, not a size optimization -- it previously sat in what would
-   otherwise be alignment padding before the uint64_t fields, so sizeof(entry) is unchanged. */
+   dropped here is redundant, not a size optimization.
+
+   Fields narrowed to their real wire ranges (2026-09-28, `.bss` reduction -- an external
+   FAP's `.bss` is held as live heap for the app's whole lifetime, see this app's
+   docs/HARDENING_BACKLOG.md/SESSION_MEMORY.md entry on the `out of memory` crash this was
+   found alongside): `last_rssi_dbm` only ever holds `rssi_offset - 128` where the decoder in
+   cbor_wardriving.c already rejects any wire `rssi_offset > 255` before a record reaches
+   here, so the real range is exactly [-128, 127] -- int8_t, no loss. `last_lat_e7_offset`/
+   `last_lon_e7_offset` only ever hold `lat_e7 + 900000000` (max 1800000000) / `lon_e7 +
+   1800000000` (max 3600000000) per docs/PROTOCOL.md's encoding -- both fit uint32_t (max
+   4294967295) with room to spare. Neither bound is re-validated by the wardriving codec
+   itself (lat/lon_e7_offset are plain uint64_t on the wire with no decoder-side ceiling), so
+   wardriving_csv.c's storing code clamps defensively rather than truncating silently if a
+   malformed/oversized value ever reaches this table. `next_evict_index` narrowed from
+   uint32_t to uint8_t in both sub-tables below (capacities 48/96, both comfortably < 256).
+   Net: sizeof(feb_wardriving_dedup_entry_t) 32 -> 16 bytes; measured
+   sizeof(feb_wardriving_dedup_table_t) 4624 -> 2312 bytes (see wardriving_csv.c's own
+   static_assert-adjacent host-test coverage for the exact figures). */
 typedef struct {
     uint8_t address[6];
     bool occupied;
-    int32_t last_rssi_dbm;
-    uint64_t last_lat_e7_offset;
-    uint64_t last_lon_e7_offset;
+    int8_t last_rssi_dbm;
+    uint32_t last_lat_e7_offset;
+    uint32_t last_lon_e7_offset;
 } feb_wardriving_dedup_entry_t;
 
 typedef struct {
     feb_wardriving_dedup_entry_t entries[FEB_WARDRIVING_DEDUP_WIFI_CAPACITY];
-    uint32_t next_evict_index;
+    uint8_t next_evict_index;
 } feb_wardriving_dedup_wifi_table_t;
 
 typedef struct {
     feb_wardriving_dedup_entry_t entries[FEB_WARDRIVING_DEDUP_BLE_CAPACITY];
-    uint32_t next_evict_index;
+    uint8_t next_evict_index;
 } feb_wardriving_dedup_ble_table_t;
 
 typedef struct {

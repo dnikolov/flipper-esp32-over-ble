@@ -164,6 +164,7 @@ feb_cbor_status_t
         uint64_t v;
         n = feb_cbor_decode_uint(in + pos, in_len - pos, &v, &status);
         if(n == 0) return status;
+        if(v > UINT32_MAX) return FEB_CBOR_ERR_TOO_LARGE;
         record->version = (uint32_t)v;
         pos += n;
     }
@@ -651,7 +652,10 @@ void feb_pairing_derive_secret(
 /* Computes HMAC-SHA-256(k_confirm, label || t), truncated to out_len bytes. `t` is T as
    produced by feb_pairing_encode_transcript(), so label_len + t_len is always within this
    function's fixed-size local buffer given FEB_PAIRING_LABEL_MAX_LEN and
-   FEB_PAIRING_MAX_TRANSCRIPT_LEN; both are clamped defensively regardless. */
+   FEB_PAIRING_MAX_TRANSCRIPT_LEN; an over-length input zeroes `out` instead of being
+   clamped, matching the ESP32's feb_pairing_hmac_label() (docs/CODE_REVIEW_FIX_PLAN.md D4,
+   HP-37) -- a wrong-but-plausible truncated-input tag would present as an unexplained
+   mismatch, whereas an all-zero tag fails verification immediately and visibly. */
 static void pairing_confirm_tag(
     const uint8_t k_confirm[FEB_PAIRING_KCONFIRM_LEN],
     const char* label,
@@ -671,11 +675,9 @@ static void pairing_confirm_tag(
     static uint8_t mac[FEB_HMAC_SHA256_LEN];
     size_t total;
 
-    if(label_len > FEB_PAIRING_LABEL_MAX_LEN) {
-        label_len = FEB_PAIRING_LABEL_MAX_LEN;
-    }
-    if(t_len > FEB_PAIRING_MAX_TRANSCRIPT_LEN) {
-        t_len = FEB_PAIRING_MAX_TRANSCRIPT_LEN;
+    if(label_len > FEB_PAIRING_LABEL_MAX_LEN || t_len > FEB_PAIRING_MAX_TRANSCRIPT_LEN) {
+        feb_secure_zero(out, out_len);
+        return;
     }
 
     memcpy(buf, label, label_len);

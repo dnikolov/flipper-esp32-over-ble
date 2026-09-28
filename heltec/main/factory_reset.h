@@ -23,4 +23,21 @@ void feb_wipe_pairing_secrets(void);
    if called before the NimBLE host task has finished its own startup. */
 void feb_wardriving_request_button_toggle(void);
 
+/* Defined in factory_reset.c: the actual NVS erase + restart (nvs_flash_erase()/
+   nvs_flash_init()/feb_wipe_pairing_secrets()/esp_restart()). Call feb_factory_reset_request()
+   below instead of this directly from factory_reset_task() -- exposed here only so main.c's
+   host-task callback can invoke it once the request has been serialized (HARDENING_PLAN.md
+   HP-13). */
+void feb_factory_reset_perform(void);
+
+/* Defined in main.c: hands the factory-reset gesture off to the NimBLE host task, the same
+   way feb_wardriving_request_button_toggle() does, so the NVS erase inside
+   feb_factory_reset_perform() can never interleave with another NVS writer's own
+   nvs_open()/nvs_set_*()/nvs_commit() sequence (persist_pairing_secret(),
+   wardriving_persist_save(), the radio kill-switch's persist). Falls back to calling
+   feb_factory_reset_perform() directly when the host task isn't currently running (radio
+   kill-switch persisted off) -- nothing there to race in that state. Safe to call from
+   factory_reset_task(). */
+void feb_factory_reset_request(void);
+
 #endif

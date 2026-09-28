@@ -131,7 +131,30 @@ The FAP targets only this pinned API. Compatibility with later Unleashed API rev
 - [x] Fetch the pinned Unleashed checkout
 - [x] Build the standalone FAP baseline
 
-The FAP was built with the pinned Unleashed Windows `fbt.cmd` wrapper using a temporary copy under `applications_user/flipper_esp32_over_ble`, because this FBT revision resolves `APPSRC` only from known app directories. The project-specific artifact is `build/f7-firmware-D/.extapps/flipper_esp32_over_ble.fap` in that checkout.
+The FAP was built with the pinned Unleashed Windows `fbt.cmd` wrapper using a temporary copy under `applications_user/flipper_esp32_over_ble`, because this FBT revision resolves `APPSRC` only from known app directories. The project-specific artifact is `build/f7-firmware/.extapps/flipper_esp32_over_ble.fap` in that checkout.
+
+**FAP build type is pinned to release (`DEBUG=0`, `-Os`) as of 2026-09-28** — until then this project built and flashed FBT's default debug (`DEBUG=1`, `-Og`) artifact from `build/f7-firmware-D/`. This is a pinned baseline, not a convenience: a FAP's compiled sections are heap-resident for the app's whole lifetime, so build type is part of this app's runtime memory budget (see `CLAUDE.md`'s Build commands section and `docs/HARDENING_BACKLOG.md` H04 for the mechanism). Measured section sizes, same source tree, both configurations:
+
+| Section | `-Og` (old default) | `-Os` (pinned) |
+| --- | --- | --- |
+| `.text` | 65,768 | 54,680 |
+| `.rodata` | 12,632 | 11,944 |
+| `.data` | 56 | 56 |
+| `.bss` | 27,992 | 27,969 |
+| **total heap held** | **106,448** | **94,649** |
+
+`.fap` file size: 138,932 -> 115,756 bytes. All three Flipper host test suites (565 checks total) and `tools/check_shared_headers.py` pass against this build.
+
+After the 2026-09-28 hardening pass ([HARDENING_PLAN.md](HARDENING_PLAN.md)) the FAP is `.text` 56,064 / `.rodata` 12,168 / `.data` 56 / `.bss` 27,985. That's +1,384 `.text` for `protocol_mutex`, batched scan events and the strict decoders. The Flipper host suites total 491 + 69 + 64 checks.
+
+**ESP-IDF build config pinned for every ESP target as of 2026-09-28** (HARDENING_PLAN.md HP-12/HP-14/HP-27). `sdkconfig.defaults` in `esp32/`, `esp32/cluster_worker/`, `esp32c5/` and `heltec/` now set `CONFIG_COMPILER_OPTIMIZATION_SIZE=y` (`-Os`, was `-Og`), `CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y`, `CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y` and `CONFIG_ESP_TASK_WDT_PANIC=y`. Each tracked `sdkconfig` was regenerated, and the old/new diff was checked to contain only these options and their derived symbols. One known side effect: `CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER` drops out, because its Kconfig depends on `COMPILER_OPTIMIZATION_DEBUG`, so a task function that `return`s instead of self-deleting no longer gets the wrapper's logged abort. The Heltec regeneration also finally applied `CONFIG_TOUCH_SUPPRESS_DEPRECATE_WARN`, which was in its defaults but missing from the stale sdkconfig. Measured `idf.py size`:
+
+| Target | Before (`-Og`, no canary) | After |
+| --- | --- | --- |
+| C6 `esp32/` total image | 1,294,566 B | 1,204,940 B (DIRAM −9,032 B) |
+| C6 `esp32/cluster_worker/` total image | 865,212 B | 796,792 B (DIRAM −8,540 B) |
+| C5 `esp32c5/` total image | 1,329,234 B | 1,239,486 B (HP SRAM +10,026 B free; app partition 41% free) |
+| Heltec DRAM / IRAM headroom | tree didn't link (−16 B DRAM) / — | **364 B / 7,309 B** (supersedes BACKLOG.md BL27's 8 B / 45 B) |
 
 The ESP32 baseline build completed successfully with ESP-IDF v5.5.2. Verified artifacts are `esp32/build/flipper_esp32_over_ble.elf` (3,590,924 bytes), `esp32/build/flipper_esp32_over_ble.bin` (161,888 bytes), `esp32/build/flipper_esp32_over_ble.map` (2,828,886 bytes), `esp32/build/flasher_args.json` (959 bytes), and `esp32/build/project_description.json` (195,509 bytes).
 

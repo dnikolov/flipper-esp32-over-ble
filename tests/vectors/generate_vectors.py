@@ -1376,6 +1376,43 @@ MESH_LOG_RECORD_BAD_FIELD = raw(
     cbor_text("foo"), cbor_uint(1))
 
 
+# =====================================================================================
+# Shared-layer strictness vectors (docs/HARDENING_PLAN.md HP-25/HP-26/HP-28). Every one of
+# these must be rejected identically by both firmwares, independent of size_t width.
+# =====================================================================================
+
+# HP-25: a map head whose 9-byte count (2^32 + 5) a 32-bit decoder would truncate to 5,
+# followed by the 5 fields of a valid record -- must be FEB_CBOR_ERR_TOO_LARGE, not accepted
+# as a 5-field record. Map/array counts and `version` are bounded by UINT32_MAX on both
+# sides (the same bound on 32- and 64-bit builds).
+MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD = bytes([0xBB]) + (2**32 + 5).to_bytes(8, "big") + RECORD[1:]
+ARRAY_HEAD_COUNT_2POW32_PLUS_1 = bytes([0x9B]) + (2**32 + 1).to_bytes(8, "big") + cbor_uint(0)
+RECORD_VERSION_2POW32_PLUS_2 = unencrypted_record(2**32 + 2, "error", SESSION_ID, BOARD_ID, PAYLOAD)
+PAIR_CONFIRM_RECORD_VERSION_2POW32_PLUS_2 = pairing_envelope(
+    2**32 + 2, "pair_confirm", PAIR_BOARD_ID, PAIR_CONFIRM_PAYLOAD)
+SESS_PROT_RECORD_VERSION_2POW32_PLUS_2 = protected_record(
+    2**32 + 2, "error", SESS_SESSION_ID, SESS_BOARD_ID, SESS_PROT1_SEQ, SESS_PROT1_CT, SESS_PROT1_TAG)
+
+# HP-26: `command.arguments` / `status.result` must be maps (major type 5) on both sides --
+# FEB_CBOR_ERR_UNEXPECTED_TYPE for an array or an unsigned integer in their place.
+COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD = command_payload("wifi_scan", WIFI_SCAN_REQUEST_ID, cbor_array_header(0))
+STATUS_RESULT_NOT_MAP_PAYLOAD = status_payload(WIFI_SCAN_REQUEST_ID, "complete", cbor_uint(0))
+
+
+# HP-28: correctly authenticated protected records (golden session, ESP32->Flipper,
+# sequence 1) whose decrypted plaintext is not exactly one CBOR value. TRAILING is a valid
+# payload map plus one extra byte (FEB_CBOR_ERR_UNEXPECTED_TYPE); TRUNCATED is a map header
+# promising more entries than the plaintext holds (FEB_CBOR_ERR_TRUNCATED).
+def _sess_prot1_with_plaintext(plaintext: bytes) -> bytes:
+    ct, tag = gcm_encrypt(SESS_KEY, SESS_PROT1_NONCE, SESS_PROT1_AAD, plaintext)
+    return protected_record(SESS_VERSION, "error", SESS_SESSION_ID, SESS_BOARD_ID, SESS_PROT1_SEQ, ct, tag)
+
+
+SESS_PROT_TRAILING_PLAINTEXT_RECORD = _sess_prot1_with_plaintext(SESS_PROT1_PAYLOAD + b"\x00")
+SESS_PROT_TRUNCATED_PLAINTEXT_RECORD = _sess_prot1_with_plaintext(
+    cbor_map_header(4) + SESS_PROT1_PAYLOAD[1:])
+
+
 def c_bytes(name: str, data: bytes) -> str:
     hex_bytes = ", ".join(f"0x{b:02x}" for b in data)
     wrapped = textwrap.fill(hex_bytes, width=96, initial_indent="    ", subsequent_indent="    ")
@@ -1851,6 +1888,27 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_EMPTY_PAYLOAD", MESH_LOG_STATUS_EMPTY_PAYLOAD))
     f.write(c_bytes("FEB_VEC_MESH_LOG_STATUS_WORST_CASE_PAYLOAD", MESH_LOG_STATUS_WORST_CASE_PAYLOAD))
 
+    f.write("/* ---- Shared-layer strictness vectors (HP-25/HP-26/HP-28), rejected identically by\n")
+    f.write("   both firmwares regardless of size_t width. ---- */\n")
+    f.write("/* 9-byte map head, count 2^32+5 (a 32-bit truncation would read 5), then a valid\n")
+    f.write("   record's 5 fields: FEB_CBOR_ERR_TOO_LARGE. */\n")
+    f.write(c_bytes("FEB_VEC_MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD", MAP_HEAD_COUNT_2POW32_PLUS_5_RECORD))
+    f.write("/* 9-byte array head, count 2^32+1, one element: FEB_CBOR_ERR_TOO_LARGE. */\n")
+    f.write(c_bytes("FEB_VEC_ARRAY_HEAD_COUNT_2POW32_PLUS_1", ARRAY_HEAD_COUNT_2POW32_PLUS_1))
+    f.write("/* `version` = 2^32+2 (a uint32_t truncation would read 2) in each record-level\n")
+    f.write("   envelope: FEB_CBOR_ERR_TOO_LARGE. */\n")
+    f.write(c_bytes("FEB_VEC_RECORD_VERSION_2POW32_PLUS_2", RECORD_VERSION_2POW32_PLUS_2))
+    f.write(c_bytes("FEB_VEC_PAIR_CONFIRM_RECORD_VERSION_2POW32_PLUS_2", PAIR_CONFIRM_RECORD_VERSION_2POW32_PLUS_2))
+    f.write(c_bytes("FEB_VEC_SESS_PROT_RECORD_VERSION_2POW32_PLUS_2", SESS_PROT_RECORD_VERSION_2POW32_PLUS_2))
+    f.write("/* command.arguments is an array / status.result is a uint: FEB_CBOR_ERR_UNEXPECTED_TYPE. */\n")
+    f.write(c_bytes("FEB_VEC_COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD", COMMAND_ARGUMENTS_NOT_MAP_PAYLOAD))
+    f.write(c_bytes("FEB_VEC_STATUS_RESULT_NOT_MAP_PAYLOAD", STATUS_RESULT_NOT_MAP_PAYLOAD))
+    f.write("/* Golden-session protected records (ESP32->Flipper, sequence 1) that authenticate\n")
+    f.write("   but whose plaintext is not exactly one CBOR value: TRAILING (valid payload + one\n")
+    f.write("   byte) -> FEB_CBOR_ERR_UNEXPECTED_TYPE; TRUNCATED (map header promises 4 entries,\n")
+    f.write("   3 present) -> FEB_CBOR_ERR_TRUNCATED. */\n")
+    f.write(c_bytes("FEB_VEC_SESS_PROT_TRAILING_PLAINTEXT_RECORD", SESS_PROT_TRAILING_PLAINTEXT_RECORD))
+    f.write(c_bytes("FEB_VEC_SESS_PROT_TRUNCATED_PLAINTEXT_RECORD", SESS_PROT_TRUNCATED_PLAINTEXT_RECORD))
     f.write("\n#endif /* FEB_TEST_VECTORS_H */\n")
 
 print("wrote vectors.h")

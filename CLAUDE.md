@@ -21,6 +21,7 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria. |
 | [docs/BACKLOG.md](docs/BACKLOG.md) | The single centralized list of open, actionable items — defects, deferred product decisions, cost/efficiency work. Check before starting anything not already in the current roadmap step. |
 | [docs/HARDENING_BACKLOG.md](docs/HARDENING_BACKLOG.md) | Deeper structural/robustness issues found during live testing that need their own investigation/design pass before fixing — distinct from BACKLOG.md's ready-to-fix items. |
+| [docs/HARDENING_PLAN.md](docs/HARDENING_PLAN.md) | 2026-09-28 full-codebase review: prioritized HP-xx findings (bugs, memory, perf, security) with a batched fix order. Check before touching any file it cites. |
 | [docs/BACKLOG_COMPLETED.md](docs/BACKLOG_COMPLETED.md) | Scannable one-line-per-item archive of resolved BACKLOG.md rows. Full narrative for any of them is in PROJECT_HISTORY.md. |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Why pairing/transport/delivery choices were made, and their accepted tradeoffs. |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The v2 wire contract — CBOR shapes, crypto derivations, UUIDs. Source of truth for both firmwares. |
@@ -71,11 +72,25 @@ On Windows this FBT revision only resolves `APPSRC` from a recognized `applicati
 subdirectory, so the app source is synced into a temp copy there before building:
 
 ```powershell
-fbt.cmd fap_flipper_esp32_over_ble
+fbt.cmd DEBUG=0 fap_flipper_esp32_over_ble
 ```
 
+`DEBUG=0` (release, `-Os`) rather than FBT's own default of `DEBUG=1` (`-Og`) is deliberate and
+load-bearing — **a memory decision, not a build-speed one.** An external FAP's
+`.text`/`.rodata`/`.data`/`.bss` are each `aligned_malloc()`ed from the live Flipper system heap
+at launch and stay resident for the app's whole lifetime
+([docs/HARDENING_BACKLOG.md](docs/HARDENING_BACKLOG.md) H04), so optimization level directly sets
+how much heap the rest of the firmware is left with. Measured 2026-09-28 on this app: `-Og` ->
+`-Os` is `.text` 65768 -> 54680 and `.rodata` 12632 -> 11944, **11,799 bytes of system heap handed
+back**, with `.text` (the largest single contiguous block the ELF loader must find) down 17%.
+Nothing is given up for it: FBT's non-COMPACT release config still defines `LOGS_DEBUG_BUILD` so
+every `FURI_LOG` level still compiles in, and this app has zero `furi_assert()` calls (it uses
+`furi_check()`, which survives `FURI_NDEBUG`). `tools/build_flipper.ps1` does this by default;
+`-DebugBuild` gets the `-Og` artifact back for a debugger session.
+
 Artifacts: ESP32 image under `esp32/build/`; FAP under
-`build/f7-firmware-D/.extapps/flipper_esp32_over_ble.fap` in the Unleashed checkout.
+`build/f7-firmware/.extapps/flipper_esp32_over_ble.fap` in the Unleashed checkout (the release
+directory, **not** the `f7-firmware-D/` debug one this project used until 2026-09-28).
 
 ## Hardware safety
 

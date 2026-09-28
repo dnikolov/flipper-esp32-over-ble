@@ -9,3 +9,11 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 CONFIG_MBEDTLS_HKDF_C=y
+# HP-12/HP-14/HP-27 (docs/HARDENING_PLAN.md): -Os frees flash/IRAM the other two options'
+# canary/panic checks need; stack-canary + task-WDT panic turn this project's most-repeated
+# bug class (NimBLE-host-task stack overflow, docs/LESSONS.md) into a clean abort instead of
+# silent corruption.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+CONFIG_ESP_TASK_WDT_PANIC=y

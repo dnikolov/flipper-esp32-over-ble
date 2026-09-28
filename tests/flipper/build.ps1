@@ -40,7 +40,10 @@ $sources = @(
     (Join-Path $flipperDir "cbor_ble_scan.c"),
     (Join-Path $flipperDir "cbor_wardriving.c"),
     (Join-Path $flipperDir "cbor_gps.c"),
-    (Join-Path $flipperDir "wardriving_csv.c")
+    (Join-Path $flipperDir "cbor_meshcore.c"),
+    (Join-Path $flipperDir "cbor_mesh_log.c"),
+    (Join-Path $flipperDir "wardriving_csv.c"),
+    (Join-Path $flipperDir "mesh_nodes.c")
 ) -join " "
 
 $includeDirs = "/I `"$flipperDir`" /I `"$vectorsDir`""

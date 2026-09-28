@@ -267,6 +267,10 @@ size_t
     if(head_len == 0) {
         return 0;
     }
+    if(raw_count > UINT32_MAX) {
+        *status = FEB_CBOR_ERR_TOO_LARGE;
+        return 0;
+    }
     *count = (size_t)raw_count;
     *status = FEB_CBOR_OK;
     return head_len;
@@ -277,6 +281,10 @@ size_t
     uint64_t raw_count = 0;
     size_t head_len = decode_head(in, in_len, 4, &raw_count, status);
     if(head_len == 0) {
+        return 0;
+    }
+    if(raw_count > UINT32_MAX) {
+        *status = FEB_CBOR_ERR_TOO_LARGE;
         return 0;
     }
     *count = (size_t)raw_count;

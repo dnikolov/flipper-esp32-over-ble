@@ -112,9 +112,11 @@
    host script's own network call can legitimately take a while, so the timeout is generous;
    neither number is wire-format-pinned, just a judgment call bounding an otherwise-unbounded
    wait for a file that might never appear (host script never ran, USB never got plugged in,
-   etc). */
+   etc). HP-10: raised 180s -> 600s to give the host script's own size-scaled archive step
+   (a large CSV's own copy/verify) room to finish inside this window instead of racing it --
+   the host side is being changed to keep its whole run, including that step, well under 600s. */
 #define FEB_PUBLISH_POLL_PERIOD_MS 2000u
-#define FEB_PUBLISH_POLL_TIMEOUT_MS 180000u
+#define FEB_PUBLISH_POLL_TIMEOUT_MS 600000u
 #define FEB_PUBLISH_RESULT_MAX_LEN 512u
 /* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
    section: this runs unattended, with no review step, so "whatever's on the default branch
@@ -387,73 +389,101 @@ typedef enum {
     AppEventPublishPollTick,
 } AppEventType;
 
-/* wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
+/* One flat member per event type used to make this struct 576 bytes -- every field of
+   every event type resident simultaneously, in an app whose whole `.bss` is a single
+   permanently-resident heap allocation (see shared_ble_event's own declaration comment and
+   docs/HARDENING_BACKLOG.md H04). It is now a tagged union: `type` selects exactly one
+   member, which is the only one a poster writes or a handler reads. Safe because every
+   field was already written by exactly one post_*() and read by exactly one branch of the
+   main loop's if/else chain on `type` -- no field was ever shared across event types. The
+   three per-capability error-message fields collapse into one `error_message` for the same
+   reason (AppEventWifiScanError/AppEventBleScanError/AppEventWardrivingError are three
+   distinct types, never in flight as the same event).
+
+   Size: 576 -> 104 bytes. That is 4 resident instances in `.bss` plus the 8-deep
+   furi_message_queue's own heap copy plus the main loop's stack local, so the saving is
+   ~1.9 KB of `.bss`, ~3.8 KB of system heap, and ~470 bytes of this app's 4 KB main-thread
+   stack.
+
+   wifi_scan per-AP display fields: phy/auth are copied (not aliased) because their source
    (feb_wifi_scan_ap_t, decoded on the BLE thread from a buffer valid only for the duration
    of that one profile_event_handler call) cannot outlive the event post; ssid is sanitized
    to printable ASCII here (docs/PROTOCOL.md: raw bytes on the wire, not guaranteed
    printable/UTF-8) so both this event and the display list downstream always hold a safe,
    NUL-terminated C string. */
+#define APP_EVENT_ERROR_MESSAGE_LEN 48
+#define APP_EVENT_WARDRIVING_SUMMARY_LEN 40
+
 typedef struct {
     AppEventType type;
-    InputEvent input;
-    BtStatus bt_status;
-    PairingPhase pairing_phase;
-    char pairing_reason[PAIRING_REASON_MAX_LEN];
-    char capability_board[CAPABILITY_BOARD_MAX_LEN + 1];
-    char capability_features[CAPABILITY_FEATURES_MAX_LEN];
-    bool capability_has_wifi_scan;
-    char wifi_scan_ap_ssid[FEB_WIFI_SCAN_SSID_MAX_LEN + 1];
-    uint8_t wifi_scan_ap_bssid[FEB_WIFI_SCAN_BSSID_LEN];
-    int32_t wifi_scan_ap_rssi_dbm;
-    uint32_t wifi_scan_ap_channel;
-    char wifi_scan_ap_phy[8];
-    char wifi_scan_ap_auth[24];
-    char wifi_scan_error_message[48];
-    bool capability_has_ble_scan;
-    uint8_t ble_scan_device_address[FEB_BLE_SCAN_ADDRESS_LEN];
-    bool ble_scan_device_has_name;
-    char ble_scan_device_name[FEB_BLE_SCAN_NAME_MAX_LEN + 1];
-    int32_t ble_scan_device_rssi_dbm;
-    char ble_scan_device_addr_type[8];
-    char ble_scan_error_message[48];
-    bool capability_has_wardriving;
-    /* wardriving fields: AppEventWardrivingRunState uses wardriving_running/
-       wardriving_is_fresh_start; AppEventWardrivingBatch uses the batch_count, the
-       backlog_remaining, and the last_* fields; AppEventWardrivingError uses
-       wardriving_error_message. Fields are shared across these three event types (like
-       pairing_reason above) rather than a union, matching this struct's existing style. */
-    bool wardriving_running;
-    bool wardriving_is_fresh_start; /* true only for a real "started" ack -- see this event's
-                                        own AppEventType comment; distinguishes a genuine new
-                                        capture (reset the on-screen record counter) from a
-                                        `busy`-error-inferred "it was already running"
-                                        correction (do not reset the counter). */
-    uint32_t wardriving_batch_count;
-    uint64_t wardriving_backlog_remaining;
-    char wardriving_last_wifi_summary[40];
-    char wardriving_last_ble_summary[40];
-    char wardriving_error_message[48];
-    bool capability_has_gps;
-    /* AppEventGpsStatus fields; gps_lat_e7_offset..gps_utc_timestamp_s are only meaningful
-       when gps_state == GpsFixStateFix (see post_gps_status()). */
-    uint8_t gps_state; /* GpsFixState value */
-    uint64_t gps_lat_e7_offset;
-    uint64_t gps_lon_e7_offset;
-    uint64_t gps_fix_quality;
-    uint64_t gps_satellites;
-    uint64_t gps_hdop_e1;
-    uint64_t gps_utc_timestamp_s;
-    uint64_t gps_altitude_dm_offset;
-    uint64_t gps_speed_e1_kmh;
-    /* Still decoded/stored even though the Flipper no longer polls meshcore_scan directly
-       (see AppScreenMeshLog) -- kept as capability-registry metadata, same as every other
-       capability_has_* flag. */
-    bool capability_has_meshcore_scan;
-    /* mesh_log (docs/WARDRIVING_PUBLISH.md "Mesh node publishing"): no dedicated AppEvent
-       fields needed -- handle_mesh_log_status() appends decoded records directly into the
-       file-scope mesh_log_display_nodes[]/mesh_log_display_count under
-       wardriving_state_mutex, it never posts an AppEvent (see that function's own comment). */
-    bool capability_has_mesh_log;
+    union {
+        InputEvent input; /* AppEventInput */
+        /* generation is protocol_generation as read (under protocol_mutex) at the moment
+           bt_status_callback posted this event -- see protocol_reset_if_unchanged()'s own
+           comment (HP-07/G10). */
+        struct {
+            BtStatus status;
+            uint32_t generation;
+        } bt_status; /* AppEventBtStatus */
+        struct {
+            PairingPhase phase;
+            char reason[PAIRING_REASON_MAX_LEN];
+        } pairing; /* AppEventPairingPhase */
+        struct {
+            char board[CAPABILITY_BOARD_MAX_LEN + 1];
+            char features[CAPABILITY_FEATURES_MAX_LEN];
+            bool has_wifi_scan;
+            bool has_ble_scan;
+            bool has_wardriving;
+            bool has_gps;
+            /* Still decoded/stored even though the Flipper no longer polls meshcore_scan
+               directly (see AppScreenMeshLog) -- kept as capability-registry metadata, same
+               as every other has_* flag. */
+            bool has_meshcore_scan;
+            bool has_mesh_log;
+        } capability; /* AppEventCapabilityInfo */
+        /* AppEventWifiScanAp / AppEventBleScanDevice carry no payload (HP-08): the decoded
+           AP/device is copied straight into wifi_scan_aps[]/ble_scan_devices[] under
+           wardriving_state_mutex by the poster (see post_wifi_scan_results_updated()/
+           post_ble_scan_results_updated()), and these two event types now exist only to
+           make the main loop redraw -- one post per `status` record, not one per item, so a
+           large batch can never silently overflow this app's 8-deep queue the way one event
+           per AP/device previously could. */
+        struct {
+            bool running;
+            bool is_fresh_start; /* true only for a real "started" ack -- see this event's
+                                     own AppEventType comment; distinguishes a genuine new
+                                     capture (reset the on-screen record counter) from a
+                                     `busy`-error-inferred "it was already running"
+                                     correction (do not reset the counter). */
+        } wardriving_run_state; /* AppEventWardrivingRunState */
+        struct {
+            uint64_t backlog_remaining;
+            uint32_t batch_count;
+            char last_wifi_summary[APP_EVENT_WARDRIVING_SUMMARY_LEN];
+            char last_ble_summary[APP_EVENT_WARDRIVING_SUMMARY_LEN];
+        } wardriving_batch; /* AppEventWardrivingBatch */
+        /* lat_e7_offset..speed_e1_kmh are only meaningful when state == GpsFixStateFix
+           (see post_gps_status()). */
+        struct {
+            uint64_t lat_e7_offset;
+            uint64_t lon_e7_offset;
+            uint64_t fix_quality;
+            uint64_t satellites;
+            uint64_t hdop_e1;
+            uint64_t utc_timestamp_s;
+            uint64_t altitude_dm_offset;
+            uint64_t speed_e1_kmh;
+            uint8_t state; /* GpsFixState value */
+        } gps; /* AppEventGpsStatus */
+        /* AppEventWifiScanError / AppEventBleScanError / AppEventWardrivingError */
+        char error_message[APP_EVENT_ERROR_MESSAGE_LEN];
+        /* AppEventWifiScanDone / AppEventBleScanDone / AppEventSessionFatal /
+           AppEventGpsPollTick / AppEventPublishPollTick carry no payload.
+           mesh_log posts no AppEvent at all -- handle_mesh_log_status() appends decoded
+           records directly into mesh_log_display_nodes[] under wardriving_state_mutex (see
+           that function's own comment). */
+    } u;
 } AppEvent;
 
 typedef struct {
@@ -633,6 +663,50 @@ static feb_reassembly_t reassembly;
    BleEventWorker stack. */
 static FuriMutex* reassembly_mutex;
 static FuriTimer* reassembly_timeout_timer;
+
+/* HP-06/HP-07/G10: serializes (a) every feb_session_encrypt_record()/feb_session_decrypt_record()
+   call (encrypt runs on the main thread, e.g. send_gps_command() from AppEventGpsPollTick,
+   wardriving start/stop, scans; decrypt runs on BleEventWorker for unsolicited pushes -- the
+   two were previously able to interleave on the shared GCM nonce/AAD/tag scratch in session.c,
+   risking nonce reuse) and (b) every reset of the pairing/session ceremony statics
+   (pairing_reset_state()/session_reset_state()), so a main-thread reset can never tear a
+   ceremony BleEventWorker is mid-way through advancing.
+
+   Design (connection-generation counter, not "move every reset onto BleEventWorker" -- see
+   docs/HARDENING_PLAN.md HP-07 for why either is acceptable): `protocol_generation` is bumped,
+   under this mutex, as the very first action of every protocol-state mutation on BleEventWorker
+   (pairing/session envelope dispatch below, and the protected-record decrypt block), strictly
+   before any of that mutation's own (unlocked, BleEventWorker-only) field writes begin. A
+   BtStatusConnected/Advertising event (posted from the separate "Bt" service thread, see
+   bt_status_callback) carries the generation value that was current at post time. The main
+   loop never resets pairing/session state directly; it calls protocol_reset_if_unchanged()
+   with that carried value, which atomically (a) compares it against the current generation
+   and (b) performs the reset only if unchanged -- i.e. only if nothing on BleEventWorker has
+   touched protocol state since this now-possibly-stale event was queued. This closes the race
+   without needing to wrap entire multi-return ceremony functions: either the compare-and-reset
+   commits before BleEventWorker's own bump (safe -- the ceremony proceeds on a freshly-reset
+   session/pairing state), or the bump commits first (any reset attempt against that now-stale
+   generation is rejected, so it can never run concurrently with the unlocked field writes that
+   follow the bump). UI-only fields (pairing_phase, connection_lost, LED, scan-UI resets) are
+   deliberately NOT gated by this check -- they always run, matching "leave the main thread
+   UI-only" for everything except the actual crypto-state reset.
+
+   Deadlock avoidance: every critical section under this mutex is a handful of memcpy/zero
+   calls or a single feb_session_encrypt_record()/feb_session_decrypt_record() call -- never a
+   BLE send (ble_gatt_characteristic_update() via send_pairing_record()/emit_fragment() always
+   runs after this mutex has already been released) and never a call back into
+   pairing_reset_state()/session_reset_state() while already holding it (their `_locked`
+   variants are used instead wherever the caller already holds the lock). reassembly_mutex may
+   be acquired while this mutex is held (protocol_reset_if_unchanged()) but never the reverse,
+   so there is a single fixed lock order and no cycle. */
+static FuriMutex* protocol_mutex;
+static uint32_t protocol_generation;
+
+/* Guards wifi_scan_aps/ble_scan_devices/mesh_log_display_nodes and the wardriving CSV/mesh-log
+   export file handles -- see its point of use further down (wardriving_csv_file's own comment)
+   for the full cross-thread argument. Declared here, ahead of the wifi_scan/ble_scan capability
+   section, so handle_wifi_scan_status()/handle_ble_scan_status() can take it too (HP-08). */
+static FuriMutex* wardriving_state_mutex;
 static uint8_t outgoing_message_id;
 
 /* `gps` poll timer (docs/PLAN.md "Real GPS driver...", decision 5: poll only while a screen
@@ -653,10 +727,12 @@ static FuriTimer* publish_poll_timer;
 static const FuriHalBleProfileTemplate profile_callbacks;
 static void start_profile(Esp32App* app);
 
-/* ---- pairing ceremony state: single BLE connection, single-threaded BLE event dispatch
-   (see profile_event_handler), so static storage for the one in-flight ceremony is safe
-   and keeps these off the ~1280-byte BleEventWorker stack (docs/SESSION_MEMORY.md's
-   stack-overflow root cause). ---- */
+/* ---- pairing ceremony state: BleEventWorker's own dispatch of these fields is
+   single-threaded/non-reentrant (see profile_event_handler), which is what makes static
+   storage safe here at all (keeps these off the ~1280-byte BleEventWorker stack,
+   docs/SESSION_MEMORY.md's stack-overflow root cause) -- but the main thread's
+   BtStatusConnected/Advertising handling also calls pairing_reset_state() on these same
+   statics (HP-07), a real cross-thread access protocol_mutex above now serializes. ---- */
 typedef enum {
     PairStageNone,
     PairStageInitReceived,
@@ -1012,6 +1088,60 @@ static bool build_app_data_path(char* out, size_t out_cap, const char* filename)
     return written > 0 && (size_t)written < out_cap;
 }
 
+/* Free-heap floor enforced before this app asks the Storage service to open a file
+   (docs/HARDENING_BACKLOG.md H04, and the 2026-09-28 user-reported "Flipper crashed and was
+   rebooted, out of memory" during a wardriving backlog flush).
+
+   Opening a file is not a cheap call on this firmware: storage_ext.c's `storage_process_file_open()`
+   mallocs an `SDFile` wrapping a FatFS `FIL`, which carries its own 512-byte sector buffer --
+   roughly 600 contiguous bytes out of the same system heap that already holds every one of
+   this FAP's `.text`/`.rodata`/`.data`/`.bss` sections (the ELF loader aligned_malloc()s each
+   one at launch, see H04). That allocation goes through `pvPortMalloc()`, which
+   `furi_check(pvReturn, "out of memory")`s on failure -- i.e. a failed open does not return an
+   error this app could handle, it reboots the whole device. Checking the margin first turns
+   that reboot into this app's own visible, recoverable failure path ("CSV export write
+   failed" on screen, session still alive, records still accumulating on the ESP32's flash
+   backlog for a later drain).
+
+   This is a heuristic, not a guarantee -- another thread can allocate between this check and
+   the Storage service's own malloc, and nothing here protects the GUI/BLE/notification
+   allocations happening concurrently. It removes the single most likely crash point, which is
+   a real improvement over rebooting, not a claim that the app is now OOM-proof. The only
+   actual fix for the underlying pressure is footprint reduction (see the .bss work in the same
+   pass as this comment).
+
+   Threshold: the ~600-byte SDFile/FIL allocation plus the Storage service's own per-call churn
+   and a deliberate cushion, since the check is racy by nature. Uses
+   memmgr_heap_get_max_free_block() rather than memmgr_get_free_heap() because the allocation
+   that fails needs one *contiguous* block, which is exactly H04's already-confirmed
+   fragmentation mechanism -- total free bytes can look healthy while no single block fits.
+
+   `logged_once` is a caller-owned latch, not a nicety: FURI_LOG_* is itself a heap allocation
+   (furi/core/log.c's furi_log_print_format() does furi_string_alloc() then grows it with
+   furi_string_vprintf()), so logging on the very path that just measured the heap as too tight
+   is the one place a log line can plausibly be the allocation that trips
+   furi_check(pvReturn, "out of memory"). One line per session per call site is worth that
+   risk for diagnosis; one per wardriving batch, for minutes on end, is not. */
+#define FEB_STORAGE_OPEN_MIN_FREE_BLOCK 3072u
+
+static bool storage_open_heap_margin_ok(const char* what, bool* logged_once) {
+    size_t largest = memmgr_heap_get_max_free_block();
+    if(largest >= FEB_STORAGE_OPEN_MIN_FREE_BLOCK) {
+        return true;
+    }
+    if(!*logged_once) {
+        *logged_once = true;
+        FURI_LOG_E(
+            TAG,
+            "%s: deferring file open, largest free heap block %u < %u (free heap %u)",
+            what,
+            (unsigned)largest,
+            (unsigned)FEB_STORAGE_OPEN_MIN_FREE_BLOCK,
+            (unsigned)memmgr_get_free_heap());
+    }
+    return false;
+}
+
 /* Atomic per-board persistence: temp-file write, exact-length verification,
    storage_file_sync(), close, remove-old, rename -- the archive_favorites.c precedent
    (docs/PLAN.md step 5) with the missing sync call added. One file per board_id so
@@ -1325,9 +1455,9 @@ static void wardriving_settings_save(const Esp32App* app) {
     }
 }
 
-/* docs/PLAN.md step 7 grew AppEvent past this file's ~100-byte static-storage threshold
-   (added capability_board/capability_features) -- event is static, not stack-local, to
-   keep it off the 1280-byte BleEventWorker stack (this function is reachable from
+/* AppEvent sits right at this file's ~100-byte static-storage threshold (104 bytes since
+   the tagged-union rework -- see its own declaration) -- event is static, not stack-local,
+   to keep it off the 1280-byte BleEventWorker stack (this function is reachable from
    profile_event_handler via the handle_pair_ and handle_hello/handle_client_auth
    callbacks). A static local with a designated initializer only runs that initializer once
    at program load, not per call (docs/SESSION_MEMORY.md's cmult() trap), so every field is
@@ -1365,28 +1495,62 @@ static union {
     feb_mesh_log_status_result_payload_t mesh_log;
 } shared_status_result;
 
+/* HP-08: every furi_message_queue_put() call in this file used to go unchecked, silently
+   dropping events -- including AppEventSessionFatal/AppEventBtStatus -- whenever the 8-deep
+   app.queue was transiently full. This wrapper counts and rate-limit-logs failures, and
+   picks a real (bounded) timeout for callers that can afford to wait a little for the main
+   thread to drain a slot: every caller here runs on its own dedicated FreeRTOS thread
+   (BleEventWorker, the "Bt" service thread, GuiSrv) except gps_poll_timer_callback/
+   publish_poll_timer_callback, which share the one FreeRTOS Timer Service task with every
+   other furi_timer_alloc() callback in the whole firmware and must always pass timeout_ms=0
+   -- blocking that thread would stall every other app's timers too. */
+static uint32_t app_queue_put_failures;
+
+static bool app_queue_put(FuriMessageQueue* queue, const AppEvent* event, uint32_t timeout_ms) {
+    FuriStatus status =
+        furi_message_queue_put(queue, event, timeout_ms ? furi_ms_to_ticks(timeout_ms) : 0);
+    if(status != FuriStatusOk) {
+        app_queue_put_failures++;
+        if(app_queue_put_failures == 1 || (app_queue_put_failures % 50) == 0) {
+            FURI_LOG_E(
+                TAG,
+                "app queue put failed: event type %d, status %d, total drops %lu",
+                (int)event->type,
+                (int)status,
+                (unsigned long)app_queue_put_failures);
+        }
+        return false;
+    }
+    return true;
+}
+
+#define APP_QUEUE_PUT_TIMEOUT_MS 20u
+
 static void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* reason) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventPairingPhase;
-    event->pairing_phase = phase;
+    event->u.pairing.phase = phase;
     if(reason) {
-        strncpy(event->pairing_reason, reason, sizeof(event->pairing_reason) - 1);
-        event->pairing_reason[sizeof(event->pairing_reason) - 1] = '\0';
+        strncpy(event->u.pairing.reason, reason, sizeof(event->u.pairing.reason) - 1);
+        event->u.pairing.reason[sizeof(event->u.pairing.reason) - 1] = '\0';
     } else {
-        event->pairing_reason[0] = '\0';
+        event->u.pairing.reason[0] = '\0';
     }
-    furi_message_queue_put(app->queue, event, 0);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_session_fatal(Esp32App* app) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventSessionFatal;
-    furi_message_queue_put(app->queue, event, 0);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
-static void pairing_reset_state(void) {
+/* Caller must already hold protocol_mutex; does not bump protocol_generation itself (callers
+   that need the bump -- i.e. every caller except protocol_reset_if_unchanged(), which bumps
+   once for both resets together -- do it themselves). */
+static void pairing_reset_state_locked(void) {
     pair_stage = PairStageNone;
     feb_secure_zero(pair_board_id, sizeof(pair_board_id));
     pair_board_id_len = 0;
@@ -1394,6 +1558,13 @@ static void pairing_reset_state(void) {
     pair_transcript_len = 0;
     feb_secure_zero(pair_k_confirm, sizeof(pair_k_confirm));
     feb_secure_zero(pair_secret, sizeof(pair_secret));
+}
+
+static void pairing_reset_state(void) {
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+    pairing_reset_state_locked();
+    protocol_generation++;
+    furi_mutex_release(protocol_mutex);
 }
 
 static void send_pairing_wire_error(Esp32BleProfile* profile, feb_pairing_error_t err) {
@@ -1769,12 +1940,14 @@ typedef enum {
 static PendingCommandKind pending_command_kind = PendingCommandNone;
 
 /* Per-AP display state, accumulated across one or more `status` records for the results
-   view. Not reachable from profile_event_handler (BLE-thread callbacks only ever post one
-   AP's worth of data at a time through app->queue -- see post_wifi_scan_ap() below), but
-   kept static and off the stack-resident Esp32App struct anyway: this app's own main-thread
-   stack size isn't documented/pinned anywhere in this project (unlike BleEventWorker's
-   1280 bytes), so a several-KB array (32 entries) is treated with the same caution rather
-   than assumed safe as a local/struct-member. */
+   view. Written directly from profile_event_handler's BleEventWorker call chain under
+   wardriving_state_mutex (copy_wifi_scan_ap_locked(), HP-08 -- one queued event per `status`
+   record now, not one per AP, to keep a large/fast batch from silently overflowing this app's
+   8-deep queue), and read from both the main thread (input handling) and the GUI thread
+   (draw_wifi_scan_results()) under the same mutex. Kept static and off the stack-resident
+   Esp32App struct regardless: this app's own main-thread stack size isn't documented/pinned
+   anywhere in this project (unlike BleEventWorker's 1280 bytes), so a several-KB array (32
+   entries) is treated with the same caution rather than assumed safe as a local/struct-member. */
 #define WIFI_SCAN_SSID_DISPLAY_LEN (FEB_WIFI_SCAN_SSID_MAX_LEN + 1)
 #define WIFI_SCAN_PHY_DISPLAY_LEN 8
 #define WIFI_SCAN_AUTH_DISPLAY_LEN 24
@@ -1792,10 +1965,17 @@ typedef struct {
 static WifiScanApDisplay wifi_scan_aps[WIFI_SCAN_MAX_DISPLAY_APS];
 static size_t wifi_scan_ap_count;
 
+/* Resets the count under wardriving_state_mutex (HP-08); stale entries past the new count are
+   harmless since every reader bounds itself by the count read under the same lock. */
+static void wifi_scan_ap_count_reset(void) {
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    wifi_scan_ap_count = 0;
+    furi_mutex_release(wardriving_state_mutex);
+}
+
 /* Per-device display state for ble_scan, mirroring wifi_scan_aps/wifi_scan_ap_count above --
-   same off-stack-struct/static rationale (this app's own main-thread stack size isn't
-   documented/pinned), populated ONLY from the main loop's event handler, never touched
-   directly from the BLE thread. */
+   same cross-thread argument (written under wardriving_state_mutex from BleEventWorker,
+   read under it from the main/GUI threads), same off-stack-struct/static rationale. */
 #define BLE_SCAN_NAME_DISPLAY_LEN (FEB_BLE_SCAN_NAME_MAX_LEN + 1)
 #define BLE_SCAN_ADDR_TYPE_DISPLAY_LEN 8
 #define BLE_SCAN_MAX_DISPLAY_DEVICES FEB_BLE_SCAN_MAX_DEVICES_PER_RECORD
@@ -1810,6 +1990,13 @@ typedef struct {
 
 static BleScanDeviceDisplay ble_scan_devices[BLE_SCAN_MAX_DISPLAY_DEVICES];
 static size_t ble_scan_device_count;
+
+/* Mirrors wifi_scan_ap_count_reset() above. */
+static void ble_scan_device_count_reset(void) {
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    ble_scan_device_count = 0;
+    furi_mutex_release(wardriving_state_mutex);
+}
 
 /* mesh_log display state (docs/WARDRIVING_PUBLISH.md "Mesh node publishing") -- unlike
    wifi_scan_aps/ble_scan_devices/the old meshcore_nodes above, this list is written from TWO
@@ -1837,7 +2024,9 @@ static size_t mesh_log_display_count;
    is defined earlier in this file than that group. */
 static bool wardriving_flush_led_active;
 
-static void session_reset_state(void) {
+/* Caller must already hold protocol_mutex; see pairing_reset_state_locked()'s own comment
+   for why this split exists and who bumps protocol_generation. */
+static void session_reset_state_locked(void) {
     session_stage = SessionStageNone;
     feb_secure_zero(session_board_id, sizeof(session_board_id));
     session_board_id_len = 0;
@@ -1851,6 +2040,48 @@ static void session_reset_state(void) {
     session_seq_out = 0;
     session_seq_in = 0;
     wardriving_flush_led_active = false;
+}
+
+static void session_reset_state(void) {
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+    session_reset_state_locked();
+    protocol_generation++;
+    furi_mutex_release(protocol_mutex);
+}
+
+/* HP-07/G10: atomically resets pairing+session ceremony state only if `generation` (captured
+   by bt_status_callback at the moment its BtStatus event was posted) still matches the
+   current protocol_generation -- i.e. only if nothing on BleEventWorker has advanced the
+   ceremony since. See protocol_mutex's own top-of-file comment for the full race argument.
+   Also resets fragment reassembly (HP-24): a stale partial fragment from a previous
+   connection must not survive into a new one, and gating it on the same check means it is
+   never wiped out from under an in-flight reassembly either. Returns true if the reset was
+   actually performed (informational only; no caller currently needs this). */
+static bool protocol_reset_if_unchanged(uint32_t generation) {
+    bool performed = false;
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+    if(generation == protocol_generation) {
+        pairing_reset_state_locked();
+        session_reset_state_locked();
+        furi_mutex_acquire(reassembly_mutex, FuriWaitForever);
+        feb_reassembly_reset(&reassembly);
+        furi_mutex_release(reassembly_mutex);
+        protocol_generation++;
+        performed = true;
+    }
+    furi_mutex_release(protocol_mutex);
+    return performed;
+}
+
+/* Bumps protocol_generation alone -- called as the very first action of a BleEventWorker
+   protocol-state mutation (pairing/session envelope dispatch, protected-record decrypt),
+   strictly before any of that mutation's own unlocked field writes begin. See protocol_mutex's
+   top comment for why this ordering is what makes protocol_reset_if_unchanged() race-free
+   without wrapping entire multi-return handler functions in the mutex. */
+static void protocol_generation_bump(void) {
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+    protocol_generation++;
+    furi_mutex_release(protocol_mutex);
 }
 
 /* docs/PROTOCOL.md's "Runtime auth failure handling": unknown_board replies use the
@@ -2046,17 +2277,17 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
     event->type = AppEventCapabilityInfo;
     format_capability_display(
         payload,
-        event->capability_board,
-        sizeof(event->capability_board),
-        event->capability_features,
-        sizeof(event->capability_features));
-    event->capability_has_wifi_scan = capability_has_feature(payload, "wifi_scan");
-    event->capability_has_ble_scan = capability_has_feature(payload, "ble_scan");
-    event->capability_has_wardriving = capability_has_feature(payload, "wardriving");
-    event->capability_has_gps = capability_has_feature(payload, "gps");
-    event->capability_has_meshcore_scan = capability_has_feature(payload, "meshcore_scan");
-    event->capability_has_mesh_log = capability_has_feature(payload, "mesh_log");
-    furi_message_queue_put(app->queue, event, 0);
+        event->u.capability.board,
+        sizeof(event->u.capability.board),
+        event->u.capability.features,
+        sizeof(event->u.capability.features));
+    event->u.capability.has_wifi_scan = capability_has_feature(payload, "wifi_scan");
+    event->u.capability.has_ble_scan = capability_has_feature(payload, "ble_scan");
+    event->u.capability.has_wardriving = capability_has_feature(payload, "wardriving");
+    event->u.capability.has_gps = capability_has_feature(payload, "gps");
+    event->u.capability.has_meshcore_scan = capability_has_feature(payload, "meshcore_scan");
+    event->u.capability.has_mesh_log = capability_has_feature(payload, "mesh_log");
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* Persists the just-received capability_response payload verbatim (docs/CAPABILITIES.md)
@@ -2117,7 +2348,13 @@ static void capability_bootstrap(Esp32BleProfile* profile) {
         FURI_LOG_W(TAG, "capability_query: payload encode failed");
         return;
     }
+    /* HP-06/G10: protocol_mutex serializes this against every other
+       feb_session_encrypt_record()/feb_session_decrypt_record() call site -- released before
+       send_pairing_record()'s BLE send below, never held across it (see protocol_mutex's own
+       top-of-file comment). */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "capability_query: session sequence at cap; reconnect required");
         return;
     }
@@ -2138,14 +2375,16 @@ static void capability_bootstrap(Esp32BleProfile* profile) {
         pairing_record_buf,
         sizeof(pairing_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "capability_query: record encode failed");
         return;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     if(!send_pairing_record(profile, pairing_record_buf, record_len)) {
         FURI_LOG_W(TAG, "capability_query: send failed");
         return;
     }
-    session_seq_out++;
     FURI_LOG_I(TAG, "capability_query sent for board '%s'", session_board_id);
 }
 
@@ -2160,40 +2399,52 @@ static void copy_clamped_text(char* dst, size_t dst_cap, const char* src, size_t
     dst[n] = '\0';
 }
 
-/* Sanitizes and posts one decoded AP for display -- ssid is raw bytes on the wire (docs/
-   PROTOCOL.md: "not guaranteed valid UTF-8"), so every non-printable-ASCII byte is replaced
-   with '.' here, once, rather than deferring sanitization to every later draw call. */
-static void post_wifi_scan_ap(Esp32App* app, const feb_wifi_scan_ap_t* ap) {
-    AppEvent* event = &shared_ble_event;
-    memset(event, 0, sizeof(*event));
-    event->type = AppEventWifiScanAp;
+/* Sanitizes one decoded AP and copies it straight into wifi_scan_aps[] under
+   wardriving_state_mutex (HP-08) -- ssid is raw bytes on the wire (docs/PROTOCOL.md: "not
+   guaranteed valid UTF-8"), so every non-printable-ASCII byte is replaced with '.' here,
+   once, rather than deferring sanitization to every later draw call. Caller must hold
+   wardriving_state_mutex. */
+static void copy_wifi_scan_ap_locked(const feb_wifi_scan_ap_t* ap) {
+    if(wifi_scan_ap_count >= WIFI_SCAN_MAX_DISPLAY_APS) {
+        return;
+    }
+    WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
     size_t ssid_len = ap->ssid_len > FEB_WIFI_SCAN_SSID_MAX_LEN ? FEB_WIFI_SCAN_SSID_MAX_LEN : ap->ssid_len;
     for(size_t i = 0; i < ssid_len; i++) {
         uint8_t b = ap->ssid[i];
-        event->wifi_scan_ap_ssid[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+        slot->ssid[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
     }
-    event->wifi_scan_ap_ssid[ssid_len] = '\0';
-    memcpy(event->wifi_scan_ap_bssid, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
-    event->wifi_scan_ap_rssi_dbm = (int32_t)ap->rssi_offset - 128;
-    event->wifi_scan_ap_channel = (uint32_t)ap->channel;
-    copy_clamped_text(event->wifi_scan_ap_phy, sizeof(event->wifi_scan_ap_phy), ap->phy, ap->phy_len);
-    copy_clamped_text(event->wifi_scan_ap_auth, sizeof(event->wifi_scan_ap_auth), ap->auth, ap->auth_len);
-    furi_message_queue_put(app->queue, event, 0);
+    slot->ssid[ssid_len] = '\0';
+    memcpy(slot->bssid, ap->bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    slot->rssi_dbm = (int32_t)ap->rssi_offset - 128;
+    slot->channel = (uint32_t)ap->channel;
+    copy_clamped_text(slot->phy, sizeof(slot->phy), ap->phy, ap->phy_len);
+    copy_clamped_text(slot->auth, sizeof(slot->auth), ap->auth, ap->auth_len);
+}
+
+/* One post per `status` record instead of one per AP (HP-08): AppEventWifiScanAp now carries
+   no payload (see AppEvent's own comment) and only tells the main loop to redraw -- the data
+   itself is already in wifi_scan_aps[] by the time this is posted. */
+static void post_wifi_scan_results_updated(Esp32App* app) {
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventWifiScanAp;
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_wifi_scan_complete(Esp32App* app) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWifiScanDone;
-    furi_message_queue_put(app->queue, event, 0);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_wifi_scan_error(Esp32App* app, const char* message) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWifiScanError;
-    strncpy(event->wifi_scan_error_message, message, sizeof(event->wifi_scan_error_message) - 1);
-    furi_message_queue_put(app->queue, event, 0);
+    strncpy(event->u.error_message, message, sizeof(event->u.error_message) - 1);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* `status` (docs/PROTOCOL.md's "`wifi_scan` command and status payloads"). `result` is
@@ -2229,9 +2480,12 @@ static void
             FURI_LOG_W(TAG, "wifi_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
         for(size_t i = 0; i < result->ap_count; i++) {
-            post_wifi_scan_ap(app, &result->aps[i]);
+            copy_wifi_scan_ap_locked(&result->aps[i]);
         }
+        furi_mutex_release(wardriving_state_mutex);
+        post_wifi_scan_results_updated(app);
     }
     if(is_complete) {
         pending_command_kind = PendingCommandNone;
@@ -2242,48 +2496,56 @@ static void
 /* ---- ble_scan capability (mirrors wifi_scan capability above, docs/PROTOCOL.md's
    "`ble_scan` command and status payloads") ---- */
 
-/* Sanitizes and posts one decoded device for display -- `name`, while declared as a CBOR
-   text string on the wire (docs/PROTOCOL.md), is still peer-controlled data with no
-   structural guarantee every byte is printable/renderable by this canvas's font, so the same
-   non-printable-ASCII-to-'.' treatment post_wifi_scan_ap() gives `ssid` is applied here too,
-   once, rather than deferring sanitization to every later draw call. */
-static void post_ble_scan_device(Esp32App* app, const feb_ble_scan_device_t* device) {
-    AppEvent* event = &shared_ble_event;
-    memset(event, 0, sizeof(*event));
-    event->type = AppEventBleScanDevice;
-    memcpy(event->ble_scan_device_address, device->address, FEB_BLE_SCAN_ADDRESS_LEN);
-    event->ble_scan_device_has_name = device->has_name;
+/* Sanitizes one decoded device and copies it straight into ble_scan_devices[] under
+   wardriving_state_mutex (HP-08), mirroring copy_wifi_scan_ap_locked() above -- `name`, while
+   declared as a CBOR text string on the wire (docs/PROTOCOL.md), is still peer-controlled data
+   with no structural guarantee every byte is printable/renderable by this canvas's font, so
+   the same non-printable-ASCII-to-'.' treatment is applied here too. Caller must hold
+   wardriving_state_mutex. */
+static void copy_ble_scan_device_locked(const feb_ble_scan_device_t* device) {
+    if(ble_scan_device_count >= BLE_SCAN_MAX_DISPLAY_DEVICES) {
+        return;
+    }
+    BleScanDeviceDisplay* slot = &ble_scan_devices[ble_scan_device_count++];
+    memcpy(slot->address, device->address, FEB_BLE_SCAN_ADDRESS_LEN);
+    slot->has_name = device->has_name;
     if(device->has_name) {
         size_t name_len =
             device->name_len > FEB_BLE_SCAN_NAME_MAX_LEN ? FEB_BLE_SCAN_NAME_MAX_LEN : device->name_len;
         for(size_t i = 0; i < name_len; i++) {
             uint8_t b = (uint8_t)device->name[i];
-            event->ble_scan_device_name[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+            slot->name[i] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
         }
-        event->ble_scan_device_name[name_len] = '\0';
+        slot->name[name_len] = '\0';
+    } else {
+        slot->name[0] = '\0';
     }
-    event->ble_scan_device_rssi_dbm = (int32_t)device->rssi_offset - 128;
-    copy_clamped_text(
-        event->ble_scan_device_addr_type,
-        sizeof(event->ble_scan_device_addr_type),
-        device->addr_type,
-        device->addr_type_len);
-    furi_message_queue_put(app->queue, event, 0);
+    slot->rssi_dbm = (int32_t)device->rssi_offset - 128;
+    copy_clamped_text(slot->addr_type, sizeof(slot->addr_type), device->addr_type, device->addr_type_len);
+}
+
+/* One post per `status` record instead of one per device (HP-08) -- see
+   post_wifi_scan_results_updated()'s own comment. */
+static void post_ble_scan_results_updated(Esp32App* app) {
+    AppEvent* event = &shared_ble_event;
+    memset(event, 0, sizeof(*event));
+    event->type = AppEventBleScanDevice;
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_ble_scan_complete(Esp32App* app) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventBleScanDone;
-    furi_message_queue_put(app->queue, event, 0);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_ble_scan_error(Esp32App* app, const char* message) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventBleScanError;
-    strncpy(event->ble_scan_error_message, message, sizeof(event->ble_scan_error_message) - 1);
-    furi_message_queue_put(app->queue, event, 0);
+    strncpy(event->u.error_message, message, sizeof(event->u.error_message) - 1);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* `status` (docs/PROTOCOL.md's "`ble_scan` command and status payloads") -- same two-state
@@ -2317,9 +2579,12 @@ static void
             FURI_LOG_W(TAG, "ble_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
         for(size_t i = 0; i < result->device_count; i++) {
-            post_ble_scan_device(app, &result->devices[i]);
+            copy_ble_scan_device_locked(&result->devices[i]);
         }
+        furi_mutex_release(wardriving_state_mutex);
+        post_ble_scan_results_updated(app);
     }
     if(is_complete) {
         pending_command_kind = PendingCommandNone;
@@ -2337,18 +2602,18 @@ static void post_gps_status(
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventGpsStatus;
-    event->gps_state = (uint8_t)state;
+    event->u.gps.state = (uint8_t)state;
     if(state == GpsFixStateFix && result != NULL) {
-        event->gps_lat_e7_offset = result->lat_e7_offset;
-        event->gps_lon_e7_offset = result->lon_e7_offset;
-        event->gps_fix_quality = result->fix_quality;
-        event->gps_satellites = result->satellites;
-        event->gps_hdop_e1 = result->hdop_e1;
-        event->gps_utc_timestamp_s = result->utc_timestamp_s;
-        event->gps_altitude_dm_offset = result->altitude_dm_offset;
-        event->gps_speed_e1_kmh = result->speed_e1_kmh;
+        event->u.gps.lat_e7_offset = result->lat_e7_offset;
+        event->u.gps.lon_e7_offset = result->lon_e7_offset;
+        event->u.gps.fix_quality = result->fix_quality;
+        event->u.gps.satellites = result->satellites;
+        event->u.gps.hdop_e1 = result->hdop_e1;
+        event->u.gps.utc_timestamp_s = result->utc_timestamp_s;
+        event->u.gps.altitude_dm_offset = result->altitude_dm_offset;
+        event->u.gps.speed_e1_kmh = result->speed_e1_kmh;
     }
-    furi_message_queue_put(app->queue, event, 0);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* `status` for `gps` (docs/PROTOCOL.md): single-shot, `state` one of "no_signal"/
@@ -2412,9 +2677,9 @@ static void post_wardriving_run_state(Esp32App* app, bool running, bool is_fresh
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWardrivingRunState;
-    event->wardriving_running = running;
-    event->wardriving_is_fresh_start = is_fresh_start;
-    furi_message_queue_put(app->queue, event, 0);
+    event->u.wardriving_run_state.running = running;
+    event->u.wardriving_run_state.is_fresh_start = is_fresh_start;
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_wardriving_batch(
@@ -2426,25 +2691,25 @@ static void post_wardriving_batch(
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWardrivingBatch;
-    event->wardriving_batch_count = batch_count;
-    event->wardriving_backlog_remaining = backlog_remaining;
+    event->u.wardriving_batch.batch_count = batch_count;
+    event->u.wardriving_batch.backlog_remaining = backlog_remaining;
     strncpy(
-        event->wardriving_last_wifi_summary,
+        event->u.wardriving_batch.last_wifi_summary,
         last_wifi_summary,
-        sizeof(event->wardriving_last_wifi_summary) - 1);
+        sizeof(event->u.wardriving_batch.last_wifi_summary) - 1);
     strncpy(
-        event->wardriving_last_ble_summary,
+        event->u.wardriving_batch.last_ble_summary,
         last_ble_summary,
-        sizeof(event->wardriving_last_ble_summary) - 1);
-    furi_message_queue_put(app->queue, event, 0);
+        sizeof(event->u.wardriving_batch.last_ble_summary) - 1);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static void post_wardriving_error(Esp32App* app, const char* message) {
     AppEvent* event = &shared_ble_event;
     memset(event, 0, sizeof(*event));
     event->type = AppEventWardrivingError;
-    strncpy(event->wardriving_error_message, message, sizeof(event->wardriving_error_message) - 1);
-    furi_message_queue_put(app->queue, event, 0);
+    strncpy(event->u.error_message, message, sizeof(event->u.error_message) - 1);
+    app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* CSV export file state -- primarily touched from handle_wardriving_status(), further below,
@@ -2466,14 +2731,30 @@ static File* wardriving_csv_file;
 static char wardriving_csv_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
 static uint32_t wardriving_csv_records_since_sync;
 static bool wardriving_csv_write_failed;
+/* One-shot latch for storage_open_heap_margin_ok()'s log line -- see that function. Cleared
+   with the rest of the export file's state in wardriving_csv_reset_state(). */
+static bool wardriving_csv_low_heap_logged;
+
+/* Why a tri-state rather than bool: a low-heap deferral and a real open failure must NOT be
+   handled the same way. A real failure (path build, storage refused the open) is permanent for
+   this session and correctly latches wardriving_csv_write_failed. A deferral is a transient
+   heap condition that may well clear before the next batch arrives, so latching on it would
+   throw away the rest of a multi-minute capture over one bad moment. */
+typedef enum {
+    WardrivingCsvOpenOk = 0,
+    WardrivingCsvOpenFailed,
+    WardrivingCsvOpenDeferred,
+} WardrivingCsvOpenResult;
 /* wardriving_csv_file/wardriving_csv_records_since_sync/wardriving_csv_write_failed/
    wardriving_dedup_table (below) are touched from two threads despite the "BLE-thread-only"
    framing above: handle_wardriving_status() on BleEventWorker, but also wardriving_csv_close()
    via reset_scan_ui_state_impl(), which runs on the app's own main thread (stop_service() at
    app exit/BtStatusUnavailable, and the AppEventSessionFatal/Back-key handlers). Same shape as
    reassembly_mutex above -- real cross-thread access, not just single-threaded BLE dispatch --
-   so it needs the same real mutex. */
-static FuriMutex* wardriving_state_mutex;
+   so it needs the same real mutex. Declared near the top of the file (next to
+   reassembly_mutex/protocol_mutex), not here, so handle_wifi_scan_status()/
+   handle_ble_scan_status() further up can also take it (HP-08's wifi_scan_aps/
+   ble_scan_devices batching, which predates this wardriving section in the file). */
 /* wardriving_flush_led_active (the solid-green-while-flushing / solid-blue-when-idle LED
    indicator for an active wardriving backlog flush, docs/PROTOCOL.md's backlog_remaining
    semantics) is declared earlier in this file, next to session_reset_state() which must
@@ -2496,6 +2777,7 @@ static feb_wardriving_dedup_table_t wardriving_dedup_table;
 static void wardriving_csv_reset_state(void) {
     wardriving_csv_records_since_sync = 0;
     wardriving_csv_write_failed = false;
+    wardriving_csv_low_heap_logged = false;
     feb_wardriving_dedup_reset(&wardriving_dedup_table);
 }
 
@@ -2518,14 +2800,20 @@ static void wardriving_csv_close(void) {
    pairing_storage_save()'s temp-file/rename dance, which does not fit an incrementally-
    appended, potentially hours-long export). Only the host script renames this file away,
    and only after a confirmed successful publish -- this FAP never renames it during capture. */
-static bool wardriving_csv_ensure_open(Storage* storage) {
+static WardrivingCsvOpenResult wardriving_csv_ensure_open(Storage* storage) {
     if(wardriving_csv_file) {
-        return true;
+        return WardrivingCsvOpenOk;
     }
     if(!build_wardriving_path(
            wardriving_csv_path, sizeof(wardriving_csv_path), FEB_WARDRIVING_CSV_FILENAME)) {
         FURI_LOG_E(TAG, "wardriving CSV: path build failed");
-        return false;
+        return WardrivingCsvOpenFailed;
+    }
+    /* Defers this batch rather than letting the Storage service's own malloc reboot the device
+       -- see storage_open_heap_margin_ok(). Costs nothing durable: the ESP32 keeps undrained
+       records in its own flash backlog, so a batch skipped here is re-offered later. */
+    if(!storage_open_heap_margin_ok("wardriving CSV", &wardriving_csv_low_heap_logged)) {
+        return WardrivingCsvOpenDeferred;
     }
 
     File* file = storage_file_alloc(storage);
@@ -2541,11 +2829,11 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
         FURI_LOG_E(TAG, "wardriving CSV: failed to create '%s'", wardriving_csv_path);
         storage_file_close(file);
         storage_file_free(file);
-        return false;
+        return WardrivingCsvOpenFailed;
     }
     wardriving_csv_file = file;
     FURI_LOG_I(TAG, "wardriving CSV: writing to '%s'", wardriving_csv_path);
-    return true;
+    return WardrivingCsvOpenOk;
 }
 
 /* FirstSeen (docs/CAPABILITIES.md, docs/PROTOCOL.md's `utc_timestamp_s` wardriving-record
@@ -2557,9 +2845,15 @@ static bool wardriving_csv_ensure_open(Storage* storage) {
    boot-relative `timestamp_ms` with no real wall-clock reference at all). No fallback path
    for a missing/zero utc_timestamp_s is implemented here: the wire contract already rules
    that case out by construction, so one would be dead code (docs/PLAN.md's own framing). */
-static bool
-    wardriving_csv_write_record(Storage* storage, const feb_wardriving_record_t* record) {
-    if(!wardriving_csv_ensure_open(storage)) {
+static bool wardriving_csv_write_record(const feb_wardriving_record_t* record) {
+    /* Precondition: handle_wardriving_status() has already resolved the export file for this
+       batch (see its own per-batch open, and WardrivingCsvOpenResult's declaration comment for
+       why that resolution cannot happen per record). Opening is deliberately NOT retried here
+       -- doing so would reintroduce the ambiguity the tri-state exists to remove, since this
+       function's bool return has no way to say "deferred, don't latch". The guard below is
+       defensive only; wardriving_csv_file is cleared solely by wardriving_csv_close(), which
+       holds the same mutex this caller holds. */
+    if(!wardriving_csv_file) {
         return false;
     }
     DateTime first_seen_dt;
@@ -2671,26 +2965,67 @@ static void
         wardriving_flush_led_active = true;
     }
 
+    /* Resolve the export file ONCE per batch, before touching the dedup table. Two reasons,
+       both load-bearing:
+
+       (1) feb_wardriving_dedup_should_write() *updates* the table as a side effect -- it marks
+       the address as written. If the CSV open is then deferred for low heap, that address is
+       recorded as already-exported for a row that never reached the file, and the dedup policy
+       would suppress its next real chance (until its RSSI improves by
+       FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB or it moves FEB_WARDRIVING_DEDUP_MOVE_METERS). So a
+       deferral has to skip the whole batch *before* the dedup table is consulted at all, not
+       per record.
+
+       (2) The heap-margin check walks the allocator's free list; doing it 32 times for one
+       batch buys nothing, since the file is either open for the whole batch or none of it. */
+    bool csv_usable = false;
+    bool csv_failed_now = false;
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    if(!wardriving_csv_write_failed) {
+        switch(wardriving_csv_ensure_open(app->storage)) {
+        case WardrivingCsvOpenOk:
+            csv_usable = true;
+            break;
+        case WardrivingCsvOpenFailed:
+            wardriving_csv_write_failed = true;
+            csv_failed_now = true;
+            break;
+        case WardrivingCsvOpenDeferred:
+            /* Transient: no latch, no dedup update, retry on the next batch. */
+            break;
+        }
+    }
+    furi_mutex_release(wardriving_state_mutex);
+    if(csv_failed_now) {
+        FURI_LOG_E(TAG, "wardriving CSV: open failed, no records written this session");
+        post_wardriving_error(app, "CSV export write failed");
+    }
+
     static char last_wifi_summary[40];
     static char last_ble_summary[40];
     last_wifi_summary[0] = '\0';
     last_ble_summary[0] = '\0';
     for(size_t i = 0; i < result->record_count; i++) {
         const feb_wardriving_record_t* record = &result->records[i];
-        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
-        bool should_write = feb_wardriving_dedup_should_write(&wardriving_dedup_table, record);
-        bool write_failed_now = false;
-        if(should_write) {
-            if(!wardriving_csv_write_failed && !wardriving_csv_write_record(app->storage, record)) {
+        /* The on-screen counters/summaries below still run for every record even when
+           csv_usable is false: the records are real, they were decoded, and the ESP32 has
+           already counted them against its backlog -- the UI should keep reflecting the
+           capture even while the export file is deferred or has failed. */
+        if(csv_usable) {
+            furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+            bool write_failed_now = false;
+            if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record) &&
+               !wardriving_csv_write_record(record)) {
                 wardriving_csv_write_failed = true;
                 write_failed_now = true;
+                csv_usable = false;
             }
-        }
-        furi_mutex_release(wardriving_state_mutex);
-        if(write_failed_now) {
-            FURI_LOG_E(
-                TAG, "wardriving CSV: write failed, no further records written this session");
-            post_wardriving_error(app, "CSV export write failed");
+            furi_mutex_release(wardriving_state_mutex);
+            if(write_failed_now) {
+                FURI_LOG_E(
+                    TAG, "wardriving CSV: write failed, no further records written this session");
+                post_wardriving_error(app, "CSV export write failed");
+            }
         }
         if(record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE) {
             const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
@@ -2748,11 +3083,14 @@ static void
 static File* mesh_log_file;
 static char mesh_log_path[FEB_MESH_LOG_PATH_MAX_LEN];
 static bool mesh_log_write_failed;
+/* One-shot latch for storage_open_heap_margin_ok()'s log line -- see that function. */
+static bool mesh_log_low_heap_logged;
 
 /* Caller must hold wardriving_state_mutex -- its only caller, mesh_log_close() below,
    already does. */
 static void mesh_log_reset_state(void) {
     mesh_log_write_failed = false;
+    mesh_log_low_heap_logged = false;
 }
 
 static void mesh_log_close(void) {
@@ -2771,13 +3109,19 @@ static void mesh_log_close(void) {
    wardriving_csv_ensure_open() -- no header row (mesh_nodes.h's format has none) and no
    calendar-date rollover; only a future host script would rename this file away, and only
    after a confirmed successful publish (out of scope for this pass). */
-static bool mesh_log_ensure_open(Storage* storage) {
+static WardrivingCsvOpenResult mesh_log_ensure_open(Storage* storage) {
     if(mesh_log_file) {
-        return true;
+        return WardrivingCsvOpenOk;
     }
     if(!build_mesh_path(mesh_log_path, sizeof(mesh_log_path), FEB_MESH_LOG_FILENAME)) {
         FURI_LOG_E(TAG, "mesh_log: path build failed");
-        return false;
+        return WardrivingCsvOpenFailed;
+    }
+    /* Same deferral reasoning as wardriving_csv_ensure_open()'s own margin check, reusing its
+       result enum rather than declaring a second identical one -- the Heltec keeps undrained
+       sightings in its own flash log, so deferring here costs a later re-drain, not data. */
+    if(!storage_open_heap_margin_ok("mesh_log", &mesh_log_low_heap_logged)) {
+        return WardrivingCsvOpenDeferred;
     }
 
     File* file = storage_file_alloc(storage);
@@ -2786,19 +3130,22 @@ static bool mesh_log_ensure_open(Storage* storage) {
         FURI_LOG_E(TAG, "mesh_log: failed to create '%s'", mesh_log_path);
         storage_file_close(file);
         storage_file_free(file);
-        return false;
+        return WardrivingCsvOpenFailed;
     }
     mesh_log_file = file;
     FURI_LOG_I(TAG, "mesh_log: writing to '%s'", mesh_log_path);
-    return true;
+    return WardrivingCsvOpenOk;
 }
 
 /* Syncs after every write rather than batching every-Nth-record like
    wardriving_csv_write_record() -- FEB_MESH_LOG_MAX_RECORDS_PER_BATCH is permanently 1
    (cbor_mesh_log.h), so there is no per-batch amortization to gain, and mesh node sightings
    are sparse enough that per-write sync overhead is not a concern (mesh_nodes.h). */
-static bool mesh_log_write_record(Storage* storage, const feb_mesh_log_record_t* record) {
-    if(!mesh_log_ensure_open(storage)) {
+static bool mesh_log_write_record(const feb_mesh_log_record_t* record) {
+    /* Precondition: handle_mesh_log_status() has already resolved the log file for this batch
+       -- same split, and the same reason, as wardriving_csv_write_record()'s own precondition
+       comment. */
+    if(!mesh_log_file) {
         return false;
     }
     /* Same explicit-double-literal style as wardriving_csv.c's own row formatter, to avoid
@@ -2933,12 +3280,34 @@ static void
         return;
     }
 
+    /* Same once-per-batch open resolution as handle_wardriving_status(), and for reason (2) of
+       the two given there. Reason (1) does not apply -- this capability has no Flipper-side
+       dedup table (the Heltec dedups "once ever" before a record ever reaches its flash log) --
+       but keeping the two handlers structurally identical is worth more than shaving one
+       branch, and the no-latch-on-deferral half matters here just as much. */
+    bool mesh_usable = false;
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    if(!mesh_log_write_failed) {
+        switch(mesh_log_ensure_open(app->storage)) {
+        case WardrivingCsvOpenOk:
+            mesh_usable = true;
+            break;
+        case WardrivingCsvOpenFailed:
+            mesh_log_write_failed = true;
+            break;
+        case WardrivingCsvOpenDeferred:
+            break;
+        }
+    }
+    furi_mutex_release(wardriving_state_mutex);
+
     for(size_t i = 0; i < result->record_count; i++) {
         const feb_mesh_log_record_t* record = &result->records[i];
         furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
         bool write_failed_now = false;
-        if(!mesh_log_write_failed && !mesh_log_write_record(app->storage, record)) {
+        if(mesh_usable && !mesh_log_write_record(record)) {
             mesh_log_write_failed = true;
+            mesh_usable = false;
             write_failed_now = true;
         }
         /* Also mirror this record into the Mesh Log screen's in-memory display list (docs/
@@ -3082,7 +3451,10 @@ static bool send_wifi_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wifi_scan command: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wifi_scan command: session sequence at cap; reconnect required");
         return false;
     }
@@ -3104,15 +3476,17 @@ static bool send_wifi_scan_command(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wifi_scan command: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     pending_command_kind = PendingCommandWifiScan;
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wifi_scan command: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(TAG, "wifi_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
     return true;
 }
@@ -3155,7 +3529,10 @@ static bool send_ble_scan_command(Esp32App* app) {
         FURI_LOG_W(TAG, "ble_scan command: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "ble_scan command: session sequence at cap; reconnect required");
         return false;
     }
@@ -3177,15 +3554,17 @@ static bool send_ble_scan_command(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "ble_scan command: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     pending_command_kind = PendingCommandBleScan;
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "ble_scan command: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(TAG, "ble_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
     return true;
 }
@@ -3228,7 +3607,10 @@ static bool send_gps_command(Esp32App* app) {
         FURI_LOG_W(TAG, "gps command: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "gps command: session sequence at cap; reconnect required");
         return false;
     }
@@ -3250,14 +3632,16 @@ static bool send_gps_command(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "gps command: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "gps command: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(TAG, "gps command sent (request_id=%llu)", (unsigned long long)command.request_id);
     return true;
 }
@@ -3367,7 +3751,10 @@ static bool send_wardriving_start_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wardriving start: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving start: session sequence at cap; reconnect required");
         return false;
     }
@@ -3389,15 +3776,17 @@ static bool send_wardriving_start_command(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving start: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     pending_command_kind = PendingCommandWardrivingStart;
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving start: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(
         TAG,
         "wardriving start command sent (request_id=%llu)",
@@ -3445,7 +3834,10 @@ static bool send_wardriving_status_query(Esp32App* app) {
         FURI_LOG_W(TAG, "wardriving status query: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving status query: session sequence at cap; reconnect required");
         return false;
     }
@@ -3467,15 +3859,17 @@ static bool send_wardriving_status_query(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving status query: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     pending_command_kind = PendingCommandWardrivingStatus;
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving status query: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(
         TAG,
         "wardriving status query sent (request_id=%llu)",
@@ -3519,7 +3913,10 @@ static bool send_wardriving_stop_command(Esp32App* app) {
         FURI_LOG_W(TAG, "wardriving stop: payload encode failed");
         return false;
     }
+    /* HP-06/G10: see capability_query's own identical comment above. */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
     if(session_seq_out >= FEB_SESSION_SEQUENCE_MAX) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving stop: session sequence at cap; reconnect required");
         return false;
     }
@@ -3541,15 +3938,17 @@ static bool send_wardriving_stop_command(Esp32App* app) {
         cmd_record_buf,
         sizeof(cmd_record_buf));
     if(record_len == 0) {
+        furi_mutex_release(protocol_mutex);
         FURI_LOG_W(TAG, "wardriving stop: record encode failed");
         return false;
     }
+    session_seq_out++;
+    furi_mutex_release(protocol_mutex);
     pending_command_kind = PendingCommandWardrivingStop;
     if(!send_pairing_record(profile, cmd_record_buf, record_len)) {
         FURI_LOG_W(TAG, "wardriving stop: send failed");
         return false;
     }
-    session_seq_out++;
     FURI_LOG_I(
         TAG,
         "wardriving stop command sent (request_id=%llu)",
@@ -3651,11 +4050,12 @@ static void reassembly_timeout_timer_callback(void* context) {
    BleEventWorker/Bt/GuiSrv, i.e. with shared_ble_event/the Bt-thread event/input_callback's
    own event, none of which this pair touches. They therefore safely share one static
    AppEvent, timer_service_event, below -- same single-in-flight rationale as
-   shared_ble_event, just scoped to this one other thread instead. AppEvent is now large
-   enough (~500+ bytes) that a stack copy here would consume roughly half this thread's
-   entire budget; matches every other post_*()/callback's static-buffer convention in this
-   file (docs/LESSONS.md's BleEventWorker entry generalizes the rule to any tight system
-   thread). Explicit reset at the top of each callback because a static initializer only
+   shared_ble_event, just scoped to this one other thread instead. AppEvent is 104 bytes
+   since the tagged-union rework (it was 576 -- roughly half this thread's entire 1024-byte
+   budget for one frame); kept static anyway, matching every other post_*()/callback's
+   static-buffer convention in this file (docs/LESSONS.md's BleEventWorker entry generalizes
+   the rule to any tight system thread) -- 104 resident bytes is not worth reopening the
+   stack-budget question on a 1024-byte thread for. Explicit reset at the top of each callback because a static initializer only
    runs once at load time, not per call. */
 static AppEvent timer_service_event;
 
@@ -3668,24 +4068,38 @@ static void gps_poll_timer_callback(void* context) {
     Esp32App* app = context;
     memset(&timer_service_event, 0, sizeof(timer_service_event));
     timer_service_event.type = AppEventGpsPollTick;
-    furi_message_queue_put(app->queue, &timer_service_event, 0);
+    /* timeout_ms must stay 0: this runs on the FreeRTOS Timer Service task, shared by every
+       furi_timer_alloc() callback in the whole firmware (HP-08) -- a dropped tick just means
+       the next one retries a moment later, which is far cheaper than stalling every other
+       app's timers too. */
+    app_queue_put(app->queue, &timer_service_event, 0);
 }
 
 static void publish_poll_timer_callback(void* context) {
     Esp32App* app = context;
     memset(&timer_service_event, 0, sizeof(timer_service_event));
     timer_service_event.type = AppEventPublishPollTick;
-    furi_message_queue_put(app->queue, &timer_service_event, 0);
+    /* Same Timer Service thread, same timeout_ms=0 reasoning as gps_poll_timer_callback(). */
+    app_queue_put(app->queue, &timer_service_event, 0);
 }
 
 /* The exact fetch-and-run line from docs/WARDRIVING_PUBLISH.md's "Launch" section --
    string-literal concatenation with the pinned-commit macro, not a runtime snprintf, since
-   both pieces are compile-time constants. */
+   both pieces are compile-time constants.
+
+   HP-31: deletes any stale local copy first (SilentlyContinue -- a first-ever run with
+   nothing to delete is not an error), then only runs the script if the download actually
+   succeeded. `-ErrorAction Stop` alone is not enough in an interactive PowerShell 5.1
+   session: a terminating error in one `;`-separated statement does NOT stop the later
+   statements on the same line (unlike a script file), so `& ...` would still run against a
+   stale/partial file after a failed download. `if ($?) { & ... }` gates on the previous
+   statement's own success flag instead. */
 static const char publish_bootstrap_command[] =
+    "Remove-Item \"$env:TEMP\\publish_wardriving.ps1\" -ErrorAction SilentlyContinue; "
     "iwr -Uri 'https://raw.githubusercontent.com/dnikolov/flipper-esp32-over-ble/"
     WARDRIVING_PUBLISH_SCRIPT_COMMIT
-    "/scripts/publish_wardriving.ps1' -OutFile \"$env:TEMP\\publish_wardriving.ps1\"; & "
-    "\"$env:TEMP\\publish_wardriving.ps1\"";
+    "/scripts/publish_wardriving.ps1' -OutFile \"$env:TEMP\\publish_wardriving.ps1\" -ErrorAction Stop; "
+    "if ($?) { & \"$env:TEMP\\publish_wardriving.ps1\" }";
 
 static void publish_badusb_press_release(uint16_t keycode) {
     furi_hal_hid_kb_press(keycode);
@@ -3746,7 +4160,11 @@ static bool publish_trigger_badusb(void) {
 
     publish_badusb_press_release(HID_KEYBOARD_R | KEY_MOD_LEFT_GUI);
     furi_delay_ms(500);
-    publish_badusb_type_string("powershell");
+    /* HP-16: plain "powershell" launches under the host's default execution policy, which on
+       a stock Windows account is Restricted -- the downloaded script then fails to run and
+       the Flipper times out with no useful signal. -NoProfile also skips the user's own
+       profile script, shaving a little launch time. */
+    publish_badusb_type_string("powershell -NoProfile -ExecutionPolicy Bypass");
     publish_badusb_press_release(HID_KEYBOARD_RETURN);
     furi_delay_ms(1200);
     publish_badusb_type_string(publish_bootstrap_command);
@@ -3870,6 +4288,19 @@ static void publish_parse_result(Esp32App* app, const char* buf, size_t len) {
    read as a final, unreadable-file failure. */
 static bool publish_try_read_result(Esp32App* app, const char* path) {
     static char buf[FEB_PUBLISH_RESULT_MAX_LEN];
+    /* Polled every FEB_PUBLISH_POLL_PERIOD_MS for up to FEB_PUBLISH_POLL_TIMEOUT_MS, so this is
+       the one open/close pair in this file that repeats on a timer rather than happening once
+       per session -- worth the margin check for that alone, and the reason its log line needs
+       the one-shot latch even more than the other two call sites do. Returning false here just
+       means "result not readable yet"; the poll loop retries on its next tick, and the publish
+       times out normally if the heap never recovers. Note publish_start() has already stopped
+       this app's BLE profile for the duration of the transfer (H04's 2026-09-26 mitigation), so
+       the heap is at its roomiest here -- a deferral at this call site would be a strong signal
+       that something outside this app is holding the heap down. */
+    static bool low_heap_logged;
+    if(!storage_open_heap_margin_ok("publish result", &low_heap_logged)) {
+        return false;
+    }
     File* file = storage_file_alloc(app->storage);
     bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
     size_t read_len = 0;
@@ -3988,6 +4419,11 @@ static void publish_start(Esp32App* app) {
         stop_ble_profile(app);
         app->publish_bt_stopped = true;
     }
+    /* Both close functions take wardriving_state_mutex internally. Without this, the CSV/
+       mesh-log FatFS handles stay open across the whole publish transfer, and the host
+       script's CLI `storage` calls on the same paths block forever (HP-09). */
+    wardriving_csv_close();
+    mesh_log_close();
 
     app->publish_waiting = true;
     app->publish_poll_elapsed_ms = 0;
@@ -4053,6 +4489,11 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                         FURI_LOG_W(TAG, "Rejected pairing record: bad version or board_id");
                         return BleEventAckFlowEnable;
                     }
+                    /* HP-07/G10: marks protocol state as touched before any of the pair_*
+                       field writes below begin -- see protocol_generation_bump()'s own
+                       comment for why this ordering (not wrapping the whole handler) is
+                       what makes protocol_reset_if_unchanged() race-free. */
+                    protocol_generation_bump();
                     if(text_matches(envelope.type, envelope.type_len, FEB_PAIR_INIT_TYPE)) {
                         handle_pair_init(profile, &envelope);
                     } else if(text_matches(envelope.type, envelope.type_len, FEB_PAIR_CONFIRM_TYPE)) {
@@ -4078,6 +4519,8 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                         FURI_LOG_W(TAG, "Rejected session record: bad version");
                         return BleEventAckFlowEnable;
                     }
+                    /* HP-07/G10: see the pairing-envelope branch's identical comment above. */
+                    protocol_generation_bump();
                     if(text_matches(session_envelope.type, session_envelope.type_len, FEB_HELLO_TYPE)) {
                         handle_hello(profile, &session_envelope);
                     } else if(text_matches(
@@ -4100,7 +4543,19 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                        posts AppEventSessionFatal instead; the main thread's event loop
                        calls bt_disconnect() on receipt. An unrecognized type is not fatal
                        and is still just dropped below. */
+                    /* HP-06/HP-07/G10: the whole decrypt-and-validate sequence runs under
+                       protocol_mutex -- this is the same mutex every encrypt call site (main
+                       thread) takes around feb_session_encrypt_record(), so the two can never
+                       interleave on session.c's shared GCM nonce/AAD/tag scratch (HP-06), and
+                       bumping protocol_generation as the first action makes any subsequent
+                       stale-event reset attempt (protocol_reset_if_unchanged()) a no-op for
+                       this connection. Released before send_pairing_record()-style BLE sends
+                       or the capability/status handlers below run -- none of that is reached
+                       from inside this critical section. */
+                    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+                    protocol_generation++;
                     if(session_stage != SessionStageActive) {
+                        furi_mutex_release(protocol_mutex);
                         FURI_LOG_W(TAG, "Ignoring protected record: no active session");
                         return BleEventAckFlowEnable;
                     }
@@ -4114,6 +4569,7 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                         sizeof(session_plaintext_buf),
                         &decrypted);
                     if(decode_status != FEB_CBOR_OK) {
+                        furi_mutex_release(protocol_mutex);
                         FURI_LOG_W(
                             TAG,
                             "Protected record decode/decrypt failed: %d; dropping (no reply)",
@@ -4128,12 +4584,14 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                        memcmp(decrypted.board_id, session_board_id, session_board_id_len) != 0 ||
                        decrypted.sequence != session_seq_in ||
                        decrypted.sequence >= FEB_SESSION_SEQUENCE_MAX) {
+                        furi_mutex_release(protocol_mutex);
                         FURI_LOG_W(TAG, "Protected record session/sequence mismatch; dropping (no reply)");
                         session_reset_state();
                         post_session_fatal(profile->app);
                         return BleEventAckFlowEnable;
                     }
                     session_seq_in++;
+                    furi_mutex_release(protocol_mutex);
 
                     if(text_matches(decrypted.type, decrypted.type_len, "capability_response")) {
                         handle_capability_response(profile, decrypted.plaintext, decrypted.plaintext_len);
@@ -4286,10 +4744,12 @@ static void bt_status_callback(BtStatus status, void* context) {
     /* static, not stack-local (found during the 2026-09-12 GPS-driver stack audit, measured
        via -fstack-usage): this callback runs on the "Bt" service's own thread
        (applications/services/bt/application.fam: stack_size=1024), a budget of the same
-       order as BleEventWorker's, not this app's own. A stack-local AppEvent here already
-       measured 480 bytes before this session's gps_* field additions and 536 after --
-       essentially half that thread's entire stack for one frame, before counting the Bt
-       service's own dispatch call chain on top. Matches every post_*() function's static
+       order as BleEventWorker's, not this app's own. A stack-local AppEvent here measured
+       480 bytes at that audit and had grown to 576 by the time capabilities stopped being
+       added -- essentially half that thread's entire stack for one frame, before counting
+       the Bt service's own dispatch call chain on top. The tagged-union rework (see
+       AppEvent's own declaration) brought it to 104 bytes, which no longer forces the
+       issue, but this stays static: matches every post_*() function's static
        convention elsewhere in this file, but deliberately its own instance rather than
        shared_ble_event (see that declaration's comment) -- the Bt thread can run
        concurrently with BleEventWorker/Timer/GuiSrv. Explicit reset below because a static
@@ -4297,8 +4757,14 @@ static void bt_status_callback(BtStatus status, void* context) {
     static AppEvent event;
     memset(&event, 0, sizeof(event));
     event.type = AppEventBtStatus;
-    event.bt_status = status;
-    furi_message_queue_put(app->queue, &event, 0);
+    event.u.bt_status.status = status;
+    /* Snapshot protocol_generation now, under protocol_mutex -- the main loop compares this
+       against the current value before ever resetting pairing/session state for this event
+       (HP-07/G10, protocol_reset_if_unchanged()). */
+    furi_mutex_acquire(protocol_mutex, FuriWaitForever);
+    event.u.bt_status.generation = protocol_generation;
+    furi_mutex_release(protocol_mutex);
+    app_queue_put(app->queue, &event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 static const char* esp_status_text(const Esp32App* app) {
@@ -4330,11 +4796,16 @@ static const char* esp_status_text(const Esp32App* app) {
 
 static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
+    /* wifi_scan_aps[]/wifi_scan_ap_count are written from BleEventWorker under
+       wardriving_state_mutex (HP-08); this draw callback runs on the GUI thread, so it takes
+       the same mutex for the whole read, mirroring draw_mesh_log_screen()'s own pattern. */
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    size_t count = wifi_scan_ap_count;
     char header[32];
     if(app->wifi_scan_in_progress) {
         snprintf(header, sizeof(header), "Scanning...");
     } else {
-        snprintf(header, sizeof(header), "Wifi scan: %u found", (unsigned)wifi_scan_ap_count);
+        snprintf(header, sizeof(header), "Wifi scan: %u found", (unsigned)count);
     }
     canvas_draw_str(canvas, 2, 11, header);
     canvas_set_font(canvas, FontSecondary);
@@ -4349,7 +4820,7 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
 
     for(size_t row = 0; row < max_rows; row++) {
         size_t index = app->wifi_scan_scroll_offset + row;
-        if(index >= wifi_scan_ap_count) {
+        if(index >= count) {
             break;
         }
         const WifiScanApDisplay* ap = &wifi_scan_aps[index];
@@ -4365,7 +4836,7 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
     }
 
     char footer[32];
-    if(wifi_scan_ap_count == 0) {
+    if(count == 0) {
         snprintf(footer, sizeof(footer), "Back: exit view");
     } else {
         snprintf(
@@ -4373,8 +4844,9 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
             sizeof(footer),
             "%u/%u  Back: exit",
             (unsigned)(app->wifi_scan_scroll_offset + 1),
-            (unsigned)wifi_scan_ap_count);
+            (unsigned)count);
     }
+    furi_mutex_release(wardriving_state_mutex);
     canvas_draw_str(canvas, 2, WIFI_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
@@ -4389,11 +4861,14 @@ static void draw_wifi_scan_results(Canvas* canvas, const Esp32App* app) {
 
 static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
     canvas_set_font(canvas, FontPrimary);
+    /* Same cross-thread argument as draw_wifi_scan_results() above. */
+    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+    size_t count = ble_scan_device_count;
     char header[32];
     if(app->ble_scan_in_progress) {
         snprintf(header, sizeof(header), "Scanning...");
     } else {
-        snprintf(header, sizeof(header), "Ble scan: %u found", (unsigned)ble_scan_device_count);
+        snprintf(header, sizeof(header), "Ble scan: %u found", (unsigned)count);
     }
     canvas_draw_str(canvas, 2, 11, header);
     canvas_set_font(canvas, FontSecondary);
@@ -4408,7 +4883,7 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
 
     for(size_t row = 0; row < max_rows; row++) {
         size_t index = app->ble_scan_scroll_offset + row;
-        if(index >= ble_scan_device_count) {
+        if(index >= count) {
             break;
         }
         const BleScanDeviceDisplay* device = &ble_scan_devices[index];
@@ -4440,7 +4915,7 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
     }
 
     char footer[32];
-    if(ble_scan_device_count == 0) {
+    if(count == 0) {
         snprintf(footer, sizeof(footer), "Back: exit view");
     } else {
         snprintf(
@@ -4448,8 +4923,9 @@ static void draw_ble_scan_results(Canvas* canvas, const Esp32App* app) {
             sizeof(footer),
             "%u/%u  Back: exit",
             (unsigned)(app->ble_scan_scroll_offset + 1),
-            (unsigned)ble_scan_device_count);
+            (unsigned)count);
     }
+    furi_mutex_release(wardriving_state_mutex);
     canvas_draw_str(canvas, 2, BLE_SCAN_RESULTS_FOOTER_Y, footer);
 }
 
@@ -5124,6 +5600,16 @@ static void draw_publish_screen(Canvas* canvas, Esp32App* app) {
         snprintf(line, sizeof(line), "nogps=%lu bad=%lu",
                  (unsigned long)app->publish_no_gps, (unsigned long)app->publish_bad_rows);
         canvas_draw_str(canvas, 2, 52, line);
+        /* The host script writes a short note into `message=` even on a successful upload
+           (e.g. archiving skipped/partial because new data arrived mid-transfer) --
+           publish_parse_result() already copies it into publish_fail_message regardless of
+           outcome (it isn't fail-only despite the field's name). Shown at the footer row,
+           relying on the canvas's own width clipping like every other results screen in this
+           file (see draw_ble_scan_results()'s identical comment); no new buffer, this just
+           draws the already-parsed field directly. */
+        if(app->publish_fail_message[0] != '\0') {
+            canvas_draw_str(canvas, 2, 62, app->publish_fail_message);
+        }
         return;
     }
 
@@ -5297,15 +5783,16 @@ static void input_callback(InputEvent* input, void* context) {
     /* static, not stack-local -- same 2026-09-12 stack-audit finding as bt_status_callback/
        gps_poll_timer_callback above: this runs on the GuiSrv thread (stack_size=2048,
        applications/services/gui/application.fam), a larger budget than Bt's/the Timer
-       Service's but the same risk class as AppEvent keeps growing with new capabilities.
+       Service's but the same risk class as AppEvent keeps growing with new capabilities
+       (104 bytes since the tagged-union rework, but it only ever grew before that).
        Deliberately its own static, not shared_ble_event (see that declaration's comment) --
        GuiSrv can run concurrently with BleEventWorker/Bt/Timer. Explicit reset below because
        a static initializer only runs once at load time, not per call. */
     static AppEvent event;
     memset(&event, 0, sizeof(event));
     event.type = AppEventInput;
-    event.input = *input;
-    furi_message_queue_put(app->queue, &event, 0);
+    event.u.input = *input;
+    app_queue_put(app->queue, &event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
 /* Returns to the main screen and discards any in-progress/completed scan results (docs/PLAN.md's
@@ -5339,12 +5826,12 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     app->wifi_scan_complete = false;
     app->wifi_scan_scroll_offset = 0;
     app->wifi_scan_error_message[0] = '\0';
-    wifi_scan_ap_count = 0;
+    wifi_scan_ap_count_reset();
     app->ble_scan_in_progress = false;
     app->ble_scan_complete = false;
     app->ble_scan_scroll_offset = 0;
     app->ble_scan_error_message[0] = '\0';
-    ble_scan_device_count = 0;
+    ble_scan_device_count_reset();
     app->wardriving_running_known = false;
     app->wardriving_running = false;
     app->wardriving_records_this_session = 0;
@@ -5463,12 +5950,17 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     }
     wardriving_settings_load(&app);
     app.has_saved_pairing = any_saved_pairing_exists(app.storage);
-    bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
-
+    /* protocol_mutex must exist before this registration: bt_set_status_changed_callback()
+       can fire bt_status_callback() (which acquires protocol_mutex to snapshot
+       protocol_generation, HP-07/G10) at any point after this call, asynchronously on the
+       "Bt" service thread, before the rest of this function's own setup has finished. */
+    protocol_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    furi_check(protocol_mutex);
     reassembly_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(reassembly_mutex);
     wardriving_state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     furi_check(wardriving_state_mutex);
+    bt_set_status_changed_callback(app.bt, bt_status_callback, &app);
     reassembly_timeout_timer = furi_timer_alloc(
         reassembly_timeout_timer_callback, FuriTimerTypePeriodic, NULL);
     furi_check(reassembly_timeout_timer);
@@ -5484,6 +5976,19 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, view_port, GuiLayerFullscreen);
 
+    /* Baseline heap margin, logged once per launch (docs/HARDENING_BACKLOG.md H04 asked for
+       exactly this number and never got it -- a launch that fails in the ELF loader never
+       reaches this line, but a launch that succeeds and later dies mid-session does, so this
+       is the reading that tells a future session how much room the app actually started
+       with). Two numbers, not one: total free heap, and the largest contiguous block, which
+       is the one that governs both the loader's own section allocations and every later
+       storage_file_open() -- see storage_open_heap_margin_ok(). */
+    FURI_LOG_I(
+        TAG,
+        "heap at launch: free %u, largest block %u",
+        (unsigned)memmgr_get_free_heap(),
+        (unsigned)memmgr_heap_get_max_free_block());
+
     /* docs/PLAN.md step 6: auto-connect when a saved pairing record already exists, no
        OK-press required -- the OK-press action below is reserved for the genuinely-new-
        pairing (no saved record at all) case. */
@@ -5498,24 +6003,28 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         if(furi_message_queue_get(app.queue, &event, FuriWaitForever) != FuriStatusOk) continue;
         if(event.type == AppEventBtStatus) {
             if(app.profile) {
-                if(event.bt_status == BtStatusConnected) {
+                if(event.u.bt_status.status == BtStatusConnected) {
                     app.connection_lost = false;
-                    pairing_reset_state();
-                    session_reset_state();
+                    /* HP-07/G10: gated on protocol_generation, not unconditional -- see
+                       protocol_reset_if_unchanged()'s own comment. If BleEventWorker has
+                       already advanced a ceremony for this connection by the time this
+                       (possibly stale/delayed) event is processed, the reset is skipped so it
+                       can never tear that ceremony's in-flight state; the UI fields below
+                       always update regardless (main thread stays UI-only either way). */
+                    protocol_reset_if_unchanged(event.u.bt_status.generation);
                     reset_scan_ui_state_keep_screen(&app);
                     app.pairing_phase = PairingPhaseExchanging;
                     app.pairing_reason[0] = '\0';
-                } else if(event.bt_status == BtStatusAdvertising) {
+                } else if(event.u.bt_status.status == BtStatusAdvertising) {
                     if(app.pairing_phase != PairingPhaseDone) {
                         app.connection_lost = false;
-                        pairing_reset_state();
-                        session_reset_state();
+                        protocol_reset_if_unchanged(event.u.bt_status.generation);
                         reset_scan_ui_state_keep_screen(&app);
                         notification_message(app.notifications, &sequence_blink_start_blue);
                         app.pairing_phase = PairingPhaseWaiting;
                         app.pairing_reason[0] = '\0';
                     }
-                } else if(event.bt_status == BtStatusUnavailable) {
+                } else if(event.u.bt_status.status == BtStatusUnavailable) {
                     stop_service(&app);
                     app.connection_lost = true;
                     app.pairing_phase = PairingPhaseFailed;
@@ -5524,16 +6033,16 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 }
             }
         } else if(event.type == AppEventPairingPhase) {
-            app.pairing_phase = event.pairing_phase;
-            if(event.pairing_phase == PairingPhaseFailed) {
-                app.connection_lost = strcmp(event.pairing_reason, "connection lost") == 0;
-                strncpy(app.pairing_reason, event.pairing_reason, sizeof(app.pairing_reason) - 1);
+            app.pairing_phase = event.u.pairing.phase;
+            if(event.u.pairing.phase == PairingPhaseFailed) {
+                app.connection_lost = strcmp(event.u.pairing.reason, "connection lost") == 0;
+                strncpy(app.pairing_reason, event.u.pairing.reason, sizeof(app.pairing_reason) - 1);
                 app.pairing_reason[sizeof(app.pairing_reason) - 1] = '\0';
             } else {
                 app.connection_lost = false;
                 app.pairing_reason[0] = '\0';
             }
-            if(event.pairing_phase == PairingPhaseDone) {
+            if(event.u.pairing.phase == PairingPhaseDone) {
                 app.has_saved_pairing = true;
             }
         } else if(event.type == AppEventSessionFatal) {
@@ -5564,40 +6073,32 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.pairing_reason[sizeof(app.pairing_reason) - 1] = '\0';
         } else if(event.type == AppEventCapabilityInfo) {
             app.has_capability_info = true;
-            strncpy(app.capability_board, event.capability_board, sizeof(app.capability_board) - 1);
+            strncpy(app.capability_board, event.u.capability.board, sizeof(app.capability_board) - 1);
             app.capability_board[sizeof(app.capability_board) - 1] = '\0';
             strncpy(
-                app.capability_features, event.capability_features, sizeof(app.capability_features) - 1);
+                app.capability_features, event.u.capability.features, sizeof(app.capability_features) - 1);
             app.capability_features[sizeof(app.capability_features) - 1] = '\0';
-            app.capability_has_wifi_scan = event.capability_has_wifi_scan;
-            app.capability_has_ble_scan = event.capability_has_ble_scan;
-            app.capability_has_wardriving = event.capability_has_wardriving;
-            app.capability_has_gps = event.capability_has_gps;
-            app.capability_has_meshcore_scan = event.capability_has_meshcore_scan;
-            app.capability_has_mesh_log = event.capability_has_mesh_log;
+            app.capability_has_wifi_scan = event.u.capability.has_wifi_scan;
+            app.capability_has_ble_scan = event.u.capability.has_ble_scan;
+            app.capability_has_wardriving = event.u.capability.has_wardriving;
+            app.capability_has_gps = event.u.capability.has_gps;
+            app.capability_has_meshcore_scan = event.u.capability.has_meshcore_scan;
+            app.capability_has_mesh_log = event.u.capability.has_mesh_log;
             /* Force-jump to Wardriving on connect (docs/WARDRIVING_REDESIGN.md, decision 6):
                the moment a session's capability info arrives and the board advertises
                wardriving, the Home cursor is forced here unconditionally, even if the user
                was sitting on Publish at that moment -- in addition to, not instead of,
                home_menu_fix_selection()'s own clamp-to-first-visible-item safety net that
                already runs on every Home draw. */
-            if(event.capability_has_wardriving) {
+            if(event.u.capability.has_wardriving) {
                 app.home_menu_index = HomeMenuWardriving;
                 home_menu_scroll_into_view(&app);
             }
         } else if(event.type == AppEventWifiScanAp) {
-            if(wifi_scan_ap_count < WIFI_SCAN_MAX_DISPLAY_APS) {
-                WifiScanApDisplay* slot = &wifi_scan_aps[wifi_scan_ap_count++];
-                strncpy(slot->ssid, event.wifi_scan_ap_ssid, sizeof(slot->ssid) - 1);
-                slot->ssid[sizeof(slot->ssid) - 1] = '\0';
-                memcpy(slot->bssid, event.wifi_scan_ap_bssid, sizeof(slot->bssid));
-                slot->rssi_dbm = event.wifi_scan_ap_rssi_dbm;
-                slot->channel = event.wifi_scan_ap_channel;
-                strncpy(slot->phy, event.wifi_scan_ap_phy, sizeof(slot->phy) - 1);
-                slot->phy[sizeof(slot->phy) - 1] = '\0';
-                strncpy(slot->auth, event.wifi_scan_ap_auth, sizeof(slot->auth) - 1);
-                slot->auth[sizeof(slot->auth) - 1] = '\0';
-            }
+            /* No-op: wifi_scan_aps[]/wifi_scan_ap_count were already updated under
+               wardriving_state_mutex by copy_wifi_scan_ap_locked() before this was posted
+               (HP-08) -- this event exists only to make the main loop wake up and redraw
+               (view_port_update() below runs unconditionally after every event). */
         } else if(event.type == AppEventWifiScanDone) {
             app.wifi_scan_in_progress = false;
             app.wifi_scan_complete = true;
@@ -5605,20 +6106,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.wifi_scan_in_progress = false;
             strncpy(
                 app.wifi_scan_error_message,
-                event.wifi_scan_error_message,
+                event.u.error_message,
                 sizeof(app.wifi_scan_error_message) - 1);
             app.wifi_scan_error_message[sizeof(app.wifi_scan_error_message) - 1] = '\0';
         } else if(event.type == AppEventBleScanDevice) {
-            if(ble_scan_device_count < BLE_SCAN_MAX_DISPLAY_DEVICES) {
-                BleScanDeviceDisplay* slot = &ble_scan_devices[ble_scan_device_count++];
-                memcpy(slot->address, event.ble_scan_device_address, sizeof(slot->address));
-                slot->has_name = event.ble_scan_device_has_name;
-                strncpy(slot->name, event.ble_scan_device_name, sizeof(slot->name) - 1);
-                slot->name[sizeof(slot->name) - 1] = '\0';
-                slot->rssi_dbm = event.ble_scan_device_rssi_dbm;
-                strncpy(slot->addr_type, event.ble_scan_device_addr_type, sizeof(slot->addr_type) - 1);
-                slot->addr_type[sizeof(slot->addr_type) - 1] = '\0';
-            }
+            /* No-op: same reasoning as AppEventWifiScanAp above -- ble_scan_devices[]/
+               ble_scan_device_count were already updated under wardriving_state_mutex by
+               copy_ble_scan_device_locked() before this was posted (HP-08). */
         } else if(event.type == AppEventBleScanDone) {
             app.ble_scan_in_progress = false;
             app.ble_scan_complete = true;
@@ -5626,13 +6120,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.ble_scan_in_progress = false;
             strncpy(
                 app.ble_scan_error_message,
-                event.ble_scan_error_message,
+                event.u.error_message,
                 sizeof(app.ble_scan_error_message) - 1);
             app.ble_scan_error_message[sizeof(app.ble_scan_error_message) - 1] = '\0';
         } else if(event.type == AppEventWardrivingRunState) {
             app.wardriving_running_known = true;
-            app.wardriving_running = event.wardriving_running;
-            if(event.wardriving_is_fresh_start) {
+            app.wardriving_running = event.u.wardriving_run_state.running;
+            if(event.u.wardriving_run_state.is_fresh_start) {
                 /* A genuine new "started" ack -- reset this session's own counters, distinct
                    from a `busy`-error-inferred "it was already running" correction (which
                    must NOT reset counts we may already be accumulating this connection). */
@@ -5653,40 +6147,40 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 app.wardriving_settings_scroll_offset = 0;
             }
         } else if(event.type == AppEventWardrivingBatch) {
-            app.wardriving_records_this_session += event.wardriving_batch_count;
-            app.wardriving_backlog_remaining = event.wardriving_backlog_remaining;
-            if(event.wardriving_last_wifi_summary[0] != '\0') {
+            app.wardriving_records_this_session += event.u.wardriving_batch.batch_count;
+            app.wardriving_backlog_remaining = event.u.wardriving_batch.backlog_remaining;
+            if(event.u.wardriving_batch.last_wifi_summary[0] != '\0') {
                 strncpy(
                     app.wardriving_last_wifi_summary,
-                    event.wardriving_last_wifi_summary,
+                    event.u.wardriving_batch.last_wifi_summary,
                     sizeof(app.wardriving_last_wifi_summary) - 1);
                 app.wardriving_last_wifi_summary[sizeof(app.wardriving_last_wifi_summary) - 1] = '\0';
             }
-            if(event.wardriving_last_ble_summary[0] != '\0') {
+            if(event.u.wardriving_batch.last_ble_summary[0] != '\0') {
                 strncpy(
                     app.wardriving_last_ble_summary,
-                    event.wardriving_last_ble_summary,
+                    event.u.wardriving_batch.last_ble_summary,
                     sizeof(app.wardriving_last_ble_summary) - 1);
                 app.wardriving_last_ble_summary[sizeof(app.wardriving_last_ble_summary) - 1] = '\0';
             }
         } else if(event.type == AppEventWardrivingError) {
             strncpy(
                 app.wardriving_error_message,
-                event.wardriving_error_message,
+                event.u.error_message,
                 sizeof(app.wardriving_error_message) - 1);
             app.wardriving_error_message[sizeof(app.wardriving_error_message) - 1] = '\0';
         } else if(event.type == AppEventGpsStatus) {
             app.gps_status_known = true;
-            app.gps_state = (GpsFixState)event.gps_state;
+            app.gps_state = (GpsFixState)event.u.gps.state;
             if(app.gps_state == GpsFixStateFix) {
-                app.gps_lat_e7_offset = event.gps_lat_e7_offset;
-                app.gps_lon_e7_offset = event.gps_lon_e7_offset;
-                app.gps_fix_quality = event.gps_fix_quality;
-                app.gps_satellites = event.gps_satellites;
-                app.gps_hdop_e1 = event.gps_hdop_e1;
-                app.gps_utc_timestamp_s = event.gps_utc_timestamp_s;
-                app.gps_altitude_dm_offset = event.gps_altitude_dm_offset;
-                app.gps_speed_e1_kmh = event.gps_speed_e1_kmh;
+                app.gps_lat_e7_offset = event.u.gps.lat_e7_offset;
+                app.gps_lon_e7_offset = event.u.gps.lon_e7_offset;
+                app.gps_fix_quality = event.u.gps.fix_quality;
+                app.gps_satellites = event.u.gps.satellites;
+                app.gps_hdop_e1 = event.u.gps.hdop_e1;
+                app.gps_utc_timestamp_s = event.u.gps.utc_timestamp_s;
+                app.gps_altitude_dm_offset = event.u.gps.altitude_dm_offset;
+                app.gps_speed_e1_kmh = event.u.gps.speed_e1_kmh;
             }
         } else if(event.type == AppEventGpsPollTick) {
             /* GPS polling must not run while the Wardriving screen is open: the Wardriving
@@ -5700,22 +6194,22 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             if(app.screen == AppScreenPublish && app.publish_waiting) {
                 publish_poll_check(&app);
             }
-        } else if(event.type == AppEventInput && event.input.type == InputTypeShort) {
+        } else if(event.type == AppEventInput && event.u.input.type == InputTypeShort) {
             if(app.connection_lost) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     app.connection_lost = false;
                     app.screen = AppScreenHome;
                 }
             } else if(app.screen == AppScreenHome) {
                 app.screen = AppScreenHome;
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     running = false;
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     home_menu_step(&app, -1);
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     home_menu_step(&app, 1);
                 } else if(
-                    event.input.key == InputKeyOk && !app.profile &&
+                    event.u.input.key == InputKeyOk && !app.profile &&
                     app.home_menu_index != HomeMenuPublish) {
                     /* First-time-pairing trigger (formerly the Legacy screen's own
                        `!app->profile` + OK call site, moved here since Legacy is gone) --
@@ -5730,7 +6224,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                        `if(app.has_saved_pairing) start_profile(&app)` at boot for an
                        already-paired board. */
                     start_profile(&app);
-                } else if(event.input.key == InputKeyOk) {
+                } else if(event.u.input.key == InputKeyOk) {
                     switch(app.home_menu_index) {
                     case HomeMenuWardriving:
                         /* Navigating in from Home always lands on whichever screen matches
@@ -5759,7 +6253,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                             app.scan_menu_index = ScanMenuWifi;
                             app.screen = AppScreenScan;
                         } else if(app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
-                            wifi_scan_ap_count = 0;
+                            wifi_scan_ap_count_reset();
                             app.wifi_scan_scroll_offset = 0;
                             app.wifi_scan_complete = false;
                             app.wifi_scan_error_message[0] = '\0';
@@ -5769,7 +6263,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                                 app.screen = AppScreenHome;
                             }
                         } else if(app.capability_has_ble_scan && !app.ble_scan_in_progress) {
-                            ble_scan_device_count = 0;
+                            ble_scan_device_count_reset();
                             app.ble_scan_scroll_offset = 0;
                             app.ble_scan_complete = false;
                             app.ble_scan_error_message[0] = '\0';
@@ -5815,15 +6309,15 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     }
                 }
             } else if(app.screen == AppScreenScan) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     scan_menu_step(&app, -1);
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     scan_menu_step(&app, 1);
-                } else if(event.input.key == InputKeyOk) {
+                } else if(event.u.input.key == InputKeyOk) {
                     if(app.scan_menu_index == ScanMenuWifi && app.capability_has_wifi_scan && !app.wifi_scan_in_progress) {
-                        wifi_scan_ap_count = 0;
+                        wifi_scan_ap_count_reset();
                         app.wifi_scan_scroll_offset = 0;
                         app.wifi_scan_complete = false;
                         app.wifi_scan_error_message[0] = '\0';
@@ -5833,7 +6327,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                             app.screen = AppScreenHome;
                         }
                     } else if(app.scan_menu_index == ScanMenuBle && app.capability_has_ble_scan && !app.ble_scan_in_progress) {
-                        ble_scan_device_count = 0;
+                        ble_scan_device_count_reset();
                         app.ble_scan_scroll_offset = 0;
                         app.ble_scan_complete = false;
                         app.ble_scan_error_message[0] = '\0';
@@ -5845,18 +6339,18 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     }
                 }
             } else if(app.screen == AppScreenGps) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
                 }
             } else if(app.screen == AppScreenMeshLog) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     app.screen = AppScreenHome;
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     if(app.mesh_log_scroll_offset > 0) {
                         app.mesh_log_scroll_offset--;
                     }
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     size_t visible_rows = MESH_LOG_RESULTS_MAX_ROWS;
                     furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
                     size_t count = mesh_log_display_count;
@@ -5866,51 +6360,55 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                     }
                 }
             } else if(app.screen == AppScreenWifiScanResults) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     reset_scan_ui_state(&app);
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     if(app.wifi_scan_scroll_offset > 0) {
                         app.wifi_scan_scroll_offset--;
                     }
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     size_t visible_rows = WIFI_SCAN_RESULTS_MAX_ROWS;
-                    if(wifi_scan_ap_count > visible_rows &&
-                       app.wifi_scan_scroll_offset < wifi_scan_ap_count - visible_rows) {
+                    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+                    size_t count = wifi_scan_ap_count;
+                    furi_mutex_release(wardriving_state_mutex);
+                    if(count > visible_rows && app.wifi_scan_scroll_offset < count - visible_rows) {
                         app.wifi_scan_scroll_offset++;
                     }
-                } else if(event.input.key == InputKeyOk && !app.wifi_scan_in_progress) {
+                } else if(event.u.input.key == InputKeyOk && !app.wifi_scan_in_progress) {
                     /* Re-trigger from inside the results view too, e.g. after a completed
                        scan -- "Scan now" is a repeatable manual action, not one-shot. */
-                    wifi_scan_ap_count = 0;
+                    wifi_scan_ap_count_reset();
                     app.wifi_scan_scroll_offset = 0;
                     app.wifi_scan_complete = false;
                     app.wifi_scan_error_message[0] = '\0';
                     app.wifi_scan_in_progress = send_wifi_scan_command(&app);
                 }
             } else if(app.screen == AppScreenBleScanResults) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     reset_scan_ui_state(&app);
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     if(app.ble_scan_scroll_offset > 0) {
                         app.ble_scan_scroll_offset--;
                     }
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     size_t visible_rows = BLE_SCAN_RESULTS_MAX_ROWS;
-                    if(ble_scan_device_count > visible_rows &&
-                       app.ble_scan_scroll_offset < ble_scan_device_count - visible_rows) {
+                    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+                    size_t count = ble_scan_device_count;
+                    furi_mutex_release(wardriving_state_mutex);
+                    if(count > visible_rows && app.ble_scan_scroll_offset < count - visible_rows) {
                         app.ble_scan_scroll_offset++;
                     }
-                } else if(event.input.key == InputKeyOk && !app.ble_scan_in_progress) {
+                } else if(event.u.input.key == InputKeyOk && !app.ble_scan_in_progress) {
                     /* Re-trigger from inside the results view too, e.g. after a completed
                        scan -- "Scan now" is a repeatable manual action, not one-shot. */
-                    ble_scan_device_count = 0;
+                    ble_scan_device_count_reset();
                     app.ble_scan_scroll_offset = 0;
                     app.ble_scan_complete = false;
                     app.ble_scan_error_message[0] = '\0';
                     app.ble_scan_in_progress = send_ble_scan_command(&app);
                 }
             } else if(app.screen == AppScreenWardrivingRunning) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     /* Unlike wifi_scan/ble_scan's Back, this does NOT stop wardriving --
                        capture runs autonomously server-side regardless of whether this
                        screen is open (docs/CAPABILITIES.md), so leaving it is pure
@@ -5919,37 +6417,37 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                        reflects them). */
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
-                } else if(event.input.key == InputKeyOk) {
+                } else if(event.u.input.key == InputKeyOk) {
                     send_wardriving_stop_command(&app);
                 }
             } else if(app.screen == AppScreenWardrivingStopped) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     /* Same "pure navigation, nothing to discard" reasoning as the Running
                        screen's own Back above -- settings-row edits are already persisted
                        to disk immediately on change (wardriving_settings_cycle_row()), not
                        held as unconfirmed in-progress state. */
                     app.screen = AppScreenHome;
                     furi_timer_stop(gps_poll_timer);
-                } else if(event.input.key == InputKeyOk) {
+                } else if(event.u.input.key == InputKeyOk) {
                     send_wardriving_start_command(&app);
-                } else if(event.input.key == InputKeyUp) {
+                } else if(event.u.input.key == InputKeyUp) {
                     wardriving_settings_step(&app, -1);
-                } else if(event.input.key == InputKeyDown) {
+                } else if(event.u.input.key == InputKeyDown) {
                     wardriving_settings_step(&app, 1);
-                } else if(event.input.key == InputKeyLeft) {
+                } else if(event.u.input.key == InputKeyLeft) {
                     wardriving_settings_cycle_row(&app, -1);
-                } else if(event.input.key == InputKeyRight) {
+                } else if(event.u.input.key == InputKeyRight) {
                     wardriving_settings_cycle_row(&app, 1);
                 }
             } else if(app.screen == AppScreenPublish) {
-                if(event.input.key == InputKeyBack) {
+                if(event.u.input.key == InputKeyBack) {
                     /* Discards any in-progress wait, matching this app's "Back never
                        persists data" convention -- the result file (if the host script does
                        eventually write one) is simply never read; nothing on the Flipper
                        side is lost by cancelling. */
                     publish_finish_waiting(&app);
                     app.screen = AppScreenHome;
-                } else if(event.input.key == InputKeyOk && !app.publish_waiting) {
+                } else if(event.u.input.key == InputKeyOk && !app.publish_waiting) {
                     publish_start(&app);
                 }
             }
@@ -5971,6 +6469,8 @@ int32_t flipper_esp32_over_ble_app(void* context) {
     reassembly_mutex = NULL;
     furi_mutex_free(wardriving_state_mutex);
     wardriving_state_mutex = NULL;
+    furi_mutex_free(protocol_mutex);
+    protocol_mutex = NULL;
     gui_remove_view_port(gui, view_port);
     view_port_free(view_port);
     furi_record_close(RECORD_GUI);

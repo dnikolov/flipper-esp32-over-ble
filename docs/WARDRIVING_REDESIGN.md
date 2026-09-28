@@ -128,6 +128,17 @@ this protocol's established "append, never reorder" convention (e.g. how `gps`'s
   `wardriving_wifi_interval_cb()` in `esp32/main/main.c`) — `handle_wifi_scan_command()`'s
   manual-scan call site is untouched, per "Scope boundaries" above.
 
+**No-fix scan suppression (added 2026-09-27, all three boards).** `wardriving_wifi_interval_cb()`
+and its BLE-scan counterpart now check `location_get_fix()` before starting a scan at all, not
+just at completion: with no fix, the scan/discovery window is skipped for that cycle (radio
+airtime isn't spent on a scan whose records would be discarded anyway) but the interval callout
+still re-arms at its normal cadence, so scanning resumes the instant a fix returns. This sits
+alongside (does not replace) the existing post-scan fix-dependency discard described in
+[PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction" section. A related backlog-flush start gate
+(same date) is documented in full in [PROTOCOL.md](PROTOCOL.md)'s "Backlog-flush start gate"
+section — it's a separate mechanism (when a BLE batch-send is allowed to begin) unrelated to
+`wifi_swelling`'s dwell-time decision above, mentioned here only for cross-reference.
+
 ### `gps` capability result: one new field
 
 Appended after `altitude_dm_offset` (same rule as above):

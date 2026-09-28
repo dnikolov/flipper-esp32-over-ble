@@ -133,6 +133,9 @@ gotcha, not a guess.
 | Onboard LED (`LED_BUILTIN`) | GPIO25 | plain LED, also DAC1 — **not** an addressable
 WS2812 like the C6's GPIO8 RGB LED; do not carry that driving code over. |
 | Boot/PRG button (`KEY_BUILTIN`) | GPIO0 | standard classic-ESP32 boot-mode strapping pin |
+| Radio kill-switch touch pad | GPIO2 | touch channel T2 (per `soc/esp32/include/soc/
+touch_sensor_channel.h`'s `TOUCH_PAD_NUM2`/`TOUCH_PAD_GPIO2_CHANNEL`), user-wired 2026-09-27,
+not a Heltec onboard pin — see note below. |
 | External GPS module RX | GPIO17 | user-wired 2026-09-23 (rewired from an earlier GPIO36
 bench test), not a Heltec onboard pin — see note below. |
 | GPS UART TX (configured, unused) | GPIO23 | not connected to the module; configured only so
@@ -153,6 +156,19 @@ original GPIO36 (input-only, no pull resistor, not 5 V-tolerant) location. Modul
 chipset, and logic-level (3.3 V vs 5 V TTL) remain unconfirmed — wired at the user's own risk
 without that check, same as the original GPIO36 wiring. UART_NUM_1, 9600 8N1, RX-only (the module
 is never transmitted to) — same driver shape as the C6's, only the pin numbers differ.
+
+**Radio kill-switch touch pad wired to GPIO2 (2026-09-27):** a capacitive touch pad, using
+GPIO2's touch channel T2 (`heltec/main/radio_killswitch.c`, classic ESP32's legacy
+`driver/touch_pad.h` API — the only touch driver ESP-IDF v5.5.2 ships for the `esp32` target;
+the newer `touch_sens` component is S2/S3/P4-only, see that file's own comment). GPIO2 was
+confirmed free (not claimed by any onboard peripheral in the tables above) and its only
+strapping concern — must be low or floating at reset for normal SPI-flash boot (see "Strapping
+/ boot-sampled pins" below) — is naturally satisfied by an unconnected touch pad. A deliberate
+touch-and-release toggles Wi-Fi + Bluetooth/BLE off entirely (LoRa is untouched); OLED shows
+`PAIR MODE: RADIO OFF` while off. Build-verified only as of this writing — see
+`docs/BACKLOG.md` BL27 for the real, measured DRAM/IRAM-footprint constraints this feature ran
+into on this board and the resulting design trade-offs, and `docs/SESSION_MEMORY.md` for
+current verification status.
 
 ## Second physical unit in use for Phase 9 (confirmed 2026-09-26)
 
@@ -228,7 +244,9 @@ need the same caution as on any classic ESP32 design:
 
 - GPIO12 (`MTDI`) — selects flash voltage (1.8 V vs 3.3 V); an externally forced level here is
   the single most common way to soft-brick a classic ESP32 board.
-- GPIO2 — must be low or floating for normal SPI-flash boot.
+- GPIO2 — must be low or floating for normal SPI-flash boot; now used as the radio kill-switch
+  touch pad (touch channel T2, see above) — an unconnected touch pad floats, so this is
+  satisfied, not overridden.
 - GPIO0 — boot-mode select (also the board's PRG button, a normal/expected use).
 
 ## Firmware baseline notes

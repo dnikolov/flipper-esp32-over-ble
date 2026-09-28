@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -319,6 +320,19 @@ static size_t wardriving_pending_drain_count;
 static uint8_t wardriving_flash_failure_count;
 static bool wardriving_wifi_self_stop_pending;
 static bool wardriving_ble_self_stop_pending;
+/* wardriving_maybe_kick_send()'s stopped-hysteresis: 0 means "not currently stopped"; set to
+   the esp_timer_get_time()-derived ms timestamp of the first below-threshold speed reading,
+   held until a reading at/above FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX resets it back
+   to 0. Same 0-as-sentinel idiom as pair_reply_wait_start_ms/hello_ack_start_ms above. */
+static uint32_t wardriving_flush_stopped_since_ms;
+/* wardriving_send_backlog_count_update()'s dedup tracker, reset to UINT64_MAX (an impossible
+   pending count, forcing a fresh report) on every new connection in BLE_GAP_EVENT_DISCONNECT's
+   per-connection state reset -- the Flipper resets its own displayed count to 0 on every
+   disconnect/reconnect (flipper_esp32_over_ble.c's reset_scan_ui_state_impl()), so this must
+   not persist a stale "already reported this count" memory across a session boundary, or a
+   reconnect where the pending count happens to match what was last reported before the
+   disconnect would leave the Flipper stuck showing 0 indefinitely. */
+static uint64_t wardriving_last_reported_backlog = UINT64_MAX;
 
 /* `wifi_scan` capture state, ported unchanged from esp32/main/main.c's manual-scan path.
    wifi_scan_done_handler() runs on the sys_evt task (esp_wifi's scan-done event);
@@ -599,6 +613,11 @@ static void start_scan(void)
     int rc;
 
     if (connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+        return;
+    }
+    /* Never run a second, dedicated reconnect scan while wardriving's BLE source owns
+       discovery -- see esp32/main/main.c:758's fuller comment (docs/LESSONS.md 2026-09-10). */
+    if (wardriving_ble_active) {
         return;
     }
     if (!connecting_permitted()) {
@@ -1247,6 +1266,11 @@ static void wifi_scan_done_cb(struct ble_npl_event *ev)
         return;
     }
 
+    /* HP-21 measurement (see the scan-start log above for rationale). */
+    ESP_LOGI(TAG, "wifi_scan: free_heap=%" PRIu32 " largest_free_block=%u at scan done (%u AP(s) found)",
+             esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)wifi_scan_found_count);
+
     if (connection_handle == BLE_HS_CONN_HANDLE_NONE ||
         runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
         ESP_LOGW(TAG, "wifi_scan completed with no authenticated connection; discarding %u result(s)",
@@ -1365,6 +1389,12 @@ static void handle_wifi_scan_command(uint16_t conn_handle, const feb_command_pay
        (default WARDRIVING_BAND_5GHZ_FULL if wardriving has never run this boot, matching
        this board's pre-existing dual-band-full-sweep default). */
     wardriving_apply_wifi_band(&scan_cfg);
+    /* docs/HARDENING_PLAN.md HP-21 (BL18 heap-pressure hypothesis): dual-band scans see more
+       APs than the 2.4GHz-only case, and the IDF driver's internal AP list scales with that,
+       outside this app's own bounded FEB_WIFI_SCAN_RAW_MAX array. Measurement only -- not a
+       fix -- to have real numbers on hand for a future hardware chase of BL18. */
+    ESP_LOGI(TAG, "wifi_scan: free_heap=%" PRIu32 " largest_free_block=%u before scan start",
+             esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     err = esp_wifi_scan_start(&scan_cfg, false);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(err));
@@ -1787,21 +1817,36 @@ static void wardriving_wifi_interval_cb(struct ble_npl_event *ev)
 {
     wifi_scan_config_t scan_cfg;
     esp_err_t err;
+    feb_location_t fix;
+    feb_location_state_t loc_state;
 
     (void)ev;
     if (!wardriving_wifi_active) {
         return;
     }
-    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
-        feb_location_t fix;
-        feb_location_state_t loc_state = location_get_fix(&fix);
+    loc_state = location_get_fix(&fix);
+    if (loc_state != FEB_LOCATION_FIX) {
+        /* No fix this cycle -- skip starting a new scan (the shared radio should not be
+           spending airtime on scans with no location to attach to them), but still re-arm
+           so scanning resumes once a fix comes back. Since we never call
+           esp_wifi_scan_start(), wifi_scan_done_cb() will not fire this cycle to do its usual
+           re-arm+kick-send, so both happen here instead. Clamped to
+           FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS rather than the raw configured interval: that
+           interval can legitimately be 0 ("aggressive"/continuous), and re-arming at 0ms here
+           produced a zero-delay refire loop that starved CPU0's IDLE task and tripped the task
+           watchdog (hardware-reproduced 2026-09-27). */
+        uint32_t retry_ms = (wardriving_wifi_interval_ms < FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS) ?
+                             FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS : wardriving_wifi_interval_ms;
 
-        if (loc_state == FEB_LOCATION_FIX) {
-            if (fix.speed_e1_kmh >= 100u) {
-                wardriving_swelling_aggressive_active = true;
-            } else if (fix.speed_e1_kmh < 80u) {
-                wardriving_swelling_aggressive_active = false;
-            }
+        wardriving_maybe_kick_send(connection_handle);
+        ble_npl_callout_reset(&wardriving_wifi_interval_co, ble_npl_time_ms_to_ticks32(retry_ms));
+        return;
+    }
+    if (wardriving_wifi_swelling == WARDRIVING_SWELLING_SPEED_BASED) {
+        if (fix.speed_e1_kmh >= 100u) {
+            wardriving_swelling_aggressive_active = true;
+        } else if (fix.speed_e1_kmh < 80u) {
+            wardriving_swelling_aggressive_active = false;
         }
     }
     memset(&scan_cfg, 0, sizeof(scan_cfg));
@@ -1826,6 +1871,14 @@ static void wardriving_ble_interval_cb(struct ble_npl_event *ev)
         return;
     }
     ble_scan_raw_count = 0;
+    /* Unlike the Wi-Fi side, this discovery window is not skipped when there's no GPS fix:
+       it is the same NimBLE discovery procedure gap_event()'s BLE_GAP_EVENT_DISC handler uses
+       to find the Flipper's advertisement for reconnect (start_scan() piggybacks on whichever
+       discovery is already running rather than starting a second one), so skipping it here
+       stalls reconnect for as long as there's no fix -- reproduced live 2026-09-27 (autostarted
+       wardriving, no GPS fix, Flipper never found/connected for the rest of the session).
+       Recording still discards results with no fix to attach them to, at window-close below;
+       only the scan itself is unconditional. */
     /* Passive capture is safe while the authenticated connection is present. During reconnect,
        use active discovery so the Flipper's service can still be found (a passive-only re-arm
        was shown to miss the reconnect match in live testing on the C6). */
@@ -2068,18 +2121,145 @@ static void wardriving_self_stop(const char *error_code)
     }
 }
 
+/* Shared scratch for both wardriving_send_backlog_count_update() and wardriving_send_next_batch()
+   below -- static, not stack-local, for the same NimBLE-host-task stack-budget reason those
+   functions' own comments explain (2026-09-10 stack-overflow bug). A second full-size
+   feb_wardriving_status_result_payload_t (~3.6 KB, dominated by its 32-entry records array)
+   would not fit in DRAM on every board (hardware-confirmed: overflowed the Heltec build by
+   3392 bytes 2026-09-27) even though the count-update path only ever touches two scalar
+   fields. Sharing is safe because the two functions are mutually exclusive in time:
+   wardriving_send_backlog_count_update() only runs while !wardriving_tx_in_flight, and
+   wardriving_send_next_batch() is the only thing that sets wardriving_tx_in_flight true. */
+static feb_wardriving_status_result_payload_t wardriving_result_scratch;
+static feb_status_payload_t wardriving_status_payload_scratch;
+static uint8_t wardriving_result_buf_scratch[FEB_CBOR_MAX_PAYLOAD];
+
+/* Sends a lightweight status(state="data") update with an empty records array -- just enough
+   to move the Flipper's displayed backlog count, without actually draining anything. Used by
+   wardriving_maybe_kick_send() below while the real flush is gated off, so pausing the flush
+   doesn't also freeze the on-screen number. record_count=0 + backlog_remaining=pending encodes
+   and decodes cleanly (verified against both cbor_wardriving.c copies -- an empty records
+   array is not a special case on either side of the wire). Returns false on encode/send
+   failure so the caller doesn't advance wardriving_last_reported_backlog on a drop, which
+   would otherwise leave the Flipper's displayed count stale until it happens to change again. */
+static bool wardriving_send_backlog_count_update(uint16_t conn_handle, size_t pending)
+{
+    size_t result_len;
+    size_t payload_len;
+
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
+    wardriving_result_scratch.backlog_remaining = pending;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
+    if (result_len == 0) {
+        return false;
+    }
+
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0;
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
+
+    payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
+    if (payload_len == 0) {
+        return false;
+    }
+    return send_protected(conn_handle, "status", strlen("status"), pairing_payload_encode_buf,
+                          payload_len);
+}
+
 /* Kicks off a wardriving status(state="data") send if a session is connected+authenticated,
    there is buffered data to send, and no batch is already in flight. Ported unchanged from
-   esp32/main/main.c. */
+   esp32/main/main.c, plus a radio-sharing gate: a flush is only allowed to *start* while
+   actively driving+scanning (as opposed to being merely called, which happens every scan/
+   window cycle regardless of whether anything new was appended) if there is no GPS fix, the
+   backlog is large enough to be urgent, or the vehicle has been stopped long enough that BLE
+   batch-send no longer competes with useful WiFi/BLE scanning. Once wardriving_send_next_batch()
+   below is reached, the drain-to-completion chain runs via TX_DONE_CONTINUE_WARDRIVING calling
+   wardriving_send_next_batch() directly (see its switch in the GATT-write completion handler)
+   -- that path bypasses this function entirely, so an in-progress drain is never re-gated
+   mid-flush.
+
+   This gate was tried without the count-update above on 2026-09-27 and removed the same day:
+   under ordinary continuous driving it stayed permanently closed, and with nothing else
+   updating the Flipper's displayed backlog count, live wardriving results looked like they'd
+   vanished entirely. Re-added with wardriving_send_backlog_count_update() so the gate now only
+   pauses when raw record *data* reaches the Flipper, not whether the count on screen moves. */
 static void wardriving_maybe_kick_send(uint16_t conn_handle)
 {
-    if (conn_handle == BLE_HS_CONN_HANDLE_NONE || runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
-        return;
+    feb_location_t fix;
+    feb_location_state_t loc_state;
+    uint32_t now_ms;
+    bool gate_open;
+    size_t pending;
+    const char *bail_reason = NULL;
+    static const char *last_bail_reason = "";
+
+    loc_state = location_get_fix(&fix);
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if (loc_state == FEB_LOCATION_FIX) {
+        if (fix.speed_e1_kmh >= FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX) {
+            wardriving_flush_stopped_since_ms = 0;
+        } else if (wardriving_flush_stopped_since_ms == 0) {
+            wardriving_flush_stopped_since_ms = now_ms;
+        }
     }
-    if (wardriving_tx_in_flight) {
-        return;
+
+    pending = wardriving_log_pending_count();
+    gate_open = (loc_state != FEB_LOCATION_FIX) ||
+                (pending > FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD) ||
+                (wardriving_flush_stopped_since_ms != 0 &&
+                 (uint32_t)(now_ms - wardriving_flush_stopped_since_ms) >=
+                     FEB_WARDRIVING_FLUSH_STOPPED_SECONDS * 1000u);
+
+    /* Diagnostic instrumentation added 2026-09-27 while chasing a live "wardriving results
+       never show up" report: this function was previously silent about which of its several
+       independent bail-out conditions was firing, which cost significant debugging time.
+       Logs only on a change of reason (comparing string-literal addresses, stable since each
+       is referenced from one fixed source location) to stay quiet during steady-state. */
+    if (!gate_open) {
+        bail_reason = "gate_closed";
+    } else if (conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        bail_reason = "no_connection";
+    } else if (runtime_auth_state != RUNTIME_AUTH_STATE_AUTHENTICATED) {
+        bail_reason = "not_authenticated";
+    } else if (wardriving_tx_in_flight) {
+        bail_reason = "tx_in_flight";
+    } else if (pending == 0) {
+        bail_reason = "no_backlog";
     }
-    if (wardriving_log_pending_count() == 0) {
+
+    if (bail_reason != last_bail_reason) {
+        if (bail_reason != NULL) {
+            ESP_LOGI(TAG, "wardriving: flush not started (%s) -- loc_state=%d pending=%u "
+                          "tx_in_flight=%d has_conn=%d auth_state=%d stopped_since_ms=%lu now_ms=%lu",
+                     bail_reason, (int)loc_state, (unsigned)pending,
+                     (int)wardriving_tx_in_flight, (int)(conn_handle != BLE_HS_CONN_HANDLE_NONE),
+                     (int)runtime_auth_state, (unsigned long)wardriving_flush_stopped_since_ms,
+                     (unsigned long)now_ms);
+        } else {
+            ESP_LOGI(TAG, "wardriving: flush starting (pending=%u)", (unsigned)pending);
+        }
+        last_bail_reason = bail_reason;
+    }
+
+    /* Keep the on-screen backlog count moving even while the real flush is paused above.
+       Skipped when bail_reason is NULL (a real flush is about to start below and will report
+       an accurate count itself) and when a real flush is already draining (same reason). */
+    if (bail_reason != NULL && conn_handle != BLE_HS_CONN_HANDLE_NONE &&
+        runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED && !wardriving_tx_in_flight &&
+        (uint64_t)pending != wardriving_last_reported_backlog) {
+        if (wardriving_send_backlog_count_update(conn_handle, pending)) {
+            wardriving_last_reported_backlog = pending;
+        }
+    }
+
+    if (bail_reason != NULL) {
         return;
     }
     wardriving_tx_in_flight = true;
@@ -2089,17 +2269,16 @@ static void wardriving_maybe_kick_send(uint16_t conn_handle)
 
 /* Builds and sends one wardriving status(state="data") record from the oldest still-pending
    flash-log records. Ported unchanged from esp32/main/main.c, including the static (not
-   stack-local) peeked/peek_scratch/result/trial/status_payload/result_buf -- see that file's
-   comment on the 2026-09-10 GATT-write-flood/stack-overflow bugs this exact shape fixes;
-   this board's NimBLE host task stack budget is the same shape as the C6/Heltec's. */
+   stack-local) peeked/peek_scratch/trial -- see that file's comment on the 2026-09-10
+   GATT-write-flood/stack-overflow bugs this exact shape fixes; this board's NimBLE host task
+   stack budget is the same shape as the C6/Heltec's. Shares wardriving_result_scratch/
+   wardriving_status_payload_scratch/wardriving_result_buf_scratch with
+   wardriving_send_backlog_count_update() above -- see that pair's declaration comment. */
 static void wardriving_send_next_batch(uint16_t conn_handle)
 {
     static feb_wardriving_record_t peeked[FEB_WARDRIVING_MAX_RECORDS_PER_BATCH];
     static uint8_t peek_scratch[FEB_WARDRIVING_PEEK_SCRATCH_LEN];
-    static feb_wardriving_status_result_payload_t result;
     static feb_wardriving_status_result_payload_t trial;
-    static feb_status_payload_t status_payload;
-    static uint8_t result_buf[FEB_CBOR_MAX_PAYLOAD];
     size_t peeked_count;
     size_t include_count;
     size_t remaining_after;
@@ -2120,47 +2299,50 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
         return;
     }
 
-    memset(&result, 0, sizeof(result));
+    memset(&wardriving_result_scratch, 0, sizeof(wardriving_result_scratch));
     include_count = 0;
     pending_now = wardriving_log_pending_count();
     while (include_count < peeked_count) {
         size_t trial_len;
 
-        trial = result;
+        trial = wardriving_result_scratch;
         trial.records[trial.record_count] = peeked[include_count];
         trial.record_count++;
         trial.backlog_remaining = (pending_now >= trial.record_count) ?
                                   (pending_now - trial.record_count) : 0;
-        trial_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &trial);
+        trial_len = feb_cbor_encode_wardriving_status_result_payload(
+            wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &trial);
         if (trial_len == 0 || trial_len + FEB_WARDRIVING_STATUS_ENCODE_HEADROOM > FEB_CBOR_MAX_PAYLOAD) {
-            if (result.record_count == 0) {
+            if (wardriving_result_scratch.record_count == 0) {
                 ESP_LOGE(TAG, "wardriving: single record too large to encode; dropping it");
                 include_count++;
                 continue;
             }
             break;
         }
-        result = trial;
+        wardriving_result_scratch = trial;
         include_count++;
     }
 
     remaining_after = (pending_now >= include_count) ? (pending_now - include_count) : 0;
-    result.backlog_remaining = remaining_after;
-    result_len = feb_cbor_encode_wardriving_status_result_payload(result_buf, sizeof(result_buf), &result);
+    wardriving_result_scratch.backlog_remaining = remaining_after;
+    result_len = feb_cbor_encode_wardriving_status_result_payload(
+        wardriving_result_buf_scratch, sizeof(wardriving_result_buf_scratch), &wardriving_result_scratch);
 
-    memset(&status_payload, 0, sizeof(status_payload));
-    status_payload.request_id = 0;
-    status_payload.state = "data";
-    status_payload.state_len = strlen("data");
-    status_payload.result_span = result_buf;
-    status_payload.result_span_len = result_len;
-    status_payload.has_result = 1;
+    memset(&wardriving_status_payload_scratch, 0, sizeof(wardriving_status_payload_scratch));
+    wardriving_status_payload_scratch.request_id = 0;
+    wardriving_status_payload_scratch.state = "data";
+    wardriving_status_payload_scratch.state_len = strlen("data");
+    wardriving_status_payload_scratch.result_span = wardriving_result_buf_scratch;
+    wardriving_status_payload_scratch.result_span_len = result_len;
+    wardriving_status_payload_scratch.has_result = 1;
 
     payload_len = feb_cbor_encode_status_payload(pairing_payload_encode_buf,
-                                                 sizeof(pairing_payload_encode_buf), &status_payload);
+                                                 sizeof(pairing_payload_encode_buf),
+                                                 &wardriving_status_payload_scratch);
     if (result_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) result encode failed (records=%u, peeked=%u)",
-                 (unsigned)result.record_count, (unsigned)peeked_count);
+                 (unsigned)wardriving_result_scratch.record_count, (unsigned)peeked_count);
     } else if (payload_len == 0) {
         ESP_LOGE(TAG, "wardriving status(data) wrapper encode failed (result_len=%u)",
                  (unsigned)result_len);
@@ -2182,7 +2364,7 @@ static void wardriving_send_next_batch(uint16_t conn_handle)
     }
     wardriving_pending_drain_count = include_count;
     ESP_LOGI(TAG, "sending wardriving status(data) (%u record(s), backlog_remaining=%u)",
-             (unsigned)result.record_count, (unsigned)remaining_after);
+             (unsigned)wardriving_result_scratch.record_count, (unsigned)remaining_after);
 }
 
 static bool wardriving_source_requested(const feb_wardriving_command_payload_t *payload, const char *name)
@@ -2935,6 +3117,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         wardriving_tx_in_flight = false; /* per-connection only -- wardriving_{wifi,ble}_active
                                              deliberately persist across connect/disconnect */
         wardriving_pending_drain_count = 0;
+        wardriving_last_reported_backlog = UINT64_MAX; /* force a fresh count report on the new
+            session -- the Flipper resets its own displayed count to 0 on every reconnect */
         rc = ble_gap_set_prefered_le_phy(connection_handle, BLE_GAP_LE_PHY_2M_MASK,
                                          BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_CODED_ANY);
         if (rc != 0) {

@@ -70,6 +70,32 @@
 #define FEB_WARDRIVING_BLE_WINDOW_DEFAULT_MS 100u
 #define FEB_WARDRIVING_BLE_INTERVAL_DEFAULT_MS 500u
 
+/* wardriving_maybe_kick_send()'s (main.c) backlog-flush gate: avoids starting/continuing a BLE
+   batch-send of raw record *data* while actively driving and scanning on the same shared
+   radio -- wardriving_send_backlog_count_update() (main.c) still keeps the Flipper's displayed
+   backlog count current while this gate is closed, so pausing the data flush doesn't also
+   freeze the on-screen number. Speed threshold set to 5.0 km/h (rather than an initial
+   1.0 km/h): speed_e1_kmh is raw, unsmoothed NMEA speed-over-ground, and ordinary GPS noise
+   near 1.0 km/h was found to repeatedly reset the stopped-hysteresis timer before it could
+   ever accumulate FEB_WARDRIVING_FLUSH_STOPPED_SECONDS continuously, even when the vehicle was
+   genuinely stationary. Fixed firmware constants, no wire-configurability. */
+#define FEB_WARDRIVING_FLUSH_STOPPED_SPEED_E1_KMH_MAX 50u
+#define FEB_WARDRIVING_FLUSH_STOPPED_SECONDS 10u
+#define FEB_WARDRIVING_FLUSH_BACKLOG_THRESHOLD 2000u
+
+/* Floor for the no-GPS-fix retry re-arm in wardriving_wifi_interval_cb() (main.c): that cycle
+   skips starting a scan and just re-checks for a fix next time, so it doesn't need to run at
+   the configured scan cadence -- which can legitimately be 0 ("aggressive"/continuous, no gap,
+   see FEB_WARDRIVING_WIFI_INTERVAL_DEFAULT_MS's comment above). Re-arming with the raw
+   interval at 0ms produces a zero-delay refire loop on the NimBLE host task that starves CPU0's
+   IDLE task and trips the task watchdog -- reproduced on hardware 2026-09-27 (C5 board
+   autostarted wardriving from a persisted 0ms wifi_interval_ms with no GPS fix present).
+   Clamp to this floor instead of the configured interval whenever retrying due to no fix.
+   wardriving_ble_interval_cb() does not have a no-fix skip at all (it shares the discovery
+   procedure start_scan() uses for Flipper reconnect, so skipping it whenever there's no fix
+   stalls reconnect indefinitely), so this floor is Wi-Fi-only. */
+#define FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS 1000u
+
 typedef struct {
     bool want_wifi;
     bool want_ble;

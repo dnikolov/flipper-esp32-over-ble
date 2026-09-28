@@ -514,6 +514,117 @@ static void test_wifi_scan_status_records(void) {
     }
 }
 
+static int all_zero(const uint8_t* p, size_t len) {
+    for(size_t i = 0; i < len; i++) {
+        if(p[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* HP-28: an authenticated plaintext must be exactly one CBOR value; anything else is
+   rejected and the plaintext buffer zeroized. HP-25: a 9-byte `version` is TOO_LARGE. */
+static void test_protected_record_plaintext_strictness(void) {
+    static uint8_t plaintext[FEB_CBOR_MAX_PAYLOAD];
+    feb_session_decrypted_record_t record;
+
+    memset(plaintext, 0xA5, sizeof(plaintext));
+    feb_cbor_status_t status = feb_session_decrypt_record(
+        FEB_VEC_SESS_KEY,
+        FEB_VEC_SESS_PROT_TRAILING_PLAINTEXT_RECORD,
+        FEB_VEC_SESS_PROT_TRAILING_PLAINTEXT_RECORD_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+        plaintext,
+        sizeof(plaintext),
+        &record);
+    CHECK(
+        status == FEB_CBOR_ERR_UNEXPECTED_TYPE && all_zero(plaintext, FEB_VEC_SESS_PROT1_PAYLOAD_LEN + 1u),
+        "protected record: trailing plaintext bytes rejected (FEB_CBOR_ERR_UNEXPECTED_TYPE), plaintext zeroized");
+
+    memset(plaintext, 0xA5, sizeof(plaintext));
+    status = feb_session_decrypt_record(
+        FEB_VEC_SESS_KEY,
+        FEB_VEC_SESS_PROT_TRUNCATED_PLAINTEXT_RECORD,
+        FEB_VEC_SESS_PROT_TRUNCATED_PLAINTEXT_RECORD_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+        plaintext,
+        sizeof(plaintext),
+        &record);
+    CHECK(
+        status == FEB_CBOR_ERR_TRUNCATED && all_zero(plaintext, FEB_VEC_SESS_PROT1_PAYLOAD_LEN),
+        "protected record: truncated plaintext rejected (FEB_CBOR_ERR_TRUNCATED), plaintext zeroized");
+
+    status = feb_session_decrypt_record(
+        FEB_VEC_SESS_KEY,
+        FEB_VEC_SESS_PROT_RECORD_VERSION_2POW32_PLUS_2,
+        FEB_VEC_SESS_PROT_RECORD_VERSION_2POW32_PLUS_2_LEN,
+        FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER,
+        plaintext,
+        sizeof(plaintext),
+        &record);
+    CHECK(status == FEB_CBOR_ERR_TOO_LARGE, "protected record: version 2^32+2 rejected (FEB_CBOR_ERR_TOO_LARGE)");
+
+    {
+        static uint8_t deep_ct[FEB_CBOR_MAX_PAYLOAD];
+        static uint8_t deep_rec[768];
+        static uint8_t deep_pt[FEB_CBOR_MAX_PAYLOAD];
+        feb_session_decrypted_record_t deep;
+        size_t deep_len = feb_session_encrypt_record(
+            FEB_VEC_SESS_KEY, 2, "status", strlen("status"), FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID,
+            FEB_VEC_SESS_BOARD_ID_LEN, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, 9,
+            FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD, FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD_LEN, deep_ct,
+            sizeof(deep_ct), deep_rec, sizeof(deep_rec));
+        CHECK(
+            deep_len > 0 &&
+                feb_session_decrypt_record(
+                    FEB_VEC_SESS_KEY, deep_rec, deep_len, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, deep_pt,
+                    sizeof(deep_pt), &deep) == FEB_CBOR_OK &&
+                bytes_equal(
+                    deep.plaintext, deep.plaintext_len, FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD,
+                    FEB_VEC_WARDRIVING_STATUS_DATA_PAYLOAD_LEN),
+            "protected record: 5-level wardriving status payload still decrypts (no depth cap)");
+    }
+}
+
+/* HP-39: the nonce carries only 24 bits of sequence, so s and s + 2^24 would share a nonce.
+   feb_session_encrypt_record() refuses every sequence >= FEB_SESSION_SEQUENCE_MAX, which
+   makes that aliasing unreachable through the API. */
+static void test_protected_record_sequence_cap(void) {
+    static uint8_t ciphertext_scratch[FEB_CBOR_MAX_PAYLOAD];
+    static uint8_t record_buf[768];
+    uint8_t nonce_a[FEB_SESSION_NONCE_LEN];
+    uint8_t nonce_b[FEB_SESSION_NONCE_LEN];
+    static const uint64_t refused[] = {
+        FEB_SESSION_SEQUENCE_MAX, FEB_SESSION_SEQUENCE_MAX + 1u, (1ull << 24) + 1u, 1ull << 32, UINT64_MAX};
+
+    feb_session_build_nonce(FEB_VEC_SESS_SESSION_ID, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, 1, nonce_a);
+    feb_session_build_nonce(
+        FEB_VEC_SESS_SESSION_ID, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, (1ull << 24) + 1u, nonce_b);
+    CHECK(
+        memcmp(nonce_a, nonce_b, sizeof(nonce_a)) == 0,
+        "nonce layout: sequence s and s + 2^24 alias (why the cap must be enforced)");
+
+    size_t len = feb_session_encrypt_record(
+        FEB_VEC_SESS_KEY, 2, "error", strlen("error"), FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID,
+        FEB_VEC_SESS_BOARD_ID_LEN, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, FEB_SESSION_SEQUENCE_MAX - 1u,
+        FEB_VEC_SESS_PROT1_PAYLOAD, FEB_VEC_SESS_PROT1_PAYLOAD_LEN, ciphertext_scratch,
+        sizeof(ciphertext_scratch), record_buf, sizeof(record_buf));
+    CHECK(len > 0, "protected record: encrypt accepts sequence FEB_SESSION_SEQUENCE_MAX - 1");
+
+    int all_refused = 1;
+    for(size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        if(feb_session_encrypt_record(
+               FEB_VEC_SESS_KEY, 2, "error", strlen("error"), FEB_VEC_SESS_SESSION_ID, FEB_VEC_SESS_BOARD_ID,
+               FEB_VEC_SESS_BOARD_ID_LEN, FEB_SESSION_DIRECTION_ESP32_TO_FLIPPER, refused[i],
+               FEB_VEC_SESS_PROT1_PAYLOAD, FEB_VEC_SESS_PROT1_PAYLOAD_LEN, ciphertext_scratch,
+               sizeof(ciphertext_scratch), record_buf, sizeof(record_buf)) != 0) {
+            all_refused = 0;
+        }
+    }
+    CHECK(all_refused, "protected record: encrypt refuses every sequence >= FEB_SESSION_SEQUENCE_MAX");
+}
+
 int main(void) {
     test_gcm_kat();
     test_golden_transcript_and_proofs();
@@ -523,6 +634,8 @@ int main(void) {
     test_protected_record_encrypt();
     test_protected_record_decrypt();
     test_protected_record_tamper_rejection();
+    test_protected_record_plaintext_strictness();
+    test_protected_record_sequence_cap();
     test_wifi_scan_command_record();
     test_wifi_scan_status_records();
 

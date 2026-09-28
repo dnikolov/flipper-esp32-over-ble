@@ -8,6 +8,12 @@ here.
 
 ## Current state (as of 2026-09-21)
 
+**2026-09-28: full-codebase hardening pass landed, build- and host-test-verified, NOT hardware-verified.**
+[HARDENING_PLAN.md](HARDENING_PLAN.md) §0 has the status table and the hardware test checklist,
+which is the next session's priority before relying on any board. Every ESP target is now `-Os`
+with the stack canary and WDT panic on (BASELINES.md). Heltec headroom is 364 B DRAM / 7,309 B
+IRAM. See PROJECT_HISTORY.md 2026-09-28.
+
 **Phase 4 (Heltec WiFi LoRa 32 V2 board support) started 2026-09-16**, via an explicit
 user decision to override `docs/PLAN.md`'s "does not start until Phase 3 backlog is cleared"
 gate (Phase 3's backlog is not cleared — see [BACKLOG.md](BACKLOG.md); it stays fully deferred,
@@ -322,6 +328,38 @@ headroom, same as BL25). New host tests in `tests/esp32/test_meshtastic_proto.c`
 and fix, 180° orientation flip, GPS time/speed line); `docs/BACKLOG.md` BL25 for the resulting
 IRAM/DRAM margin. `docs/USER_GUIDE.md` now has a Heltec-board section describing it.
 
+**GPIO2 touch-pad radio kill-switch and OLED `LOC:Y`/`LOC:N` line: build-verified 2026-09-27,
+flashed 2026-09-27, boot health still unconfirmed.** A deliberate touch-and-release on a
+capacitive pad wired to GPIO2 (touch channel T2, `heltec/main/radio_killswitch.c`) toggles
+Wi-Fi + Bluetooth/BLE off entirely (persisted in NVS, LoRa/`meshcore_scan`/`meshtastic_scan`
+untouched); OLED shows `PAIR MODE: RADIO OFF` while off (`status_display.h`'s new
+`FEB_DISPLAY_BLE_RADIO_OFF`). `status_display.c`'s MeshCore/Meshtastic RSSI lines now also show
+`LOC:Y`/`LOC:N`. This board's DRAM/IRAM budget is down to **8 bytes of DRAM headroom, 45 bytes
+IRAM** (`idf.py size`, reconfirmed via a clean rebuild-from-scratch 2026-09-27, matching BL27's
+original measurement exactly) — see `docs/BACKLOG.md` BL27 for the full constraint and the
+resulting design trade-offs (no IIR touch filter, shutdown cleanup runs directly on the touch
+task instead of being handed off to the NimBLE host task).
+
+**Flashed to the second physical unit (COM10, MAC `a4:cf:12:03:b1:74`) 2026-09-27**: a clean
+rebuild-from-scratch (`idf.py build` after deleting `build/`) succeeded, and `idf.py -p COM10
+flash` completed cleanly — esptool hash-verified all three binary writes (bootloader,
+partition table, app image) and issued its own hard reset via the RTS pin. **Boot log capture
+failed this session, not attempted-and-passed**: after that flash-triggered reset, COM10
+disappeared from Windows' serial port enumeration (`[System.IO.Ports.SerialPort]::GetPortNames()`
+stopped listing it, and `Get-PnpDevice` showed the CP210x bridge's status as `Unknown`) and did
+not return across two separate polling windows (60s, then 100s — over 160s combined). No
+`idf_monitor` session could attach, so **no boot log line was captured this pass** — no
+confirmation either way of a clean boot, a crash, a reset loop, or the radio-kill-switch/OLED
+tasks starting successfully. This is a new symptom, distinct from the already-known "COM
+assignment isn't stable across reboots" caution: the port didn't move to a different number, it
+stopped enumerating at all. Successful completion of the flash write/verify/hash-check itself
+(300+ KB written and read back over the same serial link) is indirect evidence the board and
+CP210x bridge were both working correctly *during* the flash, but says nothing about the state
+after its own post-flash reset. **Next session: reconfirm the port is back (may need a manual
+USB reseat) and capture a fresh boot log before trusting this build's runtime health at all.**
+The touch-pad gesture and Wi-Fi/BLE toggle behavior itself still needs a human physically
+touching the pad — no agent session can validate that regardless of boot-log outcome.
+
 **Phase 8 (OLIMEX MOD-ESP32-C5 board support) started 2026-09-25.** Third ESP32-family target,
 `esp32c5/`, same gate-override pattern as Phase 4/6/7. **Step 1 (board bring-up) is done and
 hardware-verified 2026-09-25:** chip confirmed as ESP32-C5 rev v1.0 (dual-band Wi-Fi 6 + BLE 5 +
@@ -455,6 +493,36 @@ implementation-status notes: [docs/WARDRIVING_PUBLISH.md](WARDRIVING_PUBLISH.md)
 - ✅ Stale wardriving log replay fixed (2026-09-13, commit b23aec0): old format records are now properly detected/cleared on boot instead of appearing as stuck backlog.
 
 For the full roadmap, phase boundaries, and each step's "done when" criteria, see [docs/PLAN.md](PLAN.md). For the complete dated history of how each step was designed, implemented, and debugged — including every bug's root cause — see [docs/PROJECT_HISTORY.md](PROJECT_HISTORY.md).
+
+**Flipper FAP memory footprint cut ~20% on 2026-09-28, after a live "out of memory" reboot
+during a wardriving CSV flush.** Root cause was a genuine runtime `malloc()` failure (the
+firmware's own `furi_check(pvReturn, "out of memory")` inside `pvPortMalloc()`), **not** the
+launch-time ELF-loader rejection this project had been chasing under
+[HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04: the lazy CSV open allocates a ~600-byte FatFS
+`FIL` at exactly the moment a backlog drain starts, on top of the ~118 KB of system heap the app
+already held. Fixed by four independent reductions totalling **23,035 bytes net (-19.4%)** —
+build type debug->release (11,799), `AppEvent` flat struct -> tagged union (5,664), X25519 donna scratch
+moved from `.bss` to an on-demand heap allocation (3,868), wardriving dedup entry narrowed 32->16
+bytes at unchanged capacity (2,312) — plus a heap-margin guard that now turns a tight heap into an
+on-screen "CSV export write failed" with the session still alive, instead of a device reboot.
+
+**Two things this changes for every future session:**
+1. **The FAP is now built and flashed from the RELEASE directory.** `fbt.cmd DEBUG=0
+   fap_flipper_esp32_over_ble`, artifact `build/f7-firmware/.extapps/flipper_esp32_over_ble.fap`
+   — *not* the `build/f7-firmware-D/` debug path every earlier session used.
+   `tools/build_flipper.ps1`/`tools/flash_flipper.ps1` already default to it; `-DebugBuild`
+   restores the old `-Og` artifact for a debugger session. Pinned in
+   [BASELINES.md](BASELINES.md).
+2. **A FAP's `.text`/`.rodata`/`.data`/`.bss` are heap, permanently** — each is
+   `aligned_malloc()`ed from the live system heap at launch and held for the app's whole
+   lifetime. Every new `static` buffer costs the whole firmware, not just this app. Re-measure
+   with `arm-none-eabi-size` after any feature that adds one.
+
+Build- and host-test-verified (565 checks across all three Flipper suites, plus
+`tools/check_shared_headers.py`); **not hardware-verified — nothing was flashed.** Biggest
+remaining win (`shared_status_result`, 2,832 bytes, needs a both-firmwares streaming-decode
+change to stay in header lockstep) and the full ranked list of what was deliberately left on the
+table are in H04's 2026-09-28 entry.
 
 ## 2026-09-13 fix batch: G30, G12, G19, G21, BL07
 

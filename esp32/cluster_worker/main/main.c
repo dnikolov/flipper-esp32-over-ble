@@ -35,6 +35,14 @@
 #define UART_RX_PIN 18
 #define UART_BAUD_RATE 115200
 #define UART_RX_BUF_SIZE 2048
+/* HP-43: a 0-byte TX ring (uart_driver_install()'s tx_buf_size argument) makes every
+   uart_write_bytes() block until the hardware FIFO drains one byte at a time at
+   UART_BAUD_RATE, so handle_scan_done()'s per-AP frame writes (up to WIFI_SCAN_RAW_MAX
+   frames back to back) stall scan_ctl_task for on the order of hundreds of ms per batch --
+   during which a scan_config_set arriving from the coordinator sits unread. A ring buffer
+   lets uart_write_bytes() return as soon as the bytes are copied in, so the ISR/hardware
+   drains it in the background instead of on this task's own time. */
+#define UART_TX_BUF_SIZE 1024
 #define UART_RX_CHUNK_SIZE 256
 #define UART_RX_TASK_STACK_SIZE 6144
 
@@ -355,12 +363,18 @@ static void uart_rx_task(void *arg)
             ESP_LOGE(TAG, "uart_read_bytes failed: %d", read);
             continue;
         }
-        for (i = 0; i < read; i++) {
+        /* Past the last input byte, keep polling: a resync can leave further complete frames
+           buffered in the decoder (HP-30). */
+        for (i = 0;; i++) {
             feb_cluster_decode_result_t result =
-                feb_cluster_decoder_feed_byte(&decoder, chunk[i], &frame);
+                (i < read) ? feb_cluster_decoder_feed_byte(&decoder, chunk[i], &frame)
+                           : feb_cluster_decoder_poll(&decoder, &frame);
             cluster_worker_event_t evt;
 
             if (result != FEB_CLUSTER_DECODE_FRAME_READY) {
+                if (i >= read) {
+                    break;
+                }
                 continue;
             }
             if (frame.msg_type != (uint8_t)FEB_CLUSTER_MSG_SCAN_CONFIG_SET) {
@@ -425,7 +439,7 @@ void app_main(void)
         return;
     }
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_RX_BUF_SIZE, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_LOGI(TAG, "UART1 up: TX=GPIO%d RX=GPIO%d baud=%d", UART_TX_PIN, UART_RX_PIN, UART_BAUD_RATE);
