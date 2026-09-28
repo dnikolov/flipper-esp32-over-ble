@@ -10,7 +10,10 @@ that pairs with a Flipper Zero over BLE and exposes board capabilities through a
 authenticated CBOR protocol. This project also has a first ESP32 target, the ESP32-C6
 (`esp32/`, a different agent's territory) — treat it as prior art to port from, never as a
 source of board facts for this board. Treat `heltec/`, the checked-out ESP-IDF, and the
-project docs as the source of truth over generic ESP32 knowledge.
+project docs as the source of truth over generic ESP32 knowledge. Before editing anything
+under `components/feb_protocol/` or otherwise shared/protocol/codec code, read
+[docs/AGENT_RULES.md](../../docs/AGENT_RULES.md) — it holds the rules this file used to repeat
+that are identical across every board/firmware agent in this project.
 
 **Read discipline:** `heltec/main/main.c` currently implements the base transport/pairing/
 session-auth protocol only (no capabilities yet as of 2026-09-16) — `Grep` for the symbol you
@@ -108,59 +111,32 @@ hardware README for citations):
   already-agreed wire behavior; the latter needs its own dedicated scoping pass first (see
   above). Don't conflate the two when deciding whether you need a design discussion before
   writing code.
-- Read [docs/SESSION_MEMORY.md](../../docs/SESSION_MEMORY.md) first for current status — this
-  project moves in discrete, ordered roadmap steps ([docs/PLAN.md](../../docs/PLAN.md)).
-  `board_id` for this board is `heltec-<12 lowercase hex chars>` (already implemented,
-  confirmed distinct/collision-safe from the C6's `esp32c6-` prefix — see Phase 4 step 4).
+- The caller supplies task context (see AGENT_RULES.md's task-context contract). `board_id`
+  for this board is `heltec-<12 lowercase hex chars>` (already implemented, confirmed distinct/
+  collision-safe from the C6's `esp32c6-` prefix — see Phase 4 step 4).
 - Toolchain: ESP-IDF **v5.5.2** at `C:\Users\Deyan\esp\esp-idf`, target `esp32` (classic
   Xtensa) — installed alongside the pre-existing `esp32c6` toolchain during Phase 4 step 1.
   Don't upgrade or change the target without flagging it.
 - Crypto/session-auth behavior is already fully ported and hardware-verified (Phase 4 step 3)
   — don't re-derive or second-guess it; it's out of scope for capability-porting work unless
   you find an actual bug.
+- This board's `heltec-a4cf1203ba58` capability record on the Flipper's SD card was already
+  populated with a **zero-feature** response during Phase 4 step 3's hardware test — see
+  AGENT_RULES.md's capability-cache rule; don't assume a hardware test will pick up new
+  `feb_features[]` automatically without invalidating that stale cache first.
 
-## The Flipper's capability cache — a real gotcha when you change what this board reports
+## Board-specific failure modes — beyond AGENT_RULES.md's shared list
 
-`capability_query` is sent exactly once per `board_id` and the Flipper caches the answer
-permanently (see [docs/CAPABILITIES.md](../../docs/CAPABILITIES.md)); the only refresh path is
-a full unpair + re-pair. This board's `heltec-a4cf1203ba58` capability record on the Flipper's
-SD card was already populated with a **zero-feature** response during Phase 4 step 3's
-hardware test. **After you add real capabilities to `feb_features[]`, that stale cached
-response will keep being served until the cache is invalidated** — flag this explicitly
-whenever you finish capability-porting work that changes what this board reports, rather than
-assuming a hardware test will pick up the new features automatically. See
-`reference_flipper_sd_card_access` project memory (or ask the main session) for how to delete
-a stale capability-cache file via `scripts/storage.py` read-write access.
+Full incident writeups (from the C6's experience porting this exact protocol layer, still
+relevant here since the wire logic is shared): [docs/LESSONS.md](../../docs/LESSONS.md).
 
-## Known failure modes — read before touching transport sizing or capability logic
-
-**A clean `idf.py build` plus passing host-native tests is close to zero evidence about BLE
-behavior against the real peer.** Report build results as build results, not as validation of
-transport, peer interaction, or radio coexistence. Full incident writeups (from the C6's
-experience porting this exact protocol layer, still relevant here since the wire logic is
-shared): [docs/LESSONS.md](../../docs/LESSONS.md).
-
-- **Size outgoing fragments against `FEB_FLIPPER_WRITE_EFFECTIVE_MTU`, never the negotiated
-  ATT MTU.** See `docs/LESSONS.md#att-mtu-vs-attribute-length`.
-- **Any fact about the Flipper's implementation must be confirmed by reading `flipper/*.c`,
-  never assumed.** See `docs/LESSONS.md#flipper-facts-must-be-read-not-assumed`.
-- After editing `sdkconfig.defaults`, grep the generated `sdkconfig` to confirm the value took,
-  and regenerate (delete + rebuild) if it didn't. See
-  `docs/LESSONS.md#sdkconfig-defaults-not-retroactive`.
 - When you port a sizing constant or interval default from `esp32/main/main.c`, do not assume
   it's safe for this board's different radio — either cite where a Heltec-specific bound came
   from, or flag that it's borrowed/unvalidated and why that's an acceptable stopgap for the
   specific case (a one-shot bounded scan is a much smaller risk than continuous concurrent
   scanning — see the coexistence note above).
-- This project has hit the same `BleEventWorker`/task-stack-overflow bug class repeatedly on
-  the C6 side (steps 3, 5, 7, and `wifi_scan`). Any new BLE-callback-path code here should
-  default to file-scope `static` storage for non-trivial buffers, and get a real
-  `-fstack-usage` check before being trusted at a tight budget.
-- **Wardriving BLE discovery doubles as the reconnect scan.** Keep `start_scan()`'s centralized
-  `wardriving_ble_active` guard. Never skip the BLE interval callback's discovery for "no GPS
-  fix"; discard no-fix results at window close instead. Clamp any no-fix Wi-Fi re-arm with
-  `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS`. See
-  `docs/LESSONS.md#wardriving-ble-discovery-is-the-reconnect-scan` and `#no-fix-retry-needs-a-floor`.
+- This project has hit the NimBLE-host-task stack-overflow bug class repeatedly on the C6 side
+  (steps 3, 5, 7, and `wifi_scan`). `docs/LESSONS.md#nimble-host-stack-budget`
 - **Any code path the touch kill-switch (`radio_ks` task) reaches runs off the NimBLE host
   task.** Heap pointers shared with host-task callbacks need a lock plus a deferred-free
   handoff, not just a flag (HP-04, `cluster_flush_records_release()`). The Wi-Fi subsystem
@@ -179,55 +155,20 @@ suites (`tests/esp32/*.ps1`) after any change to `components/feb_protocol/`, sin
 component is shared — a change here that breaks the C6 build is a real regression, not an
 out-of-scope concern.
 
-Report the exact build result. For runtime/BLE/radio behavior that needs the physical board,
-state plainly what you validated statically (build, log review) versus what remains
-hardware-dependent — do not claim a capability works without a real-device test or an explicit
-hardware-pending caveat.
-
 **Never flash, erase, or write the physical board unless the user explicitly asks.** Read-only
 diagnostics (`flash_id`, `idf.py monitor` to observe, not to send) are fine without asking.
 Known port from recent sessions: `COM10` — reconfirm, it isn't stable across reboots/replugs.
 
 ## Working method
 
-1. Anchor on the concrete task: file, symbol, failing build step, or the specific PLAN.md step
-   being implemented. If it's a capability port, read the C6's implementation of that exact
-   capability in `esp32/main/main.c` first — grep for the capability name, don't re-derive its
-   wire behavior from the protocol docs alone when a working reference implementation exists.
-2. Read the relevant doc (PROTOCOL/CAPABILITIES) before writing protocol-adjacent code — don't
-   invent a field shape or derivation that isn't specified there or in the C6's implementation.
-3. Make the smallest change consistent with the current roadmap step. Don't pull forward
-   `display`/`lora` capability work, or wardriving/gps ahead of their stated blockers, as a
-   side effect of a narrower capability port.
-4. Validate with `idf.py build` at minimum after every substantive change (both `heltec/` and
-   `esp32/` if you touched shared code), and report it as a build result only.
-5. State board/pin/radio assumptions explicitly when they matter, and confirm (don't infer)
-   any assumption about the Flipper's implementation by reading `flipper/*.c`.
-6. Record new hardware facts, root causes, or verified measurements in the relevant
-   `docs/*.md` file. If a root cause repeats a bug class already in `docs/LESSONS.md`, also
-   propose an update to this agent file — the log records history, only this file changes
-   future behavior.
-7. **When you add new shared codec functions/macros/structs in parallel with the Flipper
-   agent**, run `python tools/check_shared_headers.py` before reporting done.
+Follow AGENT_RULES.md's default working method, with one addition to step 1: if it's a
+capability port, read the C6's implementation of that exact capability in `esp32/main/main.c`
+first — grep for the capability name, don't re-derive its wire behavior from the protocol docs
+alone when a working reference implementation exists. Also don't pull forward `display`/`lora`
+capability work, or wardriving/gps ahead of their stated blockers, as a side effect of a
+narrower capability port.
 
-## Embedded standards
+## Response style and handback
 
-- Check every `esp_err_t`; treat error propagation as real functionality, not boilerplate.
-- Use FreeRTOS tasks/queues with explicit lifetimes and cleanup; don't block on slow I/O in a
-  task another subsystem depends on.
-- Keep memory bounded: no unbounded buffers, no allocation sized from unvalidated
-  peer-controlled lengths.
-- Match integer widths and format specifiers; avoid one-letter variable names.
-- Keep comments rare — only for non-obvious hardware constraints or control flow, matching the
-  existing `main.c` style on both boards.
-- Keep a header's declaration comment in sync with its implementation whenever you touch
-  either.
-- Don't validate a bound (array size, nesting depth, buffer cap) against the other firmware's
-  implementation or shared test vectors — validate against `docs/PROTOCOL.md` directly.
-
-## Response style
-
-Be concise and explicit about assumptions, especially board/pin/radio-coexistence ones. Ask a
-clarifying question only when it blocks a safe or correct change; otherwise make the
-conservative, spec-consistent choice, flag any borrowed/unvalidated numbers, and validate what
-you can statically.
+Follow AGENT_RULES.md's response-style and handback-contract sections; additionally flag any
+borrowed/unvalidated radio-coexistence numbers explicitly.

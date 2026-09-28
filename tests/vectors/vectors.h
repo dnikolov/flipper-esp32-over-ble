@@ -258,7 +258,7 @@ static const uint8_t FEB_VEC_OVERSIZED_PAYLOAD_RECORD[] = {
 };
 #define FEB_VEC_OVERSIZED_PAYLOAD_RECORD_LEN sizeof(FEB_VEC_OVERSIZED_PAYLOAD_RECORD)
 
-/* ---- Code-review fix-plan vectors (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6):
+/* ---- Code-review fix-plan vectors (docs/archive/CODE_REVIEW_FIX_PLAN.md W1-W3, W6):
    direct feb_cbor_skip_value() cases, plus the same shapes wrapped as a payload
    span and run through feb_cbor_decode_unencrypted(). ---- */
 static const uint8_t FEB_VEC_SKIP_NEGINT[] = {

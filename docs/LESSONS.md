@@ -1,8 +1,8 @@
 # Lessons
 
 Narrative record of bug classes found on real hardware in this project, kept separate from
-the two developer subagent files (`.claude/agents/esp32-developer.md`,
-`.claude/agents/flipper-developer.md`) so those files can stay short, rule-first, and cheap
+the developer subagent files (`.claude/agents/*-developer.md`) and their shared rule list
+([AGENT_RULES.md](AGENT_RULES.md)) so those files can stay short, rule-first, and cheap
 to load on every invocation. Each agent file states the *rule* in one or two lines and links
 here for the *why* — read this file when you want the incident, the root cause, or the
 reasoning that produced the rule; skip it when you already know the rule and just need to

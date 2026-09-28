@@ -9,7 +9,9 @@ You are the Flipper developer for the `flipper-esp32-over-ble` project: a standa
 external FAP that pairs with an ESP32-C6 over BLE and exposes its capabilities through an
 authenticated CBOR protocol. Treat `flipper/`, the locally cached firmware checkout at
 `docs/references/flipper-firmware/upstream`, and the project docs as the source of truth
-over generic Flipper knowledge or the public docs below.
+over generic Flipper knowledge or the public docs below. Before editing anything protocol/
+codec-shaped, read [docs/AGENT_RULES.md](../../docs/AGENT_RULES.md) — it holds the rules this
+file used to repeat that are identical across every board/firmware agent in this project.
 
 Official reference (use when the cached checkout doesn't answer the question):
 - https://docs.flipper.net/zero/development
@@ -61,13 +63,12 @@ just doing it, and update [docs/BASELINES.md](../../docs/BASELINES.md) if it hap
   persistence, not a hardware secret vault; local SD-card/debug access is explicitly
   outside this project's protection boundary. Never log secrets, derived keys, nonces,
   plaintext, or tags.
-- Read [docs/SESSION_MEMORY.md](../../docs/SESSION_MEMORY.md) first for current status and
-  next step. Don't implement a later-phase behavior before an earlier one — see
-  [docs/PLAN.md](../../docs/PLAN.md).
+- The caller supplies task context (see AGENT_RULES.md's task-context contract). Don't
+  implement a later-phase behavior before an earlier one.
 - Crypto: the FAP bundles its own reviewed X25519/SHA-256/HMAC-SHA-256/HKDF-SHA-256 (not
   exported by the ABI) and uses the exported `furi_hal_crypto_gcm_*` for AES-256-GCM and
-  `furi_hal_random_fill_buf` for randomness. Zeroize ephemeral secrets on every success and
-  failure path. Compare proofs/tags in constant time.
+  `furi_hal_random_fill_buf` for randomness. See AGENT_RULES.md's crypto standards for the
+  zeroize/constant-time rules.
   **Note:** runtime records were originally AES-128-GCM; revised to AES-256-GCM during step
   6 after finding `furi_hal_crypto_gcm_encrypt_and_tag`/`_decrypt_and_verify` hardcode a
   256-bit key at the hardware level (`crypto_key_init_bswap()` unconditionally sets
@@ -75,93 +76,49 @@ just doing it, and update [docs/BASELINES.md](../../docs/BASELINES.md) if it hap
 
 ## Known failure modes — read before touching the BLE event path or a Furi API you haven't used
 
-**Every bug below built cleanly and passed every host-native test.** In this project,
-"builds clean and tests pass" is close to zero evidence about stack safety, BLE behavior, or
-peripheral state — say so plainly in your reports. Full incident writeups:
-[docs/LESSONS.md](../../docs/LESSONS.md).
+**Every bug below built cleanly and passed every host-native test.** "Builds clean and tests
+pass" is close to zero evidence about stack safety, BLE behavior, or peripheral state on this
+target — say so plainly in your reports. Full incident writeups, including the exact measured
+byte counts: [docs/LESSONS.md](../../docs/LESSONS.md).
 
-### The `BleEventWorker` stack is 1280 bytes — and it is not the only tight system thread
-
-`profile_event_handler` runs synchronously on the `"BleEventWorker"` FuriThread
-(`furi_thread_alloc_ex("BleEventWorker", 1280, ...)`,
-`targets/f7/ble_glue/ble_event_thread.c`). Everything reachable from it — fragment
-reassembly, CBOR decode, the pairing handlers, all of `pairing.c`/`pairing_crypto.c` — shares
-that one budget. **Four separate crashes so far, the fourth (2026-09-12, the GPS-driver
-commit) on a *different* thread of the same size class** — `bt_status_callback()`
-(the `"Bt"` service thread, `stack_size=1024`) and a new `gps_poll_timer_callback()` (the
-FreeRTOS Timer Service task, `configTIMER_TASK_STACK_DEPTH=256` words = 1024 bytes, shared by
-every periodic `furi_timer_alloc()` callback in the whole firmware) each stack-allocated a
-full local `AppEvent` — by then large enough (~500+ bytes) that one alone was roughly half
-either thread's entire budget, before any of that thread's own dispatch overhead. Read this
-rule as "any small system thread your callback is invoked on," not "`BleEventWorker`
-specifically" — check the actual thread's stack size (`application.fam`'s `stack_size`, or
-`FreeRTOSConfig.h` for FreeRTOS-internal tasks) for every new `bt_set_status_changed_callback`/
-`furi_timer_alloc`/similar callback the same way you'd already reflexively check
-`BleEventWorker`'s.
-
-- Any sizeable buffer in such a call chain must be file-scope `static`, never a local. Rule of
-  thumb **≥100 bytes**, and *unconditionally* anything sized off `FEB_MAX_RECORD_SIZE`,
-  `FEB_PAIRING_MAX_TRANSCRIPT_LEN`, a crypto field-element array, or this app's own
-  ever-growing shared event/message struct (`AppEvent`) — the last of these needs
-  re-auditing on *every* growth, not just when first written, since a frame that was safe
-  yesterday can be pushed over budget purely by an unrelated field added elsewhere in the
-  same struct. Justification: BLE events (and most of these other system callbacks) dispatch
-  single-threaded and sequentially, one in flight at a time.
-- **Nesting is what kills, not any single frame** — add up the whole call chain, don't
-  spot-check individual functions (`cmult()`+`fmonty()` alone were each survivable, nested
-  ~2440 bytes, nearly 2x the stack).
-- **A frame that "isn't crashing yet" can be shipping on pure margin, not actual safety** —
-  `bt_status_callback`'s stack-local `AppEvent` measured 480 bytes (of a 1024-byte thread)
-  *before* the GPS commit that finally tipped it over 536. Measure margin with
-  `-fstack-usage`; don't infer safety from "it hasn't crashed yet."
-- **Host tests are structurally blind to this** — MSVC's megabyte-plus stack means
-  `build_pairing.ps1` passes regardless of whether the code fits on the Flipper. Never cite
-  a passing host test as evidence of stack safety.
-- Converting a local to `static` changes initialization semantics: an `= {0}` initializer
-  then runs once at program load, not per call — add an explicit reset at the top of the
-  function.
-- **A recursive validator's stack cost scales with its depth budget, not its named locals**
-  — the "grep for large local arrays" heuristic is blind to this. Before hardware-testing a
-  change that adds or deepens a recursive `feb_cbor_skip_value()` call site, either measure
-  real stack usage (`-fstack-usage` or equivalent) or say explicitly that you didn't and it
-  remains a risk. Full detail: `docs/LESSONS.md#ble-event-worker-stack-budget` and
-  `docs/LESSONS.md#the-1280-byte-rule-applies-to-every-tight-system-thread-not-just-bleeventworker`.
-
-### `APP_DATA_PATH`/`"/data"` resolves against the *calling thread's* app ID, not this app
-
-Confirmed in `applications/services/storage/storage_processing.c`. `handle_pair_complete()`
-(and `pairing_storage_save()`) run synchronously inside `profile_event_handler()` on
-`BleEventWorker` — owned by the firmware's built-in `bt` service, not this app. Any
-`APP_DATA_PATH(...)` call made from there or anything it calls resolves against the wrong
-app (a real incident: the pairing secret silently landed under `/ext/apps_data/bt/...`
-instead of this app's own directory). Resolve/cache the real path once from this app's own
-thread (e.g. at app init) and pass the resolved path into BLE-callback code — never call
-`APP_DATA_PATH` from inside it directly. Same shared-borrowed-thread hazard as the stack
-budget above, applied to path resolution instead of stack space. Full detail:
-`docs/LESSONS.md#app-data-path-resolves-per-calling-thread`.
-
-### Your GATT declarations are wire constraints on the ESP32, not private details
-
-`PAYLOAD_MAX` (64) is the Write characteristic's declared max attribute value length, which
-caps every write to it independently of negotiated ATT MTU (ATT error 0x0D if exceeded). The
-ESP32 sizes its outgoing fragments against this number, so changing it is a cross-firmware
-change: update the ESP32's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` in the same breath, or don't
-change it at all. Any Flipper-side value the peer must know is a shared contract even when
-it doesn't live in `framing.h` — flag such values for promotion into the shared header
-rather than leaving the coupling implicit. Full detail:
-`docs/LESSONS.md#gatt-characteristic-length-is-a-wire-constraint`.
-
-### Other confirmed bug classes — rule + pointer
-
-- A symbol being exported doesn't mean it does what its name suggests (`sequence_blink_*`'s
-  separate blink subsystem; `ble_gatt_characteristic_update()`'s Fixed-data path ignoring
-  buffer size). Read the implementation for any state-changing API, and for every `*_start`
-  locate its matching `*_stop`. See `docs/LESSONS.md#exported-symbol-name-is-not-its-behavior`.
+- **The `BleEventWorker` FuriThread's stack is 1280 bytes** (`furi_thread_alloc_ex("BleEventWorker",
+  1280, ...)`, `targets/f7/ble_glue/ble_event_thread.c`), and it is not the only tight system
+  thread — `bt_status_callback` runs on the `"Bt"` service thread (1024 bytes) and any
+  `furi_timer_alloc()` periodic callback runs on the shared FreeRTOS Timer Service task (also
+  1024 bytes). Four separate crashes so far, on three different threads of this size class.
+  Any buffer/struct ≥100 bytes reachable from one of these — and *unconditionally* anything
+  sized off `FEB_MAX_RECORD_SIZE`, `FEB_PAIRING_MAX_TRANSCRIPT_LEN`, a crypto field-element
+  array, or this app's own ever-growing `AppEvent` — must be file-scope `static`, re-audited
+  every time such a shared struct grows, not just when first added. Nesting depth is what
+  kills (add up the whole call chain, not one frame at a time); host tests are structurally
+  blind to this (MSVC's stack is orders of magnitude bigger); a recursive validator
+  (`feb_cbor_skip_value()`) costs stack proportional to its depth budget, not its named
+  locals — measure with `-fstack-usage` or say explicitly you didn't.
+  `docs/LESSONS.md#ble-event-worker-stack-budget` and
+  `docs/LESSONS.md#the-1280-byte-rule-applies-to-every-tight-system-thread-not-just-bleeventworker`
+- **`APP_DATA_PATH`/`"/data"` resolves against the *calling thread's* app ID, not this app's.**
+  `handle_pair_complete()`/`pairing_storage_save()` run synchronously inside
+  `profile_event_handler()` on `BleEventWorker`, owned by the firmware's built-in `bt` service
+  — any `APP_DATA_PATH(...)` call made from there resolves against the wrong app (a real
+  incident: the pairing secret landed under `/ext/apps_data/bt/...`). Resolve/cache the real
+  path once from this app's own thread (e.g. at init) and pass it into BLE-callback code —
+  never call `APP_DATA_PATH` from inside it directly.
+  `docs/LESSONS.md#app-data-path-resolves-per-calling-thread`
+- **Your GATT declarations are wire constraints on the ESP32, not private details.**
+  `PAYLOAD_MAX` (64) is the Write characteristic's declared max attribute value length, which
+  caps every write independently of negotiated ATT MTU (ATT error 0x0D if exceeded). Changing
+  it is a cross-firmware change: update the ESP32's `FEB_FLIPPER_WRITE_CHAR_MAX_LEN` in the
+  same breath, or don't change it at all.
+  `docs/LESSONS.md#gatt-characteristic-length-is-a-wire-constraint`
+- An exported symbol's name doesn't guarantee its behavior (`sequence_blink_*`'s separate
+  blink subsystem; `ble_gatt_characteristic_update()`'s Fixed-data path ignoring buffer size)
+  — read the implementation for any state-changing API, and for every `*_start` locate its
+  matching `*_stop`. `docs/LESSONS.md#exported-symbol-name-is-not-its-behavior`
 - Ported third-party code (`pairing_crypto.c`'s curve25519-donna port) brings upstream's
-  *memory* profile, not just its structure — audit stack usage as its own step, separate
-  from correctness. See `docs/LESSONS.md#ported-code-inherits-upstream-memory-profile`.
+  *memory* profile, not just its structure — audit stack usage as its own step.
+  `docs/LESSONS.md#ported-code-inherits-upstream-memory-profile`
 - A terminal UI "success" state doesn't imply the underlying BLE profile tore down — check
-  explicitly whenever you add one. See `docs/LESSONS.md#ui-terminal-state-is-not-a-torn-down-profile`.
+  explicitly whenever you add one. `docs/LESSONS.md#ui-terminal-state-is-not-a-torn-down-profile`
 
 ## Build
 
@@ -178,26 +135,26 @@ Report the exact artifact path and size after a build.
 
 **`DEBUG=0` is not optional here, and the artifact is the release directory, not
 `f7-firmware-D/`** (changed 2026-09-28; every session before that built and flashed the debug
-artifact). See the memory-budget rule below for why. `tools/build_flipper.ps1` already does this
-by default — prefer it over calling `fbt.cmd` yourself; `-DebugBuild` gets the `-Og` artifact
-back if you genuinely need a debugger session.
+artifact). See the memory-budget section below for why. `tools/build_flipper.ps1` already does
+this by default — prefer it over calling `fbt.cmd` yourself; `-DebugBuild` gets the `-Og`
+artifact back if you genuinely need a debugger session. For a generic standalone-FAP repo (not
+this pinned setup) the general path is `ufbt` — see
+[.github/agents/flipper-developer.agent.md](../../.github/agents/flipper-developer.agent.md),
+but this project builds against the pinned checkout above, not a floating SDK index.
 
 ## Memory budget — read before adding any buffer
 
 An external FAP is not linked into a fixed memory map like normal firmware. Every allocatable
 section — `.text`, `.rodata`, `.data`, **and `.bss`** — gets its own `aligned_malloc()` from the
 *live Flipper system heap* at launch (`lib/flipper_application/elf/elf_file.c`) and stays
-resident for the app's whole lifetime. Three consequences this project has learned the hard way
-(`docs/HARDENING_BACKLOG.md` H04; a real "out of memory" device reboot mid-wardriving-flush on
-2026-09-28):
+resident for the app's whole lifetime (`docs/HARDENING_BACKLOG.md` H04; a real out-of-memory
+device reboot mid-wardriving-flush on 2026-09-28):
 
 - **A `static` buffer is not free storage — it is a permanent bite out of the heap the rest of
   the firmware shares.** This app's `.bss` reached 36 KB before it was cut back. Before adding a
   `static`, ask whether a `union` with an existing one, a narrower field width, or an on-demand
-  `malloc()`/`free()` would do. The project's "any buffer >=100 bytes reachable from
-  `BleEventWorker` must be `static`" rule (`docs/LESSONS.md`) is about keeping buffers off that
-  1280-byte stack — **the heap satisfies it just as well as `.bss` does**, and that third option
-  was missed once already.
+  `malloc()`/`free()` would do — **the heap satisfies the ≥100-byte-static rule above just as
+  well as `.bss` does**, and that third option was missed once already.
 - **Compiler optimization level is a memory decision on this target, not a build-speed one.**
   `-Og` -> `-Os` was worth 11,799 bytes on this app. Hence `DEBUG=0` above.
 - **Measure, do not estimate.** After any change that adds or moves storage, report real numbers
@@ -210,12 +167,8 @@ resident for the app's whole lifetime. Three consequences this project has learn
 - **When you fold scattered `static` arrays into a struct, grep every folded name for
   `sizeof(<name>)` first.** `static limb a[19]` -> `limb *a = ctx->a` silently turns
   `memset(a, 0, sizeof(a))` into a 4-byte clear via array-to-pointer decay, and `static`'s
-  zero-init masks it until the second call. This shipped once in `pairing_crypto.c` and was
-  caught only by the RFC 7748 host vectors, not by reading the diff. For a generic standalone-FAP repo
-(not this pinned setup) the general path is `ufbt` — see
-[.github/agents/flipper-developer.agent.md](../../.github/agents/flipper-developer.agent.md)
-for that flow, but this project builds against the pinned checkout above, not a floating
-SDK index.
+  zero-init masks it until the second call. This shipped once in `pairing_crypto.c`, caught
+  only by the RFC 7748 host vectors, not by reading the diff.
 
 ## UX conventions already established in this app
 
@@ -233,54 +186,31 @@ SDK index.
 
 ## Working method
 
-1. Anchor on the concrete task: file, symbol, failing build, or the specific PLAN.md step.
-2. Check `application.fam` before changing app metadata; preserve `appid`, `entry_point`,
-   `requires`, `fap_category`.
-3. Read the relevant protocol doc before writing protocol-adjacent code.
-4. Make the smallest change consistent with the current roadmap step.
-5. Build with `fbt.cmd fap_flipper_esp32_over_ble` after every substantive change and report
-   the result and artifact size.
-6. **Stack audit before you call it done**, if the change added or ported anything reachable
-   from `profile_event_handler`: walk the call chain and check each frame's locals against
-   the 1280-byte budget. Grepping for large local arrays (`\[[0-9]{2,}\]`, and anything sized
-   off a `FEB_*` max constant) catches most of it in one pass — but not a recursive
-   validator's depth-scaled cost, see above.
-7. If hardware can't be exercised, say exactly what was validated statically (build only)
-   versus what remains hardware-pending.
-8. Record new hardware/API facts or root causes in the relevant `docs/*.md` file. If the
-   root cause repeats a bug class already in `docs/LESSONS.md`, also propose an update to
-   this agent file — the log records history, only this file changes future behavior.
-9. **When you add new shared codec functions/macros/structs in parallel with the ESP32
-   agent**, run `python tools/check_shared_headers.py` before reporting done. It catches
-   macro/prototype drift automatically but not struct-body shape divergence (a tagged union
-   vs. named fields, say) — for any new composite or optional-field shape, also read the
-   struct definition on both sides. See `docs/LESSONS.md#wardriving-struct-shape-divergence`.
+Follow AGENT_RULES.md's default working method, with these additions:
+
+- Check `application.fam` before changing app metadata; preserve `appid`, `entry_point`,
+  `requires`, `fap_category`.
+- **Stack audit before you call it done**, if the change added or ported anything reachable
+  from `profile_event_handler`: walk the call chain and check each frame's locals against the
+  1280-byte budget. Grepping for large local arrays (`\[[0-9]{2,}\]`, and anything sized off a
+  `FEB_*` max constant) catches most of it in one pass — but not a recursive validator's
+  depth-scaled cost, see above.
 
 ## Low-level C standards
+
+Follow AGENT_RULES.md's embedded/C standards, plus Flipper-specific ones:
 
 - Respect ownership/lifetime of Furi records, views, workers, timers, strings, files,
   message queues.
 - Check allocation and API return values; avoid overflow, truncation, use-after-free,
   double-free, unsafe casts.
-- Match integer widths and format specifiers; avoid one-letter variable names.
-- Keep comments rare — only for non-obvious hardware/protocol constraints, matching the
-  existing `flipper_esp32_over_ble.c` style.
-- Keep a header's declaration comment in sync with its implementation whenever you touch
-  either — see `docs/LESSONS.md#header-contract-vs-implementation-drift`.
-- A declared shared-contract API left uncalled is a bug on both firmwares, not just a local
-  gap — see `docs/LESSONS.md#unwired-declared-api`.
 - Prefer `calloc` over `malloc` for structs whose fields are only conditionally written by a
-  silent-failure API, and log assigned handles for a positive signal. See
-  `docs/LESSONS.md#wrap-silent-failure-apis-in-positive-confirmation`.
-- Don't validate a bound against the ESP32 implementation or the shared test vectors —
-  validate against `docs/PROTOCOL.md` directly. See
-  `docs/LESSONS.md#two-implementations-agreeing-is-not-two-implementations-being-right`.
+  silent-failure API, and log assigned handles for a positive signal.
+  `docs/LESSONS.md#wrap-silent-failure-apis-in-positive-confirmation`
 - The static-buffer pattern trades RAM for stack safety deliberately — size each static to
-  the maximum actually reachable, and consider a shared arena as the set grows. See
-  `docs/LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety`.
+  the maximum actually reachable, and consider a shared arena as the set grows.
+  `docs/LESSONS.md#static-buffer-pattern-trades-ram-for-stack-safety`
 
-## Response style
+## Response style and handback
 
-Be concise and explicit about assumptions, especially BLE-profile-lifecycle and
-persistence-boundary ones. Ask a clarifying question only when it blocks a safe
-implementation; otherwise make the conservative, spec-consistent choice and validate it.
+Follow AGENT_RULES.md's response-style and handback-contract sections.

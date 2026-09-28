@@ -653,7 +653,7 @@ void feb_pairing_derive_secret(
    produced by feb_pairing_encode_transcript(), so label_len + t_len is always within this
    function's fixed-size local buffer given FEB_PAIRING_LABEL_MAX_LEN and
    FEB_PAIRING_MAX_TRANSCRIPT_LEN; an over-length input zeroes `out` instead of being
-   clamped, matching the ESP32's feb_pairing_hmac_label() (docs/CODE_REVIEW_FIX_PLAN.md D4,
+   clamped, matching the ESP32's feb_pairing_hmac_label() (docs/archive/CODE_REVIEW_FIX_PLAN.md D4,
    HP-37) -- a wrong-but-plausible truncated-input tag would present as an unexplained
    mismatch, whereas an all-zero tag fails verification immediately and visibly. */
 static void pairing_confirm_tag(

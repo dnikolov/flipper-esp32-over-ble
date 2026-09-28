@@ -1,6 +1,6 @@
 # Grok 4.6 code review findings (2026-09-11)
 
-**At-a-glance status lives in [docs/BACKLOG.md](BACKLOG.md)** — that file is the single
+**At-a-glance status lives in [docs/BACKLOG.md](../BACKLOG.md)** — that file is the single
 centralized list of every open item across the project; this file is its detailed technical
 appendix for the G-numbered items (exact evidence, fix sketch, tests, dependencies). Update the
 `FIXED`/status marker in both places when an item closes.
@@ -17,8 +17,8 @@ adds new findings from the now-live protected-record / wardriving path.
 
 ## How another model should use this document
 
-1. Read [SESSION_MEMORY.md](SESSION_MEMORY.md) and [PROTOCOL.md](PROTOCOL.md) first.
-2. Do **not** implement Phase 4/5 capabilities or reorder [PLAN.md](PLAN.md) steps.
+1. Read [SESSION_MEMORY.md](../SESSION_MEMORY.md) and [PROTOCOL.md](../PROTOCOL.md) first.
+2. Do **not** implement Phase 4/5 capabilities or reorder [PLAN.md](../PLAN.md) steps.
 3. Do **not** flash, erase, or write the physical board unless the user explicitly asks.
 4. Prefer the smallest isolated fix that matches existing style (comment-sparse C,
    `feb_secure_zero` for secrets, static buffers on BLE-callback paths).
@@ -28,9 +28,9 @@ adds new findings from the now-live protected-record / wardriving path.
 6. Host-test the touched module (`tests/esp32/`, `tests/flipper/`) after the change.
    Do not claim hardware-verified unless a real-device pass happened.
 7. If a change alters on-screen text, buttons, pairing/reconnect/reset, or CSV
-   behavior already described in [USER_GUIDE.md](USER_GUIDE.md), sync that guide in
+   behavior already described in [USER_GUIDE.md](../USER_GUIDE.md), sync that guide in
    the same pass via the cheapest capable model (project convention: Haiku).
-8. Finished narrative belongs in [PROJECT_HISTORY.md](PROJECT_HISTORY.md), not in
+8. Finished narrative belongs in [PROJECT_HISTORY.md](../PROJECT_HISTORY.md), not in
    PLAN.md / SESSION_MEMORY.md. After fixing an item here, add a one-line pointer
    in SESSION_MEMORY.md's "Known open items" only if the item was already listed
    there.
@@ -58,7 +58,7 @@ trusted environment; runtime records are AES-256-GCM over canonical CBOR. Phase 
 mostly hardware-verified; a few acceptance items remain (see SESSION_MEMORY.md).
 
 Pinned baselines (do not silently change): ESP-IDF v5.5.2, Unleashed `unlshd-092`
-API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
+API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](../PROTOCOL.md).
 
 ---
 
@@ -389,7 +389,7 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 
 - **Status:** Known #12
 - **Files:** [flipper/flipper_esp32_over_ble.c](../flipper/flipper_esp32_over_ble.c) `send_pairing_record` uses `feb_fragment_capacity(FEB_DEFAULT_ATT_MTU)` for pairing **and** all session commands.
-- **Fix:** After connection/MTU is known, use `PAYLOAD_MAX` (64) + `FEB_ATT_WRITE_OVERHEAD` → 60-byte fragments (`feb_fragment_capacity(64 + FEB_ATT_WRITE_OVERHEAD)`). Keep 23 only before MTU settle. Do **not** use the link's 256 MTU — Flipper characteristic is 64 bytes ([LESSONS.md](LESSONS.md) att-mtu-vs-attribute-length).
+- **Fix:** After connection/MTU is known, use `PAYLOAD_MAX` (64) + `FEB_ATT_WRITE_OVERHEAD` → 60-byte fragments (`feb_fragment_capacity(64 + FEB_ATT_WRITE_OVERHEAD)`). Keep 23 only before MTU settle. Do **not** use the link's 256 MTU — Flipper characteristic is 64 bytes ([LESSONS.md](../LESSONS.md) att-mtu-vs-attribute-length).
 - **Gain:** ~3–4× fewer notifications per `hello_ack` / `pair_reply` / command.
 
 ### G15 — ESP32 HMAC `full[32]` not zeroized after truncation to 16
@@ -492,16 +492,16 @@ API 88.4, 4 MB C6 flash. Contract: [PROTOCOL.md](PROTOCOL.md).
 
 | File | Drift |
 | --- | --- |
-| [README.md](../README.md) | ~~Still says AES-128; capability list aspirational.~~ **FIXED 2026-09-11** — rewritten to match PROTOCOL.md/CAPABILITIES.md. |
-| [docs/BASELINES.md](BASELINES.md) | ~~Step 2 section says pairing/encryption/CBOR "remain future work."~~ **FIXED 2026-09-11** — reframed as historical, points to SESSION_MEMORY.md for current status. |
+| [README.md](../../README.md) | ~~Still says AES-128; capability list aspirational.~~ **FIXED 2026-09-11** — rewritten to match PROTOCOL.md/CAPABILITIES.md. |
+| [docs/BASELINES.md](../BASELINES.md) | ~~Step 2 section says pairing/encryption/CBOR "remain future work."~~ **FIXED 2026-09-11** — reframed as historical, points to SESSION_MEMORY.md for current status. |
 | [docs/CODE_REVIEW_FINDINGS.md](CODE_REVIEW_FINDINGS.md) | Scope note "protected path has zero call sites / step 7 not wired" is **false** now. Leave the file as historical; do not rewrite. |
-| [docs/PLAN.md](PLAN.md) | ~~Step 8's "done when" said wardriving-log persistence "not yet started."~~ **FIXED 2026-09-11** — it's implemented; hardware acceptance for it is tracked in BACKLOG.md instead. |
+| [docs/PLAN.md](../PLAN.md) | ~~Step 8's "done when" said wardriving-log persistence "not yet started."~~ **FIXED 2026-09-11** — it's implemented; hardware acceptance for it is tracked in BACKLOG.md instead. |
 
 ---
 
 ## Optimizations (not bugs)
 
-Already tracked in [BACKLOG.md](BACKLOG.md)'s "Codebase & agent cost-efficiency" section
+Already tracked in [BACKLOG.md](../BACKLOG.md)'s "Codebase & agent cost-efficiency" section
 (folded in 2026-09-11 from the retired `OPTIMIZATION.md`); still valid:
 
 1. Extract capability dispatch from `esp32/main/main.c` and `flipper/flipper_esp32_over_ble.c` (hold until a roadmap boundary; decide static-buffer arena first).
@@ -535,7 +535,7 @@ Small, isolated, both-sides-agree items first. Skip anything the user has explic
 
 ## Explicit non-findings / do not "fix"
 
-- Pairing X25519 is unauthenticated by design ([DECISIONS.md](DECISIONS.md)).
+- Pairing X25519 is unauthenticated by design ([DECISIONS.md](../DECISIONS.md)).
 - Flipper cannot be GATT client (standalone FAP ABI).
 - Idle 30s disconnect is specified; heartbeat is a protocol redesign.
 - `requested` on `capability_query` is intentionally unimplemented.

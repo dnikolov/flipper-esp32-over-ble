@@ -16,9 +16,10 @@ file before touching related code rather than relying on this summary, which wil
 
 | File | Read it for |
 | --- | --- |
-| [docs/SESSION_MEMORY.md](docs/SESSION_MEMORY.md) | Current state, what's implemented, what's next. **Start here every session.** |
+| [docs/SESSION_MEMORY.md](docs/SESSION_MEMORY.md) | Current state, what's implemented, what's next (capped 10 KB by a hook). **Start here every session.** |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Building, flashing, and pairing the two devices as they work today — scoped to what's actually implemented and hardware-verified. |
-| [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria. |
+| [docs/PLAN.md](docs/PLAN.md) | Phased roadmap and per-phase "done when" acceptance criteria for open/future work (capped ~36 KB by a hook). |
+| [docs/PLAN_ARCHIVE.md](docs/PLAN_ARCHIVE.md) | Completed phases/steps moved verbatim out of PLAN.md, with their original done-when criteria. |
 | [docs/BACKLOG.md](docs/BACKLOG.md) | The single centralized list of open, actionable items — defects, deferred product decisions, cost/efficiency work. Check before starting anything not already in the current roadmap step. |
 | [docs/HARDENING_BACKLOG.md](docs/HARDENING_BACKLOG.md) | Deeper structural/robustness issues found during live testing that need their own investigation/design pass before fixing — distinct from BACKLOG.md's ready-to-fix items. |
 | [docs/HARDENING_PLAN.md](docs/HARDENING_PLAN.md) | 2026-09-28 full-codebase review: prioritized HP-xx findings (bugs, memory, perf, security) with a batched fix order. Check before touching any file it cites. |
@@ -30,10 +31,12 @@ file before touching related code rather than relying on this summary, which wil
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | Capability-registry string format and record shape. |
 | [docs/BASELINES.md](docs/BASELINES.md) | Pinned toolchain/board/firmware versions and build verification status. |
 | [docs/UI_REDESIGN.md](docs/UI_REDESIGN.md) | Design-only Flipper FAP menu/navigation overhaul (Home/Menu/Scan/GPS/Settings/About) — no phase assigned yet, no code written against it. |
-| [docs/CLUSTER.md](docs/CLUSTER.md) | Phase 9 design (frozen, not yet implemented): C6 + C5 + Heltec wired together over UART, each dedicated to one scanning job, to eliminate radio coexistence and share one GPS module. |
+| [docs/CLUSTER.md](docs/CLUSTER.md) | Phase 9 design (frozen; implementation in progress, see SESSION_MEMORY.md): C6 + C5 + Heltec wired together over UART, each dedicated to one scanning job, to eliminate radio coexistence and share one GPS module. |
 | [docs/WARDRIVING_REDESIGN.md](docs/WARDRIVING_REDESIGN.md) | Phase 7 (implemented, hardware-verified 2026-09-21): Wardriving Stopped/Running screen split, persisted per-run settings, WiFi scan-dwell/country-code control, GPS speed. Supersedes UI_REDESIGN.md's Wardriving subsection. |
-| [docs/WARDRIVING_PUBLISH.md](docs/WARDRIVING_PUBLISH.md) | Phase 6 design (frozen, not yet implemented): publishing the wardriving CSV to wdgwars.pl via a Flipper-triggered BadUSB/host-script flow. |
-| [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the two developer subagents link to instead of restating inline — read for the "why" behind a rule. |
+| [docs/WARDRIVING_PUBLISH.md](docs/WARDRIVING_PUBLISH.md) | Phase 6 (implemented 2026-09-18, extended 2026-09-27): publishing the wardriving CSV to wdgwars.pl via a Flipper-triggered BadUSB/host-script flow. |
+| [docs/LESSONS.md](docs/LESSONS.md) | Narrative bug writeups the developer subagents link to instead of restating inline — read for the "why" behind a rule. |
+| [docs/AGENT_RULES.md](docs/AGENT_RULES.md) | Cross-board rules plus the task-context and handback contract shared by all `*-developer` agents. |
+| [docs/archive/](docs/archive/) | Point-in-time review outputs (CODE_REVIEW_*, BL06, grok findings), superseded by HARDENING_*. |
 | [docs/STANDALONE_FAP.md](docs/STANDALONE_FAP.md) | What the Flipper external-app ABI can and can't do; feasibility evidence with file citations. |
 | [docs/PROJECT_HISTORY.md](docs/PROJECT_HISTORY.md) | Dated narrative log of setup/debugging (toolchain repairs, root causes). Reference, don't duplicate. |
 | [docs/hardware/esp32-c6-devkitc-1/README.md](docs/hardware/esp32-c6-devkitc-1/README.md) | Board pinout, strapping pins, USB paths, vendor datasheets. |
@@ -101,6 +104,8 @@ directory, **not** the `f7-firmware-D/` debug one this project used until 2026-0
   ports are not stable across sessions/reboots.
 - Treat GPIO0, 4, 5, 8, 9, 15 as strapping/JTAG pins — do not wire or drive them without checking
   the chip datasheet first.
+- For a user-requested flash + boot-log check, use the `/flash-verify` skill (user-invoked only;
+  it carries the per-board reset rules and delegates to Haiku) instead of ad hoc commands.
 
 ## Conventions
 
@@ -139,7 +144,22 @@ directory, **not** the `f7-firmware-D/` debug one this project used until 2026-0
   exists) — delegate via the Agent tool with `model: "haiku"` — rather than editing it
   inline with whatever model is doing the main task.** It's a mechanical sync (reflect a
   known behavior change into prose that already has an established structure/tone), not
-  work that needs the main model's reasoning budget.
+  work that needs the main model's reasoning budget. The `sync-user-guide` skill does this.
+
+## Session hygiene (token cost)
+
+Cost here is dominated by context size × call count, not model price
+([docs/TOOLING_PLAN.md](docs/TOOLING_PLAN.md) §1). So:
+
+- One task per session, or `/clear` between unrelated tasks; `/compact` before ~150K context.
+- Wait on long work with `run_in_background` / Monitor, never `sleep` poll loops.
+- Brief subagents with the context they need rather than having them read SESSION_MEMORY.md;
+  hold them to the handback contract in their agent file. Spawn a fresh agent for an unrelated
+  follow-up instead of SendMessage-ing a long-lived one.
+- Builds and host tests go through the `build-verify` skill; don't hand-escape PowerShell
+  inside Git Bash.
+- Default model for this repo is Sonnet at medium effort (`.claude/settings.json`); switch
+  with `/model opus` for design, review, or hard debugging.
 
 ## Specialized agents
 

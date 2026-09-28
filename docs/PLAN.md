@@ -35,122 +35,17 @@ For the full dated narrative of how each phase/step was designed, implemented, a
 - ESP-IDF: use ESP-IDF `v5.5.2` for the initial C6 baseline; record the installed toolchain revision when setup completes.
 - Initial phase 1 scope: ESP-IDF firmware skeleton and standalone FAP skeleton, both built before adding project code.
 
-## 1. Establish the build baselines
+✅ Step 1 (establish the build baselines) — done, see [PLAN_ARCHIVE.md#1-establish-the-build-baselines](PLAN_ARCHIVE.md#1-establish-the-build-baselines).
 
-- Select and record one ESP-IDF release that supports `esp32c6`, NimBLE central mode, X25519, HKDF-SHA-256, HMAC-SHA-256, AES-256-GCM, and encrypted NVS.
-- Create the ESP-IDF project under `esp32/` with an `esp32c6` target and a partition table suitable for the board's verified flash size.
-- Create the standalone FAP project, delivered as a standalone external FAP, and pin it to the locally cached Flipper firmware API revision. It owns a custom BLE GATT profile while active; custom/in-tree firmware is optional hardening for stronger key storage or Bluetooth coexistence.
-- Build an unmodified baseline for both targets before adding project code.
+✅ Step 2 (prove the BLE transport, incl. the long-run reconnect policy) — done, hardware-verified, see [PLAN_ARCHIVE.md#2-prove-the-ble-transport](PLAN_ARCHIVE.md#2-prove-the-ble-transport).
 
-**Done when:** both baseline images build reproducibly and the C6 flash size is measured on the target board. ✅ Met 2026-09-01/02 — see `docs/PROJECT_HISTORY.md`.
+✅ Step 3 (define and implement record framing) — done, see [PLAN_ARCHIVE.md#3-define-and-implement-record-framing](PLAN_ARCHIVE.md#3-define-and-implement-record-framing).
 
-## 2. Prove the BLE transport
+✅ Step 4 (validate BLE / Wi-Fi radio coexistence, incl. the interval-bounds results) — done, see [PLAN_ARCHIVE.md#4-validate-ble--wi-fi-radio-coexistence](PLAN_ARCHIVE.md#4-validate-ble--wi-fi-radio-coexistence).
 
-### Confirmed transport configuration
+✅ Step 5 (implement trusted-environment pairing) — done, see [PLAN_ARCHIVE.md#5-implement-trusted-environment-pairing](PLAN_ARCHIVE.md#5-implement-trusted-environment-pairing).
 
-- Real hardware validation will use both the ESP32-C6 and a Flipper Zero.
-- If no ESP32 pairing record exists, the Flipper app presents an explicit pair/connect action and starts its temporary BLE profile for that workflow.
-- If a pairing record exists, the Flipper app attempts to connect automatically to the saved ESP32.
-- The ESP32-C6 scans and attempts connection automatically at boot.
-- The first transport smoke test uses a fixed payload. The implementation will then advance to the protocol CBOR envelope.
-- Enforce one active connection and use bounded exponential reconnect backoff with a maximum of five automatic retries (superseded for production behavior — see "Revised long-run reconnect policy" below).
-
-**Done when:** the C6 discovers the service, connects, writes a test record, receives a notification, and recovers from a disconnect on real hardware. ✅ Met on 2026-09-02 — see `docs/PROJECT_HISTORY.md`.
-
-**Future enhancement:** add an adapter layer for later Unleashed API revisions after the pinned stable baseline is working.
-
-### Revised long-run reconnect policy (supersedes "five retries" above for production behavior)
-
-The original five-retry ceiling was designed for recovering from a transient disconnect during active use, not for a board that may go unattended for hours or days (the wardriving use case). Production reconnect behavior is:
-
-- Bounded exponential backoff for the first several attempts, same as above, for fast recovery from a transient disconnect.
-- After reaching a backoff ceiling, do not give up — continue retrying indefinitely at a slow, fixed cadence (on the order of tens of seconds) so a board left running for a long unattended stretch is still connectable whenever a Flipper eventually comes into range, without requiring a reboot.
-- When BLE-source wardriving scanning is active, do not run a separate dedicated reconnect scan — reuse the same scan pass (**active**, not passive — see 2026-09-11 correction below), filtering for the Flipper's fixed v2 service UUID, and trigger a connection attempt on a match. Fall back to a dedicated reconnect scan using the policy above only when BLE-source wardriving is not running.
-
-This policy is implemented on the ESP32 as two independent two-phase (exponential-then-flatten) backoff paths — one for GAP-level connect failures (`MAX_RECONNECT_RETRIES`, flattening to a 30-second cadence), one for runtime-auth proof failures (a separate, longer 5-minute flattened cadence, since that path also throttles repeated bad credentials) — and is **hardware-verified** on both paths (see `docs/PROJECT_HISTORY.md`'s step-6 stability-fixes entry for the connect-failure path; runtime-auth failures were exercised as part of step 6's own hardware verification). The merged-reconnect-scan behavior (bullet 3 above) was implemented as a **passive** scan pass and code-reviewed but not yet exercised under a live forced disconnect at the time step 4 closed. **2026-09-11**: a live forced disconnect during wardriving's BLE capture found it never reconnects under a passive-only pass; wardriving's BLE re-arm (`wardriving_ble_interval_cb()` and its `start` counterpart in `main.c`) now scans active, matching `start_scan()`'s already-working reconnect scan — see `docs/LESSONS.md`'s "wardriving-passive-scan-reconnect-stall" entry and `docs/PROJECT_HISTORY.md`. Build-verified; hardware re-verification of the fix itself is still pending (see `docs/SESSION_MEMORY.md`).
-
-## 3. Define and implement record framing
-
-- Fragment header format, size limits, and rejection rules are defined in [PROTOCOL.md](PROTOCOL.md#fragmentation) — implement exactly as specified there rather than re-deriving the format here.
-- Derive fragment payload capacity from negotiated ATT MTU minus the GATT and fragment-header overhead.
-- Reject duplicate, inconsistent, oversized, incomplete, and out-of-order fragments without allocating from peer-controlled lengths.
-- Implement canonical CBOR envelope encoding and bounded decoding with limits on nesting, map entries, arrays, text, and byte strings, using the fixed-field-order definition of "canonical" in [PROTOCOL.md](PROTOCOL.md#canonical-cbor-encoding-definition).
-- No third-party CBOR library — a hand-rolled, schema-specific canonical codec on both firmwares, since the message shapes are fixed and small and a general-purpose library would still need custom validation layered on top.
-- Malformed fragment/message handling (a case PROTOCOL.md leaves connection-level-silent on): drop the reassembly buffer for that `message_id` and keep the connection open — do not close the connection or reply. A persistent flood is expected to be caught by the idle-connection timeout and session/auth layer, not the fragment layer.
-
-**Done when:** two independent codec tests exchange records at ATT MTU 23 and 247, including fragmented records and malformed-input rejection. ✅ Met on 2026-09-02 (host-native tests, both target builds); on-device smoke test over real hardware also passed 2026-09-03, after finding and fixing a real stack-overflow bug in the shared `framing.c` (an internal fragment buffer was stack-local, overflowing the Flipper's 1280-byte `BleEventWorker` thread). Step 3 is fully closed. Full narrative (both host-test results, the stack-overflow root cause and fix, and the on-device exchange) is in `docs/PROJECT_HISTORY.md`.
-
-## 4. Validate BLE / Wi-Fi radio coexistence
-
-The ESP32-C6 has a single 2.4GHz radio shared between Wi-Fi, BLE, and (later) 802.15.4. The `wifi_scan`/`ble_scan`/`wardriving` capabilities depend on this radio being usable concurrently for scanning and for maintaining the BLE connection to the Flipper, so this needed validating before those capabilities were built on unverified assumptions — pulled ahead of pairing/session work rather than left to the final validation pass (step 9).
-
-**802.15.4 is out of scope for this step.** No 802.15.4 code or radio activity exists on either firmware (Zigbee/Thread recon is a later-phase item) and this step's tests only exercise Wi-Fi scanning + BLE. 802.15.4 coexistence gets its own validation pass once the Zigbee/Thread recon phase actually adds 802.15.4 radio activity to test against.
-
-- Using the step 2/3 transport (no pairing/session/capability layers needed), run Wi-Fi scanning, an active BLE connection to the Flipper, and a passive BLE observer scan together for an extended period (30+ minutes).
-- Test both configurations: BLE-source scanning **paused** during an active connection, and BLE-source scanning **concurrent** with an active connection. Only build an automatic pause-on-connection-degradation fallback if the concurrent configuration proves unstable; do not build it preemptively.
-- Validate the merged reconnect-scan behavior from step 2: while BLE-source scanning is active, confirm it correctly detects and connects to the Flipper's advertised v2 service UUID within the same scan pass, without a separate dedicated reconnect scan running at the same time.
-- Record safe minimum/maximum bounds and sensible default values for Wi-Fi and BLE scan intervals from these results — the `wardriving` capability uses these as its interval defaults/bounds rather than guessed values.
-
-**Done when:** Wi-Fi scanning, an active BLE connection, and a BLE observer scan run together without the connection dropping outside the reconnect policy's expected behavior, for both the paused and concurrent configurations, with results and chosen interval bounds recorded here. ✅ Met on 2026-09-03 — see "Step 4 results" below. Full design-decision rationale and orchestration incidents are in `docs/PROJECT_HISTORY.md`.
-
-### Step 4 results (2026-09-03) — interval bounds other capabilities depend on
-
-An overnight sweep on a throwaway harness (`esp32/coex_test/`) validated 5 points; all passed
-cleanly with zero disconnects/degradations up to the theoretical maximum duty cycle. Full sweep
-table and narrative: `docs/PROJECT_HISTORY.md`'s "Step 4 (radio coexistence) validated on real
-hardware" entry. The bounds below are load-bearing (used as `wardriving`/`ble_scan` defaults),
-not just historical record:
-
-- **Minimum (most conservative) BLE observer duty:** window=100ms/interval=1000ms, Wi-Fi rescan
-  every 30s — proven stable, lowest radio-time cost.
-- **Maximum (most aggressive) BLE observer duty:** window=30ms/interval=30ms (NimBLE's own
-  default fast-scan params, already relied on by `esp32/main/main.c`'s reconnect scan),
-  continuous Wi-Fi scanning — proven stable at 100% duty.
-- **Default:** anywhere in the 50-90% duty range tested equally clean; pick based on the
-  capability's actual power/latency priorities — a product choice, not a stability constraint.
-
-**Accepted gap:** the merged reconnect-scan behavior was never exercised (zero disconnects
-occurred in the sweep) — tracked in the Backlog for step 9's full-system validation. **Still
-open as of 2026-09-11**: a live forced disconnect during wardriving's BLE capture exercised it
-for the first time and found it never reconnects. The first candidate fix (switching
-wardriving's BLE re-arm from passive to active scanning) was flashed and retested live and did
-**not** resolve it — zero reconnects over 130+ discovery restarts. See `docs/LESSONS.md`'s
-"wardriving-passive-scan-reconnect-stall" entry for the current investigation state and leading
-(unconfirmed) suspect.
-
-## 5. Implement trusted-environment pairing
-
-- On ESP reset, generate a fresh 16-byte `pairing_epoch` and open exactly one 120-second pairing window.
-- Generate a fresh X25519 ephemeral keypair and 16-byte `device_nonce` for each pairing attempt.
-- Implement `pair_init`, `pair_reply`, `pair_confirm`, and `pair_complete` exactly as defined in [PROTOCOL.md](PROTOCOL.md).
-- Generate the Flipper X25519 keypair and 16-byte `client_nonce` only after the pairing UI is active.
-- Derive `K_shared`, `K_confirm`, and the 32-byte `pairing_secret` with the documented HKDF inputs and transcript.
-- Reject an all-zero X25519 shared secret. Compare confirmation tags in constant time. Zeroize all ephemeral secrets on success, failure, expiry, and disconnect.
-- Persist `pairing_secret` transactionally on the ESP32 before `pair_complete`; persist it on Flipper only after completion verification.
-- Close pairing immediately after success. Return `pairing_disabled` after the window closes or succeeds; a later ESP reset permits replacement pairing **only while no working stored secret exists** — see step 6, which revises this once a secret is stored.
-- The Flipper stores multiple pairing records, keyed by `board_id`, rather than a single record — supporting more than one paired board at a time (see step 7). Each board's record lives in its own file (`pairings/<board_id>.dat`), so replacing one board's record cannot touch another's, and `board_id` is validated against a strict `[A-Za-z0-9_-]` charset before it is ever used to build a filesystem path (it arrives before any cryptographic confirmation, so treating it as trusted input early would be a path-traversal-shaped gap).
-- `board_id` is recomputed every ESP32 boot from the chip's factory base MAC (`esp32c6-<12 lowercase hex chars>`) — no NVS write needed for it.
-- Zeroization on both sides goes through a named helper (`feb_secure_zero()`), not ad-hoc `memset`, since an optimizing compiler can legally elide a `memset` on a variable it proves is dead (CWE-14).
-
-**Done when:** a first pairing survives reboot, a reset-and-repair replaces the old relationship for that board only (other stored pairings are unaffected), and passive capture does not expose the persisted pairing secret. ✅ Met on 2026-09-05 — see `docs/PROJECT_HISTORY.md` for the full design session (including a real feasibility blocker: a standalone FAP cannot link the firmware's own X25519/HKDF/HMAC, resolved by porting `curve25519-donna` and hand-rolling the hash/MAC/KDF primitives into the Flipper), the implementation, two real hardware bugs found and fixed (an ESP32 write-fragment/GATT-characteristic-size mismatch, and a Flipper-side X25519 stack overflow), and the hardware-verification pass.
-
-Two findings from the hardware-verification pass were backlogged rather than fixed in this step (both since resolved during step 6 — see `docs/PROJECT_HISTORY.md`): pairing files were saved under the wrong app's data directory, and the custom BLE profile could stay connectable after a successful pairing, letting a subsequent ESP32 reset silently complete an unwanted second ceremony.
-
-## 6. Add authenticated runtime sessions
-
-- Implement `hello`, `hello_ack`, and `client_auth` using the stored `pairing_secret`.
-- The Flipper looks up which stored pairing record to use by the `board_id` carried in the incoming `hello` record.
-- Derive a fresh 32-byte **AES-256-GCM** key for every connection using HKDF-SHA-256, `client_nonce`, `device_nonce`, `board_id`, and `session_id`. (Originally specified as a 16-byte AES-128-GCM key; revised to AES-256-GCM during this step's design — the Flipper's only exported raw-key AES-GCM hardware primitive is hardcoded to a 256-bit key, with no software fallback available. See `docs/DECISIONS.md` and `docs/PROJECT_HISTORY.md`.)
-- Generate a new ESP32 `session_id` for every authenticated session.
-- Enforce per-direction sequence counters, the specified 12-byte nonce construction, canonical-CBOR AAD, and a 16-byte GCM tag.
-- Disconnect on authentication failure, replay, unexpected sequence, malformed CBOR, or counter exhaustion. Do not resume counters after reconnect.
-- **Reset-vs-runtime-auth boot decision:** on boot, if a `pairing_secret` is already stored, the ESP32 attempts runtime auth first; a pairing window opens only if no secret exists yet, or that attempt fails with `unknown_board` (a new `error.code` value meaning "the Flipper has no stored record for this `board_id`"). A proof-verification failure (as opposed to "never paired") does **not** auto-open a window — it's logged and rate-limited only, so a radio attacker can't force repeated pairing-window openings by corrupting proofs in transit. This revises step 5's "physical reset alone authorizes re-pairing" framing — see `docs/DECISIONS.md`/`docs/PAIRING.md`, which carry the current wording.
-- **Explicit re-pair while a valid secret exists on both sides** is done via the Flipper's local "unpair this board" action (step 8 scope) alone — no ESP32-side action is needed, since its next connection attempt gets `unknown_board` from the Flipper.
-- **Session teardown/reconnect:** the existing 30-second idle-timeout / no-counter-resumption / disconnect-on-any-auth-failure policy in [PROTOCOL.md](PROTOCOL.md) is sufficient as specified — no additional rules were needed.
-
-**Done when:** both sides pass shared known-answer vectors and reject modified ciphertext, modified AAD, replayed records, and sequence gaps. ✅ Met, and hardware-verified, on 2026-09-06 — see `docs/PROJECT_HISTORY.md` for the full design session (including the AES-256-GCM revision), implementation, and hardware-verification narrative, plus the pairing-file path-resolution bugfix carried over from step 5.
-
-**Judgment calls made during implementation, not blocking:** ESP32 rate-limits repeated proof failures (1/2/4/8/16/32s backoff then a 5-minute fixed cadence, reset on any success) and enforces a 5-second `hello_ack` timeout — neither is numerically specified in the docs. The Flipper routes an incoming record to the pairing- or session-envelope decoder by peeking the CBOR map's field count (the three envelope shapes are distinct sizes). A malformed `hello`/`client_auth` payload is silently dropped with no reply, matching the treatment of a proof-verification failure (arguably a security positive: it keeps the two failure modes indistinguishable to an attacker).
+✅ Step 6 (add authenticated runtime sessions) — done, hardware-verified, see [PLAN_ARCHIVE.md#6-add-authenticated-runtime-sessions](PLAN_ARCHIVE.md#6-add-authenticated-runtime-sessions).
 
 ## 7. Implement board identity and capability registry
 
@@ -184,7 +79,7 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 
 ## 8. Harden persistent state and release configuration
 
-- Store the C6 pairing record in a dedicated encrypted NVS namespace with a version, validity marker, and atomic replacement procedure. Cross-referenced from `docs/CODE_REVIEW_FINDINGS.md` finding #17: today's ESP32 storage (`persist_pairing_secret`/`load_pairing_secret`) is a bare `nvs_set_blob()` with none of version/validity-marker/atomicity — a real, currently-uncosted gap against the written contract that this step owns closing.
+- Store the C6 pairing record in a dedicated encrypted NVS namespace with a version, validity marker, and atomic replacement procedure. Cross-referenced from `docs/archive/CODE_REVIEW_FINDINGS.md` finding #17: today's ESP32 storage (`persist_pairing_secret`/`load_pairing_secret`) is a bare `nvs_set_blob()` with none of version/validity-marker/atomicity — a real, currently-uncosted gap against the written contract that this step owns closing.
 - Implement explicit local unpair/factory-reset behavior and define which pairing record is removed on each side (unpairing one board must not disturb other stored pairing records — see step 7).
 - Store the Flipper pairing record through an atomic app-owned storage update (temporary file, exact write verification, `storage_file_sync()`, close, rename) and do not log it. Treat local SD-card, debug, and modified-firmware access as outside the standalone FAP protection boundary (see [PROTOCOL.md](PROTOCOL.md) "Implementation security requirements" — this is an accepted limitation, not a gap to close in this phase).
 - The wardriving buffer uses the same atomic-persistence philosophy: a hand-rolled, checksummed, append-only log on raw flash (not a FAT-based wear-levelling filesystem), so an unclean power loss (e.g. car ignition cut) loses at most the single record being written at that instant, never the rest of the log. Circular — when full, evicts the oldest **erase-sector's worth** of records at once (raw NOR flash only erases a whole sector at a time; true single-record eviction would need a wear-levelling translation layer, which this bullet's own "not a FAT-based wear-levelling filesystem" already rules out) — not literally the single oldest record. See [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction" note.
@@ -231,198 +126,11 @@ Because of that accepted threat model, none of the following are required for an
 
 **No irreversible hardware operations are to be performed on any board in this phase.** If this work is ever picked up, it requires a dedicated sacrificial board for eFuse validation before any irreversible setting is applied to a board actually in use — do not attempt it on the primary development board.
 
-## Wi-Fi scan capability (Phase 3 follow-on step)
+✅ Wi-Fi scan capability (Phase 3 follow-on step) — done, hardware-verified 2026-09-07, see [PLAN_ARCHIVE.md#wi-fi-scan-capability-phase-3-follow-on-step](PLAN_ARCHIVE.md#wi-fi-scan-capability-phase-3-follow-on-step).
 
-The first real use of the generic `command`/`status` message types (defined in [PROTOCOL.md](PROTOCOL.md) but previously unimplemented) — this is the "follow-on `wifi_scan`-command step" named in Phase 3's roadmap description above, not step 8 and not part of step 7 (which explicitly deferred all `command`/`status` handling here).
+✅ `ble_scan`/`wardriving` + the GPS-stub reorder (Phase 3) — both done and hardware-verified (`ble_scan` 2026-09-08, `wardriving` 2026-09-10), see PLAN_ARCHIVE.md for the full design/implementation record.
 
-**Wire format and behavior**: frozen in [PROTOCOL.md](PROTOCOL.md)'s "`wifi_scan` command and status payloads" section and [CAPABILITIES.md](CAPABILITIES.md) — read those directly rather than this plan; nothing here duplicates that spec.
-
-**Done when** (wire-format/build bar): ✅ Met 2026-09-07, both firmwares build- and host-test-verified against the frozen contract and shared vectors.
-
-**Hardware verification:** ✅ Complete 2026-09-07 — full narrative (two real bugs found and fixed, a stack-usage measurement) in `docs/PROJECT_HISTORY.md`'s "wifi_scan capability implemented and hardware-verified" entry.
-
-## `ble_scan`, `wardriving`, and the GPS-stub reorder (Phase 3, decided 2026-09-07)
-
-The original roadmap gated `ble_scan`/`wardriving` on a GY-NEO6MV2/NEO-6M GPS module being
-physically wired to the C6 first. The user decided to unblock this work now instead: implement
-both capabilities using a **fixed-coordinate GPS stub** behind a clean location-source interface
-(`location_get_fix()`), so wiring up real GPS later is a small, localized swap — not a rewrite
-— rather than continuing to wait on hardware bring-up. This also pulls forward the
-wardriving-log half of step 8 below (the hardened flash-backed persistence), built for real now
-scoped to just the wardriving log; the pairing-record/capability-file persistence hardening
-that's the other half of step 8 stays deferred (see step 8's note).
-
-Full design (wire protocol, ESP32 engine including the productionized merged-reconnect-scan
-mechanism, the raw-flash circular log, and the Flipper UI/WiGLE export) is captured in
-[PROTOCOL.md](PROTOCOL.md)'s `ble_scan`/`wardriving` sections and [CAPABILITIES.md](CAPABILITIES.md).
-Key decisions from that design pass, made explicitly with the user:
-
-- **`ble_scan` ships as its own standalone manually-triggered capability** (mirrors `wifi_scan`'s
-  "Scan now" pattern), in addition to being used internally by `wardriving`'s capture engine.
-- **Flash-log eviction is batch-by-sector**, not strict single-record drop-oldest — raw NOR
-  flash's erase-block constraint means true single-record eviction would need a wear-levelling
-  translation layer this project deliberately avoids (see step 8's "not a FAT-based
-  wear-levelling filesystem" framing, and [PROTOCOL.md](PROTOCOL.md)'s "Flash log eviction"
-  note). This corrects step 8's original "drop the oldest record" wording below.
-- **Wardriving's default cadence was the most aggressive/thorough validated point from step 4**
-  (continuous-ish Wi-Fi scanning, ~90-100% BLE observer duty — also NimBLE's own default
-  fast-scan parameters), prioritizing capture thoroughness — through 2026-09-09. **Corrected
-  2026-09-10**: real wardriving traffic on real hardware showed 100% BLE duty starves the
-  active connection itself (see "Known open items" below and `docs/PROTOCOL.md`'s "Interval
-  bounds and defaults"); `ble_interval_ms`'s default is now 500ms. **Corrected again same day**:
-  `ble_window_ms`'s default (left at 30ms by the first fix, ~6% duty) was raised to 100ms
-  (~20% duty) after a short test run showed a real chance of missing every nearby BLE device's
-  advertisement at 6% duty — still far below the 100% duty that caused the starvation. Fully
-  configurable per-session via the wire protocol regardless.
-- **The Flipper's wardriving control screen ships with fixed defaults only for v1** — one-tap
-  start/stop, no source-selection or interval-entry UI. The app has no form/settings-entry
-  widget anywhere yet; building one is a separate, larger scope addition than anything else here.
-  **Corrected 2026-09-11**: a Left/Right source-selection toggle (Wi-Fi/BLE/both, offered only
-  when the board advertises both) was added to unblock the reconnect-stall investigation's
-  BLE-only isolation test — see `docs/PROJECT_HISTORY.md`. This is a toggle on the existing
-  screen, not the form/settings-entry widget described above; interval-entry is still absent.
-
-**Done when:** matches `wifi_scan`'s bar — both capabilities build- and host-test-verified
-against the frozen wire contract with shared vectors, then hardware-verified on real devices,
-including a forced-disconnect test of the newly-productionized merged-reconnect-scan mechanism
-(closing step 4's long-open "never exercised" gap) and an extended unattended run validating the
-flash log's wraparound and power-loss behavior.
-
-**`ble_scan`: done, hardware-verified 2026-09-08 (see above). `wardriving`: implemented on
-both firmwares, build/host-test-verified 2026-09-09, hardware-verified 2026-09-10.** Two real
-ESP32-side bugs were found and fixed during the first hardware test — see
-`docs/PROJECT_HISTORY.md`'s "wardriving hardware-verified" entry for the full narrative
-(`nimble_host` stack overflow in `wardriving_send_next_batch()`, and GATT-write-flood +
-reconnect-scan-restart collision). Both fixes are hardware re-verified. Three items still
-open per the "done when" bar — see `docs/SESSION_MEMORY.md`'s "Known open items" for exactly
-what remains: forced-disconnect test under live BLE capture (ran 2026-09-11, found and fixed a
-real bug — see the "Accepted gap" note above and `docs/SESSION_MEMORY.md`), extended unattended
-flash-log wraparound/power-loss run, and CSV export SD-card confirmation.
-
-## Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps (Phase 3, decided 2026-09-12)
-
-Reached via a grill-me design session with the user. Replaces `esp32/main/location.c`'s
-fixed-coordinate stub with a real UART/NMEA-0183 driver, and closes two backlog items that
-depended on it (wardriving's discard-on-no-fix behavior becoming real, and replacing the CSV
-`FirstSeen` backdating approximation with a real timestamp). Full wire contract:
-[PROTOCOL.md](PROTOCOL.md)'s new "`gps` command and status payloads" section, the new
-`utc_timestamp_s` wardriving-record field, and the updated "Location source" note; capability
-description: [CAPABILITIES.md](CAPABILITIES.md)'s `gps` and updated `wardriving` entries. Not yet
-implemented — this section is the frozen design, not a "done when" bar met.
-
-**Scope boundary (deliberately excluded from this design):** making the GPS UART's GPIO pin
-assignment runtime-configurable from a Flipper Settings screen — the user's original ask included
-this, but it was split out during grilling because it drags in a prerequisite this project
-doesn't have yet (any form/pin-entry widget on the Flipper — see [UI_REDESIGN.md](UI_REDESIGN.md)'s
-own note that Settings is still an unscoped placeholder) and a new wire-protocol surface (a
-get/set config command, ESP32-side persistence, safe re-init of an already-open UART driver).
-Pins stay a compile-time constant (`UART_NUM_1`, RX=GPIO18, TX=GPIO19, 9600 8N1, no flow control —
-the values [tools/test_gps_antenna.ps1](../tools/test_gps_antenna.ps1) already hardware-verified)
-until that later slice happens. See "Backlog" below for the deferred item.
-
-Key decisions from the design session:
-
-1. **Driver behavior.** `location_init()` opens UART1 and starts a background parse task, RX-only
-   (never transmits to the module — an earlier wake/cold-start command burst was proven actively
-   harmful in the antenna smoke test, forcing re-acquisition on every reconnect). Tracks three
-   states — `no_signal`, `acquiring` (valid NMEA traffic, no valid fix yet), `fix` (both `GGA` fix
-   quality > 0 and `RMC` status `A`) — rather than the interface's current binary `has_fix`.
-   **`no_signal`'s exact definition (reconciled 2026-09-12 after implementation):** any
-   checksum-valid `$`-prefixed NMEA sentence of *any* type (not only `GGA`/`RMC`) flips
-   `no_signal` → `acquiring` — chosen over the stricter "only `GGA`/`RMC` count" reading because it
-   correctly keeps garbage bytes from a wrong baud rate or bad wiring at `no_signal` rather than
-   misreporting `acquiring`. (This section's decision list previously said "never seen a byte,"
-   which was the same intent stated less precisely — no behavior change, just a wording fix.)
-2. **Sentence types parsed: `GGA` and `RMC` only.** `GGA` gives fix quality/satellite
-   count/HDOP/lat-lon; `RMC` gives date+time (used for `utc_timestamp_s`) and, incidentally,
-   speed/course (parsed but not yet wired to anything — see "Backlog" below). `ZDA` was
-   considered for date+time but rejected: the real captured antenna-test log
-   (`tools/gps_antenna_last_run.log`) shows the actual module never emits `ZDA` at all, only
-   `GGA`/`RMC`/`VTG` — designing against an NMEA sentence this hardware has never been observed
-   to send would be a real feasibility risk, whereas `RMC` is already confirmed present and
-   carries both fields needed. `VTG` is not parsed (its only content — speed/course — is already
-   available from `RMC`).
-3. **No fix-quality/HDOP/satellite-count threshold.** Any non-zero `GGA` fix quality counts as a
-   fix — a NEO-6M-class module's first fix is typically loose (HDOP 3-10+, 4-6 satellites),
-   requiring quality ≥ 2 (DGPS) would likely never be satisfied on this hardware at all, and
-   wardriving's own accuracy tolerance (tens of meters, same as any WiGLE-style capture) doesn't
-   need tighter. A user-configurable threshold is backlogged separately, not built now.
-4. **Wardriving's "depends on a GPS fix" is a record-level filter, not a `start`-level gate.**
-   `wardriving start` is never rejected for lack of a fix — it behaves exactly as it does today
-   (rejected only for the existing reasons: already running, unsupported source, busy). Instead,
-   any record captured while the location driver is not reporting `state = "fix"` is discarded —
-   never logged to flash, never streamed to the Flipper — and this is a continuous rule, not a
-   one-time "before the first fix" check: a fix lost mid-capture (module unplugged, tunnel, etc.)
-   pauses logging until the fix returns, without auto-stopping the capture. Rejected alternative:
-   gating `start` itself on an existing fix, considered and then walked back once it became clear
-   it just reinvents the record-level discard behavior [CAPABILITIES.md](CAPABILITIES.md) already
-   documented as accepted, with worse UX (a hard rejection instead of "start now, it'll catch up").
-5. **New `gps` capability + poll-only `gps_status`-shaped command**, not a push/unsolicited
-   mechanism. Both the GPS screen (coordinates/time/speed in [UI_REDESIGN.md](UI_REDESIGN.md)) and
-   the Wardriving screen's fix icon need live status independent of whether a capture is running,
-   which nothing in the wire protocol provided before this — but GPS position changing at
-   walking/driving speed doesn't need push latency, so polling only while the relevant screen is
-   open is sufficient and keeps this idle-cost-free otherwise (this board runs unattended for
-   hours during a real wardriving session).
-6. **Wardriving screen's Start action gets a cosmetic label toggle** ("Start" when a fix exists,
-   "Start (delayed)" otherwise, read from the same `gps` status the fix icon already needs) rather
-   than being disabled/greyed when no fix — matches decision 4: the action always behaves the
-   same regardless of label, so disabling it would be misleading, not protective. This applies to
-   whichever Wardriving screen ships it — today's existing flat-button screen
-   (`flipper/flipper_esp32_over_ble.c`) now, and [UI_REDESIGN.md](UI_REDESIGN.md)'s future
-   redesigned screen later, both reading the same underlying `gps` status.
-7. **New `utc_timestamp_s` wardriving-record field, additive (not replacing `timestamp_ms`).**
-   Unix epoch seconds derived from `RMC`. Guaranteed present and valid on every logged record
-   (decision 4 already requires a valid fix, which requires a valid `RMC`, to log at all) — no
-   backward-compatibility/optional-field case to design around. The Flipper's CSV exporter uses it
-   directly for WiGLE's `FirstSeen` column, in the exact format WiGLE's spec requires
-   (`YYYY-MM-DD hh:mm:ss`, UTC — confirmed against https://api.wigle.net/csvFormat.html during
-   this design session), replacing the current RTC-anchored backdating approximation for any
-   record that carries the new field.
-
-**Done when:** matches the project's established two-stage bar — both firmwares build- and
-host-test-verified against the frozen contract above (including shared vectors for the new `gps`
-status shape and the `utc_timestamp_s` field), then hardware-verified: the real module correctly
-drives all three `gps` states through a cold-start-to-fix cycle, a wardriving capture started
-before a fix arrives logs nothing until `state = "fix"`, a fix lost mid-capture pauses logging and
-resumes correctly when it returns, and the Flipper's exported CSV `FirstSeen` column matches
-WiGLE's format using the new real timestamp.
-
-**Both sides implemented 2026-09-12, build- and host-test-verified independently, hardware
-verification of the complete feature not yet started.**
-
-- **ESP32 side:** `esp32/main/nmea_parser.c`/`.h` (new, pure/host-testable `GGA`/`RMC` parser, no
-  floats, Howard Hinnant `days_from_civil` for UTC→Unix time), `esp32/main/location.c`/`.h`
-  (rewritten: real UART1 driver, dedicated `gps_parse` FreeRTOS task with its own stack and
-  file-scope line buffer, `portMUX`-guarded state snapshot read by the NimBLE host task),
-  `esp32/main/cbor_gps.c`/`.h` (new, the `gps` capability's wire codec), `"gps"` added to the
-  capability list, `handle_gps_command()` in `main.c`, and both wardriving record-capture call
-  sites updated for the fix-dependency and `utc_timestamp_s`. `idf.py build` clean; all host-native
-  test suites pass, including new `gps` vectors added to the shared `tests/vectors/vectors.h`.
-- **Flipper side:** new `gps` command client/status parsing (`flipper/cbor_gps.c`/`.h`), the
-  `utc_timestamp_s` wardriving-record field (`flipper/cbor_wardriving.c`/`.h`), a poll-only `gps`
-  status query while the Wardriving screen is open (2s cadence, a `FuriTimer` started/stopped on
-  screen entry/exit — see `flipper_esp32_over_ble.c`'s `gps_poll_timer`), the Wardriving screen's
-  three-state fix indicator and "Start"/"Start (delayed)" label toggle (decision 6), and the WiGLE
-  CSV `FirstSeen` column now built directly from `utc_timestamp_s` (the old RTC-anchored
-  backdating approximation and `feb_wardriving_backdate_first_seen()` were removed as dead code
-  once the field became mandatory on the wire). `fbt.cmd fap_flipper_esp32_over_ble` clean;
-  523/523 host-native checks pass; `tools/check_shared_headers.py` confirms both sides'
-  `cbor_gps.h`/`cbor_wardriving.h` agree on field order/types.
-- **Known implementation notes, not covered by the frozen design above:**
-  - **Old on-flash wardriving records will fail to decode and be silently skipped** once this
-    ships, since they predate the mandatory `utc_timestamp_s` field — the existing
-    checksum/decode-failure path in `wardriving_log.c` already handles this safely (skip, warn,
-    don't crash or misread), and the circular log naturally rotates them out as new captures
-    continue. **Accepted by the user 2026-09-12** as a one-time cost of this format upgrade — not
-    a bug, no migration built.
-  - **The already-existing GPS screen** (`draw_gps_screen`, part of the Phase 3a menu shell — see
-    [UI_REDESIGN.md](UI_REDESIGN.md)) is now wired to the new live `gps` status (2026-09-12,
-    build-verified only, explicitly-approved follow-on) — real fix state, coordinates, and
-    GPS-derived UTC time when fixed, falling back to the Flipper's RTC clock otherwise, speed
-    still `--`. Found and fixed a pre-existing capability-gating bug along the way:
-    `HomeMenuGps`'s visibility was checking `capability_has_wardriving` instead of
-    `capability_has_gps`.
+✅ Real GPS driver, wardriving fix-dependency, and real wardriving-record timestamps (Phase 3) — done, hardware-verified 2026-09-13 (see Phase 3's status line above), see PLAN_ARCHIVE.md for the full design/implementation record.
 
 ## Phase 4: Heltec WiFi LoRa 32 V2 board support
 
@@ -443,132 +151,20 @@ per-vendor-documentation-only, not locally verified — mirroring the precision 
 [docs/hardware/esp32-c6-devkitc-1/README.md](hardware/esp32-c6-devkitc-1/README.md). See
 `docs/BASELINES.md`'s Heltec stub for the pinned-baseline framing of this board.
 
-### Architecture decision: shared component (confirmed 2026-09-16)
-
-Today's `esp32/` is a single ESP-IDF project hardcoded to `CONFIG_IDF_TARGET="esp32c6"` in
-`sdkconfig.defaults`. A Heltec target needs `esp32` (classic Xtensa), a different target —
-ESP-IDF does not support two targets from one `sdkconfig`/build tree. Two ways to structure
-this:
-
-- **(a) Second top-level project (`heltec/`) sharing protocol/crypto logic with `esp32/` via
-  an ESP-IDF shared component directory** (`EXTRA_COMPONENT_DIRS`) — `framing.c`, `pairing.c`,
-  `pairing_crypto.c`, `session.c`, `session_crypto.c`, and the `cbor_*.c` codec files move into
-  a shared component consumed by both `esp32/` and `heltec/`, each with its own board-specific
-  `main.c`/capability handlers/`sdkconfig.defaults`/target. `docs/PROTOCOL.md` stays implemented
-  exactly once across both ESP32-family boards.
-- **(b) Two fully independent project trees**, each separately implementing the protocol —
-  duplicates every line of framing/crypto/codec logic, with the drift risk that already
-  motivates this project's "keep the two firmwares in lockstep" convention (`CLAUDE.md`) —
-  except now across **three** independent implementations (Flipper, C6, Heltec) instead of two.
-
-**Recommendation: (a).** The shared-component approach is a build-system detail (ESP-IDF's
-`EXTRA_COMPONENT_DIRS` is designed exactly for this — one component consumed by multiple
-project trees/targets), not a rewrite, and it's the only option consistent with this project's
-own stated convention that a wire-format/crypto change "is not done until both sides implement
-it identically." Duplicating the protocol logic into a third tree triples the surface area for
-exactly the convergence bugs `docs/LESSONS.md` already documents recurring between two
-implementations.
-
-**Confirmed 2026-09-16 (grill-me session): (a), shared component.** This was flagged per
-`CLAUDE.md`'s own rule ("Changing any of these [baselines] is a project decision... confirm
-with the user before proceeding"), and the user picked (a) over (b) or a third structure. Step
-2 below (project scaffolding) is unblocked.
+✅ Architecture decision: shared component — confirmed 2026-09-16 (option (a), one shared `components/feb_protocol/` component consumed via `EXTRA_COMPONENT_DIRS`), see [PLAN_ARCHIVE.md#architecture-decision-shared-component-confirmed-2026-09-16](PLAN_ARCHIVE.md#architecture-decision-shared-component-confirmed-2026-09-16).
 
 ### Step breakdown
 
 Mirrors how Phase 1–3 steps are written above (numbered steps, each with a "Done when" line).
 Step 1 is done (2026-09-16); steps 2–6 have not started.
 
-**1. Board acquisition + baseline bring-up.**
-- Acquire a physical unit and confirm its exact revision (V2 vs V2.1 vs V1/V3+) against its
-  silkscreen/label — see the hardware doc's "Board revision ambiguity" section.
-- Verify flash size via `esptool flash_id` — **read-only**, `--before default_reset --after
-  no_reset` per this project's `esptool` read-only convention (see `docs/LESSONS.md`); do not
-  flash/erase/write without explicit user request.
-- Build an unmodified `esp32` target baseline (plain ESP-IDF example or a minimal skeleton) for
-  this specific chip, independent of any project code, the same way Phase 1 did for the C6.
+✅ Step 1 (board acquisition + baseline bring-up) — done, hardware-verified 2026-09-16, see PLAN_ARCHIVE.md ("Phase 4 -- Step 1").
 
-**Done when:** board revision confirmed, flash size measured read-only, an unmodified `esp32`
-target baseline builds and boots on the physical unit. ✅ **Met 2026-09-16** — board confirmed
-from its own silkscreen as "WiFi LoRa 32 V2" (not V2.1), chip ESP32-D0WDQ6 rev v1.0, MAC
-`a4:cf:12:03:ba:58`, 8MB Winbond flash measured via read-only `esptool flash_id`
-(`--before default_reset --after no_reset`, no erase/write) on COM10 (Silicon Labs CP210x
-bridge) — matches the hardware doc's V2/V2.1 8MB expectation and rules out V1's 4MB. The
-classic-`esp32` (Xtensa) toolchain was not yet installed (this project had only ever installed
-`esp32c6`'s RISC-V toolchain); installed via `idf_tools.py install --targets=esp32`. An
-unmodified `hello_world` example (built in a throwaway temp directory, not committed to this
-repo) built and flashed cleanly; serial output confirmed a clean boot (`Hello world!`, correct
-chip/flash identification, no crash/reset loop beyond the example's own restart countdown).
+✅ Step 2 (project scaffolding) — done 2026-09-16, see PLAN_ARCHIVE.md ("Phase 4 -- Step 2").
 
-**2. Project scaffolding**, per whichever architecture the user confirms above. If (a): create
-the shared component directory, move the listed files into it with no behavior change, wire
-`EXTRA_COMPONENT_DIRS` into both `esp32/`'s and the new `heltec/`'s `CMakeLists.txt`, and
-confirm `esp32/`'s existing build and all its host-native tests are unaffected by the move
-before adding any Heltec-specific code.
+✅ Step 3 (port BLE transport + pairing + session crypto onto classic ESP32) — done, hardware-verified 2026-09-16, see PLAN_ARCHIVE.md ("Phase 4 -- Step 3").
 
-**Done when:** both `esp32/` (unchanged behavior) and a new empty `heltec/` skeleton build
-against the shared component, with `esp32/`'s existing test suite still passing. ✅ **Met
-2026-09-16.** Shared component created at `components/feb_protocol/` (13 file pairs moved via
-`git mv`, no logic changes: `framing`, `pairing`/`pairing_crypto`, `session`/`session_crypto`,
-all `cbor_*` codec files, `cbor_codec.h`/`cbor_internal.h`; `REQUIRES mbedtls` only — none of
-the moved files touch ESP-IDF/FreeRTOS headers). `EXTRA_COMPONENT_DIRS` wired into both
-`esp32/CMakeLists.txt` and the new `heltec/CMakeLists.txt`. New `heltec/` project targets
-`esp32` (classic Xtensa) with a trivial `main.c` that includes `framing.h` and calls
-`feb_fragment_capacity()` to prove the link, nothing more. `esp32/`'s `idf.py build` and all
-five `tests/esp32/*.ps1` host-native suites pass unchanged (three scripts repointed to the new
-shared-component path); `heltec/`'s `idf.py build` passes against the default (uncorrected)
-2MB flash-size assumption — the real 8MB partition sizing is out of this step's scope.
-`tools/check_shared_headers.py` repointed to the new paths and passing. Full detail:
-`docs/PROJECT_HISTORY.md`.
-
-**3. Port/reuse the BLE transport + pairing + session crypto layer onto classic ESP32.**
-Nothing here is assumed working without re-verification:
-- **NimBLE central-mode support on classic ESP32** — confirm it's available and behaves the
-  same as on the C6 (central role, GATT client, notification subscription); classic ESP32 ships
-  a different combo Wi-Fi/BT radio than the C6's single 2.4 GHz Wi-Fi6+BLE5+802.15.4 radio, so
-  none of Phase 3/step 4's coexistence bounds transfer — this needs its own coexistence
-  validation pass (see the radio note below), not an assumption that the C6's numbers apply.
-- **mbedTLS primitive availability** — confirm X25519, HKDF-SHA-256, HMAC-SHA-256, and
-  AES-256-GCM are equally available on the `esp32` target. mbedTLS itself isn't chip-specific,
-  so this should be true, but per this project's "confirm, don't assume" discipline (see
-  `docs/BASELINES.md`'s C6 entry, which explicitly confirmed rather than assumed the same list),
-  it must be checked against this target's actual sdkconfig/component availability, not inferred
-  from the C6 having it.
-- Re-implement the ESP32-side halves of `docs/PROTOCOL.md`/`docs/PAIRING.md` against the shared
-  component from step 2, byte-for-byte identical wire behavior to the C6 build.
-
-**Done when:** the Heltec build passes the same shared host-native codec/crypto test vectors as
-the C6 build, and a real pairing + authenticated session round-trip is hardware-verified against
-a Flipper, independent of any capability beyond the base protocol. ✅ **Met 2026-09-16.**
-`heltec/main/main.c` has the full transport/pairing/session-auth port (base protocol only);
-`heltec`'s `idf.py build` and `esp32`'s own build + all host-native test suites pass. Flashed to
-the physical Heltec board (COM10): fresh-boot pairing ceremony against the Flipper completed
-(X25519 exchange, `pair_confirm`, secret persisted, `pair_complete`), and a subsequent reset
-completed the runtime `hello`/`hello_ack`/`client_auth` round-trip using the stored secret with
-no pairing window reopened. Full detail: `docs/PROJECT_HISTORY.md`'s 2026-09-16 entry.
-
-**4. `board_id` / multi-board-pairing implications.** Today's `board_id` format is
-`esp32c6-<12 lowercase hex chars>`, derived from the factory MAC (see step 5/7 above and
-`docs/PROTOCOL.md`). A Heltec board needs its own distinguishable prefix (e.g.
-`heltec-<12 lowercase hex chars>`) so the Flipper's per-`board_id` pairing-record files
-(`pairings/<board_id>.dat`) and capability caches keep boards distinct. This is a small but real
-shared-contract detail, not a wire-format change — `board_id` is already opaque,
-charset-validated text per step 5, so a new prefix value requires no protocol/CBOR shape change,
-just an ESP32-side constant and confirmation that the Flipper's existing charset validation
-accepts it unchanged.
-
-**Done when:** a Heltec board and a C6 board can be paired to the same Flipper simultaneously
-(subject to the existing "one BLE connection at a time" limitation — see "Multi-board pairing"
-under step 7 above), each keeping its own pairing record and capability cache with no filename
-collision. ✅ **Met 2026-09-16.** No code change was needed: `heltec/main/main.c` already derives
-`board_id` as `heltec-<12 lowercase hex chars>` (distinct from the C6's `esp32c6-` prefix), and
-the Flipper's pairing/capability storage (`build_pairing_path`/`build_capability_path` in
-`flipper/flipper_esp32_over_ble.c`) was already fully generic on `board_id`/`board_id_len` with
-no fixed-prefix/length assumption. Verified by inspecting the Flipper's SD card (`scripts/
-storage.py list /ext/apps_data/flipper_esp32_over_ble`, read-only): `pairings/
-esp32c6-acebe6fffeda.dat` and `pairings/heltec-a4cf1203ba58.dat` coexist (32 bytes each), as do
-`capabilities/esp32c6-acebe6fffeda.dat` (82 bytes, real capability list) and `capabilities/
-heltec-a4cf1203ba58.dat` (55 bytes, zero-feature base protocol) — no collision.
+✅ Step 4 (`board_id` / multi-board-pairing implications) — done, verified 2026-09-16, see PLAN_ARCHIVE.md ("Phase 4 -- Step 4").
 
 **5. Radio/coexistence note.** Unlike the C6 (one 2.4 GHz radio shared by Wi-Fi, BLE, and
 802.15.4), the Heltec's LoRa radio is a separate SPI-attached chip (SX1276/SX1278) on its own
@@ -596,91 +192,11 @@ pass, the same way `gps` got one before implementation (see the "Real GPS driver
 above) — do not design or implement `display`/`lora` wire formats as a side effect of this
 phase's earlier steps.
 
-**7. `wifi_scan`/`ble_scan` capability porting** (added 2026-09-17, by explicit user request —
-not originally written into this Phase 4 plan). Unlike `display`/`lora`, these two capabilities
-are already fully specified (`docs/PROTOCOL.md`, `docs/CAPABILITIES.md`) and implemented on the
-C6 — this is a straight port of already-agreed wire behavior onto a second board, not new
-capability design. `wardriving` and `gps` are explicitly excluded from this step: `wardriving`
-needs the coexistence-interval bounds that step 5 above skipped, and `gps` needs physical UART
-wiring not yet documented for this board (see `docs/hardware/heltec-wifi-lora-32-v2/README.md`).
+✅ Step 7 (`wifi_scan`/`ble_scan` capability porting) — done, build-verified 2026-09-17, real hardware round-trip confirmed the same day (see `docs/SESSION_MEMORY.md`), see PLAN_ARCHIVE.md ("Phase 4 -- Step 7").
 
-**Done when:** `heltec/main/main.c` reports `wifi_scan`/`ble_scan` in its capability response
-and both commands work end-to-end against a real Flipper, exercised concurrently with the
-active BLE connection (unlike step 5's skipped sweep, a manual one-shot scan is a bounded,
-low-risk action, but this board's Wi-Fi+BT combo radio has never been hardware-tested running a
-scan while BLE-connected — that gap must be closed by an actual test, not assumed away).
-✅ **Build-verified 2026-09-17** — both capabilities ported from `esp32/main/main.c`'s reference
-implementation into `heltec/main/main.c` (reusing the shared, unmodified
-`components/feb_protocol/cbor_wifi_scan.c`/`cbor_ble_scan.c` codecs), `feb_features[]` now
-`{"wifi_scan", "ble_scan"}`, `idf.py build` passes for both `heltec/` and `esp32/`. **Hardware
-verification still pending** — see `docs/PROJECT_HISTORY.md`'s 2026-09-17 entry for the full
-change narrative. Flashed to the physical board (COM10) 2026-09-17; boot log confirmed healthy
-(Wi-Fi STA init, NimBLE scan start, no crash). The Flipper's stale cached capability record
-(`capabilities/heltec-a4cf1203ba58.dat`, zero features from the step-3 test) was deleted the
-same day, so the next session's `capability_query` will reach this firmware's real feature
-list — an actual paired `wifi_scan`/`ble_scan` round-trip against the Flipper is still
-untested.
+✅ Step 8 (`gps` capability porting) — done, build-verified and flashed 2026-09-23; GPS read-path hardware verification status tracked in `docs/SESSION_MEMORY.md`, see PLAN_ARCHIVE.md ("Phase 4 -- Step 8").
 
-**8. `gps` capability porting** (added 2026-09-23, by explicit user request — not originally
-written into this Phase 4 plan). The physical-UART-wiring blocker step 7 flagged is resolved: a
-GPS module is wired to this board's GPIO17 (RX-only, replacing an earlier bench-test wiring on
-GPIO36 — see `docs/hardware/heltec-wifi-lora-32-v2/README.md`). `wardriving` remains excluded
-(still needs step 5's skipped coexistence sweep, and has not been ported to this board at all).
-
-**Done when:** `heltec/main/main.c` reports `gps` in its capability response and a real,
-paired `gps` status query against the Flipper returns a sane state (`no_signal`/`acquiring`/
-`fix`) reflecting the physically-wired module.
-✅ **Build-verified 2026-09-23** — `location.c`/`nmea_parser.c` ported from `esp32/main/`'s
-reference implementation (hardcoded to `UART_NUM_1`, RX=GPIO17, unchanged 9600 baud, RX-only),
-`handle_gps_command()` copied unchanged (reuses the shared, unmodified
-`components/feb_protocol/cbor_gps.c` codec), `feb_features[]` now
-`{"wifi_scan", "ble_scan", "gps"}`. Adding `esp_driver_uart` pushed classic ESP32's `iram0_0_seg`
-over budget by ~750 bytes — fixed via `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y`; flash
-partition is now 96% full (see `docs/BACKLOG.md` BL13). `idf.py build` passes for both `heltec/`
-and `esp32/`; `esp32/`'s five host-native suites and `tools/check_shared_headers.py` still pass
-unchanged. **Flashed to the physical board (COM10) 2026-09-23; boot log confirmed healthy**
-(no UART-init error lines). **Hardware verification of the actual GPS read path is still
-pending** — no Flipper was paired during the boot-log capture, so a real `gps` query has not yet
-been answered by this board; the Flipper's stale cached capability record
-(`capabilities/heltec-a4cf1203ba58.dat`) must be deleted before its next `capability_query` will
-see `gps` in the list (same gotcha as step 7). See `docs/PROJECT_HISTORY.md`'s 2026-09-23 entry
-for the full change narrative. **Update, same day:** the user deleted the stale cache and
-confirmed `wifi_scan`/`ble_scan` work end-to-end on real hardware — the first real test of step
-7's port. The `gps` read path itself (a live NMEA fix from the GPIO17-wired module) is still
-unconfirmed.
-
-**9. `wardriving` capability porting** (added 2026-09-23, by explicit user request — not
-originally written into this Phase 4 plan). Unlike steps 7/8, this is the capability step 5
-excluded (needs the coexistence-interval bounds that step 5 skipped) — proceeding without that
-validation was an explicit, informed user decision, continuing this Phase 4 section's own
-gate-override pattern. Ported as a straight port of the C6's already-frozen wire behavior, not
-new design.
-
-**Done when:** `heltec/main/main.c` reports `wardriving` in its capability response, a live
-multi-minute capture run against the paired Flipper produces real logged records (GPS-fix-gated,
-same as the C6), and the board survives that run without a reconnect stall or crash — i.e. step
-5's skipped validation is actually exercised here, even if informally, rather than assumed away
-a second time.
-✅ **Build-verified 2026-09-23** — `wardriving_record_format.c/h`, `wardriving_validate.c/h`,
-`wardriving_dedup.c/h`, `wardriving_log.c/h`, `wardriving_persist.c/h` ported unchanged from
-`esp32/main/`; `heltec/main/main.c`'s full wardriving command/state-machine/scan-arbitration
-plumbing ported line-for-line (structurally diffed against the C6 reference: zero logic
-deviations found). `feb_features[]` now `{"wifi_scan", "ble_scan", "gps", "wardriving"}`. A new
-custom `heltec/partitions.csv` was created (this board previously used ESP-IDF's stock table,
-already 96% full per `docs/BACKLOG.md` BL13 — see that item, now resolved) sized for this
-board's confirmed 8 MB flash: 2 MB `factory` app (51% free) + a 2800 KB `wardrive` data
-partition + ~3.2 MB unallocated headroom. `idf.py build` passes for both `heltec/` and `esp32/`;
-`esp32/`'s five host-native suites and `tools/check_shared_headers.py` still pass unchanged.
-**Flashed to the physical board (COM10) 2026-09-23; boot log confirmed healthy** — new
-partition table matches design exactly, `wardriving_log` resumed cleanly against real flash,
-Wi-Fi/BLE init clean, no crash or reset loop. **Everything beyond clean boot is still
-unverified**: no live wardriving capture has been run against the Flipper yet, this board's
-radio coexistence under wardriving's concurrent Wi-Fi+BLE load remains genuinely untested (step
-5's gap, not closed by this port), and the Flipper's cached capability record needs deleting
-again (same gotcha as steps 7/8, now for `wardriving`) before it will even show up. A cosmetic
-judgment call was made for this board's plain on/off LED (double-speed blink during wardriving
-in place of the C6's color swap) — flagged as `docs/BACKLOG.md` BL14 for the user to confirm or
-override. See `docs/PROJECT_HISTORY.md`'s 2026-09-23 entry for the full change narrative.
+✅ Step 9 (`wardriving` capability porting) — done, build-verified and flashed 2026-09-23; hardware capture/coexistence verification status tracked in `docs/SESSION_MEMORY.md`, see PLAN_ARCHIVE.md ("Phase 4 -- Step 9").
 
 ### Cross-references
 
@@ -711,118 +227,9 @@ step 3 below):**
   BOOT-hold-5s gesture to. Tracked as `docs/BACKLOG.md` BL15; revisit only if the user wires an
   external button or requests a different mechanism.
 
-**Step 3 (started 2026-09-25): dual-band Wi-Fi (2.4 GHz + 5 GHz) and `wardriving` port.**
-- Switch `esp32c5`'s Wi-Fi band mode from `WIFI_BAND_MODE_2G_ONLY` to `WIFI_BAND_MODE_AUTO` so
-  `wifi_scan`/`wardriving` see 5 GHz APs too. The wire protocol needs no change for this — a
-  `wifi_scan` result's `channel` field is a bare channel number, and 2.4 GHz (1-14) and 5 GHz
-  (36+) channel numbers never overlap, so the band is already implicit in the existing field.
-- Port `wardriving` from the C6 reference (structurally identical to Heltec's port), lifting the
-  scope cut above. This is this board's first exposure to sustained concurrent Wi-Fi+BLE radio
-  load — no coexistence sweep has been run for this chip (`docs/BACKLOG.md` BL16), so watch for
-  instability under real wardriving duty cycles, not just short manual scans.
-- **Flipper-side CSV fix (not an ESP32 change):** `flipper/wardriving_csv.c`'s
-  `channel_to_freq_mhz()` was written 2.4GHz-only (its own comment: "this board has a single
-  2.4GHz radio, no 5GHz") and computes wrong frequencies for any 5GHz channel number handed to
-  it. Needs a 5GHz branch (`5000 + 5*channel` for the standard 36-177 range) before this board's
-  wardriving CSV rows can show correct `Frequency` values for 5GHz APs.
+✅ Step 3 (dual-band Wi-Fi + `wardriving` port) — done, build-verified 2026-09-25; hardware verification and the BL16/BL18 open items tracked in `docs/BACKLOG.md`/`docs/SESSION_MEMORY.md`, see PLAN_ARCHIVE.md ("Phase 8 -- Step 3").
 
-**Step 3: ✅ build-verified 2026-09-25, hardware-verification still pending.**
-- **Dual-band switch**: `start_wifi_subsystem()` now calls
-  `esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO)` (confirmed against the installed ESP-IDF v5.5.2
-  headers — `esp_wifi_types_generic.h`'s `wifi_band_mode_t` enum) in place of the step-2
-  `WIFI_BAND_MODE_2G_ONLY` call. No wire-format change: confirmed `wifi_ap_record_t.primary`
-  ("Channel of AP") is a single band-agnostic channel field with no separate band indicator, so
-  5GHz channel numbers (36+) flow through the exact same `channel` field 2.4GHz results already
-  use, and 2.4/5GHz channel numbers never overlap.
-- **`wardriving` ported** from `esp32/main/main.c`'s reference implementation (structurally
-  matching the Heltec port): `wardriving_record_format.c/h`, `wardriving_log.c/h`,
-  `wardriving_validate.c/h`, `wardriving_dedup.c/h`, `wardriving_persist.c/h` copied unchanged
-  (no target-specific code in any of the five); `main.c`'s wardriving state machine,
-  scan-arbitration (`wifi_scan_active_source`/`ble_scan_active_source`), interval callbacks,
-  status-LED sync, and `handle_wardriving_command()` ported line-for-line from the C6 reference.
-  **Deliberately not ported**: the boot-button toggle mechanism
-  (`feb_wardriving_request_button_toggle()`/`wardriving_button_toggle_cb()`) — its only caller on
-  the C6/Heltec is `factory_reset.c`'s BOOT-button short-press handler, and this board has
-  neither a button nor a `factory_reset.c` (BL15), so there is no trigger for it to serve; boot
-  autostart from persisted state (`wardriving_persist_load()`) is unaffected and still wired into
-  `host_synced()`.
-  `feb_features[]` is now `{"wifi_scan", "ble_scan", "gps", "wardriving"}`.
-- **New `esp32c5/partitions.csv`** (custom table, replacing step 2's stock
-  `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE`): 2 MB `factory` app + a 700-sector (0x2BC000 =
-  2,867,200 bytes) `wardrive` data partition, identical sizing to `heltec/partitions.csv`'s own
-  wardrive partition (matches `wardriving_log.c`'s `WD_MAX_SECTORS` bound exactly) — ~4.8 MB
-  used of this board's 8 MB flash, ~3.2 MB unallocated headroom. `idf.py build`'s
-  `check_sizes.py` reports the factory app binary (0x143ef0 bytes) at 37% free against the 2 MB
-  slot. Required deleting the generated `esp32c5/sdkconfig` and `esp32c5/build/` and rebuilding
-  from scratch — `sdkconfig.defaults`' new `CONFIG_PARTITION_TABLE_CUSTOM=y` did not take effect
-  on an incremental rebuild over the step-2 cached `sdkconfig` (same "sdkconfig-defaults-not-
-  retroactive" class documented in `docs/LESSONS.md`); confirmed via a first build that silently
-  kept the old 0x177000-byte single-app partition size until the regenerate.
-- **Status LED**: `status_led.c`'s red LED (`FEB_STATUS_LED_FLUSHING`) is now reachable —
-  `wardriving_maybe_kick_send()`/`wardriving_send_next_batch()` drive it exactly like the
-  C6/Heltec builds. `feb_status_led_set_wardriving_active()` was added for call-site parity with
-  `wardriving_sync_status_led()`, but is a deliberate no-op on this board (records the flag,
-  applies no visual change) — this board's two-LED design
-  (`docs/hardware/olimex-mod-esp32-c5/README.md`) only ever specified two states (connection
-  status, backlog-flushing), not a third "wardriving active" indication; flagged as
-  `docs/BACKLOG.md` BL17 for the user to confirm or override, mirroring the Heltec's own BL14
-  judgment call.
-- `idf.py build` clean for both the dual-band change and the wardriving port (built and verified
-  separately, per instruction) — no warnings, no errors. `components/feb_protocol/`, `esp32/`,
-  and `heltec/` were not touched (`git status` confirms no diff under any of those paths), so
-  their builds were not re-run.
-- **Not yet done**: flashing to the physical board and any hardware-verified `wifi_scan` (5GHz
-  AP visible)/`wardriving` (live multi-minute capture, GPS-fix-gated logging, survives a real
-  Wi-Fi+BLE concurrent-load run) round-trip against a real Flipper — explicitly deferred per this
-  session's "build-only unless asked" instruction. This board's own radio-coexistence sweep
-  remains unrun (BL16, now also covering wardriving's sustained load, not just a manual scan).
-  **A prior hardware session (before this build-only pass) saw an unconfirmed, not-yet-
-  reproduced apparent reboot-loop after a `wifi_scan` trigger** — tracked as `docs/BACKLOG.md`
-  BL18; not chased further in this pass (no flashing was done), and not assumed fixed or caused
-  by any specific change here.
-
-**Step 4 (2026-09-26): `wifi_band` — configurable dual-band scan speed/coverage tradeoff.**
-Step 3's dual-band default (`WIFI_BAND_MODE_AUTO`, every channel including DFS) made a manual
-`wifi_scan` noticeably slower than the pre-dual-band 2.4GHz-only path — DFS channels require
-slow passive listening for radar-detection compliance. User's explicit choice was "make it
-configurable", not "default to skipping DFS" or "leave it slow".
-
-- **Shared codec** (`components/feb_protocol/cbor_wardriving.c`/`.h`): `wifi_band` decoded as
-  an 8th optional field on `wardriving`'s `start` action, immediately after `country`, following
-  `country`'s exact codec-level pattern (structurally optional here; required-with-`"wifi"`-in-
-  `sources` enforcement is a caller/`main.c` concern, matching this file's established caller-
-  validation split). `esp32/`/`heltec/` decode it and simply never read it — no `main.c` change
-  needed on either, since neither board's wardriving command handler references the field.
-- **`esp32c5/main/main.c`**: `wardriving_wifi_band_t` (`WARDRIVING_BAND_2_4GHZ`/
-  `_5GHZ_FAST`/`_5GHZ_FULL`), validated in `handle_wardriving_command()` alongside
-  `wifi_swelling`/`country`, applied once at wardriving start via
-  `wardriving_set_wifi_band_mode()` (radio-level `esp_wifi_set_band_mode()`, sticky like
-  `country`) and `wardriving_apply_wifi_band()` (per-call `wifi_scan_config_t` shaping, re-run
-  on every wardriving re-arm and by a later manual `wifi_scan` — the "global setting a manual
-  scan just observes" pattern `country` already established). Boot default (before any
-  wardriving `start` this boot) is `WARDRIVING_BAND_5GHZ_FULL`, matching step 3's already-
-  verified boot behavior; wardriving's own autostart-from-persisted-state hardcodes the more
-  conservative `WARDRIVING_BAND_2_4GHZ` instead (same reasoning as its existing
-  `WARDRIVING_SWELLING_NORMAL`/`WARDRIVING_COUNTRY_ROW` hardcoding: an unattended boot
-  shouldn't default into the never-swept dual-band+BLE coexistence combo BL16 already flags).
-- **`5ghz_fast` mechanism** (`"2.4ghz"`/`"5ghz_full"` are a single existing
-  `esp_wifi_set_band_mode()` call each, no new mechanism needed): confirmed against the
-  installed ESP-IDF v5.5.2 headers that `wifi_scan_config_t.channel_bitmap`
-  (`wifi_scan_channel_bitmap_t`, `esp_wifi_types_generic.h`) restricts a scan to an explicit
-  channel subset in a single `esp_wifi_scan_start()` call (channel must be `0` for the bitmap
-  to take effect) — a real documented mechanism, not a guess: also used by
-  `esp-idf/examples/wifi/scan/main/scan.c` and `wpa_supplicant`'s `esp_scan.c`. `"5ghz_fast"`
-  sets the bitmap to 2.4GHz channels 1-14 plus non-DFS 5GHz channels 36/40/44/48 (UNII-1-low)
-  and 149/153/157/161/165 (UNII-3). **No multi-scan/sequential-per-channel restructuring was
-  needed** — this stays one `esp_wifi_scan_start()` call yielding one `WIFI_EVENT_SCAN_DONE`,
-  so `wifi_scan_done_handler()`/wardriving's scan-cycle timing are unchanged from step 3.
-- `idf.py build` clean in `esp32c5/`, `esp32/`, and `heltec/` (all three rebuilt since the
-  shared codec changed); `tests/esp32/build.ps1`'s host-native codec test suite still passes in
-  full. `python tools/check_shared_headers.py` reports every header pair (including
-  `cbor_wardriving.h`) matching — the Flipper-side mirror was updated in a concurrent session,
-  independently landing the identical field name/order/macro.
-- **Not yet done:** hardware verification of any of the three `wifi_band` values (relative scan
-  duration, correct AP set per mode) — build-only per this session's instruction.
+✅ Step 4 (`wifi_band` — configurable dual-band scan speed/coverage) — done, build-verified 2026-09-26; hardware verification tracked in `docs/SESSION_MEMORY.md`, see PLAN_ARCHIVE.md ("Phase 8 -- Step 4").
 
 Hardware facts, pin map, and the ATGM336H GPS wiring are recorded in
 [docs/hardware/olimex-mod-esp32-c5/README.md](hardware/olimex-mod-esp32-c5/README.md); pinned
@@ -832,56 +239,9 @@ baseline framing in `docs/BASELINES.md`'s MOD-ESP32-C5 entry.
 
 Mirrors Phase 4's step numbering/shape.
 
-**1. Board acquisition + baseline bring-up.**
-- Confirm chip/flash/MAC via `esptool` read-only, install the `esp32c5` toolchain target if
-  missing, build+boot an unmodified minimal `app_main` baseline.
+✅ Step 1 (board acquisition + baseline bring-up) — done, hardware-verified 2026-09-25, see PLAN_ARCHIVE.md ("Phase 8 -- Step breakdown Step 1").
 
-**Done when:** an unmodified `esp32c5`-target baseline builds and boots on the physical unit,
-with chip/flash facts recorded read-only. ✅ **Met 2026-09-25** — chip confirmed as ESP32-C5 rev
-v1.0 (dual-band Wi-Fi 6, BLE 5, 802.15.4, single core + LP core, 240 MHz) via `esptool chip_id`
-on COM11; flash confirmed 8 MB via `esptool flash_id` (both read-only, matching this project's
-`esptool` read-only convention). ESP-IDF v5.5.2 already carries `esp32c5` SoC support; the
-`riscv32-esp-elf` toolchain is shared with the already-installed C6 target, so
-`idf_tools.py install --targets=esp32c5` only needed to register the target, nothing new to
-download. `esp32c5/` scaffolded mirroring `heltec/`'s project layout (own `CMakeLists.txt`,
-`sdkconfig.defaults`, `main/`), wired into the shared `components/feb_protocol/` component via
-the same `EXTRA_COMPONENT_DIRS` mechanism.
-
-**2. Port BLE transport + pairing + session crypto, then wifi_scan (2.4 GHz-only)/ble_scan/gps.**
-
-**Done when:** `esp32c5/main/main.c` builds against the same shared protocol/crypto layer as
-the C6/Heltec, reports `feb_features[] = {"wifi_scan", "ble_scan", "gps"}` (no `wardriving`,
-explicitly out of scope this phase), and a real pairing + authenticated session round-trip
-plus each capability's manual/poll query is hardware-verified against a Flipper. ✅ **Build-
-verified 2026-09-25, hardware-verification still pending.** Ported from `esp32/main/main.c`
-(the RISC-V/NimBLE-central reference, not the Heltec's classic-Xtensa port) with board-specific
-adaptations only:
-- Transport/pairing/session-auth layer and `wifi_scan`/`ble_scan`/`gps` capability handlers
-  carried over byte-for-byte against the shared wire contract; `wardriving` and
-  `factory_reset.c` deliberately not ported (out of scope; no onboard pushbutton — BL15).
-- **2.4 GHz-only mechanism**: `esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY)` (confirmed
-  against the installed ESP-IDF v5.5.2 `esp_wifi.h`/`esp_wifi_types_generic.h` headers, not
-  guessed), called once in `start_wifi_subsystem()` right after `esp_wifi_start()` succeeds —
-  see `docs/hardware/olimex-mod-esp32-c5/README.md` for the full mechanism note.
-- **Two-LED status mapping** (new `esp32c5/main/status_led.c`, plain `gpio_set_level()`, not
-  the C6's WS2812): green (GPIO27, USER_LED1) mirrors the single-LED boards' connection-state
-  indicator; red (GPIO26, USER_LED2) is wired for the wardriving-style backlog-flushing state
-  but currently unreachable (no wardriving this phase) — see the hardware doc's "Status LED
-  mapping" section.
-- GPS (`location.c`/`nmea_parser.c`) ported unchanged, pins retargeted to GPIO4 (RX)/GPIO5 (TX)
-  only.
-- `board_id` prefix `esp32c5-` (distinct from `esp32c6-`/`heltec-`, same charset/derivation).
-- Partition table: stock `CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE` (1500K factory, no OTA) —
-  the stock 1MB default was too small for this build (~1.31MB with NimBLE+mbedTLS+esp_wifi);
-  no custom `partitions.csv` needed since there's no wardriving data partition to size around
-  this phase.
-- `idf.py build` clean in `esp32c5/` (15% free in the factory partition); `components/
-  feb_protocol/`, `esp32/`, and `heltec/` were not touched by this step, so their builds were
-  not re-run (`git status` confirms no diff under either path).
-- **Not yet done:** flashing to the physical board and any hardware-verified pairing/session/
-  capability round-trip against a real Flipper (explicitly deferred to a separate session per
-  this project's hardware-safety convention); this board's own Wi-Fi+BLE radio-coexistence
-  sweep (BL16, same accepted gap class as Heltec's skipped step 5).
+✅ Step 2 (port BLE transport + pairing + session crypto, then `wifi_scan` 2.4 GHz-only/`ble_scan`/`gps`) — done, build-verified and pairing-hardware-verified 2026-09-25, see PLAN_ARCHIVE.md ("Phase 8 -- Step breakdown Step 2").
 
 ### Cross-references
 

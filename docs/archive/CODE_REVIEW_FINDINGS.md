@@ -47,7 +47,7 @@ is how this drifted unnoticed.
 **Resolution:** converged on the ESP32's stricter behavior (decision D2 in
 [CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)) — both sides now accept only majors 0
 (unsigned int), 2 (bytes), 3 (text), 4 (array), 5 (map), rejecting negative integers, tags, and
-`true`/`false`/`null`. Recorded in [PROTOCOL.md](PROTOCOL.md)'s "Canonical CBOR encoding"
+`true`/`false`/`null`. Recorded in [PROTOCOL.md](../PROTOCOL.md)'s "Canonical CBOR encoding"
 section. Direct `feb_cbor_skip_value()` unit tests added to both `tests/esp32/` and
 `tests/flipper/`, asserting identical `feb_cbor_status_t` on both sides.
 
@@ -177,7 +177,7 @@ and it's cheap to close: one length check per decoder.
 [CODE_REVIEW_FIX_PLAN.md](CODE_REVIEW_FIX_PLAN.md)) to all three record-level decoders on both
 firmwares: `feb_cbor_decode_unencrypted`, `feb_cbor_decode_protected`, and
 `feb_cbor_decode_pairing_envelope`. Deliberately **not** applied to the payload-specific decoders
-(`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`) — see [PROTOCOL.md](PROTOCOL.md)'s
+(`hello`, `hello_ack`, `client_auth`, `pair_*`, `error`) — see [PROTOCOL.md](../PROTOCOL.md)'s
 "Trailing bytes" note for why that's structurally unnecessary there, not an oversight.
 
 ## Memory & performance (embedded-target relevant)

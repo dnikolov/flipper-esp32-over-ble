@@ -16,3 +16,6 @@ docs/references/flipper-firmware/upstream/
 
 # Claude Code runtime state
 .claude/scheduled_tasks.lock
+
+# Captured tool output (e.g. flash logs) -- never tracked
+*_output.txt

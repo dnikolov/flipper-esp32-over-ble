@@ -28,10 +28,20 @@ Longer term these modules belong in a shared component (docs/HARDENING_PLAN.md H
 Usage: python tools/check_shared_headers.py
 Exit code 0 if every pair and every per-board module matches, 1 on any mismatch or a missing
 per-board file.
+
+--changed: only check groups (a HEADER_PAIRS pair, or one BOARD_IDENTICAL/BOARD_EQUIVALENT
+module across its three board copies) where at least one member file differs from git HEAD
+(tracked changes via `git diff --name-only HEAD`, plus untracked files via
+`git ls-files --others --exclude-standard`). Prints MISMATCH blocks only -- no OK/INFO lines --
+plus a one-line summary of how many groups were touched and how many mismatched. Intended for
+staged multi-board rollouts where most groups are untouched and reprinting every OK line is
+pure noise; the plain (no-flag) invocation is unchanged and remains the full report.
 """
 
+import argparse
 import hashlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -211,31 +221,77 @@ def compare_board_module(name, identical):
     return problems, info
 
 
+def get_changed_files():
+    changed = set()
+    for cmd in (
+        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ):
+        try:
+            out = subprocess.run(
+                cmd, cwd=ROOT, capture_output=True, text=True, check=True
+            ).stdout
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        changed.update(line.strip() for line in out.splitlines() if line.strip())
+    return {c.replace("\\", "/") for c in changed}
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--changed",
+        action="store_true",
+        help="only check groups touching a file that differs from git HEAD (tracked + "
+        "untracked); print MISMATCH lines and a one-line summary only",
+    )
+    args = parser.parse_args()
+
+    changed_files = get_changed_files() if args.changed else None
+
     any_problems = False
+    touched = 0
+    mismatched = 0
+
     for path_a, path_b in HEADER_PAIRS:
+        if changed_files is not None and not ({path_a, path_b} & changed_files):
+            continue
+        touched += 1
         problems = compare(path_a, path_b)
         if problems:
             any_problems = True
+            mismatched += 1
             print(f"MISMATCH: {path_a} <-> {path_b}")
             for p in problems:
                 print(p)
-        else:
+        elif not args.changed:
             print(f"OK: {path_a} <-> {path_b}")
 
     for names, identical in ((BOARD_IDENTICAL, True), (BOARD_EQUIVALENT, False)):
         for name in names:
+            if changed_files is not None:
+                board_paths = {f"{b}/main/{name}" for b in BOARDS}
+                if not (board_paths & changed_files):
+                    continue
+            touched += 1
             problems, info = compare_board_module(name, identical)
             label = f"{'/'.join(BOARDS)} main/{name}" + (" [byte-identical]" if identical else "")
             if problems:
                 any_problems = True
+                mismatched += 1
                 print(f"MISMATCH: {label}")
                 for p in problems:
                     print(p)
-            else:
+                for line in info:
+                    print(line)
+            elif not args.changed:
                 print(f"OK: {label}")
-            for line in info:
-                print(line)
+                for line in info:
+                    print(line)
+
+    if args.changed:
+        print(f"--changed: {touched} group(s) touched, {mismatched} mismatch(es)")
+        return 1 if any_problems else 0
 
     if any_problems:
         print(

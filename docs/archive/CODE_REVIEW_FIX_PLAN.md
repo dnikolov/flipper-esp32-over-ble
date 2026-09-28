@@ -18,7 +18,7 @@ out of scope — see "Non-goals" at the end.
 ## Read first
 
 - [CODE_REVIEW_FINDINGS.md](CODE_REVIEW_FINDINGS.md) — findings #1, #2, #3, #4, #9, #10.
-- [PROTOCOL.md](PROTOCOL.md) — "Canonical CBOR encoding (definition)" and "Cryptographic
+- [PROTOCOL.md](../PROTOCOL.md) — "Canonical CBOR encoding (definition)" and "Cryptographic
   requirements"; W2 and W6 add to the former.
 - `CLAUDE.md` "Conventions" — in particular: a wire-format change is not done until both sides
   implement it identically and both build.

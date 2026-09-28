@@ -6,7 +6,9 @@ Host-native unit tests for the framing (`framing.c`/`.h`) and canonical-CBOR
 `cbor_primitives.c`/`.h`, `cbor_records.c`/`.h`, `cbor_wifi_scan.c`/`.h`,
 `cbor_ble_scan.c`/`.h`, `cbor_wardriving.c`/`.h`) modules — see
 [docs/PLAN.md](../docs/PLAN.md) step 3 and [docs/PROTOCOL.md](../docs/PROTOCOL.md). No
-board required; built and run with MSVC (`cl.exe`) on the host.
+board required; built and run with MSVC (`cl.exe`) on the host. To run all suites at once
+with compact pass/fail output, use `.claude/skills/build-verify/scripts/run_hosttests.ps1`
+(the `build-verify` skill's `hosttests` target).
 
 - `vectors/generate_vectors.py` — generates `vectors/vectors.h` directly from the
   canonical-encoding rules in PROTOCOL.md (not from either firmware's codec). Re-run

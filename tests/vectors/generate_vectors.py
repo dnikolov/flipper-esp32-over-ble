@@ -170,7 +170,7 @@ oversized_payload_record = unencrypted_record(2, "error", SESSION_ID, BOARD_ID, 
 assert len(oversized_payload) > 512, "vector must actually exceed FEB_CBOR_MAX_PAYLOAD"
 
 
-# ---- Code-review fix-plan vectors (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6): direct
+# ---- Code-review fix-plan vectors (docs/archive/CODE_REVIEW_FIX_PLAN.md W1-W3, W6): direct
 # feb_cbor_skip_value() cases plus full-record wrappers exercising the same shapes through
 # feb_cbor_decode_unencrypted(), so a decoder-level regression and a skip_value-level
 # regression are both caught by a status-code equality check on both firmwares. ----
@@ -1461,7 +1461,7 @@ with open("vectors.h", "w") as f:
     f.write(c_bytes("FEB_VEC_OVERSIZED_PAYLOAD_RECORD", oversized_payload_record))
     f.write("\n")
 
-    f.write("/* ---- Code-review fix-plan vectors (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6):\n")
+    f.write("/* ---- Code-review fix-plan vectors (docs/archive/CODE_REVIEW_FIX_PLAN.md W1-W3, W6):\n")
     f.write("   direct feb_cbor_skip_value() cases, plus the same shapes wrapped as a payload\n")
     f.write("   span and run through feb_cbor_decode_unencrypted(). ---- */\n")
     f.write(c_bytes("FEB_VEC_SKIP_NEGINT", skip_negint))

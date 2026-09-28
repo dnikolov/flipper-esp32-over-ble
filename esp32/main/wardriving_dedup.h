@@ -8,7 +8,7 @@
    type discriminator, which let a WiFi and a BLE address alias to the same slot
    (former docs/BACKLOG.md G22). Sizes are picked against a real field capture that
    saw 517 distinct addresses in one session (172 WiFi, 345 BLE;
-   docs/grok-4.6-findings-2026-09-11.md), not the prior "~64 active devices per
+   docs/archive/grok-4.6-findings-2026-09-11.md), not the prior "~64 active devices per
    type" guess, which assumed a small working set that depended on the table being
    wiped often (see the G35 scope note below — no longer true). Each table probes
    linearly on an FNV-1a hash of the address, so a same-type hash collision no

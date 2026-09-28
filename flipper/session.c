@@ -306,7 +306,7 @@ size_t feb_session_encode_transcript(uint8_t* out, size_t out_cap, const feb_ses
    bytes. `s` is S as produced by feb_session_encode_transcript(), so label_len + s_len is
    always within this function's fixed-size local buffer given FEB_SESSION_LABEL_MAX_LEN
    and FEB_SESSION_MAX_TRANSCRIPT_LEN; an over-length input zeroes `out` instead of being
-   clamped, matching the ESP32's feb_session_hmac_label() (docs/CODE_REVIEW_FIX_PLAN.md D4,
+   clamped, matching the ESP32's feb_session_hmac_label() (docs/archive/CODE_REVIEW_FIX_PLAN.md D4,
    HP-37) -- a wrong-but-plausible truncated-input proof would present as an unexplained
    mismatch, whereas an all-zero proof fails verification immediately and visibly. */
 static void session_proof_tag(

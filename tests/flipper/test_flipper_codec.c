@@ -236,7 +236,7 @@ static void test_malformed_cbor(
     CHECK(status == expected, desc);
 }
 
-/* docs/CODE_REVIEW_FIX_PLAN.md W1-W3: feb_cbor_skip_value() itself has zero direct test
+/* docs/archive/CODE_REVIEW_FIX_PLAN.md W1-W3: feb_cbor_skip_value() itself has zero direct test
    coverage prior to this pass; these call it directly rather than only through envelope
    decoding of well-formed payloads. */
 static void test_skip_value_direct(void) {
@@ -270,7 +270,7 @@ static void test_skip_value_direct(void) {
 }
 
 /* Same shapes as above, wrapped as a real payload span and decoded through the full
-   envelope decoder (docs/CODE_REVIEW_FIX_PLAN.md W1-W3, W6). */
+   envelope decoder (docs/archive/CODE_REVIEW_FIX_PLAN.md W1-W3, W6). */
 static void test_payload_type_depth_and_trailing(void) {
     feb_unencrypted_record_t record;
     feb_cbor_status_t status;

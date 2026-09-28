@@ -1,0 +1,16 @@
+# Normalizes this project's cross-board shared C sources/headers (and the Python scripts that
+# generate/verify them) to LF checkouts, so the byte-identical esp32/esp32c5/heltec/flipper
+# copies tools/check_shared_headers.py compares stop producing CRLF warnings on every git
+# command (docs/TOOLING_PLAN.md TP-12). Verified 2026-09-28: every tracked .c/.h/.py file
+# already stores LF in the index (`git ls-files --eol`), so this only changes future
+# working-tree checkouts, not the index -- no renormalization was needed or performed.
+#
+# Windows-only tooling (build/flash/flash-verify wrapper scripts) is left alone: these are
+# edited and run on Windows exclusively, so CRLF is the natural, expected line ending here,
+# not something to normalize away.
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
