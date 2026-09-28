@@ -109,3 +109,18 @@ bool feb_mesh_log_parse_line(const char* line, size_t line_len, feb_mesh_node_en
     out->lon = lon;
     return true;
 }
+
+void feb_mesh_node_entry_to_display(
+    const feb_mesh_node_entry_t* src, feb_mesh_node_display_entry_t* dst) {
+    memcpy(dst->node_id, src->node_id, sizeof(dst->node_id));
+    memcpy(dst->network, src->network, sizeof(dst->network));
+    /* (double)N casts, not N.0/1eN literals -- this target's FBT build defaults floating
+       literals to `float` (`-fsingle-precision-constant`-equivalent), so an undecorated
+       literal in a double expression trips -Werror=double-promotion; an explicit cast is not
+       an implicit promotion. Matches wardriving_csv.c's own established idiom for the same
+       lat/lon e7 arithmetic. */
+    double lat_e7 = src->lat * (double)10000000;
+    double lon_e7 = src->lon * (double)10000000;
+    dst->lat_e7 = (int32_t)(lat_e7 >= (double)0 ? lat_e7 + (double)0.5 : lat_e7 - (double)0.5);
+    dst->lon_e7 = (int32_t)(lon_e7 >= (double)0 ? lon_e7 + (double)0.5 : lon_e7 - (double)0.5);
+}

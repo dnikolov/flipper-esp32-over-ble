@@ -455,6 +455,82 @@ static void test_wifi_scan_result_payload_codec(void) {
     }
 }
 
+/* ---- streaming decode (docs/HARDENING_BACKLOG.md H04) -- one-AP-at-a-time counterpart to
+   feb_cbor_decode_wifi_scan_result_payload() above. Confirms: (1) a well-formed batch's
+   streaming decode matches the whole-array decode exactly, element-by-element, in order; (2)
+   a batch that's malformed partway through fails identically on both decoders and invokes the
+   streaming callback zero times -- no partial prefix of a batch that turns out invalid. */
+#define WIFI_SCAN_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_wifi_scan_ap_t aps[WIFI_SCAN_STREAM_CAPTURE_MAX];
+    size_t count;
+} wifi_scan_stream_capture_t;
+
+static void wifi_scan_stream_capture_cb(const feb_wifi_scan_ap_t* ap, void* ctx) {
+    wifi_scan_stream_capture_t* cap = (wifi_scan_stream_capture_t*)ctx;
+    if(cap->count < WIFI_SCAN_STREAM_CAPTURE_MAX) {
+        cap->aps[cap->count++] = *ap;
+    }
+}
+
+static void test_wifi_scan_result_payload_stream(void) {
+    feb_wifi_scan_result_payload_t whole;
+    feb_cbor_status_t whole_status = feb_cbor_decode_wifi_scan_result_payload(
+        FEB_VEC_WIFI_SCAN_RESULT_MULTI, FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN, &whole);
+    CHECK(
+        whole_status == FEB_CBOR_OK && whole.ap_count == 3,
+        "WIFI_SCAN_STREAM: whole-array baseline decodes 3 APs");
+
+    wifi_scan_stream_capture_t cap;
+    memset(&cap, 0, sizeof(cap));
+    size_t ap_count_out = 0;
+    feb_cbor_status_t stream_status = feb_cbor_decode_wifi_scan_result_payload_stream(
+        FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+        FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN,
+        wifi_scan_stream_capture_cb,
+        &cap,
+        &ap_count_out);
+    CHECK(stream_status == FEB_CBOR_OK, "WIFI_SCAN_STREAM: streaming decode status OK");
+    CHECK(
+        ap_count_out == 3 && cap.count == 3,
+        "WIFI_SCAN_STREAM: streaming decode reports/captures 3 APs");
+    CHECK(
+        cap.aps[0].channel == whole.aps[0].channel && cap.aps[1].channel == whole.aps[1].channel &&
+            cap.aps[2].channel == whole.aps[2].channel,
+        "WIFI_SCAN_STREAM: captured APs match whole-array decode, in order (channel)");
+    CHECK(
+        cap.aps[0].ssid_len == whole.aps[0].ssid_len &&
+            memcmp(cap.aps[0].ssid, whole.aps[0].ssid, cap.aps[0].ssid_len) == 0,
+        "WIFI_SCAN_STREAM: captured AP0 ssid matches whole-array decode");
+
+    /* Truncate the last byte of the 3-AP vector, landing inside the 3rd AP's trailing `auth`
+       field. */
+    size_t truncated_len = FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN - 1;
+    feb_wifi_scan_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status = feb_cbor_decode_wifi_scan_result_payload(
+        FEB_VEC_WIFI_SCAN_RESULT_MULTI, truncated_len, &whole_truncated);
+    CHECK(
+        whole_truncated_status != FEB_CBOR_OK,
+        "WIFI_SCAN_STREAM: whole-array decode of a truncated 3-AP batch fails");
+
+    wifi_scan_stream_capture_t cap_truncated;
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    size_t ap_count_out_truncated = 123; /* poisoned; must come back 0 */
+    feb_cbor_status_t stream_truncated_status = feb_cbor_decode_wifi_scan_result_payload_stream(
+        FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+        truncated_len,
+        wifi_scan_stream_capture_cb,
+        &cap_truncated,
+        &ap_count_out_truncated);
+    CHECK(
+        stream_truncated_status == whole_truncated_status,
+        "WIFI_SCAN_STREAM: streaming decode of the same truncated batch fails with the same status");
+    CHECK(
+        cap_truncated.count == 0 && ap_count_out_truncated == 0,
+        "WIFI_SCAN_STREAM: a malformed batch invokes the callback zero times (no partial prefix)");
+}
+
 static void test_command_payload_codec(void) {
     /* valid: empty arguments */
     {
@@ -733,6 +809,88 @@ static void test_ble_scan_result_payload_codec(void) {
         CHECK(status == FEB_CBOR_OK, "BLE_RESULT_EMPTY: decode status OK");
         CHECK(decoded.device_count == 0, "BLE_RESULT_EMPTY: device_count == 0");
     }
+}
+
+/* ---- streaming decode (docs/HARDENING_BACKLOG.md H04) -- same contract as
+   test_wifi_scan_result_payload_stream() above. */
+#define BLE_SCAN_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_ble_scan_device_t devices[BLE_SCAN_STREAM_CAPTURE_MAX];
+    size_t count;
+} ble_scan_stream_capture_t;
+
+static void ble_scan_stream_capture_cb(const feb_ble_scan_device_t* device, void* ctx) {
+    ble_scan_stream_capture_t* cap = (ble_scan_stream_capture_t*)ctx;
+    if(cap->count < BLE_SCAN_STREAM_CAPTURE_MAX) {
+        cap->devices[cap->count++] = *device;
+    }
+}
+
+static void test_ble_scan_result_payload_stream(void) {
+    feb_ble_scan_device_t device1, device2;
+    memset(&device1, 0, sizeof(device1));
+    memset(&device2, 0, sizeof(device2));
+    static const uint8_t addr1[FEB_BLE_SCAN_ADDRESS_LEN] = {1, 2, 3, 4, 5, 6};
+    static const uint8_t addr2[FEB_BLE_SCAN_ADDRESS_LEN] = {6, 5, 4, 3, 2, 1};
+    memcpy(device1.address, addr1, FEB_BLE_SCAN_ADDRESS_LEN);
+    device1.name = "Alpha";
+    device1.name_len = strlen(device1.name);
+    device1.has_name = 1;
+    device1.rssi_offset = 90;
+    device1.addr_type = "public";
+    device1.addr_type_len = strlen(device1.addr_type);
+
+    memcpy(device2.address, addr2, FEB_BLE_SCAN_ADDRESS_LEN);
+    device2.has_name = 0;
+    device2.rssi_offset = 40;
+    device2.addr_type = "random";
+    device2.addr_type_len = strlen(device2.addr_type);
+
+    feb_ble_scan_result_payload_t payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.devices[0] = device1;
+    payload.devices[1] = device2;
+    payload.device_count = 2;
+
+    uint8_t out[256];
+    size_t out_len = feb_cbor_encode_ble_scan_result_payload(out, sizeof(out), &payload);
+    CHECK(out_len > 0, "BLE_SCAN_STREAM: encode succeeds");
+
+    ble_scan_stream_capture_t cap;
+    memset(&cap, 0, sizeof(cap));
+    size_t device_count_out = 0;
+    feb_cbor_status_t stream_status = feb_cbor_decode_ble_scan_result_payload_stream(
+        out, out_len, ble_scan_stream_capture_cb, &cap, &device_count_out);
+    CHECK(stream_status == FEB_CBOR_OK, "BLE_SCAN_STREAM: streaming decode status OK");
+    CHECK(
+        device_count_out == 2 && cap.count == 2,
+        "BLE_SCAN_STREAM: streaming decode reports/captures 2 devices");
+    CHECK(cap.devices[0].has_name == 1, "BLE_SCAN_STREAM: captured device0 has_name");
+    CHECK(cap.devices[1].has_name == 0, "BLE_SCAN_STREAM: captured device1 has no name");
+    CHECK(
+        cap.devices[0].rssi_offset == 90 && cap.devices[1].rssi_offset == 40,
+        "BLE_SCAN_STREAM: captured rssi_offset matches, in order");
+
+    size_t truncated_len = out_len - 1;
+    feb_ble_scan_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status =
+        feb_cbor_decode_ble_scan_result_payload(out, truncated_len, &whole_truncated);
+    CHECK(
+        whole_truncated_status != FEB_CBOR_OK,
+        "BLE_SCAN_STREAM: whole-array decode of a truncated batch fails");
+
+    ble_scan_stream_capture_t cap_truncated;
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    size_t device_count_out_truncated = 123;
+    feb_cbor_status_t stream_truncated_status = feb_cbor_decode_ble_scan_result_payload_stream(
+        out, truncated_len, ble_scan_stream_capture_cb, &cap_truncated, &device_count_out_truncated);
+    CHECK(
+        stream_truncated_status == whole_truncated_status,
+        "BLE_SCAN_STREAM: streaming decode of the same truncated batch fails with the same status");
+    CHECK(
+        cap_truncated.count == 0 && device_count_out_truncated == 0,
+        "BLE_SCAN_STREAM: a malformed batch invokes the callback zero times (no partial prefix)");
 }
 
 /* ---- wardriving payload codecs (docs/PROTOCOL.md "`wardriving` command and status
@@ -1116,6 +1274,123 @@ static void test_wardriving_record_and_status_result_codec(void) {
         CHECK(reparsed_status == FEB_CBOR_OK, "WARDRIVING_STATUS_DATA: nested result re-decodes OK");
         CHECK(reparsed.record_count == 2, "WARDRIVING_STATUS_DATA: nested result has 2 records");
     }
+}
+
+/* ---- streaming decode (docs/HARDENING_BACKLOG.md H04) -- one-record-at-a-time counterpart
+   to feb_cbor_decode_wardriving_status_result_payload() above, same contract as
+   test_wifi_scan_result_payload_stream()'s own comment. The truncation case here is chosen
+   deliberately to land inside the trailing `backlog_remaining` field, AFTER both records
+   already decode cleanly on their own -- the specific shape this decoder's two-pass
+   validate-then-apply design exists for (a single-pass streaming decoder would have already
+   invoked the callback for both records before ever reaching the broken tail). */
+#define WARDRIVING_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_wardriving_record_t records[WARDRIVING_STREAM_CAPTURE_MAX];
+    size_t count;
+} wardriving_stream_capture_t;
+
+static void wardriving_stream_capture_cb(const feb_wardriving_record_t* record, void* ctx) {
+    wardriving_stream_capture_t* cap = (wardriving_stream_capture_t*)ctx;
+    if(cap->count < WARDRIVING_STREAM_CAPTURE_MAX) {
+        cap->records[cap->count++] = *record;
+    }
+}
+
+static void test_wardriving_status_result_payload_stream(void) {
+    feb_wardriving_record_t wifi_record;
+    memset(&wifi_record, 0, sizeof(wifi_record));
+    wifi_record.timestamp_ms = 12345;
+    wifi_record.utc_timestamp_s = 1700000000;
+    wifi_record.lat_e7_offset = 900000000u + 12345678u;
+    wifi_record.lon_e7_offset = 1800000000u + 98765432u;
+    wifi_record.source = "wifi";
+    wifi_record.source_len = strlen(wifi_record.source);
+    static const uint8_t stream_bssid[FEB_WIFI_SCAN_BSSID_LEN] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
+    wifi_record.payload_kind = FEB_WARDRIVING_PAYLOAD_WIFI;
+    wifi_record.payload.wifi.ssid = (const uint8_t*)"TestAP";
+    wifi_record.payload.wifi.ssid_len = strlen("TestAP");
+    memcpy(wifi_record.payload.wifi.bssid, stream_bssid, FEB_WIFI_SCAN_BSSID_LEN);
+    wifi_record.payload.wifi.rssi_offset = 78;
+    wifi_record.payload.wifi.channel = 6;
+    wifi_record.payload.wifi.auth = "wpa2_psk";
+    wifi_record.payload.wifi.auth_len = strlen(wifi_record.payload.wifi.auth);
+
+    feb_wardriving_record_t ble_record;
+    memset(&ble_record, 0, sizeof(ble_record));
+    ble_record.timestamp_ms = 67890;
+    ble_record.utc_timestamp_s = 1700000123;
+    ble_record.lat_e7_offset = 900000000u + 11111111u;
+    ble_record.lon_e7_offset = 1800000000u + 22222222u;
+    ble_record.source = "ble";
+    ble_record.source_len = strlen(ble_record.source);
+    static const uint8_t stream_ble_addr[FEB_BLE_SCAN_ADDRESS_LEN] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16};
+    ble_record.payload_kind = FEB_WARDRIVING_PAYLOAD_BLE;
+    memcpy(ble_record.payload.ble.address, stream_ble_addr, FEB_BLE_SCAN_ADDRESS_LEN);
+    ble_record.payload.ble.name = "Widget";
+    ble_record.payload.ble.name_len = strlen(ble_record.payload.ble.name);
+    ble_record.payload.ble.has_name = 1;
+    ble_record.payload.ble.rssi_offset = 100;
+
+    feb_wardriving_status_result_payload_t payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.records[0] = wifi_record;
+    payload.records[1] = ble_record;
+    payload.record_count = 2;
+    payload.backlog_remaining = 5;
+
+    uint8_t out[512];
+    size_t out_len = feb_cbor_encode_wardriving_status_result_payload(out, sizeof(out), &payload);
+    CHECK(out_len > 0, "WARDRIVING_STREAM: encode succeeds");
+
+    wardriving_stream_capture_t cap;
+    memset(&cap, 0, sizeof(cap));
+    uint64_t backlog_remaining_out = 0;
+    feb_cbor_status_t stream_status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        out, out_len, wardriving_stream_capture_cb, &cap, &backlog_remaining_out);
+    CHECK(stream_status == FEB_CBOR_OK, "WARDRIVING_STREAM: streaming decode status OK");
+    CHECK(cap.count == 2, "WARDRIVING_STREAM: streaming decode captures 2 records");
+    CHECK(backlog_remaining_out == 5, "WARDRIVING_STREAM: streaming decode reports backlog_remaining == 5");
+    CHECK(
+        cap.records[0].payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI &&
+            cap.records[1].payload_kind == FEB_WARDRIVING_PAYLOAD_BLE,
+        "WARDRIVING_STREAM: captured records match encode order (wifi then ble)");
+    CHECK(
+        cap.records[0].payload.wifi.ssid_len == strlen("TestAP") &&
+            memcmp(cap.records[0].payload.wifi.ssid, "TestAP", cap.records[0].payload.wifi.ssid_len) == 0,
+        "WARDRIVING_STREAM: captured record0 ssid matches");
+    CHECK(
+        cap.records[1].payload.ble.has_name == 1 &&
+            cap.records[1].payload.ble.name_len == strlen("Widget") &&
+            memcmp(cap.records[1].payload.ble.name, "Widget", cap.records[1].payload.ble.name_len) == 0,
+        "WARDRIVING_STREAM: captured record1 name matches");
+
+    /* Truncate the last byte, landing inside backlog_remaining's own encoding -- both
+       records still decode cleanly on their own. */
+    size_t truncated_len = out_len - 1;
+    feb_wardriving_status_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status =
+        feb_cbor_decode_wardriving_status_result_payload(out, truncated_len, &whole_truncated);
+    CHECK(
+        whole_truncated_status != FEB_CBOR_OK,
+        "WARDRIVING_STREAM: whole-array decode of a truncated batch (bad trailing backlog_remaining) fails");
+
+    wardriving_stream_capture_t cap_truncated;
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    uint64_t backlog_remaining_out_truncated = 123;
+    feb_cbor_status_t stream_truncated_status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        out,
+        truncated_len,
+        wardriving_stream_capture_cb,
+        &cap_truncated,
+        &backlog_remaining_out_truncated);
+    CHECK(
+        stream_truncated_status == whole_truncated_status,
+        "WARDRIVING_STREAM: streaming decode of the same truncated batch fails with the same status");
+    CHECK(
+        cap_truncated.count == 0 && backlog_remaining_out_truncated == 0,
+        "WARDRIVING_STREAM: a malformed trailing field invokes the callback zero times even though "
+        "both records were individually well-formed (two-pass validate-then-apply contract)");
 }
 
 /* ---- shared cross-firmware vectors (tests/vectors/vectors.h), <wardriving-record> with
@@ -2102,6 +2377,63 @@ static void test_mesh_nodes_line_roundtrip(void) {
         "MESH_NODES_LINE: a line with fewer than 4 pipe-delimited fields is rejected");
 }
 
+/* ---- feb_mesh_node_entry_to_display() (docs/HARDENING_BACKLOG.md H04) -- the Mesh Log
+   screen's display-only int32_t-e7 struct, replacing a two-double struct at the same
+   MESH_LOG_DISPLAY_MAX_NODES(64) capacity. The whole point of storing e7 ints instead of a
+   `double` (or, worse, a `float` -- see H04's own note) is that reconstructing a double from
+   the stored e7 value at draw time and formatting it with "%.5f" must produce byte-identical
+   output to formatting the ORIGINAL double directly -- checked here across a spread of
+   realistic-magnitude values, including ones near a %.5f rounding boundary, not just the one
+   value test_mesh_nodes_line_roundtrip() above already exercises. */
+static void test_mesh_nodes_display_entry_conversion(void) {
+    feb_mesh_node_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    strcpy(entry.node_id, "aabbccddeeff0011");
+    strcpy(entry.network, "meshcore");
+    entry.lat = 42.3601000;
+    entry.lon = -7.1058929;
+
+    feb_mesh_node_display_entry_t display;
+    feb_mesh_node_entry_to_display(&entry, &display);
+    CHECK(
+        strcmp(display.node_id, "aabbccddeeff0011") == 0 && strcmp(display.network, "meshcore") == 0,
+        "MESH_NODES_DISPLAY: node_id/network copied");
+    CHECK(display.lat_e7 == 423601000, "MESH_NODES_DISPLAY: lat_e7 == 423601000 (exact e7 conversion)");
+    CHECK(display.lon_e7 == -71058929, "MESH_NODES_DISPLAY: lon_e7 == -71058929 (exact e7 conversion)");
+
+    static const double stream_lat_samples[] = {
+        42.3601000, -7.1058929, 0.0, 89.999995, -89.999994, 0.000005, -0.000005, 51.500000};
+    static const double stream_lon_samples[] = {
+        -7.1058929, 179.999995, -179.999994, 0.0, 0.000005, -0.000005, 23.323230, -122.083922};
+    for(size_t i = 0; i < sizeof(stream_lat_samples) / sizeof(stream_lat_samples[0]); i++) {
+        feb_mesh_node_entry_t src;
+        memset(&src, 0, sizeof(src));
+        strcpy(src.node_id, "n");
+        strcpy(src.network, "meshcore");
+        src.lat = stream_lat_samples[i];
+        src.lon = stream_lon_samples[i];
+
+        feb_mesh_node_display_entry_t disp;
+        feb_mesh_node_entry_to_display(&src, &disp);
+
+        char expected[32];
+        snprintf(expected, sizeof(expected), "%.5f,%.5f", src.lat, src.lon);
+
+        double reconstructed_lat = (double)disp.lat_e7 / 10000000.0;
+        double reconstructed_lon = (double)disp.lon_e7 / 10000000.0;
+        char actual[32];
+        snprintf(actual, sizeof(actual), "%.5f,%.5f", reconstructed_lat, reconstructed_lon);
+
+        char check_name[96];
+        snprintf(
+            check_name,
+            sizeof(check_name),
+            "MESH_NODES_DISPLAY: sample %u e7 round-trip matches %%.5f exactly",
+            (unsigned)i);
+        CHECK(strcmp(expected, actual) == 0, check_name);
+    }
+}
+
 /* HP-25/HP-26/HP-38 shared-layer strictness (tests/vectors/vectors.h). Same expected status
    on both firmwares, independent of size_t width. */
 static void test_shared_strictness_vectors(void) {
@@ -2263,14 +2595,17 @@ int main(void) {
 
     test_wifi_scan_ap_codec();
     test_wifi_scan_result_payload_codec();
+    test_wifi_scan_result_payload_stream();
     test_command_payload_codec();
     test_status_payload_codec();
 
     test_ble_scan_device_codec();
     test_ble_scan_result_payload_codec();
+    test_ble_scan_result_payload_stream();
     test_wardriving_command_payload_codec();
     test_wardriving_record_and_status_result_codec();
     test_wardriving_record_and_status_result_vectors();
+    test_wardriving_status_result_payload_stream();
 
     test_gps_status_result_payload_codec();
     test_gps_payload_vectors();
@@ -2287,6 +2622,7 @@ int main(void) {
     test_mesh_log_record_vectors();
     test_mesh_log_status_vectors();
     test_mesh_nodes_line_roundtrip();
+    test_mesh_nodes_display_entry_conversion();
     test_shared_strictness_vectors();
 
     printf("\n%d/%d checks passed\n", g_total - g_failed, g_total);

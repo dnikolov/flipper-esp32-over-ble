@@ -333,6 +333,79 @@ static void test_wifi_scan_result_payload(void)
           "wifi_scan result (empty): encode round-trip byte-identical");
 }
 
+/* Streaming decode (docs/HARDENING_BACKLOG.md H04): one-AP-at-a-time counterpart to
+   feb_cbor_decode_wifi_scan_result_payload() above. Confirms a well-formed batch matches the
+   whole-array decode element-by-element, and a batch malformed partway through fails
+   identically on both decoders with zero callback invocations -- no partial prefix of a batch
+   that turns out invalid. */
+#define WIFI_SCAN_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_wifi_scan_ap_t aps[WIFI_SCAN_STREAM_CAPTURE_MAX];
+    size_t count;
+} wifi_scan_stream_capture_t;
+
+static void wifi_scan_stream_capture_cb(const feb_wifi_scan_ap_t *ap, void *ctx)
+{
+    wifi_scan_stream_capture_t *cap = (wifi_scan_stream_capture_t *)ctx;
+
+    if (cap->count < WIFI_SCAN_STREAM_CAPTURE_MAX) {
+        cap->aps[cap->count++] = *ap;
+    }
+}
+
+static void test_wifi_scan_result_payload_stream(void)
+{
+    feb_wifi_scan_result_payload_t whole;
+    feb_cbor_status_t whole_status;
+    wifi_scan_stream_capture_t cap;
+    feb_cbor_status_t stream_status;
+    size_t ap_count_out;
+    size_t truncated_len;
+    feb_wifi_scan_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status;
+    wifi_scan_stream_capture_t cap_truncated;
+    size_t ap_count_out_truncated;
+
+    whole_status = feb_cbor_decode_wifi_scan_result_payload(FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+                                                              FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN, &whole);
+    check(whole_status == FEB_CBOR_OK && whole.ap_count == 3,
+          "wifi_scan result stream: whole-array baseline decodes 3 APs");
+
+    memset(&cap, 0, sizeof(cap));
+    ap_count_out = 0;
+    stream_status = feb_cbor_decode_wifi_scan_result_payload_stream(FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+                                                                      FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN,
+                                                                      wifi_scan_stream_capture_cb, &cap,
+                                                                      &ap_count_out);
+    check(stream_status == FEB_CBOR_OK, "wifi_scan result stream: streaming decode status OK");
+    check(ap_count_out == 3 && cap.count == 3,
+          "wifi_scan result stream: streaming decode reports/captures 3 APs");
+    check(cap.aps[0].channel == whole.aps[0].channel && cap.aps[1].channel == whole.aps[1].channel &&
+          cap.aps[2].channel == whole.aps[2].channel,
+          "wifi_scan result stream: captured APs match whole-array decode, in order (channel)");
+    check(cap.aps[0].ssid_len == whole.aps[0].ssid_len &&
+          memcmp(cap.aps[0].ssid, whole.aps[0].ssid, cap.aps[0].ssid_len) == 0,
+          "wifi_scan result stream: captured AP0 ssid matches whole-array decode");
+
+    /* Truncate the last byte, landing inside the 3rd AP's trailing `auth` field. */
+    truncated_len = FEB_VEC_WIFI_SCAN_RESULT_MULTI_LEN - 1;
+    whole_truncated_status = feb_cbor_decode_wifi_scan_result_payload(FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+                                                                       truncated_len, &whole_truncated);
+    check(whole_truncated_status != FEB_CBOR_OK,
+          "wifi_scan result stream: whole-array decode of a truncated 3-AP batch fails");
+
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    ap_count_out_truncated = 123; /* poisoned; must come back 0 */
+    stream_status = feb_cbor_decode_wifi_scan_result_payload_stream(FEB_VEC_WIFI_SCAN_RESULT_MULTI,
+                                                                      truncated_len, wifi_scan_stream_capture_cb,
+                                                                      &cap_truncated, &ap_count_out_truncated);
+    check(stream_status == whole_truncated_status,
+          "wifi_scan result stream: streaming decode of the same truncated batch fails with the same status");
+    check(cap_truncated.count == 0 && ap_count_out_truncated == 0,
+          "wifi_scan result stream: a malformed batch invokes the callback zero times (no partial prefix)");
+}
+
 static void test_wifi_scan_command_payload(void)
 {
     feb_command_payload_t cmd;
@@ -473,6 +546,65 @@ static void test_ble_scan_result_payload(void)
     encoded_len = feb_cbor_encode_ble_scan_result_payload(encode_buf, sizeof(encode_buf), &result);
     check(bytes_eq(encode_buf, encoded_len, FEB_VEC_BLE_SCAN_RESULT_EMPTY, FEB_VEC_BLE_SCAN_RESULT_EMPTY_LEN),
           "ble_scan result (empty): encode round-trip byte-identical");
+}
+
+/* Streaming decode (docs/HARDENING_BACKLOG.md H04) -- same contract as
+   test_wifi_scan_result_payload_stream() above. */
+#define BLE_SCAN_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_ble_scan_device_t devices[BLE_SCAN_STREAM_CAPTURE_MAX];
+    size_t count;
+} ble_scan_stream_capture_t;
+
+static void ble_scan_stream_capture_cb(const feb_ble_scan_device_t *device, void *ctx)
+{
+    ble_scan_stream_capture_t *cap = (ble_scan_stream_capture_t *)ctx;
+
+    if (cap->count < BLE_SCAN_STREAM_CAPTURE_MAX) {
+        cap->devices[cap->count++] = *device;
+    }
+}
+
+static void test_ble_scan_result_payload_stream(void)
+{
+    ble_scan_stream_capture_t cap;
+    feb_cbor_status_t stream_status;
+    size_t device_count_out;
+    size_t truncated_len;
+    feb_ble_scan_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status;
+    ble_scan_stream_capture_t cap_truncated;
+    size_t device_count_out_truncated;
+
+    memset(&cap, 0, sizeof(cap));
+    device_count_out = 0;
+    stream_status = feb_cbor_decode_ble_scan_result_payload_stream(FEB_VEC_BLE_SCAN_RESULT_MULTI,
+                                                                     FEB_VEC_BLE_SCAN_RESULT_MULTI_LEN,
+                                                                     ble_scan_stream_capture_cb, &cap,
+                                                                     &device_count_out);
+    check(stream_status == FEB_CBOR_OK, "ble_scan result stream: streaming decode status OK");
+    check(device_count_out == 2 && cap.count == 2,
+          "ble_scan result stream: streaming decode reports/captures 2 devices");
+    check(cap.devices[1].has_name == 0,
+          "ble_scan result stream: captured device 2 has_name is 0 (no name advertised)");
+
+    /* Truncate the last byte of the 2-device vector. */
+    truncated_len = FEB_VEC_BLE_SCAN_RESULT_MULTI_LEN - 1;
+    whole_truncated_status = feb_cbor_decode_ble_scan_result_payload(FEB_VEC_BLE_SCAN_RESULT_MULTI,
+                                                                      truncated_len, &whole_truncated);
+    check(whole_truncated_status != FEB_CBOR_OK,
+          "ble_scan result stream: whole-array decode of a truncated batch fails");
+
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    device_count_out_truncated = 123;
+    stream_status = feb_cbor_decode_ble_scan_result_payload_stream(FEB_VEC_BLE_SCAN_RESULT_MULTI,
+                                                                     truncated_len, ble_scan_stream_capture_cb,
+                                                                     &cap_truncated, &device_count_out_truncated);
+    check(stream_status == whole_truncated_status,
+          "ble_scan result stream: streaming decode of the same truncated batch fails with the same status");
+    check(cap_truncated.count == 0 && device_count_out_truncated == 0,
+          "ble_scan result stream: a malformed batch invokes the callback zero times (no partial prefix)");
 }
 
 static void test_ble_scan_command_payload(void)
@@ -745,6 +877,73 @@ static void test_wardriving_status_result_payload(void)
     ok = (status == FEB_CBOR_OK) && st.request_id == 502 && !st.has_result;
     ok = ok && st.state_len == strlen("stopped") && memcmp(st.state, "stopped", st.state_len) == 0;
     check(ok, "wardriving status (stopped): decodes request_id/state, no result field");
+}
+
+/* Streaming decode (docs/HARDENING_BACKLOG.md H04) -- one-record-at-a-time counterpart to
+   feb_cbor_decode_wardriving_status_result_payload() above, same contract as
+   test_wifi_scan_result_payload_stream()'s own comment. The truncation case here lands inside
+   the trailing `backlog_remaining` field, AFTER both records already decode cleanly on their
+   own -- the specific shape this decoder's two-pass validate-then-apply design exists for (a
+   single-pass streaming decoder would have already invoked the callback for both records
+   before ever reaching the broken tail). */
+#define WARDRIVING_STREAM_CAPTURE_MAX 8u
+
+typedef struct {
+    feb_wardriving_record_t records[WARDRIVING_STREAM_CAPTURE_MAX];
+    size_t count;
+} wardriving_stream_capture_t;
+
+static void wardriving_stream_capture_cb(const feb_wardriving_record_t *record, void *ctx)
+{
+    wardriving_stream_capture_t *cap = (wardriving_stream_capture_t *)ctx;
+
+    if (cap->count < WARDRIVING_STREAM_CAPTURE_MAX) {
+        cap->records[cap->count++] = *record;
+    }
+}
+
+static void test_wardriving_status_result_payload_stream(void)
+{
+    wardriving_stream_capture_t cap;
+    uint64_t backlog_remaining_out;
+    feb_cbor_status_t stream_status;
+    size_t truncated_len;
+    feb_wardriving_status_result_payload_t whole_truncated;
+    feb_cbor_status_t whole_truncated_status;
+    wardriving_stream_capture_t cap_truncated;
+    uint64_t backlog_remaining_out_truncated;
+
+    memset(&cap, 0, sizeof(cap));
+    backlog_remaining_out = 0;
+    stream_status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        FEB_VEC_WARDRIVING_RESULT_MIXED, FEB_VEC_WARDRIVING_RESULT_MIXED_LEN,
+        wardriving_stream_capture_cb, &cap, &backlog_remaining_out);
+    check(stream_status == FEB_CBOR_OK, "wardriving result stream: streaming decode status OK");
+    check(cap.count == 2, "wardriving result stream: streaming decode captures 2 records");
+    check(backlog_remaining_out == 3, "wardriving result stream: streaming decode reports backlog_remaining == 3");
+    check(cap.records[0].payload_kind == FEB_WARDRIVING_PAYLOAD_WIFI &&
+          cap.records[1].payload_kind == FEB_WARDRIVING_PAYLOAD_BLE,
+          "wardriving result stream: captured records match encode order (wifi then ble)");
+
+    /* Truncate the last byte, landing inside backlog_remaining's own encoding -- both
+       records still decode cleanly on their own. */
+    truncated_len = FEB_VEC_WARDRIVING_RESULT_MIXED_LEN - 1;
+    whole_truncated_status = feb_cbor_decode_wardriving_status_result_payload(
+        FEB_VEC_WARDRIVING_RESULT_MIXED, truncated_len, &whole_truncated);
+    check(whole_truncated_status != FEB_CBOR_OK,
+          "wardriving result stream: whole-array decode of a truncated batch (bad trailing "
+          "backlog_remaining) fails");
+
+    memset(&cap_truncated, 0, sizeof(cap_truncated));
+    backlog_remaining_out_truncated = 123;
+    stream_status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        FEB_VEC_WARDRIVING_RESULT_MIXED, truncated_len, wardriving_stream_capture_cb,
+        &cap_truncated, &backlog_remaining_out_truncated);
+    check(stream_status == whole_truncated_status,
+          "wardriving result stream: streaming decode of the same truncated batch fails with the same status");
+    check(cap_truncated.count == 0 && backlog_remaining_out_truncated == 0,
+          "wardriving result stream: a malformed trailing field invokes the callback zero times "
+          "even though both records were individually well-formed (two-pass validate-then-apply)");
 }
 
 /* gps codec vectors (docs/PROTOCOL.md "`gps` command and status payloads", design frozen
@@ -1426,6 +1625,7 @@ int main(void)
                                     "wifi_scan AP3 (rssi_offset=255 boundary, non-UTF-8 SSID, auth=unknown)");
     }
     test_wifi_scan_result_payload();
+    test_wifi_scan_result_payload_stream();
     test_wifi_scan_command_payload();
     test_wifi_scan_status_payload();
 
@@ -1441,12 +1641,14 @@ int main(void)
                                         "ble_scan DEVICE2 (no name, rssi_offset=0 boundary)");
     }
     test_ble_scan_result_payload();
+    test_ble_scan_result_payload_stream();
     test_ble_scan_command_payload();
     test_ble_scan_status_payload();
 
     test_wardriving_command_payload();
     test_wardriving_record_roundtrip();
     test_wardriving_status_result_payload();
+    test_wardriving_status_result_payload_stream();
 
     test_gps_command_payload();
     test_gps_status_payload();

@@ -664,6 +664,20 @@ size_t feb_cbor_encode_wardriving_status_result_payload(
     return pos;
 }
 
+/* feb_cbor_decode_wardriving_status_result_payload() below is a thin wrapper over the
+   streaming decoder further down (feb_cbor_decode_wardriving_status_result_payload_stream())
+   -- one decode body per payload, not two; see cbor_wifi_scan.c's identical wrapper for the
+   full rationale. */
+typedef struct {
+    feb_wardriving_status_result_payload_t* payload;
+    size_t index;
+} WardrivingArrayFillCtx;
+
+static void wardriving_array_fill_cb(const feb_wardriving_record_t* record, void* ctx_ptr) {
+    WardrivingArrayFillCtx* ctx = (WardrivingArrayFillCtx*)ctx_ptr;
+    ctx->payload->records[ctx->index++] = *record;
+}
+
 feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload(
     const uint8_t* in,
     size_t in_len,
@@ -672,6 +686,41 @@ feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload(
         return FEB_CBOR_ERR_UNEXPECTED_TYPE;
     }
     memset(payload, 0, sizeof(*payload));
+
+    WardrivingArrayFillCtx ctx = {.payload = payload, .index = 0};
+    uint64_t backlog_remaining = 0;
+    feb_cbor_status_t status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        in, in_len, wardriving_array_fill_cb, &ctx, &backlog_remaining);
+    if(status != FEB_CBOR_OK) {
+        return status;
+    }
+    payload->record_count = ctx.index;
+    payload->backlog_remaining = backlog_remaining;
+
+    return FEB_CBOR_OK;
+}
+
+/* mode: cb == NULL is the validate-only pass (no side effects); cb != NULL is the apply pass.
+   See feb_cbor_decode_wardriving_status_result_payload_stream()'s header comment for why both
+   passes exist. `record` is file-scope `static`, not a local of this function: at 100+ bytes
+   (feb_wardriving_record_t: 4 uint64 fields, a text alias pair, the payload_kind tag, and a
+   wifi/ble payload union) it is reachable from BleEventWorker via handle_wardriving_status()
+   (docs/LESSONS.md's "any buffer >=100 bytes reachable from BleEventWorker must be static"
+   rule) -- safe to share one instance across both passes and across calls since BLE-thread
+   dispatch is single-threaded/synchronous (same reasoning as this project's other shared
+   per-capability decode statics). */
+static feb_cbor_status_t wardriving_status_result_payload_stream_pass(
+    const uint8_t* in,
+    size_t in_len,
+    feb_wardriving_record_stream_cb_t cb,
+    void* ctx,
+    uint64_t* backlog_remaining_out) {
+    if(in == NULL) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
+    if(backlog_remaining_out != NULL) {
+        *backlog_remaining_out = 0;
+    }
     feb_cbor_status_t status = FEB_CBOR_OK;
     size_t count = 0;
     size_t pos = feb_cbor_decode_map_header(in, in_len, &count, &status);
@@ -700,22 +749,46 @@ feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload(
         return FEB_CBOR_ERR_TOO_MANY_ENTRIES;
     }
     pos += n;
+
+    static feb_wardriving_record_t record;
     for(size_t i = 0; i < array_count; i++) {
-        size_t item_len =
-            feb_cbor_decode_wardriving_record(in + pos, in_len - pos, &payload->records[i], &status);
+        size_t item_len = feb_cbor_decode_wardriving_record(in + pos, in_len - pos, &record, &status);
         if(item_len == 0) {
             return status;
         }
         pos += item_len;
+        if(cb != NULL) {
+            cb(&record, ctx);
+        }
     }
-    payload->record_count = array_count;
 
     n = feb_cbor_i_decode_expected_key(in + pos, in_len - pos, "backlog_remaining", seen_ptrs, seen_lens, 1, &status);
     if(n == 0) return status;
     pos += n;
-    n = feb_cbor_decode_uint(in + pos, in_len - pos, &payload->backlog_remaining, &status);
+    uint64_t value = 0;
+    n = feb_cbor_decode_uint(in + pos, in_len - pos, &value, &status);
     if(n == 0) return status;
     pos += n;
+    if(backlog_remaining_out != NULL) {
+        *backlog_remaining_out = value;
+    }
 
     return FEB_CBOR_OK;
+}
+
+feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload_stream(
+    const uint8_t* in,
+    size_t in_len,
+    feb_wardriving_record_stream_cb_t cb,
+    void* ctx,
+    uint64_t* backlog_remaining_out) {
+    feb_cbor_status_t status =
+        wardriving_status_result_payload_stream_pass(in, in_len, NULL, NULL, NULL);
+    if(status != FEB_CBOR_OK) {
+        if(backlog_remaining_out != NULL) {
+            *backlog_remaining_out = 0;
+        }
+        return status;
+    }
+    return wardriving_status_result_payload_stream_pass(in, in_len, cb, ctx, backlog_remaining_out);
 }

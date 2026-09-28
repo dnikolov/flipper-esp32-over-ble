@@ -521,10 +521,18 @@ on-screen "CSV export write failed" with the session still alive, instead of a d
    with `arm-none-eabi-size` after any feature that adds one.
 
 Build- and host-test-verified (565 checks across all three Flipper suites, plus
-`tools/check_shared_headers.py`); **not hardware-verified — nothing was flashed.** Biggest
-remaining win (`shared_status_result`, 2,832 bytes, needs a both-firmwares streaming-decode
-change to stay in header lockstep) and the full ranked list of what was deliberately left on the
-table are in H04's 2026-09-28 entry.
+`tools/check_shared_headers.py`); **not hardware-verified — nothing was flashed.** The full
+ranked list of what was deliberately left on the table is in H04's 2026-09-28 entry.
+
+**Both of that list's top two items closed the same day (later pass), also build/host-test-
+verified only.** `shared_status_result` (2,832 -> 64 bytes) and `mesh_log_display_nodes`
+(3,072 -> 2,304 bytes) — see H04's own updated entry and PROJECT_HISTORY.md's "Streaming
+decode + mesh_log e7 display entry" for the API shape and measurements, including a follow-up
+pass that removed the whole-array-decoder duplication those two entries left behind (turned
+out to change nothing measurable in any shipped binary — the duplicated bodies were already
+dead-code-eliminated, not actually costing anything). Total system heap held: 95,481 ->
+94,652 bytes. Remaining open items (`wifi_scan_aps`/`ble_scan_devices`, the per-function
+`static char path[160]` scratch buffers) are unchanged, still in H04.
 
 ## 2026-09-13 fix batch: G30, G12, G19, G21, BL07
 

@@ -69,4 +69,26 @@ typedef struct {
    line, not the whole screen). */
 bool feb_mesh_log_parse_line(const char* line, size_t line_len, feb_mesh_node_entry_t* out);
 
+/* Display-only variant of feb_mesh_node_entry_t (docs/HARDENING_BACKLOG.md H04) -- the Mesh
+   Log screen's backing array (mesh_log_display_nodes[] in flipper_esp32_over_ble.c) only ever
+   needs to render "%.5f,%.5f", so it stores lat/lon as int32_t e7 (degrees * 1e7, exact for
+   every value this protocol ever produces -- see cbor_wardriving.h's own lat_e7_offset/
+   lon_e7_offset convention) instead of two `double`s. NOT `float`: a float's ~7.2 significant
+   digits does not cover a 3-digit-longitude e7 value (H04's own note). Cuts this struct from
+   48 to 36 bytes at MESH_LOG_DISPLAY_MAX_NODES(64)'s unchanged capacity. */
+typedef struct {
+    char node_id[FEB_MESH_NODES_NODE_ID_DISPLAY_LEN];
+    char network[FEB_MESH_NODES_NETWORK_DISPLAY_LEN];
+    int32_t lat_e7;
+    int32_t lon_e7;
+} feb_mesh_node_display_entry_t;
+
+/* Converts a parsed accumulator-file entry (decimal-degree doubles, from
+   feb_mesh_log_parse_line() above) to the display-only e7 representation, rounding to the
+   nearest 1e-7 degree -- exact for any value that was itself derived from an integer e7 wire
+   offset, which is every value this project ever writes to the accumulator file (see
+   mesh_nodes.c). Call once at insert/reload time, never per draw call; the draw call converts
+   back to a double only for its own single `%.5f` snprintf, never storing one. */
+void feb_mesh_node_entry_to_display(const feb_mesh_node_entry_t* src, feb_mesh_node_display_entry_t* dst);
+
 #endif /* FEB_MESH_NODES_H */

@@ -1051,23 +1051,51 @@ Three non-obvious details the guard needed to get right, none of which were in t
 inside the ELF loader still never reaches it — that gap is unchanged — but a launch that succeeds
 and later dies mid-session now leaves a baseline in the log.
 
-**Still open, deliberately not attempted this pass** (in descending size, all in
-`flipper_esp32_over_ble.c`, whose `.bss` is 24,371 of the remaining 27,964):
+**2026-09-28 (later same day): `shared_status_result` and `mesh_log_display_nodes` both done,
+build- and host-test-verified, all three ESP32 targets (C6/C5/Heltec) reconfirmed building
+clean.** See "Streaming decode + mesh_log e7 display entry" in `docs/PROJECT_HISTORY.md` for
+the full implementation narrative (API shape, malformed-mid-batch handling, per-symbol
+measurements, and the whole-array-decoder deduplication pass folded into the same entry).
 
-- `shared_status_result`, **2,832 bytes** — union of the per-capability decode-scratch structs,
-  sized by its largest member, `wardriving`'s 32-record array. The Flipper writes each wardriving
-  record to CSV and each wifi_scan/ble_scan result to the UI *one at a time*, so none of the
-  three needs the whole array resident; a streaming/incremental decode would cut this to ~100
-  bytes. Not done because the decoders live in `cbor_wardriving.c`/`cbor_wifi_scan.c`/
-  `cbor_ble_scan.c`, whose headers are in `tools/check_shared_headers.py`'s `HEADER_PAIRS` — a
-  Flipper-only entry point would break the lockstep convention, so it has to land on both
-  firmwares with host tests on both sides. Biggest remaining single win.
-- `mesh_log_display_nodes`, **3,072 bytes** (64 x 48) — `feb_mesh_node_entry_t` stores lat/lon as
-  two `double`s for a screen that renders `%.5f`. A display-only struct with `int32_t` e7
-  coordinates would be 32 bytes/entry (-1,024); halving the 64-node capacity would save another
-  ~1,000. The capacity is a documented product decision ("sparse, dozens not hundreds"), so it
-  needs the user's call, not a silent change. Note `float` is *not* a safe substitute here —
-  ~7.2 significant digits does not cover `%.5f` at three-digit longitudes.
+The whole-array decoders (`feb_cbor_decode_{wifi_scan,ble_scan,wardriving_status}_result_
+payload()`) were re-implemented as thin wrappers over their streaming counterpart (an
+array-filling callback + ctx) in both `components/feb_protocol/` and `flipper/`, so there is
+one decode body per payload again, not two — grepping confirmed no firmware (`flipper/`,
+`esp32/`, `esp32c5/`, `heltec/main/`) calls the whole-array form anymore, only host tests.
+**This measurably changed nothing in any shipped binary**: `arm-none-eabi-nm` on the FAP's
+linked ELF shows the whole-array wrapper functions and their fill callbacks are **absent from
+the final ELF entirely**, both before and after this pass — this build's linker already
+eliminates them as unreachable dead code (nothing in the FAP's real call graph, starting from
+its entry point, ever calls them; only the separately-compiled host test binaries do). The
+`.text` growth from adding the streaming decoders was never "two decoder bodies kept for the
+same payload" — it was genuinely new, *reachable* code (the streaming pass functions plus the
+new callback functions in `flipper_esp32_over_ble.c`), which the deduplication pass does not
+and cannot remove, since that code is still called. Re-measured via `arm-none-eabi-size`/`-nm`
+against the built ELF (still carrying the unrelated concurrent session's small BadUSB-timing/
+footer-constant edits, confirmed adding no static storage): `.text` 57176 -> 57168 (-8,
+noise-level), `.rodata` unchanged (12304), `.bss` 24289 -> 24292 (+3, noise-level), message
+queue unchanged (832). **Total system heap held: 94,657 -> 94,652 (-5).** `.fap` artifact:
+121,916 -> 121,908 bytes. The two target structures (`shared_status_result` 64 bytes,
+`mesh_log_display_nodes` 2304 bytes) are unaffected, as expected — that reduction lives in
+`flipper_esp32_over_ble.c`, a file this pass didn't touch.
+
+**Net across both passes today, against H04's last-documented pre-this-work baseline: total
+system heap held 95,481 -> 94,652 bytes (-829).** The deduplication was still worth doing —
+one decode body per payload is real, permanent source-level maintainability (the two bodies
+could otherwise silently drift, exactly the failure class `docs/LESSONS.md`'s
+"two-implementations-agreeing-is-not-two-implementations-being-right" already warns about) —
+just not a further *measured* memory win on top of the streaming-decode work itself, since the
+duplicate code it removed was already unreachable and already being stripped.
+
+`esp32`(C6)/`esp32c5`/`heltec` all rebuilt: byte-identical `.bin` sizes to the pre-deduplication
+build in every case (C6 23% free, C5 41% free, Heltec 50% free) — confirms none of them ever
+called the whole-array decoders either. Heltec's `idf.py size` also unchanged (348 B DRAM /
+7309 B IRAM headroom) from the pre-deduplication measurement — see that measurement's own
+already-recorded caveat (the 348 B baseline predates this session, from an unrelated
+already-committed change) just above.
+
+**Still open, deliberately not attempted this pass:**
+
 - `wifi_scan_aps` / `ble_scan_devices`, **4,224 bytes combined** — unchanged; this entry's
   existing "do this one last, if at all" assessment and its traced cross-capability-corruption
   risk both still stand. Narrowing their fields (`int32_t rssi` -> `int8_t`, `uint32_t channel`

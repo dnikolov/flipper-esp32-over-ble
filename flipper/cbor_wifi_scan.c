@@ -173,6 +173,22 @@ size_t feb_cbor_encode_wifi_scan_result_payload(
     return pos;
 }
 
+/* feb_cbor_decode_wifi_scan_result_payload() below is a thin wrapper over the streaming
+   decoder further down (feb_cbor_decode_wifi_scan_result_payload_stream()) -- one decode body
+   per payload, not two; the array-cap check and per-AP validation still run exactly once,
+   inside the streaming pass, so this wrapper's only job is filling payload->aps[] in order
+   from the callback and matching the old direct-decode function's exact zero-on-failure/
+   ap_count-set-only-on-success semantics. */
+typedef struct {
+    feb_wifi_scan_result_payload_t* payload;
+    size_t index;
+} WifiScanArrayFillCtx;
+
+static void wifi_scan_array_fill_cb(const feb_wifi_scan_ap_t* ap, void* ctx_ptr) {
+    WifiScanArrayFillCtx* ctx = (WifiScanArrayFillCtx*)ctx_ptr;
+    ctx->payload->aps[ctx->index++] = *ap;
+}
+
 feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(
     const uint8_t* in,
     size_t in_len,
@@ -181,6 +197,36 @@ feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(
         return FEB_CBOR_ERR_UNEXPECTED_TYPE;
     }
     memset(payload, 0, sizeof(*payload));
+
+    WifiScanArrayFillCtx ctx = {.payload = payload, .index = 0};
+    size_t ap_count = 0;
+    feb_cbor_status_t status = feb_cbor_decode_wifi_scan_result_payload_stream(
+        in, in_len, wifi_scan_array_fill_cb, &ctx, &ap_count);
+    if(status != FEB_CBOR_OK) {
+        return status;
+    }
+    payload->ap_count = ap_count;
+
+    return FEB_CBOR_OK;
+}
+
+/* mode: cb == NULL is the validate-only pass (no side effects); cb != NULL is the apply pass.
+   See feb_cbor_decode_wifi_scan_result_payload_stream()'s header comment for why both passes
+   exist. `ap` is a plain local, not `static`: feb_wifi_scan_ap_t is ~64 bytes, under this
+   project's ">=100 bytes reachable from BleEventWorker must be static" threshold
+   (docs/LESSONS.md), so a stack frame here is fine. */
+static feb_cbor_status_t wifi_scan_result_payload_stream_pass(
+    const uint8_t* in,
+    size_t in_len,
+    feb_wifi_scan_ap_stream_cb_t cb,
+    void* ctx,
+    size_t* ap_count_out) {
+    if(in == NULL) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
+    if(ap_count_out != NULL) {
+        *ap_count_out = 0;
+    }
     feb_cbor_status_t status = FEB_CBOR_OK;
     size_t count = 0;
     size_t pos = feb_cbor_decode_map_header(in, in_len, &count, &status);
@@ -210,14 +256,36 @@ feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(
     }
     pos += n;
 
+    feb_wifi_scan_ap_t ap;
     for(size_t i = 0; i < array_count; i++) {
-        size_t item_len = feb_cbor_decode_wifi_scan_ap(in + pos, in_len - pos, &payload->aps[i], &status);
+        size_t item_len = feb_cbor_decode_wifi_scan_ap(in + pos, in_len - pos, &ap, &status);
         if(item_len == 0) {
             return status;
         }
         pos += item_len;
+        if(cb != NULL) {
+            cb(&ap, ctx);
+        }
     }
-    payload->ap_count = array_count;
+    if(ap_count_out != NULL) {
+        *ap_count_out = array_count;
+    }
 
     return FEB_CBOR_OK;
+}
+
+feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload_stream(
+    const uint8_t* in,
+    size_t in_len,
+    feb_wifi_scan_ap_stream_cb_t cb,
+    void* ctx,
+    size_t* ap_count_out) {
+    feb_cbor_status_t status = wifi_scan_result_payload_stream_pass(in, in_len, NULL, NULL, NULL);
+    if(status != FEB_CBOR_OK) {
+        if(ap_count_out != NULL) {
+            *ap_count_out = 0;
+        }
+        return status;
+    }
+    return wifi_scan_result_payload_stream_pass(in, in_len, cb, ctx, ap_count_out);
 }

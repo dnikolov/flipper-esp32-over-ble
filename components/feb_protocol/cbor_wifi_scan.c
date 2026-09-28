@@ -250,7 +250,52 @@ size_t feb_cbor_encode_wifi_scan_result_payload(uint8_t *out, size_t out_cap, co
     return pos;
 }
 
+/* feb_cbor_decode_wifi_scan_result_payload() below is a thin wrapper over the streaming
+   decoder just below it (feb_cbor_decode_wifi_scan_result_payload_stream()) -- one decode
+   body per payload, not two. This fill callback is the only whole-array-specific piece: it
+   writes each streamed AP into payload->aps[] in order, matching the pre-streaming
+   implementation's own loop exactly (grep history: this file used to decode directly into
+   payload->aps[i] in a single pass; array-cap overflow and per-field validation are still
+   enforced identically, just inside the streaming pass now). */
+typedef struct {
+    feb_wifi_scan_result_payload_t *payload;
+    size_t index;
+} wifi_scan_array_fill_ctx_t;
+
+static void wifi_scan_array_fill_cb(const feb_wifi_scan_ap_t *ap, void *ctx_ptr)
+{
+    wifi_scan_array_fill_ctx_t *ctx = (wifi_scan_array_fill_ctx_t *)ctx_ptr;
+
+    ctx->payload->aps[ctx->index++] = *ap;
+}
+
 feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, size_t in_len, feb_wifi_scan_result_payload_t *payload)
+{
+    wifi_scan_array_fill_ctx_t ctx;
+    size_t ap_count = 0;
+    feb_cbor_status_t status;
+
+    if (in == NULL || payload == NULL) {
+        return FEB_CBOR_ERR_TRUNCATED;
+    }
+    payload->ap_count = 0;
+    ctx.payload = payload;
+    ctx.index = 0;
+
+    status = feb_cbor_decode_wifi_scan_result_payload_stream(in, in_len, wifi_scan_array_fill_cb, &ctx, &ap_count);
+    if (status != FEB_CBOR_OK) {
+        return status;
+    }
+    payload->ap_count = ap_count;
+
+    return FEB_CBOR_OK;
+}
+
+/* mode: cb == NULL is the validate-only pass (no side effects); cb != NULL is the apply pass.
+   See feb_cbor_decode_wifi_scan_result_payload_stream()'s header comment for why both passes
+   exist. */
+static feb_cbor_status_t wifi_scan_result_payload_stream_pass(const uint8_t *in, size_t in_len,
+    feb_wifi_scan_ap_stream_cb_t cb, void *ctx, size_t *ap_count_out)
 {
     size_t count;
     size_t pos;
@@ -262,11 +307,14 @@ feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, si
     size_t key_consumed;
     size_t arr_count;
     size_t arr_consumed;
+    feb_wifi_scan_ap_t ap;
 
-    if (in == NULL || payload == NULL) {
+    if (in == NULL) {
         return FEB_CBOR_ERR_TRUNCATED;
     }
-    payload->ap_count = 0;
+    if (ap_count_out != NULL) {
+        *ap_count_out = 0;
+    }
 
     consumed = feb_cbor_decode_map_header(in, in_len, &count, &status);
     if (consumed == 0) {
@@ -300,14 +348,33 @@ feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, si
     pos += arr_consumed;
 
     for (i = 0; i < arr_count; i++) {
-        size_t ap_consumed = feb_cbor_decode_wifi_scan_ap(in + pos, in_len - pos, &payload->aps[i], &status);
+        size_t ap_consumed = feb_cbor_decode_wifi_scan_ap(in + pos, in_len - pos, &ap, &status);
 
         if (ap_consumed == 0) {
             return status;
         }
         pos += ap_consumed;
+        if (cb != NULL) {
+            cb(&ap, ctx);
+        }
     }
-    payload->ap_count = arr_count;
+    if (ap_count_out != NULL) {
+        *ap_count_out = arr_count;
+    }
 
     return FEB_CBOR_OK;
+}
+
+feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload_stream(const uint8_t *in, size_t in_len,
+    feb_wifi_scan_ap_stream_cb_t cb, void *ctx, size_t *ap_count_out)
+{
+    feb_cbor_status_t status = wifi_scan_result_payload_stream_pass(in, in_len, NULL, NULL, NULL);
+
+    if (status != FEB_CBOR_OK) {
+        if (ap_count_out != NULL) {
+            *ap_count_out = 0;
+        }
+        return status;
+    }
+    return wifi_scan_result_payload_stream_pass(in, in_len, cb, ctx, ap_count_out);
 }

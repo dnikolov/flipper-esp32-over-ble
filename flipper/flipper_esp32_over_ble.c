@@ -1507,21 +1507,25 @@ static void wardriving_settings_save(const Esp32App* app) {
 static AppEvent shared_ble_event;
 
 /* shared_status_result: same single-in-flight BLE-thread reasoning as shared_ble_event just
-   above, applied to the per-capability decode-scratch struct each status handler below
-   (handle_wifi_scan_status/handle_ble_scan_status/handle_gps_status/handle_wardriving_status/
-   handle_mesh_log_status) declares for its own feb_cbor_decode_*_result_payload() call.
-   Unlike shared_ble_event these are five different struct types, not five instances of one
-   type, so a union rather than a single typed static -- each handler fully decodes into and
-   drains its own member (posted onward as AppEvents, or written to the wardriving CSV/dedup
-   table or mesh_log accumulator) before returning, and none holds a pointer into it across a
-   call boundary or into a different handler, so all five can safely overlay the same storage.
-   Sized to the largest member (wardriving's, the only one holding up to 32 full records)
-   instead of the sum of all five. */
+   above, applied to the per-capability decode-scratch struct handle_gps_status() and
+   handle_mesh_log_status() each declare for their own feb_cbor_decode_*_result_payload()
+   call. A union rather than two single typed statics since these are different struct types
+   -- each handler fully decodes into and drains its own member (posted onward as an AppEvent,
+   or written to the mesh_log accumulator) before returning, and neither holds a pointer into
+   it across a call boundary or into the other handler, so both can safely overlay the same
+   storage. Sized to the larger member (mesh_log's, capped at
+   FEB_MESH_LOG_MAX_RECORDS_PER_BATCH == 1 record per batch by wire-format contract, not gps's
+   handful of scalar fields).
+
+   wifi_scan/ble_scan/wardriving used to have their own members here too (up to 32 full
+   records/APs/devices resident at once, ~2.8 KB combined -- H04's original "biggest remaining
+   single win"), removed 2026-09-28 once their decoders gained a streaming, one-element-at-a-
+   time entry point (feb_cbor_decode_wifi_scan_result_payload_stream()/_ble_scan_.../
+   _wardriving_status_..., the cbor_*.h headers) that handle_wifi_scan_status()/
+   handle_ble_scan_status()/handle_wardriving_status() now call instead -- see those handlers'
+   own comments and wardriving_record_stream_cb()'s comment above handle_wardriving_status(). */
 static union {
-    feb_wifi_scan_result_payload_t wifi_scan;
-    feb_ble_scan_result_payload_t ble_scan;
     feb_gps_result_payload_t gps;
-    feb_wardriving_status_result_payload_t wardriving;
     feb_mesh_log_status_result_payload_t mesh_log;
 } shared_status_result;
 
@@ -2043,7 +2047,13 @@ static void ble_scan_device_count_reset(void) {
    already succeeded before this list is touched). */
 #define MESH_LOG_DISPLAY_MAX_NODES 64u
 
-static feb_mesh_node_entry_t mesh_log_display_nodes[MESH_LOG_DISPLAY_MAX_NODES];
+/* feb_mesh_node_display_entry_t (mesh_nodes.h), not feb_mesh_node_entry_t -- int32_t e7
+   lat/lon instead of two doubles, 36 bytes/entry instead of 48 at this same unchanged
+   64-entry capacity (docs/HARDENING_BACKLOG.md H04). Both writers below convert at
+   insert/reload time (feb_mesh_node_entry_to_display(), or direct wire-offset arithmetic in
+   handle_mesh_log_status()); draw_mesh_log_screen() converts back to a double only for its
+   own single `%.5f` snprintf call, never storing one. */
+static feb_mesh_node_display_entry_t mesh_log_display_nodes[MESH_LOG_DISPLAY_MAX_NODES];
 static size_t mesh_log_display_count;
 
 /* Solid-green-while-flushing / solid-blue-when-idle LED indicator for an active wardriving
@@ -2433,8 +2443,12 @@ static void copy_clamped_text(char* dst, size_t dst_cap, const char* src, size_t
    wardriving_state_mutex (HP-08) -- ssid is raw bytes on the wire (docs/PROTOCOL.md: "not
    guaranteed valid UTF-8"), so every non-printable-ASCII byte is replaced with '.' here,
    once, rather than deferring sanitization to every later draw call. Caller must hold
-   wardriving_state_mutex. */
-static void copy_wifi_scan_ap_locked(const feb_wifi_scan_ap_t* ap) {
+   wardriving_state_mutex. Matches feb_wifi_scan_ap_stream_cb_t's signature (cbor_wifi_scan.h)
+   so it can be passed directly as handle_wifi_scan_status()'s streaming-decode callback; `ctx`
+   is unused (docs/HARDENING_BACKLOG.md H04 -- wardriving_state_mutex is already held around
+   the whole streaming-decode call, not passed through per element). */
+static void copy_wifi_scan_ap_locked(const feb_wifi_scan_ap_t* ap, void* ctx) {
+    (void)ctx;
     if(wifi_scan_ap_count >= WIFI_SCAN_MAX_DISPLAY_APS) {
         return;
     }
@@ -2503,18 +2517,25 @@ static void
         return;
     }
     if(status_payload.has_result) {
-        feb_wifi_scan_result_payload_t* result = &shared_status_result.wifi_scan;
-        feb_cbor_status_t result_status = feb_cbor_decode_wifi_scan_result_payload(
-            status_payload.result_span, status_payload.result_span_len, result);
+        /* Streaming decode (docs/HARDENING_BACKLOG.md H04): copy_wifi_scan_ap_locked() is
+           invoked once per AP, in wire order, only after the whole `result` payload has
+           already been confirmed to decode cleanly (cbor_wifi_scan.h's own header comment on
+           this decoder) -- a malformed AP anywhere in the batch drops the whole batch with
+           zero copies, matching the former whole-array decode's all-or-nothing behavior.
+           wardriving_state_mutex is held around the entire call rather than per AP, same
+           critical-section shape as the former decode-then-loop split. */
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+        feb_cbor_status_t result_status = feb_cbor_decode_wifi_scan_result_payload_stream(
+            status_payload.result_span,
+            status_payload.result_span_len,
+            copy_wifi_scan_ap_locked,
+            NULL,
+            NULL);
+        furi_mutex_release(wardriving_state_mutex);
         if(result_status != FEB_CBOR_OK) {
             FURI_LOG_W(TAG, "wifi_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
-        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
-        for(size_t i = 0; i < result->ap_count; i++) {
-            copy_wifi_scan_ap_locked(&result->aps[i]);
-        }
-        furi_mutex_release(wardriving_state_mutex);
         post_wifi_scan_results_updated(app);
     }
     if(is_complete) {
@@ -2531,8 +2552,13 @@ static void
    declared as a CBOR text string on the wire (docs/PROTOCOL.md), is still peer-controlled data
    with no structural guarantee every byte is printable/renderable by this canvas's font, so
    the same non-printable-ASCII-to-'.' treatment is applied here too. Caller must hold
-   wardriving_state_mutex. */
-static void copy_ble_scan_device_locked(const feb_ble_scan_device_t* device) {
+   wardriving_state_mutex. Matches feb_ble_scan_device_stream_cb_t's signature
+   (cbor_ble_scan.h) so it can be passed directly as handle_ble_scan_status()'s
+   streaming-decode callback; `ctx` is unused (docs/HARDENING_BACKLOG.md H04 --
+   wardriving_state_mutex is already held around the whole streaming-decode call, not passed
+   through per element). */
+static void copy_ble_scan_device_locked(const feb_ble_scan_device_t* device, void* ctx) {
+    (void)ctx;
     if(ble_scan_device_count >= BLE_SCAN_MAX_DISPLAY_DEVICES) {
         return;
     }
@@ -2602,18 +2628,21 @@ static void
         return;
     }
     if(status_payload.has_result) {
-        feb_ble_scan_result_payload_t* result = &shared_status_result.ble_scan;
-        feb_cbor_status_t result_status = feb_cbor_decode_ble_scan_result_payload(
-            status_payload.result_span, status_payload.result_span_len, result);
+        /* Streaming decode (docs/HARDENING_BACKLOG.md H04): same contract as
+           handle_wifi_scan_status()'s own streaming-decode call above -- a malformed device
+           anywhere in the batch drops the whole batch with zero copies. */
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+        feb_cbor_status_t result_status = feb_cbor_decode_ble_scan_result_payload_stream(
+            status_payload.result_span,
+            status_payload.result_span_len,
+            copy_ble_scan_device_locked,
+            NULL,
+            NULL);
+        furi_mutex_release(wardriving_state_mutex);
         if(result_status != FEB_CBOR_OK) {
             FURI_LOG_W(TAG, "ble_scan status.result decode failed: %d; dropping", result_status);
             return;
         }
-        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
-        for(size_t i = 0; i < result->device_count; i++) {
-            copy_ble_scan_device_locked(&result->devices[i]);
-        }
-        furi_mutex_release(wardriving_state_mutex);
         post_ble_scan_results_updated(app);
     }
     if(is_complete) {
@@ -2985,6 +3014,113 @@ static bool wardriving_csv_write_record(const feb_wardriving_record_t* record) {
     return true;
 }
 
+/* Streaming apply-pass state for handle_wardriving_status()'s "data" branch, one instance per
+   batch (docs/HARDENING_BACKLOG.md H04 -- replaces the former whole-array
+   feb_wardriving_status_result_payload_t decode-scratch, up to 32 full records resident at
+   once, with feb_cbor_decode_wardriving_status_result_payload_stream()'s one-record-at-a-time
+   callback, cbor_wardriving.h). csv_resolved/csv_usable replace the old code's own "resolve
+   the export file ONCE per batch, before touching the dedup table" locals: the callback below
+   resolves the file lazily on its own first invocation instead of a caller-owned loop resolving
+   it up front. This is equivalent to, not merely similar to, the old contract: by the time ANY
+   callback fires, the streaming decoder's own internal validate pass has already confirmed the
+   WHOLE batch -- every record and the trailing backlog_remaining field -- decodes cleanly, so a
+   malformed batch never invokes this callback at all, and the file is still resolved at most
+   once per batch, before the dedup table is touched for any record in it (feb_wardriving_dedup_
+   should_write() updates the table as a side effect, so a deferred-open batch must never reach
+   it -- see cbor_wardriving.h's own header comment on this decoder for why). Declared `static`,
+   not a stack local of the callback/handler pair: at ~96 bytes it sits right at this project's
+   ">=100 bytes reachable from BleEventWorker must be static" threshold (docs/LESSONS.md), and it
+   replaces two buffers (last_wifi_summary/last_ble_summary) that were already static. Reset at
+   the top of every handle_wardriving_status() "data" call (BLE-thread single-in-flight, same
+   reasoning as shared_status_result's own comment) since every field here is per-batch state,
+   never accumulated across batches. */
+typedef struct {
+    Esp32App* app;
+    bool csv_resolved;
+    bool csv_usable;
+    char last_wifi_summary[40];
+    char last_ble_summary[40];
+} WardrivingRecordStreamCtx;
+
+static void wardriving_record_stream_cb(const feb_wardriving_record_t* record, void* ctx_ptr) {
+    WardrivingRecordStreamCtx* ctx = (WardrivingRecordStreamCtx*)ctx_ptr;
+    Esp32App* app = ctx->app;
+
+    if(!ctx->csv_resolved) {
+        ctx->csv_resolved = true;
+        bool csv_failed_now = false;
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+        if(!wardriving_csv_write_failed) {
+            switch(wardriving_csv_ensure_open(app->storage)) {
+            case WardrivingCsvOpenOk:
+                ctx->csv_usable = true;
+                break;
+            case WardrivingCsvOpenFailed:
+                wardriving_csv_write_failed = true;
+                csv_failed_now = true;
+                break;
+            case WardrivingCsvOpenDeferred:
+                /* Transient: no latch, no dedup update, retry on the next batch. */
+                break;
+            }
+        }
+        furi_mutex_release(wardriving_state_mutex);
+        if(csv_failed_now) {
+            FURI_LOG_E(TAG, "wardriving CSV: open failed, no records written this session");
+            post_wardriving_error(app, "CSV export write failed");
+        }
+    }
+
+    /* The on-screen counters/summaries below still run for every record even when csv_usable
+       is false: the records are real, they were decoded, and the ESP32 has already counted
+       them against its backlog -- the UI should keep reflecting the capture even while the
+       export file is deferred or has failed. */
+    if(ctx->csv_usable) {
+        furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
+        bool write_failed_now = false;
+        if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record) &&
+           !wardriving_csv_write_record(record)) {
+            wardriving_csv_write_failed = true;
+            write_failed_now = true;
+            ctx->csv_usable = false;
+        }
+        furi_mutex_release(wardriving_state_mutex);
+        if(write_failed_now) {
+            FURI_LOG_E(
+                TAG, "wardriving CSV: write failed, no further records written this session");
+            post_wardriving_error(app, "CSV export write failed");
+        }
+    }
+
+    if(record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE) {
+        const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
+        snprintf(
+            ctx->last_ble_summary,
+            sizeof(ctx->last_ble_summary),
+            "%02x:%02x:%02x:%02x:%02x:%02x",
+            ble->address[0],
+            ble->address[1],
+            ble->address[2],
+            ble->address[3],
+            ble->address[4],
+            ble->address[5]);
+    } else {
+        const feb_wardriving_wifi_payload_t* wifi = &record->payload.wifi;
+        size_t n = wifi->ssid_len > sizeof(ctx->last_wifi_summary) - 1 ?
+                       sizeof(ctx->last_wifi_summary) - 1 :
+                       wifi->ssid_len;
+        for(size_t j = 0; j < n; j++) {
+            uint8_t b = wifi->ssid[j];
+            ctx->last_wifi_summary[j] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+        }
+        ctx->last_wifi_summary[n] = '\0';
+        if(n == 0) {
+            strncpy(ctx->last_wifi_summary, "(hidden)", sizeof(ctx->last_wifi_summary) - 1);
+            ctx->last_wifi_summary[sizeof(ctx->last_wifi_summary) - 1] = '\0';
+        }
+    }
+}
+
 /* `status` (docs/PROTOCOL.md "`wardriving` command and status payloads") -- unlike
    wifi_scan/ble_scan's `partial`/`complete` pair, wardriving's own states ("started"/"data"/
    "stopped") are never ambiguous with those or each other by text alone, so no
@@ -2993,14 +3129,15 @@ static bool wardriving_csv_write_record(const feb_wardriving_record_t* record) {
    `request_id`, including the `request_id == 0` unsolicited-backlog-drain sentinel
    (docs/PROTOCOL.md "Unsolicited backlog drain") -- this function never inspects
    status_payload.request_id at all, so there is nothing to special-case for it. CSV writes
-   for a "data" batch happen synchronously here, one record at a time as each is decoded, on
-   the BLE thread itself -- not deferred through app->queue -- so the export file is genuinely
-   appended-to incrementally even under an hours-long capture (docs/CAPABILITIES.md), and a
-   32-record batch can never overrun the main-thread event queue's depth (see
-   AppEventWardrivingBatch's own comment). Each record is first gated through
-   feb_wardriving_dedup_should_write() (wardriving_csv.h) -- a redundant repeat of an
-   already-written address is skipped before it ever reaches wardriving_csv_write_record(), not
-   an error path. */
+   for a "data" batch happen synchronously here, one record at a time as each is decoded (via
+   wardriving_record_stream_cb() above, invoked from inside
+   feb_cbor_decode_wardriving_status_result_payload_stream()), on the BLE thread itself -- not
+   deferred through app->queue -- so the export file is genuinely appended-to incrementally
+   even under an hours-long capture (docs/CAPABILITIES.md), and a 32-record batch can never
+   overrun the main-thread event queue's depth (see AppEventWardrivingBatch's own comment).
+   Each record is first gated through feb_wardriving_dedup_should_write() (wardriving_csv.h) --
+   a redundant repeat of an already-written address is skipped before it ever reaches
+   wardriving_csv_write_record(), not an error path. */
 static void
     handle_wardriving_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len) {
     Esp32App* app = profile->app;
@@ -3053,9 +3190,17 @@ static void
        reconnect or a reopened screen, and the user sees Start instead of Stop. */
     post_wardriving_run_state(app, true, false);
 
-    feb_wardriving_status_result_payload_t* result = &shared_status_result.wardriving;
-    feb_cbor_status_t result_status = feb_cbor_decode_wardriving_status_result_payload(
-        status_payload.result_span, status_payload.result_span_len, result);
+    static WardrivingRecordStreamCtx stream_ctx;
+    memset(&stream_ctx, 0, sizeof(stream_ctx));
+    stream_ctx.app = app;
+
+    uint64_t backlog_remaining = 0;
+    feb_cbor_status_t result_status = feb_cbor_decode_wardriving_status_result_payload_stream(
+        status_payload.result_span,
+        status_payload.result_span_len,
+        wardriving_record_stream_cb,
+        &stream_ctx,
+        &backlog_remaining);
     if(result_status != FEB_CBOR_OK) {
         FURI_LOG_W(TAG, "wardriving status.result decode failed: %d; dropping", result_status);
         return;
@@ -3066,104 +3211,16 @@ static void
         wardriving_flush_led_active = true;
     }
 
-    /* Resolve the export file ONCE per batch, before touching the dedup table. Two reasons,
-       both load-bearing:
-
-       (1) feb_wardriving_dedup_should_write() *updates* the table as a side effect -- it marks
-       the address as written. If the CSV open is then deferred for low heap, that address is
-       recorded as already-exported for a row that never reached the file, and the dedup policy
-       would suppress its next real chance (until its RSSI improves by
-       FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB or it moves FEB_WARDRIVING_DEDUP_MOVE_METERS). So a
-       deferral has to skip the whole batch *before* the dedup table is consulted at all, not
-       per record.
-
-       (2) The heap-margin check walks the allocator's free list; doing it 32 times for one
-       batch buys nothing, since the file is either open for the whole batch or none of it. */
-    bool csv_usable = false;
-    bool csv_failed_now = false;
-    furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
-    if(!wardriving_csv_write_failed) {
-        switch(wardriving_csv_ensure_open(app->storage)) {
-        case WardrivingCsvOpenOk:
-            csv_usable = true;
-            break;
-        case WardrivingCsvOpenFailed:
-            wardriving_csv_write_failed = true;
-            csv_failed_now = true;
-            break;
-        case WardrivingCsvOpenDeferred:
-            /* Transient: no latch, no dedup update, retry on the next batch. */
-            break;
-        }
-    }
-    furi_mutex_release(wardriving_state_mutex);
-    if(csv_failed_now) {
-        FURI_LOG_E(TAG, "wardriving CSV: open failed, no records written this session");
-        post_wardriving_error(app, "CSV export write failed");
-    }
-
-    static char last_wifi_summary[40];
-    static char last_ble_summary[40];
-    last_wifi_summary[0] = '\0';
-    last_ble_summary[0] = '\0';
-    for(size_t i = 0; i < result->record_count; i++) {
-        const feb_wardriving_record_t* record = &result->records[i];
-        /* The on-screen counters/summaries below still run for every record even when
-           csv_usable is false: the records are real, they were decoded, and the ESP32 has
-           already counted them against its backlog -- the UI should keep reflecting the
-           capture even while the export file is deferred or has failed. */
-        if(csv_usable) {
-            furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
-            bool write_failed_now = false;
-            if(feb_wardriving_dedup_should_write(&wardriving_dedup_table, record) &&
-               !wardriving_csv_write_record(record)) {
-                wardriving_csv_write_failed = true;
-                write_failed_now = true;
-                csv_usable = false;
-            }
-            furi_mutex_release(wardriving_state_mutex);
-            if(write_failed_now) {
-                FURI_LOG_E(
-                    TAG, "wardriving CSV: write failed, no further records written this session");
-                post_wardriving_error(app, "CSV export write failed");
-            }
-        }
-        if(record->payload_kind == FEB_WARDRIVING_PAYLOAD_BLE) {
-            const feb_wardriving_ble_payload_t* ble = &record->payload.ble;
-            snprintf(
-                last_ble_summary,
-                sizeof(last_ble_summary),
-                "%02x:%02x:%02x:%02x:%02x:%02x",
-                ble->address[0],
-                ble->address[1],
-                ble->address[2],
-                ble->address[3],
-                ble->address[4],
-                ble->address[5]);
-        } else {
-            const feb_wardriving_wifi_payload_t* wifi = &record->payload.wifi;
-            size_t n = wifi->ssid_len > sizeof(last_wifi_summary) - 1 ? sizeof(last_wifi_summary) - 1
-                                                                       : wifi->ssid_len;
-            for(size_t j = 0; j < n; j++) {
-                uint8_t b = wifi->ssid[j];
-                last_wifi_summary[j] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
-            }
-            last_wifi_summary[n] = '\0';
-            if(n == 0) {
-                strncpy(last_wifi_summary, "(hidden)", sizeof(last_wifi_summary) - 1);
-                last_wifi_summary[sizeof(last_wifi_summary) - 1] = '\0';
-            }
-        }
-    }
-
     /* Report the file-backed count, not this batch's record_count -- Recs must reflect rows
-       actually written to the CSV, including the dedup skips above. */
+       actually written to the CSV, including the dedup skips wardriving_record_stream_cb()
+       applied above. */
     furi_mutex_acquire(wardriving_state_mutex, FuriWaitForever);
     uint32_t csv_rows = wardriving_csv_row_count;
     furi_mutex_release(wardriving_state_mutex);
-    post_wardriving_batch(app, csv_rows, result->backlog_remaining, last_wifi_summary, last_ble_summary);
+    post_wardriving_batch(
+        app, csv_rows, backlog_remaining, stream_ctx.last_wifi_summary, stream_ctx.last_ble_summary);
 
-    if(wardriving_flush_led_active && result->backlog_remaining == 0 && app->notifications) {
+    if(wardriving_flush_led_active && backlog_remaining == 0 && app->notifications) {
         notification_message(app->notifications, &sequence_set_only_blue_255);
         wardriving_flush_led_active = false;
     }
@@ -3324,7 +3381,8 @@ static void mesh_log_display_reload(Esp32App* app) {
                         if(line_carry_len > 0 && !line_overflowed) {
                             feb_mesh_node_entry_t entry;
                             if(feb_mesh_log_parse_line(line_carry, line_carry_len, &entry)) {
-                                mesh_log_display_nodes[mesh_log_display_count++] = entry;
+                                feb_mesh_node_entry_to_display(
+                                    &entry, &mesh_log_display_nodes[mesh_log_display_count++]);
                             }
                         }
                         line_carry_len = 0;
@@ -3345,7 +3403,8 @@ static void mesh_log_display_reload(Esp32App* app) {
                mesh_log_display_count < MESH_LOG_DISPLAY_MAX_NODES) {
                 feb_mesh_node_entry_t entry;
                 if(feb_mesh_log_parse_line(line_carry, line_carry_len, &entry)) {
-                    mesh_log_display_nodes[mesh_log_display_count++] = entry;
+                    feb_mesh_node_entry_to_display(
+                        &entry, &mesh_log_display_nodes[mesh_log_display_count++]);
                 }
             }
         }
@@ -3423,15 +3482,19 @@ static void
            disk write failed. Silently dropped from the display only (never from the file)
            once MESH_LOG_DISPLAY_MAX_NODES is reached. */
         if(mesh_log_display_count < MESH_LOG_DISPLAY_MAX_NODES) {
-            feb_mesh_node_entry_t* entry = &mesh_log_display_nodes[mesh_log_display_count];
+            feb_mesh_node_display_entry_t* entry = &mesh_log_display_nodes[mesh_log_display_count];
             copy_clamped_text(
                 entry->node_id, sizeof(entry->node_id), record->node_id, record->node_id_len);
             copy_clamped_text(
                 entry->network, sizeof(entry->network), record->network, record->network_len);
-            entry->lat =
-                ((double)(int64_t)record->lat_e7_offset - (double)900000000) / (double)10000000;
-            entry->lon =
-                ((double)(int64_t)record->lon_e7_offset - (double)1800000000) / (double)10000000;
+            /* Exact integer arithmetic, no double at all: record->lat_e7_offset/
+               lon_e7_offset are already the wire's own signed-degrees*1e7 value shifted to an
+               unsigned offset (cbor_mesh_log.h), so subtracting the same offset back recovers
+               the original int32_t exactly -- no double round-trip needed here the way
+               feb_mesh_node_entry_to_display() needs one for the file-reload path (mesh_nodes.c),
+               whose only source is already-lossy decimal text. */
+            entry->lat_e7 = (int32_t)((int64_t)record->lat_e7_offset - (int64_t)900000000);
+            entry->lon_e7 = (int32_t)((int64_t)record->lon_e7_offset - (int64_t)1800000000);
             mesh_log_display_count++;
         }
         furi_mutex_release(wardriving_state_mutex);
@@ -4211,14 +4274,17 @@ static void publish_badusb_press_release(uint16_t keycode) {
     furi_hal_hid_kb_release(keycode);
 }
 
-/* No per-character delay -- matches Unleashed's own ducky_string()'s default (0ms
-   stringdelay) fast path: press-then-release each character back to back, relying on the
-   USB polling interval for pacing rather than an explicit sleep. */
+/* Hardware-verified failure, 2026-09-28: typing back to back with no per-character delay
+   (Unleashed ducky_string()'s 0ms default) dropped keystrokes mid-string in Windows Terminal,
+   leaving an unterminated quote and a `>>` continuation prompt instead of running the
+   bootstrap. Each character is now paced explicitly. */
+#define PUBLISH_BADUSB_CHAR_DELAY_MS 10u
 static void publish_badusb_type_string(const char* text) {
     for(size_t i = 0; text[i] != '\0'; i++) {
         uint16_t keycode = HID_ASCII_TO_KEY(text[i]);
         if(keycode != HID_KEYBOARD_NONE) {
             publish_badusb_press_release(keycode);
+            furi_delay_ms(PUBLISH_BADUSB_CHAR_DELAY_MS);
         }
     }
 }
@@ -4264,14 +4330,17 @@ static bool publish_trigger_badusb(void) {
     furi_delay_ms(2000);
 
     publish_badusb_press_release(HID_KEYBOARD_R | KEY_MOD_LEFT_GUI);
-    furi_delay_ms(500);
+    furi_delay_ms(1000);
     /* HP-16: plain "powershell" launches under the host's default execution policy, which on
        a stock Windows account is Restricted -- the downloaded script then fails to run and
        the Flipper times out with no useful signal. -NoProfile also skips the user's own
        profile script, shaving a little launch time. */
     publish_badusb_type_string("powershell -NoProfile -ExecutionPolicy Bypass");
     publish_badusb_press_release(HID_KEYBOARD_RETURN);
-    furi_delay_ms(1200);
+    /* Windows 11 opens PowerShell inside Windows Terminal, which takes well over the old
+       1200 ms to accept input -- keystrokes typed before that are silently lost (the head of
+       the bootstrap line went missing, 2026-09-28). */
+    furi_delay_ms(3500);
     publish_badusb_type_string(publish_bootstrap_command);
     publish_badusb_press_release(HID_KEYBOARD_RETURN);
     furi_delay_ms(300);
@@ -5110,7 +5179,7 @@ static void draw_wardriving_running_screen(Canvas* canvas, const Esp32App* app) 
         canvas_draw_str(canvas, 2, 52, line);
     }
 
-    canvas_draw_str(canvas, 2, 56, "OK: stop  Back: exit");
+    canvas_draw_str(canvas, 2, 62, "OK: stop  Back: exit");
 }
 
 /* Stopped-screen settings rows (docs/WARDRIVING_REDESIGN.md) -- capability-gated only, not
@@ -5351,7 +5420,7 @@ static void draw_wardriving_stopped_screen(Canvas* canvas, Esp32App* app) {
     const char* start_label = gps_delayed ? "start (delayed)" : "start";
     char footer_buf[40];
     snprintf(footer_buf, sizeof(footer_buf), "OK:%s L/R:val Back:exit", start_label);
-    canvas_draw_str(canvas, 2, 56, footer_buf);
+    canvas_draw_str(canvas, 2, 62, footer_buf);
 }
 
 /* Home screen layout: same proven 10px-pitch / y=62-footer convention as the
@@ -5647,7 +5716,11 @@ static void draw_mesh_log_screen(Canvas* canvas, Esp32App* app) {
         if(index >= count) {
             break;
         }
-        const feb_mesh_node_entry_t* node = &mesh_log_display_nodes[index];
+        const feb_mesh_node_display_entry_t* node = &mesh_log_display_nodes[index];
+        /* Converted back to a double only here, for this one snprintf call -- never stored
+           (docs/HARDENING_BACKLOG.md H04, mesh_log_display_nodes's own declaration comment). */
+        double lat = (double)node->lat_e7 / (double)10000000;
+        double lon = (double)node->lon_e7 / (double)10000000;
         char line[64];
         snprintf(
             line,
@@ -5655,8 +5728,8 @@ static void draw_mesh_log_screen(Canvas* canvas, Esp32App* app) {
             "%s %s %.5f,%.5f",
             node->node_id,
             node->network,
-            node->lat,
-            node->lon);
+            lat,
+            lon);
         canvas_draw_str(canvas, 2, (uint8_t)(y + row * MESH_LOG_RESULTS_ROW_HEIGHT), line);
     }
     furi_mutex_release(wardriving_state_mutex);

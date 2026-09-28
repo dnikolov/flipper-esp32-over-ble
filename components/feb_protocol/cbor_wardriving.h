@@ -183,4 +183,22 @@ typedef struct {
 size_t feb_cbor_encode_wardriving_status_result_payload(uint8_t *out, size_t out_cap, const feb_wardriving_status_result_payload_t *payload);
 feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload(const uint8_t *in, size_t in_len, feb_wardriving_status_result_payload_t *payload);
 
+/* Streaming counterpart to feb_cbor_decode_wardriving_status_result_payload() above
+   (docs/HARDENING_BACKLOG.md H04) -- for a caller that consumes each record as it's decoded
+   (writing it to a CSV row, say) instead of needing the whole
+   FEB_WARDRIVING_MAX_RECORDS_PER_BATCH-entry array resident at once. Same two-pass
+   validate-then-apply contract as feb_cbor_decode_wifi_scan_result_payload_stream()
+   (cbor_wifi_scan.h): the whole `{"records": [...], "backlog_remaining": N}` map -- every
+   record AND the trailing backlog_remaining field -- is confirmed to decode cleanly with zero
+   `cb` invocations before a second pass invokes `cb` once per record, in wire order. A
+   malformed record or a missing/malformed backlog_remaining anywhere in the batch fails the
+   whole decode with zero side effects, matching the whole-array decoder's all-or-nothing
+   contract -- callers that resolve an output file/table once per batch (this codec's own
+   convention, see docs/HARDENING_BACKLOG.md H04's "resolve export file once per batch" note)
+   should do so only after this returns FEB_CBOR_OK, not before. `record` passed to `cb` is
+   only valid for the duration of that call. `backlog_remaining_out` (may be NULL) receives
+   the decoded value on FEB_CBOR_OK, 0 otherwise. */
+typedef void (*feb_wardriving_record_stream_cb_t)(const feb_wardriving_record_t *record, void *ctx);
+feb_cbor_status_t feb_cbor_decode_wardriving_status_result_payload_stream(const uint8_t *in, size_t in_len, feb_wardriving_record_stream_cb_t cb, void *ctx, uint64_t *backlog_remaining_out);
+
 #endif /* FEB_CBOR_WARDRIVING_H */

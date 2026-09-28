@@ -49,4 +49,13 @@ typedef struct {
 size_t feb_cbor_encode_ble_scan_result_payload(uint8_t *out, size_t out_cap, const feb_ble_scan_result_payload_t *payload);
 feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload(const uint8_t *in, size_t in_len, feb_ble_scan_result_payload_t *payload);
 
+/* Streaming counterpart to feb_cbor_decode_ble_scan_result_payload() above
+   (docs/HARDENING_BACKLOG.md H04) -- same two-pass validate-then-apply contract as
+   feb_cbor_decode_wifi_scan_result_payload_stream() (cbor_wifi_scan.h): a malformed device
+   anywhere in the batch fails the whole decode with zero `cb` invocations, never a partial
+   prefix. `device` passed to `cb` is only valid for the duration of that call.
+   `device_count_out` (may be NULL) receives the decoded count on FEB_CBOR_OK, 0 otherwise. */
+typedef void (*feb_ble_scan_device_stream_cb_t)(const feb_ble_scan_device_t *device, void *ctx);
+feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload_stream(const uint8_t *in, size_t in_len, feb_ble_scan_device_stream_cb_t cb, void *ctx, size_t *device_count_out);
+
 #endif /* FEB_CBOR_BLE_SCAN_H */

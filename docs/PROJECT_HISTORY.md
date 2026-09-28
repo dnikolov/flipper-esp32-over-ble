@@ -2711,6 +2711,159 @@ mesh-dedup shrink), run in parallel where the plan's dependency order allowed. A
 builds and both host test suites (`tests/flipper/build.ps1`, `tests/esp32/build_wardriving.ps1`)
 passed; `tools/check_shared_headers.py` reports no mismatch.
 
+## 2026-09-28: Publish BadUSB bootstrap lost keystrokes after the hardening pass
+
+After the hardening pass (HP-16 `-NoProfile -ExecutionPolicy Bypass`, HP-31 `Remove-Item` prefix +
+`if ($?)` gate) the typed bootstrap line got ~50% longer, and on the user's Windows 11 PC only its
+tail arrived (`g.ps1"-ErrorAction Stop; if ($?) {...}`) -- the head was typed before Windows
+Terminal accepted input, and a mid-string space was also dropped. The resulting unterminated quote
+left PowerShell at a `>>` continuation prompt; the fetched script itself was fine (byte-identical
+to the pinned commit, and a mocked end-to-end run passed). Fix in `publish_trigger_badusb()` /
+`publish_badusb_type_string()`: 10 ms per-character delay, Run-dialog wait 500 -> 1000 ms,
+PowerShell-launch wait 1200 -> 3500 ms. No change to the pinned script commit. Build-verified;
+hardware re-test pending.
+
+## 2026-09-28: H04's two remaining "still open" items — streaming decode + mesh_log e7 display entry
+
+Closed the two items H04's 2026-09-28 hardening-pass entry had left on the table
+(`shared_status_result` and `mesh_log_display_nodes`), the first the entry's own "biggest
+remaining single win." Build- and host-test-verified; not hardware-tested.
+
+**`shared_status_result` (2,832 -> 64 bytes).** `wifi_scan`/`ble_scan`/`wardriving` each got a
+new streaming decode entry point in their shared codec (`components/feb_protocol/
+cbor_wifi_scan.h`/`cbor_ble_scan.h`/`cbor_wardriving.h`, mirrored in `flipper/`):
+`feb_cbor_decode_<x>_result_payload_stream(in, in_len, cb, ctx, count_out)`, invoking `cb`
+once per decoded element instead of writing a whole array. The existing whole-array decoders
+were kept unchanged (still used by the ESP32 side and existing host tests) — this is a new
+entry point alongside them, not a replacement, per the shared-codec lockstep convention.
+
+**API shape chosen, and why:** each new function is internally a *two-pass* decode
+(`static ..._stream_pass(in, in_len, cb, ctx, ...)`, called once with `cb == NULL` to validate
+the whole payload with zero side effects, then again with the real `cb` only if that succeeds)
+rather than a single pass that fires `cb` as each element decodes. This was a deliberate
+choice, not the simplest option: a single-pass design would invoke `cb` for elements 0..k-1
+before discovering element k (or, for `wardriving`, the *trailing* `backlog_remaining` field
+that comes after every record) is malformed — a caller doing real work in `cb` (a CSV write, a
+dedup-table update) would then have already applied a prefix of a batch that turns out
+invalid, diverging from the whole-array decoder's existing all-or-nothing contract. The
+two-pass design costs decode time twice over (negligible — tens of tiny CBOR map decodes) in
+exchange for the callback only ever firing once the *entire* batch is confirmed well-formed,
+preserving that contract exactly. A dedicated host test on both sides (`WARDRIVING_STREAM`/
+`wardriving result stream` in `tests/flipper/test_flipper_codec.c` and
+`tests/esp32/test_framing_cbor.c`) proves this concretely: a batch with two individually
+well-formed records but a corrupted trailing `backlog_remaining` invokes the callback **zero**
+times on both firmwares' decoders, matching the whole-array decoder's own rejection of the
+same input.
+
+**Malformed-mid-batch handling, concretely:** every new streaming call site in
+`flipper/flipper_esp32_over_ble.c` treats the streaming decode's return status exactly like
+the old whole-array decode's status — a non-`FEB_CBOR_OK` result logs a warning and returns
+with no side effects, since the two-pass design guarantees none occurred. For `wardriving`
+specifically, this preserves H04's own "resolve the export file once per batch, before the
+dedup table is touched" rule *by construction* rather than needing the caller to sequence it:
+the new `wardriving_record_stream_cb()` resolves (opens) the CSV file lazily on its own first
+invocation, guarded by a per-batch `csv_resolved` flag in a new `WardrivingRecordStreamCtx`
+(reset before each streaming-decode call) — since no callback ever fires for a batch that
+doesn't fully decode, the file is never resolved for a malformed batch either, matching the
+old code's ordering (decode-then-resolve) with an equivalent ordering (validate-then-resolve),
+not a looser one. The dedup-table side effect (`feb_wardriving_dedup_should_write()`, which
+marks an address as exported) still only runs for records confirmed to belong to a
+successfully-decoding batch, same as before.
+
+**Where the buffers ended up (stack vs. `static`):** `feb_wifi_scan_ap_t`/
+`feb_ble_scan_device_t` scratch (~64/~56 bytes) stayed plain function locals in the new
+`_stream_pass()` helpers — under this project's own "≥100 bytes reachable from
+`BleEventWorker` must be `static`" threshold. `feb_wardriving_record_t` scratch (100+ bytes:
+four `uint64_t` fields, a text-alias pair, a tag, and a wifi/ble payload union) is `static`
+inside `cbor_wardriving.c`'s pass helper, reused across both passes and both firmwares' calls,
+per that same rule. The new per-batch `WardrivingRecordStreamCtx` in
+`flipper_esp32_over_ble.c` (measured 88 bytes via `arm-none-eabi-nm`, replacing two
+already-`static` 40-byte summary buffers) is also `static` for the same reason, even though it
+sits right at the threshold rather than clearly over it.
+
+**`mesh_log_display_nodes` (3,072 -> 2,304 bytes, capacity unchanged at 64).** New
+`feb_mesh_node_display_entry_t` (`flipper/mesh_nodes.h`/`.c`) stores lat/lon as `int32_t` e7
+(degrees × 1e7) instead of two `double`s — 36 bytes/entry instead of 48, matching H04's own
+warning that `float` (not attempted) would lose precision at three-digit longitudes.
+`feb_mesh_node_entry_t`/`feb_mesh_log_parse_line()` (the accumulator *file's* own
+double-based line format) were left unchanged, since that's the on-disk format
+`scripts/publish_wardriving.ps1`'s own parser also depends on — a new converter,
+`feb_mesh_node_entry_to_display()`, runs once at insert/reload time. `handle_mesh_log_status()`
+(the live-append path) doesn't even go through a double at all: it derives the e7 value
+directly from the wire's own `lat_e7_offset`/`lon_e7_offset` integer fields
+(`(int32_t)((int64_t)record->lat_e7_offset - 900000000)`), which is exact, unlike
+`mesh_log_display_reload()`'s file-reload path, which necessarily starts from an
+already-decimal-text-derived double and rounds once converting to e7.
+`draw_mesh_log_screen()` converts back to a `double` only for its own single `%.5f` snprintf
+call, never storing one. A host test (`MESH_NODES_DISPLAY`/`test_mesh_nodes_display_entry_
+conversion`) checks this round-trip produces byte-identical `%.5f` text across 8 sample
+coordinates, including near-rounding-boundary values, not just one hand-picked value.
+
+**A real compile-time snag, not caught by either host test suite:** the FBT ARM build (but not
+MSVC) treats undecorated floating-point literals (`1e7`, `0.5`, `10000000.0`) as `float`, so an
+expression mixing one with a `double` operand trips `-Werror=double-promotion` on an *implicit*
+promotion. Fixed by switching to the codebase's own already-established `(double)N` explicit-cast
+idiom (already used elsewhere for the same lat/lon e7 arithmetic, e.g. `wardriving_csv.c`) —
+an explicit cast isn't an implicit promotion, so it doesn't warn. This shipped once, caught only
+by the real `tools/build_flipper.ps1` FBT build, exactly the kind of gap this project's own
+"host tests are structurally blind" pattern (`docs/LESSONS.md`) already warns about, just for a
+compiler-diagnostics reason rather than a stack-safety one.
+
+**Whole-array-decoder duplication removed, same day, follow-up pass.** A first measurement
+pass (below) showed `.text` growing +2496 bytes and attributed it to "keeping the old
+whole-array decoder body alongside the new streaming one" for each of the three payloads.
+Grepping confirmed no firmware (`flipper/`, `esp32/`, `esp32c5/`, `heltec/main/`) calls the
+whole-array form anymore, only host tests, so each was re-implemented as a thin wrapper over
+its streaming counterpart (an array-filling callback + ctx, identically in
+`components/feb_protocol/` and `flipper/`) — one decode body per payload again. The public
+prototypes, all-or-nothing validation contract, and exact array-cap-overflow/count reporting
+are unchanged (the wrapper just fills `payload->aps[]`/`devices[]`/`records[]` from the
+streaming callback and copies the reported count/`backlog_remaining` back out), so every
+existing test kept passing unchanged. **This measurably changed nothing in any shipped
+binary**: `arm-none-eabi-nm` shows the whole-array wrapper functions and their fill callbacks
+are **absent from the FAP's linked ELF entirely, both before and after this pass** — the
+linker already eliminates them as unreachable dead code, since nothing in the FAP's real call
+graph calls them (only the separately-compiled host test binaries do). The `.text` growth
+below was never "two bodies kept for one payload" — it was genuinely new, *reachable* code
+(the streaming pass functions plus the new callback functions in
+`flipper_esp32_over_ble.c`), which this deduplication pass does not and cannot remove, since
+that code is still called. Worth doing anyway, for the same-source-of-truth reason
+`docs/LESSONS.md`'s "two-implementations-agreeing-is-not-two-implementations-being-right"
+already documents (two bodies can silently drift even if neither is currently reachable) — just
+not a further measured memory win.
+
+**Measured (final, both passes; in a working tree that also carries an unrelated,
+already-noted concurrent session's small BadUSB-timing/footer-constant edits — see the entry
+above; those add no static storage, confirmed by reading their diff):** `arm-none-eabi-size`/
+`-nm` against the real built `flipper_esp32_over_ble_d.elf`, streaming-decode pass then
+deduplication pass: `.text` 54680 -> 57176 -> 57168 (net +2488), `.rodata` 11944 -> 12304 ->
+12304 (net +360, unaffected by dedup), `.bss` 27969 -> 24289 -> 24292 (net -3677, the +3 from
+dedup is noise-level, not a real cost), message-queue heap unchanged throughout (832 —
+`AppEvent` itself was never touched). **Total system heap held: 95,481 -> 94,657 -> 94,652
+bytes (net -829).** In isolation, via `arm-none-eabi-nm` (unaffected by the dedup pass, since
+that only touched `cbor_*.c`, not `flipper_esp32_over_ble.c`): `shared_status_result` 2832 ->
+64 bytes, `mesh_log_display_nodes` 3072 -> 2304 bytes. Read honestly: the total-heap win is
+smaller than the sum of those two structures' own reductions (3536 bytes) because implementing
+the streaming API costs real, *reachable* `.text` that the whole-array-decoder deduplication
+correctly could not claw back (see above) — H04's original framing (a pure `.bss` cut)
+undercounted this tradeoff, and the initial hypothesis that removing decoder duplication would
+recover most of it was also wrong, for the reason explained above. `.fap` artifact: 121,916 ->
+121,908 bytes. `esp32`(C6)/`esp32c5`/`heltec` all rebuilt clean against the changed shared
+component both passes; every `.bin` size was byte-identical before and after the deduplication
+pass on all three boards (confirms none of them ever called the whole-array decoders either).
+Heltec's `idf.py size` was likewise unchanged by the deduplication pass (348 B DRAM / 7309 B
+IRAM headroom) — see the streaming-decode pass's own already-recorded caveat on that 348 B
+figure (it predates this session, from an unrelated already-committed change) just above.
+
+Host tests, final (both passes): the Flipper suite (`tests/flipper/build.ps1`, the only one of
+the three that compiles the touched files) went 491/491 -> 529/529 (+38, this session's new
+streaming/display-conversion checks) and stayed 529/529 through the deduplication pass.
+ESP32-side `tests/esp32/build.ps1` (the touched codec files' other consumer) is 180/180 both
+passes, "All tests passed" — no pre-session baseline count was captured for this suite
+specifically, so no delta is claimed for it, only that it stayed green. `build_pairing.ps1`/
+`build_session.ps1`/`build_wardriving.ps1` (which also compile the touched codec files)
+reconfirmed passing after both passes. `tools/check_shared_headers.py` clean throughout.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

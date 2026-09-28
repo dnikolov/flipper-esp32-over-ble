@@ -160,6 +160,19 @@ size_t feb_cbor_encode_ble_scan_result_payload(
     return pos;
 }
 
+/* feb_cbor_decode_ble_scan_result_payload() below is a thin wrapper over the streaming
+   decoder further down (feb_cbor_decode_ble_scan_result_payload_stream()) -- one decode body
+   per payload, not two; see cbor_wifi_scan.c's identical wrapper for the full rationale. */
+typedef struct {
+    feb_ble_scan_result_payload_t* payload;
+    size_t index;
+} BleScanArrayFillCtx;
+
+static void ble_scan_array_fill_cb(const feb_ble_scan_device_t* device, void* ctx_ptr) {
+    BleScanArrayFillCtx* ctx = (BleScanArrayFillCtx*)ctx_ptr;
+    ctx->payload->devices[ctx->index++] = *device;
+}
+
 feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload(
     const uint8_t* in,
     size_t in_len,
@@ -168,6 +181,36 @@ feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload(
         return FEB_CBOR_ERR_UNEXPECTED_TYPE;
     }
     memset(payload, 0, sizeof(*payload));
+
+    BleScanArrayFillCtx ctx = {.payload = payload, .index = 0};
+    size_t device_count = 0;
+    feb_cbor_status_t status = feb_cbor_decode_ble_scan_result_payload_stream(
+        in, in_len, ble_scan_array_fill_cb, &ctx, &device_count);
+    if(status != FEB_CBOR_OK) {
+        return status;
+    }
+    payload->device_count = device_count;
+
+    return FEB_CBOR_OK;
+}
+
+/* mode: cb == NULL is the validate-only pass (no side effects); cb != NULL is the apply pass.
+   See feb_cbor_decode_ble_scan_result_payload_stream()'s header comment for why both passes
+   exist. `device` is a plain local, not `static`: feb_ble_scan_device_t is well under this
+   project's ">=100 bytes reachable from BleEventWorker must be static" threshold
+   (docs/LESSONS.md), so a stack frame here is fine. */
+static feb_cbor_status_t ble_scan_result_payload_stream_pass(
+    const uint8_t* in,
+    size_t in_len,
+    feb_ble_scan_device_stream_cb_t cb,
+    void* ctx,
+    size_t* device_count_out) {
+    if(in == NULL) {
+        return FEB_CBOR_ERR_UNEXPECTED_TYPE;
+    }
+    if(device_count_out != NULL) {
+        *device_count_out = 0;
+    }
     feb_cbor_status_t status = FEB_CBOR_OK;
     size_t count = 0;
     size_t pos = feb_cbor_decode_map_header(in, in_len, &count, &status);
@@ -197,15 +240,36 @@ feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload(
     }
     pos += n;
 
+    feb_ble_scan_device_t device;
     for(size_t i = 0; i < array_count; i++) {
-        size_t item_len =
-            feb_cbor_decode_ble_scan_device(in + pos, in_len - pos, &payload->devices[i], &status);
+        size_t item_len = feb_cbor_decode_ble_scan_device(in + pos, in_len - pos, &device, &status);
         if(item_len == 0) {
             return status;
         }
         pos += item_len;
+        if(cb != NULL) {
+            cb(&device, ctx);
+        }
     }
-    payload->device_count = array_count;
+    if(device_count_out != NULL) {
+        *device_count_out = array_count;
+    }
 
     return FEB_CBOR_OK;
+}
+
+feb_cbor_status_t feb_cbor_decode_ble_scan_result_payload_stream(
+    const uint8_t* in,
+    size_t in_len,
+    feb_ble_scan_device_stream_cb_t cb,
+    void* ctx,
+    size_t* device_count_out) {
+    feb_cbor_status_t status = ble_scan_result_payload_stream_pass(in, in_len, NULL, NULL, NULL);
+    if(status != FEB_CBOR_OK) {
+        if(device_count_out != NULL) {
+            *device_count_out = 0;
+        }
+        return status;
+    }
+    return ble_scan_result_payload_stream_pass(in, in_len, cb, ctx, device_count_out);
 }

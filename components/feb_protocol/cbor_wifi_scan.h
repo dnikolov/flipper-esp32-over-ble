@@ -55,4 +55,18 @@ typedef struct {
 size_t feb_cbor_encode_wifi_scan_result_payload(uint8_t *out, size_t out_cap, const feb_wifi_scan_result_payload_t *payload);
 feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload(const uint8_t *in, size_t in_len, feb_wifi_scan_result_payload_t *payload);
 
+/* Streaming counterpart to feb_cbor_decode_wifi_scan_result_payload() above
+   (docs/HARDENING_BACKLOG.md H04) -- for a caller that consumes each AP as it's decoded
+   instead of needing the whole FEB_WIFI_SCAN_MAX_APS_PER_RECORD-entry array resident at once.
+   Enforces identical validation (array cap, per-AP field order/type/range) as the whole-array
+   decoder. Internally two passes over `in`: the first decodes every AP without invoking `cb`,
+   purely to confirm the whole payload is well-formed; only once that succeeds does a second
+   pass invoke `cb` once per AP, in wire order. This preserves the whole-array decoder's own
+   all-or-nothing contract -- a malformed AP anywhere in the batch fails the whole decode with
+   zero `cb` invocations, never a partial prefix of a batch that turns out invalid. `ap` passed
+   to `cb` is only valid for the duration of that call. `ap_count_out` (may be NULL) receives
+   the decoded count on FEB_CBOR_OK, 0 otherwise. */
+typedef void (*feb_wifi_scan_ap_stream_cb_t)(const feb_wifi_scan_ap_t *ap, void *ctx);
+feb_cbor_status_t feb_cbor_decode_wifi_scan_result_payload_stream(const uint8_t *in, size_t in_len, feb_wifi_scan_ap_stream_cb_t cb, void *ctx, size_t *ap_count_out);
+
 #endif /* FEB_CBOR_WIFI_SCAN_H */
