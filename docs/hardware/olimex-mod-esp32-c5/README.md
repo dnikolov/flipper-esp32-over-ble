@@ -150,3 +150,33 @@ the same physical pins the schematic labels as the UEXT connector's dedicated UA
 UEXT I2C pins on GPIO2/GPIO3). ATGM336H is a UART NMEA-0183 GPS/GNSS module (typically 9600
 baud default) — same driver shape as the C6/Heltec's existing `location.c`/`nmea_parser.c`,
 retargeted to these two pins.
+
+**Verified 2026-09-28** (temporary raw-NMEA debug build, 90 s capture, since reverted):
+- Firmware: `$PCAS06,0` → `SW=URANUS5,V5.3.0.0`. `$PCAS06,1` (hardware model) got no reply.
+- Enabled constellations out of the box: **GPS + BeiDou only** — `$GPGSV`/`$BDGSV` present, no
+  `$GLGSV` (GLONASS) or `$GAGSV` (Galileo). `$GNGSA` carries NMEA 4.1 system IDs (1 = GPS,
+  4 = BDS) — the fix used both.
+- Default output set: GGA, GLL, GSA, GSV, RMC, VTG, ZDA, TXT (`ANTENNA OK` every second), 1 Hz.
+- Sample fix: 9 satellites in use, HDOP 1.3.
+- **No Galileo possible on this module** (web research 2026-09-28): the CASIC protocol spec's
+  `$PCAS04` is an enum 1–7 (1 GPS, 2 BDS, 4 GLONASS, sums thereof) with no Galileo value;
+  `URANUS5,V5.3.0.0` is a mask-ROM firmware (Quectel L76K ships the same string; "does not
+  support version upgrades"). Galileo needs the AT6668-based ATGM336H-6N. GLONASS
+  (`$PCAS04,7*1E`) may or may not work — some AT6558 variants (e.g. -5N-31) are GPS+BDS only;
+  verify by looking for `$GLGSV` after sending it. **Hardware-tested 2026-09-28** (RAM-only, no
+  `$PCAS00`, since restored to `$PCAS04,3`): `$PCAS04,15` and `$PCAS04,8` are silently ignored
+  (`$PCAS06,2` still reports `MO=GB`, no `$GAGSV`); `$PCAS04,7` is accepted (`MO=GBR`, `$GLGSV`
+  appears, 2 GLONASS sats in view within ~30 s but none used in the fix yet). So this unit is a
+  GLONASS-capable variant; Galileo is confirmed unavailable. Datasheet TTFF: cold ~35 s, hot ~1 s (hot
+  requires VBAT backup power to survive power-off). Never send `$PCAS10,1/2/3` (warm/cold/factory
+  restart) from routine code.
+
+**Module config is non-default — saved to the module's own flash 2026-09-28** (one-shot
+throwaway build; prod firmware is unchanged and still never writes to the GPS):
+`$PCAS03,1,0,1,5,1,0,0,0` (GGA/GSA/RMC every fix, GSV every 5th, GLL/VTG/ZDA/antenna-TXT off —
+the firmware only parses GGA+RMC; trimmed to keep 3-constellation output well under 9600 baud),
+`$PCAS04,7` (GPS+BDS+GLONASS), `$PCAS00` (save). Verified surviving a full USB power cycle:
+`MO=GBR` and the trimmed sentence set present before any command was sent. Immediate effect
+on the same bench spot: 9 sats / HDOP 1.3 → 14 sats / HDOP 0.9. A `$PCAS10,3` factory reset
+reverts to GPS+BDS with the full default sentence set; re-send the three commands above to
+restore.
