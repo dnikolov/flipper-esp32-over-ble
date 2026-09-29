@@ -1,0 +1,1 @@
+idf_component_register(SRCS "nmea_parser.c" "wardriving_record_format.c" "wardriving_log.c" "wardriving_validate.c" "wardriving_dedup.c" "wardriving_persist.c" INCLUDE_DIRS "." REQUIRES feb_protocol nvs_flash esp_partition)

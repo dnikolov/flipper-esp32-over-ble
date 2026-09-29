@@ -19,9 +19,23 @@ Official reference (use when the cached checkout doesn't answer the question):
 - https://developer.flipper.net/flipperzero/doxygen/dev_tools.html
 - https://developer.flipper.net/flipperzero/doxygen/system.html
 
-**Read discipline:** `flipper/flipper_esp32_over_ble.c` and `flipper/cbor_codec.c` are large
-(2400+/2300+ lines). `Grep` for the symbol you need first, then `Read` with `offset`/`limit`
-around it — don't read either file whole unless you're doing a full-file review.
+**App source layout (unity build, [docs/SOURCE_SPLIT.md](../../docs/SOURCE_SPLIT.md) §3):**
+- The app is split into modules, each small enough to read whole: `app_internal.h`,
+  `ble_transport.c`, `session_flow.c`, `app_storage.c`, `wardriving_settings.c`,
+  `wardriving_rx.c`, `wardriving_ui.c`, `scan_rx.c`, `gps_rx.c`, `mesh_log_rx.c`,
+  `publish.c` and `app_ui.c`.
+- They compile as **one translation unit**: `flipper_esp32_over_ble.c` `#include`s them, and only
+  that file is listed in `application.fam`. This keeps FAP heap at or below the old monolith's
+  (H04). Separate TUs cost about 2.5 KB of resident `.text` plus `.fast.rel.text`.
+- Internal functions and shared variables are marked `APP_FN` / `APP_DATA`, which expand to
+  `static`. Mark every new cross-module function the same way.
+- **A shared variable's one real definition lives in `app_internal.h`.** A second declaration in
+  a module trips `-Werror=redundant-decls`.
+- Never add a module to `application.fam` sources. The `#error` guard at the top of each module
+  enforces this.
+- The pre-existing pure modules (`cbor_*`, `framing`, `wardriving_csv`, `mesh_nodes`,
+  `pairing*`, `session*`) are still separate TUs.
+- When measuring heap cost, include the `.fast.rel.*` sections: the loader keeps them resident.
 
 ## Pinned firmware — do not silently change
 
@@ -57,7 +71,7 @@ just doing it, and update [docs/BASELINES.md](../../docs/BASELINES.md) if it hap
 - The wire contract is [docs/PROTOCOL.md](../../docs/PROTOCOL.md); the pairing ceremony is
   [docs/PAIRING.md](../../docs/PAIRING.md). Both firmwares must agree byte-for-byte on CBOR
   shapes, UUIDs, and crypto derivations — check the ESP32 side
-  ([esp32/main/main.c](../../esp32/main/main.c)) before changing anything protocol-shaped.
+  ([components/feb_app_core/](../../components/feb_app_core/)) before changing anything protocol-shaped.
 - `pairing_secret` and other long-term secrets go through app-owned persistent storage
   (temp file, verified write, `storage_file_sync()`, close, atomic rename) — functional
   persistence, not a hardware secret vault; local SD-card/debug access is explicitly

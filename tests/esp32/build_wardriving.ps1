@@ -7,7 +7,8 @@
 # since neither of these depends on the cbor codec at all. wardriving_log.c itself depends
 # directly on esp_partition.h and is not host-buildable; see its header comment. No
 # gcc/MinGW is assumed to be on PATH (see docs/PLAN.md step 3 implementation decisions,
-# which this mirrors).
+# which this mirrors). Sources live in components/feb_wardriving/ (shared across esp32/
+# esp32c5/heltec since docs/SOURCE_SPLIT.md stage E1), not under esp32/main/.
 $ErrorActionPreference = "Stop"
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -30,7 +31,7 @@ if(-not (Test-Path $vcvarsall)) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
-$esp32Dir = Join-Path $repoRoot "esp32\main"
+$wardrivingDir = Join-Path $repoRoot "components\feb_wardriving"
 $outDir = Join-Path $scriptDir "build"
 
 if(-not (Test-Path $outDir)) {
@@ -39,11 +40,11 @@ if(-not (Test-Path $outDir)) {
 
 $sources = @(
     (Join-Path $scriptDir "test_wardriving_log.c"),
-    (Join-Path $esp32Dir "wardriving_record_format.c"),
-    (Join-Path $esp32Dir "wardriving_validate.c")
+    (Join-Path $wardrivingDir "wardriving_record_format.c"),
+    (Join-Path $wardrivingDir "wardriving_validate.c")
 ) -join " "
 
-$includeDirs = "/I `"$esp32Dir`""
+$includeDirs = "/I `"$wardrivingDir`""
 $exePath = Join-Path $outDir "test_wardriving_log.exe"
 
 $cmd = "call `"$vcvarsall`" >nul && cl.exe /nologo /W4 /std:c11 $includeDirs /Fe:`"$exePath`" /Fo:`"$outDir\\`" $sources"

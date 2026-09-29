@@ -16,7 +16,17 @@ source of truth over generic ESP32 knowledge. Before editing anything under
 [docs/AGENT_RULES.md](../../docs/AGENT_RULES.md) — it holds the rules this file used to repeat
 that are identical across every board/firmware agent in this project.
 
-**Read discipline:** the wire-protocol/crypto layer (`framing`, `pairing`/`pairing_crypto`,
+**Read discipline / source layout** ([docs/SOURCE_SPLIT.md](../../docs/SOURCE_SPLIT.md)):
+the board-independent application logic (BLE central, pairing/runtime auth, TX queue, and
+the wifi_scan/ble_scan/gps/wardriving capabilities) lives in the shared
+`components/feb_app_core/` (`feb_link.c`, `feb_central.c`, `feb_cap_scan.c`, `feb_cap_gps.c`,
+`feb_cap_wardriving.c`, `feb_cap_wardriving_cmd.c`), consumed by all three ESP boards;
+wardriving storage/validation and the NMEA parser live in `components/feb_wardriving/`. A
+board's `main/` keeps only `main.c` (host_synced/app_main/Wi-Fi init/features/command table),
+`board_config.h`, its hooks, and board-only modules. Every file is small enough to read whole.
+**A change to either shared component is a three-board change** (AGENT_RULES.md).
+C5 board files: `esp32c5/main/{main.c, wifi_band.c}` (dual-band hooks behind
+`FEB_WIFI_DUAL_BAND`). The wire-protocol/crypto layer (`framing`, `pairing`/`pairing_crypto`,
 `session`/`session_crypto`, all `cbor_*` codec files, split by capability:
 `cbor_primitives.c`, `cbor_records.c`, `cbor_wifi_scan.c`, `cbor_ble_scan.c`,
 `cbor_wardriving.c`, `cbor_gps.c`) lives in the shared `components/feb_protocol/` component,
@@ -71,9 +81,9 @@ schematic, and strapping-pin notes:
 - The wire contract is [docs/PROTOCOL.md](../../docs/PROTOCOL.md); the capability registry
   format is [docs/CAPABILITIES.md](../../docs/CAPABILITIES.md). All three ESP32-family boards
   and the Flipper must agree byte-for-byte on CBOR shapes, UUIDs, and crypto derivations for
-  anything in `components/feb_protocol/` — check `esp32/main/main.c`'s existing capability
+  anything in `components/feb_protocol/` — check `components/feb_app_core/`'s existing capability
   implementation (the thing you're porting from) and the Flipper side
-  ([flipper/flipper_esp32_over_ble.c](../../flipper/flipper_esp32_over_ble.c)) before assuming
+  (`flipper/*_rx.c` / [flipper/session_flow.c](../../flipper/session_flow.c)) before assuming
   a shape rather than reading it.
 - **Porting an existing capability (`wifi_scan`, `ble_scan`, `gps` — already fully specified in
   PROTOCOL.md/CAPABILITIES.md and implemented on the C6/Heltec) is not the same as designing a
@@ -123,7 +133,7 @@ asking. Known port from this session: `COM11` — reconfirm, it isn't stable acr
 ## Working method
 
 Follow AGENT_RULES.md's default working method, with one addition to step 1: if it's a
-capability port, read the C6's implementation of that exact capability in `esp32/main/main.c`
+capability port, read the existing implementation of that exact capability in `components/feb_app_core/`
 first — grep for the capability name, don't re-derive its wire behavior from the protocol docs
 alone when a working reference implementation exists. Also don't pull forward `wardriving`,
 5 GHz Wi-Fi, or factory-reset work as a side effect of a narrower capability port — all three

@@ -122,7 +122,7 @@ Opus/high for other repos); D2 archive to `docs/archive/`; D3 TP-15 backlogged i
 | TP-12 | `.gitattributes` (`*.c/*.h/*.py` LF, `*.ps1/*.cmd` CRLF); the index was already all LF, so no renormalize was needed. |
 | TP-13 | `flash-verify` skill (user-invoked only, Haiku delegate). **Open:** supervised per-board run; C5 and Heltec have no flash script (the skill says so and does not invent commands). |
 | TP-14 | `sync-user-guide` skill. |
-| TP-15 | Backlogged in BACKLOG.md ("Codebase & agent cost-efficiency"). |
+| TP-15 | Backlogged in BACKLOG.md ("Codebase & agent cost-efficiency"). Designed and implemented 2026-09-29 ([SOURCE_SPLIT.md](SOURCE_SPLIT.md)). Build-verified; hardware passes pending. |
 | TP-16 | `tools/claude_usage.py` reproduces §1 (e.g. compactions 30, avg ctx 183K/143K). |
 | TP-17 | 1 memory deleted (UI-redesign status), 4 refreshed, MEMORY.md re-indexed. |
 | TP-18 | ⬜ Re-measure around 2026-10-12 with `python tools/claude_usage.py --since 2026-09-29`. |

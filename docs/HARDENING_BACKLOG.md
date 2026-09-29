@@ -331,7 +331,7 @@ reduction of 11840 bytes, ~26%. See `docs/PROJECT_HISTORY.md` for the full verif
 
 **Also fixed, same session:** `wardriving_dedup_table` split into independent Wi-Fi (48-slot) /
 BLE (96-slot) sub-tables instead of one shared 256-slot ring (the ESP32's own independent dedup
-layer, `esp32/main/wardriving_dedup.c`, already uses two separate tables at the same 1:2 ratio, for
+layer, `components/feb_wardriving/wardriving_dedup.c`, already uses two separate tables at the same 1:2 ratio, for
 the same reason: BLE's faster churn was evicting still-relevant Wi-Fi entries out of a shared
 ring, causing avoidable duplicate CSV rows). This combined the split with a capacity shrink
 (256 -> 144 total entries), cutting this table from 8200 to 4624 bytes. `.bss`: 32972 -> 29400.

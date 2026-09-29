@@ -52,7 +52,7 @@
    mesh-scan capabilities' tables coexisted -- see that header's own sizing note for the
    measured `idf.py build` numbers that drove this down. Meshtastic's short_name is already
    conventionally a compact (often <=4 character) tag, so 8 is generous headroom for it, unlike
-   truncating the free-form long_name field would be. main.c re-clamps to
+   truncating the free-form long_name field would be. mesh_caps.c re-clamps to
    FEB_MESHTASTIC_NAME_MAX_LEN defensively when building a feb_meshtastic_node_t. */
 #define MESHTASTIC_NAME_MAX_LEN 8u
 

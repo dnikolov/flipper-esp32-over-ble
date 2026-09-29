@@ -79,6 +79,19 @@ task, and only if the brief doesn't already give you what you need.
   `docs/CAPABILITIES.md` and the `reference_flipper_sd_card_access` project memory for deleting
   a stale cache file via `scripts/storage.py`.
 
+## Shared application core
+
+- `components/feb_app_core/` and `components/feb_wardriving/` are compiled into all three ESP
+  boards. A change there is not done until `esp32`, `esp32c5`, `heltec` and
+  `esp32/cluster_worker` all build, and Heltec's `idf.py size` DRAM headroom is checked (it is
+  ~100 B). Report the affected boards for hardware checks.
+- Board differences go through the board's `board_config.h` flags or the `const
+  feb_app_hooks_t` table ([SOURCE_SPLIT.md](SOURCE_SPLIT.md) §5.2), never `#ifdef
+  CONFIG_IDF_TARGET_*` sprinkled in the core and never weak symbols. New hooks are appended;
+  NimBLE callouts/events are created only in each board's `host_synced` (8-callout cap).
+- The Flipper app modules compile as one translation unit (`APP_FN`/`APP_DATA`); see
+  flipper-developer.md.
+
 ## Crypto standards
 
 - Zeroize ephemeral key material (X25519 private keys, shared secrets, session keys) on every

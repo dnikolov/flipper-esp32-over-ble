@@ -144,7 +144,7 @@ against `esp32/main/cbor_gps.h`/`.c` (and their byte-identical `flipper/` copies
 `esp32/main/cbor_gps.c`) and `tests/flipper/test_flipper_codec.c` (via
 `tests/flipper/build.ps1`) both exercise these vectors.
 
-`esp32/main/nmea_parser.c`/`.h` -- the pure, zero-ESP-IDF-dependency GGA/RMC sentence
+`components/feb_wardriving/nmea_parser.c`/`.h` -- the pure, zero-ESP-IDF-dependency GGA/RMC sentence
 parser underneath `location.c`'s real UART-driven GPS driver -- has its own host-native
 test (`tests/esp32/test_location.c`, via `tests/esp32/build_location.ps1`), retained under
 its original filename even though it no longer compiles `location.c` directly:

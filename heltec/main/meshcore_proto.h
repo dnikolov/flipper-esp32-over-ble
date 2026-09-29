@@ -32,7 +32,7 @@
    this session (see meshcore_table.h's sizing note) ruled out carrying any extra margin
    above the wire codec's own bound through this board's whole meshcore_scan stack, so this
    is a single source of truth for "the longest name this capability will ever keep," not a
-   generous-margin guess. main.c still re-clamps to FEB_MESHCORE_NAME_MAX_LEN defensively
+   generous-margin guess. mesh_caps.c still re-clamps to FEB_MESHCORE_NAME_MAX_LEN defensively
    when building a feb_meshcore_node_t, since the two constants are independently defined and
    nothing enforces they stay equal if either changes in the future. */
 #define MESHCORE_NAME_MAX_LEN 24u

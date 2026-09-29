@@ -33,7 +33,7 @@ void feb_status_led_set(feb_status_led_state_t state);
 /* Records whether a wardriving capture session is currently active. Unlike the C6 (which
    renders this as a blue-vs-purple color change), this board's plain on/off LED can only
    double the CONNECTING blink rate while active -- CONNECTED (solid on) and FLUSHING (already
-   its own fast blink) are unaffected. Exists so main.c's wardriving_sync_status_led() (ported
+   its own fast blink) are unaffected. Exists so components/feb_app_core's wardriving_sync_status_led() (ported
    unchanged from esp32/main/main.c) has the same call site available on both boards. */
 void feb_status_led_set_wardriving_active(bool active);
 

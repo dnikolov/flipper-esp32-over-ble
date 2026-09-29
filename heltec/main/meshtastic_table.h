@@ -1,7 +1,7 @@
 /* In-RAM, spinlock-guarded Meshtastic node table -- keyed by node_id_hex (upsert semantics:
    a repeated sighting of the same node_id updates its existing entry rather than adding a
    duplicate). Written by lora_shared_radio.cpp's dedicated RX task on every successfully
-   parsed Meshtastic packet (meshtastic_proto.h); read by handle_meshtastic_command() (main.c)
+   parsed Meshtastic packet (meshtastic_proto.h); read by feb_handle_meshtastic_command() (mesh_caps.c)
    via meshtastic_table_snapshot(). Mirrors meshcore_table.h's shape/pattern exactly (same
    guarded-shared-state convention location.h's location_spinlock/location_get_fix() use).
 

@@ -280,7 +280,11 @@ to matter in practice.
   `wardriving_settings.txt` last had selected. `wardriving_persist.h`'s NVS blob was
   deliberately not extended for this pass (out of scope — the Flipper-side file is this
   redesign's persistence story). Real gap if per-board ESP32-side persistence of these two
-  settings is ever wanted for the autostart case specifically.
+  settings is ever wanted for the autostart case specifically. **Resolved 2026-09-29
+  (build-verified, hardware pending):** the NVS blob is now version 2 and stores
+  `wifi_swelling`, `country` and `wifi_band`, saved on every successful `start`. Autostart and
+  the boot button reuse them. The C5's autostart still forces 2.4 GHz until BL16's
+  coexistence sweep. See BACKLOG.md.
 - **`esp_wifi_set_country_code()` failure is treated as non-fatal** — wardriving start still
   proceeds (world-safe default remains usable) rather than aborting with an error. Not specified
   either way by this doc originally; an implementation judgment call, not revisited since it's a

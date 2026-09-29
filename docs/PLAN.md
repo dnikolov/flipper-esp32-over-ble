@@ -86,7 +86,7 @@ Capabilities ship incrementally, gated on hardware actually present on a given b
 - **Scope note (added 2026-09-07):** the wardriving-log half of this step is being built now, ahead of the rest of Phase 3, as part of "`ble_scan`, `wardriving`, and the GPS-stub reorder" above — not deferred to a later pass through step 8. The pairing-record/capability-file persistence hardening (the first two bullets above) remains deferred; this step isn't "done" until those land too.
 
 **Status:**
-- **Wardriving-log persistence:** ✅ done (checksummed circular flash log, `esp32/main/wardriving_log.c`), hardware-verified 2026-09-13 (extended wraparound/power-loss runs, stale record cleanup on boot/replay).
+- **Wardriving-log persistence:** ✅ done (checksummed circular flash log, `components/feb_wardriving/wardriving_log.c`), hardware-verified 2026-09-13 (extended wraparound/power-loss runs, stale record cleanup on boot/replay).
 - **Pairing-record/capability-file hardening:** not yet started — future work after Phase 3 completion.
 
 **Done when (future):** interrupted writes, reboot during pairing, unpair, and factory reset leave no ambiguous paired state for pairing records and capability cache files (matching the robustness already achieved for wardriving log).

@@ -4,6 +4,8 @@
 # wardriving-record timestamps") and is not host-buildable -- same treatment as
 # wardriving_log.c/wardriving_record_format.c's split; this script (kept under its original
 # name/location) now targets nmea_parser.c, the pure sentence-parsing module underneath it.
+# nmea_parser.c now lives in components/feb_wardriving/ (shared across esp32/esp32c5/heltec
+# since docs/SOURCE_SPLIT.md stage E1), not under esp32/main/.
 $ErrorActionPreference = "Stop"
 
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -26,7 +28,7 @@ if(-not (Test-Path $vcvarsall)) {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptDir "..\..")
-$esp32Dir = Join-Path $repoRoot "esp32\main"
+$wardrivingDir = Join-Path $repoRoot "components\feb_wardriving"
 $outDir = Join-Path $scriptDir "build"
 
 if(-not (Test-Path $outDir)) {
@@ -35,10 +37,10 @@ if(-not (Test-Path $outDir)) {
 
 $sources = @(
     (Join-Path $scriptDir "test_location.c"),
-    (Join-Path $esp32Dir "nmea_parser.c")
+    (Join-Path $wardrivingDir "nmea_parser.c")
 ) -join " "
 
-$includeDirs = "/I `"$esp32Dir`""
+$includeDirs = "/I `"$wardrivingDir`""
 $exePath = Join-Path $outDir "test_location.exe"
 
 $cmd = "call `"$vcvarsall`" >nul && cl.exe /nologo /W4 /std:c11 $includeDirs /Fe:`"$exePath`" /Fo:`"$outDir\\`" $sources"

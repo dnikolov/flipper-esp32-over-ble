@@ -15,10 +15,19 @@ under `components/feb_protocol/` or otherwise shared/protocol/codec code, read
 [docs/AGENT_RULES.md](../../docs/AGENT_RULES.md) — it holds the rules this file used to repeat
 that are identical across every board/firmware agent in this project.
 
-**Read discipline:** `heltec/main/main.c` currently implements the base transport/pairing/
-session-auth protocol only (no capabilities yet as of 2026-09-16) — `Grep` for the symbol you
-need first, then `Read` with `offset`/`limit` around it rather than reading it whole unless
-you're doing a full-file review. The wire-protocol/crypto layer (`framing`, `pairing`/
+**Read discipline / source layout** ([docs/SOURCE_SPLIT.md](../../docs/SOURCE_SPLIT.md)):
+the board-independent application logic (BLE central, pairing/runtime auth, TX queue, and
+the wifi_scan/ble_scan/gps/wardriving capabilities) lives in the shared
+`components/feb_app_core/` (`feb_link.c`, `feb_central.c`, `feb_cap_scan.c`, `feb_cap_gps.c`,
+`feb_cap_wardriving.c`, `feb_cap_wardriving_cmd.c`), consumed by all three ESP boards;
+wardriving storage/validation and the NMEA parser live in `components/feb_wardriving/`. A
+board's `main/` keeps only `main.c` (host_synced/app_main/Wi-Fi init/features/command table),
+`board_config.h`, its hooks, and board-only modules. Every file is small enough to read whole.
+**A change to either shared component is a three-board change** (AGENT_RULES.md).
+Heltec-only code: `heltec/main/{main.c, cluster_glue.c, mesh_caps.c, killswitch_glue.c,
+board_hooks.c}` plus the mesh/LoRa/display modules; it plugs into the core via the
+`FEB_HAS_LINK_HOOKS` hooks and the `FEB_HAS_CLUSTER_WORKER` `feb_cluster_*()` functions.
+Heltec DRAM headroom is ~100 B: check `idf.py size` on every core change. The wire-protocol/crypto layer (`framing`, `pairing`/
 `pairing_crypto`, `session`/`session_crypto`, all `cbor_*` codec files, split by capability:
 `cbor_primitives.c`, `cbor_records.c`, `cbor_wifi_scan.c`, `cbor_ble_scan.c`,
 `cbor_wardriving.c`, `cbor_gps.c`) lives in the shared `components/feb_protocol/` component,
@@ -101,9 +110,9 @@ hardware README for citations):
 - The wire contract is [docs/PROTOCOL.md](../../docs/PROTOCOL.md); the capability registry
   format is [docs/CAPABILITIES.md](../../docs/CAPABILITIES.md). Both firmwares (this board and
   the C6) and the Flipper must agree byte-for-byte on CBOR shapes, UUIDs, and crypto
-  derivations for anything in `components/feb_protocol/` — check `esp32/main/main.c`'s existing
+  derivations for anything in `components/feb_protocol/` — check `components/feb_app_core/`'s existing
   capability implementation (the thing you're porting from) and the Flipper side
-  ([flipper/flipper_esp32_over_ble.c](../../flipper/flipper_esp32_over_ble.c)) before assuming
+  (`flipper/*_rx.c` / [flipper/session_flow.c](../../flipper/session_flow.c)) before assuming
   a shape rather than reading it.
 - **Porting an existing capability (`wifi_scan`, `ble_scan`, already fully specified in
   PROTOCOL.md/CAPABILITIES.md and implemented on the C6) is not the same as designing a new
@@ -130,7 +139,7 @@ hardware README for citations):
 Full incident writeups (from the C6's experience porting this exact protocol layer, still
 relevant here since the wire logic is shared): [docs/LESSONS.md](../../docs/LESSONS.md).
 
-- When you port a sizing constant or interval default from `esp32/main/main.c`, do not assume
+- When you port a sizing constant or interval default from `components/feb_app_core/`, do not assume
   it's safe for this board's different radio — either cite where a Heltec-specific bound came
   from, or flag that it's borrowed/unvalidated and why that's an acceptable stopgap for the
   specific case (a one-shot bounded scan is a much smaller risk than continuous concurrent
@@ -162,7 +171,7 @@ Known port from recent sessions: `COM10` — reconfirm, it isn't stable across r
 ## Working method
 
 Follow AGENT_RULES.md's default working method, with one addition to step 1: if it's a
-capability port, read the C6's implementation of that exact capability in `esp32/main/main.c`
+capability port, read the existing implementation of that exact capability in `components/feb_app_core/`
 first — grep for the capability name, don't re-derive its wire behavior from the protocol docs
 alone when a working reference implementation exists. Also don't pull forward `display`/`lora`
 capability work, or wardriving/gps ahead of their stated blockers, as a side effect of a

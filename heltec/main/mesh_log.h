@@ -15,7 +15,7 @@
      task on every successfully decoded, positioned sighting (mirrors where
      `meshcore_table_upsert()`/`meshtastic_table_upsert()` are already called from). Every
      other function here (`mesh_log_pending_count()`/`mesh_log_peek_pending()`/
-     `mesh_log_mark_drained()`) is only ever called from the NimBLE host task (`main.c`'s
+     `mesh_log_mark_drained()`) is only ever called from the NimBLE host task (`mesh_caps.c`'s
      `mesh_log_send_next_batch()`, itself only reachable from BLE session-authenticated
      handling). Since both tasks touch the same on-flash bookkeeping state, every public entry
      point here takes a real FreeRTOS mutex (not a spinlock: `esp_partition_write`/
@@ -24,13 +24,13 @@
      meshcore_table.c's plain-memory-only critical sections, not for this module's flash I/O).
      `mesh_log_peek_pending()`'s scratch buffer is caller-supplied (exactly like
      wardriving_log_peek_pending()'s own convention) specifically so it can live on the NimBLE
-     host task's *stack* (main.c's `mesh_log_send_next_batch()`, a plain local, not `static`)
+     host task's *stack* (mesh_caps.c's `feb_mesh_log_send_next_batch()`, a plain local, not `static`)
      rather than adding a second permanent `.bss` buffer here -- classic ESP32 is dual-core, so
      that task and the LoRa RX task can genuinely execute simultaneously; a single scratch
      buffer shared between the two paths would be a real, silent data race, but two *disjoint*
      buffers (mesh_log_record_sighting()'s own stack-local one -- see that function's own
      comment on why it too is a plain local, not `static`, despite this codebase's usual
-     BLE/radio-callback-path convention -- and main.c's own stack-local one, used only inside
+     BLE/radio-callback-path convention -- and mesh_caps.c's own stack-local one, used only inside
      `mesh_log_send_next_batch()`'s own mutex-held call into `mesh_log_peek_pending()`) never
      touch each other, so there is nothing to race over.
    - `FEB_MESH_LOG_MAX_RECORDS_PER_BATCH` (cbor_mesh_log.h) is 1, not a dynamically-packed

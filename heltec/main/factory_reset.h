@@ -11,13 +11,14 @@
    unchanged from esp32/main/factory_reset.c now that wardriving is ported on this board too. */
 void feb_factory_reset_start(void);
 
-/* Defined in main.c: zeroizes the in-RAM stored pairing secret plus any live
-   pairing/session-auth scratch (reusing pairing_attempt_zeroize()/runtime_auth_zeroize()).
+/* Defined in components/feb_app_core (feb_link.c): zeroizes the in-RAM stored pairing secret
+   plus any live pairing/session-auth scratch (reusing feb_pairing_attempt_zeroize()/
+   feb_runtime_auth_zeroize()).
    Must be called before esp_restart() in the factory-reset path so a warm-boot crash
    between NVS erase and restart cannot leave the old secret sitting in SRAM. */
 void feb_wipe_pairing_secrets(void);
 
-/* Defined in main.c: hands a boot-button short press off to the wardriving on/off toggle,
+/* Defined in board_hooks.c: hands a boot-button short press off to the wardriving on/off toggle,
    which only ever runs on the NimBLE host task -- this function itself just arms a
    ble_npl_event and is safe to call from factory_reset_task(). A no-op (logs a warning)
    if called before the NimBLE host task has finished its own startup. */
@@ -25,12 +26,12 @@ void feb_wardriving_request_button_toggle(void);
 
 /* Defined in factory_reset.c: the actual NVS erase + restart (nvs_flash_erase()/
    nvs_flash_init()/feb_wipe_pairing_secrets()/esp_restart()). Call feb_factory_reset_request()
-   below instead of this directly from factory_reset_task() -- exposed here only so main.c's
+   below instead of this directly from factory_reset_task() -- exposed here only so board_hooks.c's
    host-task callback can invoke it once the request has been serialized (HARDENING_PLAN.md
    HP-13). */
 void feb_factory_reset_perform(void);
 
-/* Defined in main.c: hands the factory-reset gesture off to the NimBLE host task, the same
+/* Defined in board_hooks.c: hands the factory-reset gesture off to the NimBLE host task, the same
    way feb_wardriving_request_button_toggle() does, so the NVS erase inside
    feb_factory_reset_perform() can never interleave with another NVS writer's own
    nvs_open()/nvs_set_*()/nvs_commit() sequence (persist_pairing_secret(),

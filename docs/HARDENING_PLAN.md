@@ -1,5 +1,14 @@
 # Hardening plan (code review 2026-09-28)
 
+> **Line references predate the 2026-09-29 source split.** Citations like `<board>/main/main.c:NNN`
+> and `flipper/flipper_esp32_over_ble.c:NNN` point at pre-split commit `e9e08bb`. The code now
+> lives elsewhere:
+> - **Shared ESP logic:** `components/feb_app_core/`, with a `feb_` prefix on shared symbols.
+> - **Wardriving and NMEA:** `components/feb_wardriving/`.
+> - **Flipper:** the `flipper/*.c` modules.
+>
+> Grep for the function name. [SOURCE_SPLIT.md](SOURCE_SPLIT.md) has the layout.
+
 Output of a full read-only review of all four firmwares (Flipper FAP, ESP32-C6, OLIMEX
 ESP32-C5, Heltec V2), the shared `components/feb_protocol/` + `components/feb_cluster_link/`
 layer, the host publish script, and tooling/tests — reviewed against
@@ -110,7 +119,7 @@ The sections below are the original review text as written before implementation
 - **Where:** `wardriving_wifi_interval_cb()` in [esp32/main/main.c:2031](../esp32/main/main.c#L2031)
   and [heltec/main/main.c:2416](../heltec/main/main.c#L2416) (uncommitted edits in both; HEAD has no
   no-fix skip). Reference fix: [esp32c5/main/main.c:1810-1826](../esp32c5/main/main.c#L1810-L1826)
-  + `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS` in `esp32c5/main/wardriving_validate.h:97`.
+  + `FEB_WARDRIVING_NO_FIX_RETRY_FLOOR_MS` in `components/feb_wardriving/wardriving_validate.h:97`.
 - **What:** on no fix, the new branch re-arms the callout with the raw
   `wardriving_wifi_interval_ms`. `FEB_WARDRIVING_WIFI_INTERVAL_MIN_MS` is `0`, and "WiFi Cooldown
   0s" is a normal user-selectable Flipper setting. The C5 hardware-reproduced this on 2026-09-27:
@@ -355,7 +364,7 @@ The sections below are the original review text as written before implementation
 | ID | Where | Issue | Fix |
 | --- | --- | --- | --- |
 | HP-22 | [esp32/main/main.c:2415-2496](../esp32/main/main.c#L2415) (and ports) | `wardriving_send_backlog_count_update()` ignores the send result, but `wardriving_last_reported_backlog` advances anyway, so the Flipper's backlog count stays stale after a full-FIFO drop | Return `bool`; advance only on success |
-| HP-23 | [esp32/main/nmea_parser.c:258-316](../esp32/main/nmea_parser.c#L258) (identical in all 3) | No range check on RMC date/time fields, so a checksum-valid but insane value becomes a bogus `utc_timestamp_s` baked into records | Reject hh≥24, mm/ss≥60, day∉1..31, month∉1..12 |
+| HP-23 | [components/feb_wardriving/nmea_parser.c:258-316](../components/feb_wardriving/nmea_parser.c#L258) (identical in all 3) | No range check on RMC date/time fields, so a checksum-valid but insane value becomes a bogus `utc_timestamp_s` baked into records | Reject hh≥24, mm/ss≥60, day∉1..31, month∉1..12 |
 | HP-24 | Flipper [framing reassembly](../flipper/flipper_esp32_over_ble.c#L4420) | `feb_reassembly_reset()` runs only in `profile_start()`, not per connection; the ESP's `tx_message_id` is a never-reset `uint8_t`, so after an ESP reboot a stale partial can collide 1/256 (bounded by the reassembly timeout timer) | Reset under `reassembly_mutex` on every connect |
 | HP-25 | `components/feb_protocol/cbor_primitives.c:330,357`, `cbor_records.c:190,325` + Flipper mirrors | 64-bit CBOR heads truncated to 32-bit `size_t`/`version`; non-canonical acceptance on device (not on 64-bit host tests); a MITM can re-encode `version` and the AAD still matches | Reject values > `SIZE_MAX`/`UINT32_MAX` with `TOO_LARGE`; add vector |
 | HP-26 | `flipper/cbor_records.c:696,800` vs `components/.../cbor_records.c:940,1098` | Flipper accepts non-map `arguments`/`result`, the ESP requires a map (lockstep violation, not exploitable today) | Mirror the major-type-5 check; add vector |

@@ -66,22 +66,9 @@ HEADER_PAIRS = [
 
 BOARDS = ["esp32", "esp32c5", "heltec"]
 
-BOARD_IDENTICAL = [
-    "wardriving_validate.c",
-    "wardriving_dedup.c",
-    "wardriving_log.c",
-    "wardriving_record_format.c",
-    "wardriving_persist.c",
-    "nmea_parser.c",
-]
+BOARD_IDENTICAL = []
 
 BOARD_EQUIVALENT = [
-    "wardriving_validate.h",
-    "wardriving_dedup.h",
-    "wardriving_log.h",
-    "wardriving_record_format.h",
-    "wardriving_persist.h",
-    "nmea_parser.h",
     "location.h",
     "location.c",
 ]

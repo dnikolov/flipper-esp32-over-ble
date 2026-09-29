@@ -12,7 +12,7 @@ static const char *TAG = "feb_status_led";
 
 /* Cadence, in units of feb_status_led_tick() calls (piggybacked on
    reassembly_timeout_cb(), i.e. roughly every FEB_REASSEMBLY_CHECK_INTERVAL_MS -- see
-   main.c): CONNECTING toggles every FEB_STATUS_LED_CONNECTING_TICKS ticks (slow blink),
+   components/feb_app_core): CONNECTING toggles every FEB_STATUS_LED_CONNECTING_TICKS ticks (slow blink),
    FLUSHING toggles every tick (fast blink). Judgment call, not a protocol detail -- see
    docs/PLAN.md Phase 4 step 3's brief. */
 #define FEB_STATUS_LED_CONNECTING_TICKS 4u

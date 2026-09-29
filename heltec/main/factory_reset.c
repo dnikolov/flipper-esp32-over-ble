@@ -53,6 +53,7 @@ static void factory_reset_task(void *arg)
 {
     bool held = false;
     bool led_on = false;
+    bool reset_requested = false;
     uint32_t hold_start_ms = 0;
     uint32_t last_blink_ms = 0;
 
@@ -69,9 +70,16 @@ static void factory_reset_task(void *arg)
                 led_on = true;
                 feb_status_led_factory_reset_begin();
                 feb_led_set(true);
-            } else if (now_ms - hold_start_ms >= FEB_FACTORY_RESET_HOLD_MS) {
+            } else if (!reset_requested && now_ms - hold_start_ms >= FEB_FACTORY_RESET_HOLD_MS) {
+                /* Hands the actual NVS erase off to the NimBLE host task (HARDENING_PLAN.md
+                   HP-13) -- feb_factory_reset_request() never returns in practice (it always
+                   ends in esp_restart(), whether performed here-and-now or on the host task),
+                   but reset_requested guards this branch anyway in case the queued event is
+                   delayed behind other host-task work for a poll tick or two. Ported from
+                   esp32/main/factory_reset.c (same HP-13 commit missed this guard here). */
+                reset_requested = true;
                 feb_factory_reset_request();
-            } else if (now_ms - last_blink_ms >= FEB_FACTORY_RESET_BLINK_MS) {
+            } else if (!reset_requested && now_ms - last_blink_ms >= FEB_FACTORY_RESET_BLINK_MS) {
                 last_blink_ms = now_ms;
                 led_on = !led_on;
                 feb_led_set(led_on);

@@ -13,9 +13,17 @@ as the source of truth over generic ESP32 knowledge. Before editing anything und
 [docs/AGENT_RULES.md](../../docs/AGENT_RULES.md) — it holds the rules this file used to repeat
 that are identical across every board/firmware agent in this project.
 
-**Read discipline:** `esp32/main/main.c` is large (2300+ lines) — `Grep` for the symbol you
-need first, then `Read` with `offset`/`limit` around it rather than reading it whole unless
-you're doing a full-file review. The CBOR codec is split by capability (`cbor_primitives.c`,
+**Read discipline / source layout** ([docs/SOURCE_SPLIT.md](../../docs/SOURCE_SPLIT.md)):
+the board-independent application logic (BLE central, pairing/runtime auth, TX queue, and
+the wifi_scan/ble_scan/gps/wardriving capabilities) lives in the shared
+`components/feb_app_core/` (`feb_link.c`, `feb_central.c`, `feb_cap_scan.c`, `feb_cap_gps.c`,
+`feb_cap_wardriving.c`, `feb_cap_wardriving_cmd.c`), consumed by all three ESP boards;
+wardriving storage/validation and the NMEA parser live in `components/feb_wardriving/`. A
+board's `main/` keeps only `main.c` (host_synced/app_main/Wi-Fi init/features/command table),
+`board_config.h`, its hooks, and board-only modules. Every file is small enough to read whole.
+**A change to either shared component is a three-board change** (AGENT_RULES.md).
+C6 board files: `esp32/main/{main.c, board_hooks.c, factory_reset.c, status_led.c,
+location.c}`. The CBOR codec is split by capability (`cbor_primitives.c`,
 `cbor_records.c`, `cbor_wifi_scan.c`, `cbor_ble_scan.c`, `cbor_wardriving.c`, `cbor_gps.c`) and
 lives in the shared `components/feb_protocol/` component (moved there 2026-09-16, Phase 4 step
 2), not under `esp32/main/`.

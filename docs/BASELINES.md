@@ -156,6 +156,19 @@ After the 2026-09-28 hardening pass ([HARDENING_PLAN.md](HARDENING_PLAN.md)) the
 | C5 `esp32c5/` total image | 1,329,234 B | 1,239,486 B (HP SRAM +10,026 B free; app partition 41% free) |
 | Heltec DRAM / IRAM headroom | tree didn't link (−16 B DRAM) / — | **364 B / 7,309 B** (supersedes BACKLOG.md BL27's 8 B / 45 B) |
 | Heltec DRAM headroom, after flush-window gate (2026-09-28, see PROJECT_HISTORY.md) | 364 B | **348 B / 7,309 B** (−16 B net; the mesh-dedup hash shrink in the same pass is heap-only, 0 B DRAM change) |
+| Heltec DRAM headroom, after the 2026-09-29 source split + fixes (BL30/BL09/G25/settings persistence, see PROJECT_HISTORY.md) | 356 B (post-split) | **92 B / 7,309 B**. BL30/BL09/persistence cost 8 B; making the notify-RX buffer `static` (G25) cost 256 B. Measured with `idf.py size`, not estimated. |
+| Heltec DRAM headroom, after moving onto `components/feb_app_core` (2026-09-29, [SOURCE_SPLIT.md](SOURCE_SPLIT.md) E2) | 92 B | **100 B / 7,309 B**. Flash code 756,780 → 757,092; image 1,057,971 → 1,058,363. |
+
+**After the 2026-09-29 source split ([SOURCE_SPLIT.md](SOURCE_SPLIT.md) §9-10):**
+- **Flipper FAP (unity build):** `.text` 56,328, `.rodata` 11,816, `.data` 56, `.bss` 24,312,
+  `.fast.rel.text` 10,236, `.fast.rel.rodata` 124. That is 1,357 B less resident heap than the
+  pre-split monolith. Resident-heap comparisons must include the `.fast.rel.*` sections, because
+  the loader keeps them allocated.
+- **C6:** DIRAM +68 B, flash +148 B, from the core move alone.
+- **C5:** the core's `wifi_band` and diagnostic additions compile out on other boards.
+- **C6 and C5 binaries:** unchanged by the Heltec switchover (verified with the ELF-SHA bytes
+  masked).
+- **cluster_worker:** md5-identical.
 
 The ESP32 baseline build completed successfully with ESP-IDF v5.5.2. Verified artifacts are `esp32/build/flipper_esp32_over_ble.elf` (3,590,924 bytes), `esp32/build/flipper_esp32_over_ble.bin` (161,888 bytes), `esp32/build/flipper_esp32_over_ble.map` (2,828,886 bytes), `esp32/build/flasher_args.json` (959 bytes), and `esp32/build/project_description.json` (195,509 bytes).
 

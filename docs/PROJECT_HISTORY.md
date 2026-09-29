@@ -3266,6 +3266,48 @@ per-capability decode-scratch structs) and splitting/shrinking the wardriving de
 separate Wi-Fi/BLE sub-tables — ✅ done, see `docs/PROJECT_HISTORY.md`. Remaining `.bss`-reduction
 item (`wifi_scan_aps`/`ble_scan_devices`) tracked in [HARDENING_BACKLOG.md](HARDENING_BACKLOG.md) H04.
 
+## 2026-09-29: Scheduled fix pass — G08, BL09, BL28, BL29, BL30, G25, ESP Wi-Fi settings persistence
+
+The user queued this at 01:31. It ran unattended from 04:06, on top of the uncommitted,
+hardware-unverified source split ([SOURCE_SPLIT.md](SOURCE_SPLIT.md) E1/E2-C6/F; the C5 was also
+already on `feb_app_core`). Before any edit, the exact pre-fix tree was saved as
+`refs/snapshots/pre-fixes-2026-09-29`, so the split's "pure moves" invariant stays separable
+from these logic changes:
+
+```
+git diff refs/snapshots/pre-fixes-2026-09-29
+```
+
+(For untracked files, use a temp index.) Everything was left uncommitted, per the user.
+Build- and host-test-verified only; nothing was flashed.
+
+- **BL30 root cause** (all ESP boards, pre-dates the split):
+  - `sources=["ble_passive"]` sets `want_ble=false`, and `wardriving_start_internal()` opened BLE
+    discovery only under `if (want_ble)`. So passive-only never scanned, via the command,
+    autostart or button path.
+  - Also, `wardriving_persist.c` rejected `!want_wifi && !want_ble` on load, so a saved
+    passive-only run was reset to defaults with autostart off.
+  - Both fixed. The busy pre-checks now include passive.
+- **ESP settings persistence:** `wardriving_persist.h` v2 adds `wifi_swelling`, `country` and
+  `wifi_band`. A v1 blob is migrated, not discarded. Autostart and the boot button reuse the
+  saved values. A C5 agent had also switched the C5's autostart to the saved band; the
+  coordinator reverted it to a forced 2.4 GHz, because that was a deliberate BL16 safety default.
+- **BL09:** each board keeps the Flipper's last `peer_ota_addr` (set on connect, kept across
+  disconnects) and drops matching records from wardriving capture only.
+- **G25:** the notify-RX buffer is now `static` on all three boards. On the Heltec it cost
+  256 B, and DRAM free is now 92 B.
+- **BL28:** confirmed already ported by the split (DR1).
+- **G08:** Flipper SD writes (CSV, mesh_log, pairing save, capability cache) moved from
+  BleEventWorker to the main thread via static rings and hand-off buffers.
+  - `profile_event_handler` frame: 96 → 88 B.
+  - Resident FAP heap: +6,703 B (a 3,328 B CSV ring for one full batch, since there's no
+    storage ack). This is flagged in BACKLOG.md as a decision for the user.
+- **BL29:** candidate only. `handle_hello()`'s `session_reset_state()` cleared the
+  flush-LED flag without resetting the physical LED; it now forces blue. Not confirmed as the
+  user's trigger.
+- **New finding:** on the Heltec, a kill-switch OFF→ON doesn't resume a wardriving run.
+  Logged in BACKLOG.md, not fixed.
+
 ## Current project state and handoff
 
 This section intentionally does not restate a dated status snapshot — that drifts stale by

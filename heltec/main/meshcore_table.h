@@ -1,7 +1,7 @@
 /* In-RAM, spinlock-guarded MeshCore node table -- keyed by node_id_hex (upsert semantics: a
    repeated sighting of the same node_id updates its existing entry rather than adding a
    duplicate). Written by meshcore_radio.cpp's dedicated RX task on every successfully parsed
-   ADVERT (meshcore_proto.h); read by handle_meshcore_command() (main.c) via
+   ADVERT (meshcore_proto.h); read by feb_handle_meshcore_command() (mesh_caps.c) via
    meshcore_table_snapshot(), the same guarded-shared-state pattern location.h's
    location_spinlock/location_get_fix() use for the GPS driver.
 
@@ -82,7 +82,7 @@ void meshcore_table_upsert(const meshcore_advert_t *advert, int32_t rssi_dbm, ui
    number of entries actually copied (<= max_entries and <= the table's current occupancy).
    If out_total_known is non-NULL, *out_total_known receives the table's current total
    occupied-entry count, which may exceed the return value when max_entries is smaller --
-   the caller (handle_meshcore_command(), main.c) surfaces that gap via the wire's
+   the caller (feb_handle_meshcore_command(), mesh_caps.c) surfaces that gap via the wire's
    `total_known_nodes` field rather than silently under-reporting. Thread-safe. */
 size_t meshcore_table_snapshot(meshcore_table_entry_t *out, size_t max_entries, uint64_t *out_total_known);
 

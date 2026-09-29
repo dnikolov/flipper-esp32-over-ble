@@ -17,7 +17,7 @@ void feb_radio_kill_switch_persist(bool enabled);
    feb_radio_kill_switch_toggle(); it does not itself touch any radio state. */
 void feb_radio_kill_switch_start(void);
 
-/* Implemented in main.c. Called from the touch debounce task (never from the NimBLE host
+/* Implemented in killswitch_glue.c. Called from the touch debounce task (never from the NimBLE host
    task) on a single deliberate touch-and-release; flips the current Wi-Fi/BLE enabled state,
    performs the actual stop-or-start sequence for both radios, updates the OLED, and persists
    the new state via feb_radio_kill_switch_persist(). */

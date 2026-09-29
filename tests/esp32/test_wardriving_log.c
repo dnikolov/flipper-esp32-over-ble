@@ -1,4 +1,4 @@
-/* Host-native test driver for esp32/main/wardriving_record_format.c -- the pure,
+/* Host-native test driver for components/feb_wardriving/wardriving_record_format.c -- the pure,
    zero-ESP-IDF-dependency checksum/header-packing/eviction-ordering helpers underneath
    wardriving_log.c's raw-flash circular log (docs/PLAN.md step 8's wardriving-log
    persistence). wardriving_log.c itself is not exercised here since it depends directly on
