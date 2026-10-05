@@ -868,7 +868,9 @@ function Get-MeshNodesFromLines {
 function Send-WdgwarsMeshUpload {
     param([string]$Url, [string]$ApiKey, [array]$MeshNodes, [int]$TimeoutSec)
 
-    $payload = @{ meshcore_nodes = $MeshNodes }
+    # Empty `networks` alongside: wdgwars' Method 2 rejects a body without it as HTTP 400
+    # "Invalid data format" (first live run 2026-10-05), even when only meshcore_nodes is set.
+    $payload = [ordered]@{ networks = @(); meshcore_nodes = @($MeshNodes) }
     $json = $payload | ConvertTo-Json -Depth 6 -Compress
     $dataB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
 
