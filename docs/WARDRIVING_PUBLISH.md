@@ -539,6 +539,23 @@ This depends on the in-progress `meshtastic_scan`/shared-radio work (`meshtastic
 table-upsert call sites. Implementation does not start until that work is confirmed
 build/host-test-verified.
 
+## Host script `-Mode` (A-GPS sync, added 2026-10-06; offline-tested only, no hardware)
+
+`scripts/publish_wardriving.ps1 -Mode All|Publish|Agps` (default `Publish`, so older pinned
+FAPs and the flow above are unchanged). `Agps` never reads or prompts for the wdgwars key;
+`All` runs Publish, then Agps, each with its own result file
+(`wardriving_publish_result.txt` / `agps_sync_result.txt`), and an Agps failure never touches
+the Publish result. The Agps flow (spec: [AGPS.md](AGPS.md) "Build contract") sets the Flipper
+RTC to PC **UTC** with CLI `date YYYY-MM-DD HH:MM:SS <weekday 1-7, Monday=1>` (firmware
+`cli_main_commands.c` `cli_command_date`: `sscanf "%hu-%hu-%hu %hu:%hu:%hu %hu"`, all 7 fields
+required, weekday 0 is rejected by `datetime_validate_datetime`), reads it back (must be within 5 s),
+runs the hash-pinned `agps_gen.exe` (`$AgpsGenTag`/`$AgpsGenSha256` at the top of the script;
+cached under `%LOCALAPPDATA%\flipper-esp32-over-ble\agps_gen\<sha256>\`; `-AgpsGenPath` or
+`FEB_AGPS_GEN_PATH` bypasses download and hash check for development), validates the header,
+pushes `agps.bin.tmp` then renames to `agps.bin`, and writes one line to
+`agps_sync_result.txt`: `OK <window_count> <last_valid_to_unix>` or `ERR <short message>`.
+Self-test: `scripts/test_agps_sync.ps1`.
+
 ## wigle.net (explicitly deferred)
 
 Not built in this phase. The only forward-looking accommodation made now is the keyed

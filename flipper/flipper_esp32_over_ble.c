@@ -13,6 +13,7 @@
 #include "wardriving_settings.c"
 #include "publish.c"
 #include "mesh_log_rx.c"
+#include "agps_rx.c"
 #include "gps_rx.c"
 #include "scan_rx.c"
 #include "wardriving_rx.c"
@@ -197,6 +198,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
             app.capability_has_gps = event.u.capability.has_gps;
             app.capability_has_meshcore_scan = event.u.capability.has_meshcore_scan;
             app.capability_has_mesh_log = event.u.capability.has_mesh_log;
+            app.capability_has_agps = event.u.capability.has_agps;
             /* Force-jump to Wardriving on connect (docs/WARDRIVING_REDESIGN.md, decision 6):
                the moment a session's capability info arrives and the board advertises
                wardriving, the Home cursor is forced here unconditionally, even if the user
@@ -317,8 +319,18 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                disconnect the session. Only the dedicated GPS screen should keep the timer
                active. */
             if(app.screen == AppScreenGps && app.capability_has_gps) {
-                send_gps_command(&app);
+                /* While an A-GPS transfer is in flight the C5 is busy feeding the GPS UART --
+                   no gps polling then, only the reply-timeout bookkeeping. */
+                if(app.agps_state == AgpsStateWaitingReply || app.agps_state == AgpsStateSending) {
+                    agps_wait_tick(&app);
+                } else {
+                    send_gps_command(&app);
+                }
             }
+        } else if(event.type == AppEventAgpsPartial) {
+            agps_on_partial(&app, event.u.agps.request_id);
+        } else if(event.type == AppEventAgpsResult || event.type == AppEventAgpsError) {
+            agps_apply_result(&app, &event);
         } else if(event.type == AppEventPublishPollTick) {
             if(app.screen == AppScreenPublish && app.publish_waiting) {
                 publish_poll_check(&app);

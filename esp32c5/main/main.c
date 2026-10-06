@@ -31,7 +31,11 @@ static bool wardriving_autostart_attempted;
 static void nimble_host_task(void *arg);
 static void start_wifi_subsystem(void);
 
-const char *const feb_features[] = {"wifi_scan", "ble_scan", "gps", "wardriving"};
+const char *const feb_features[] = {"wifi_scan", "ble_scan", "gps", "wardriving"
+#if FEB_HAS_AGPS
+                                    , "agps"
+#endif
+};
 const size_t feb_feature_count = sizeof(feb_features) / sizeof(feb_features[0]);
 
 /* docs/PLAN.md "`ble_scan`, `wardriving`, and the GPS-stub reorder": capability-name
@@ -50,6 +54,11 @@ void feb_handle_command(uint16_t conn_handle, const feb_command_payload_t *cmd)
     } else if (cmd->capability_len == strlen("gps") &&
               memcmp(cmd->capability, "gps", cmd->capability_len) == 0) {
         feb_handle_gps_command(conn_handle, cmd);
+#if FEB_HAS_AGPS
+    } else if (cmd->capability_len == strlen("agps") &&
+              memcmp(cmd->capability, "agps", cmd->capability_len) == 0) {
+        feb_handle_agps_command(conn_handle, cmd);
+#endif
     } else if (!feb_send_protected_error(conn_handle, "unsupported_capability", strlen("unsupported_capability"),
                                      1, cmd->request_id)) {
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);

@@ -10,6 +10,7 @@ endif()
 
 idf_component_register(SRCS "feb_link.c" "feb_central.c" "feb_cap_scan.c" "feb_cap_gps.c"
                             "feb_cap_wardriving.c" "feb_cap_wardriving_cmd.c"
+                            "feb_cap_agps.c" "feb_agps_casic.c" "feb_agps_blob.c" "feb_agps_cmd.c"
                        INCLUDE_DIRS "."
                        PRIV_INCLUDE_DIRS ${feb_app_core_board_dir}
                        REQUIRES feb_protocol feb_wardriving bt esp_timer nvs_flash esp_hw_support

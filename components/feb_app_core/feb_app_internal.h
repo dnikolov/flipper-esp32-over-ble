@@ -262,6 +262,13 @@ bool feb_send_protected_error(uint16_t conn_handle, const char *code, size_t cod
                                  int has_request_id, uint64_t request_id);
 void feb_reassembly_timeout_cb(struct ble_npl_event *ev);
 
+#if FEB_HAS_AGPS
+void feb_handle_agps_command(uint16_t conn_handle, const feb_command_payload_t *cmd);
+/* Host task, once per reassembly-check tick: expires a stalled blob, delivers the feed result. */
+void feb_agps_poll(void);
+void feb_agps_on_disconnect(void);
+#endif
+
 #if FEB_HAS_LINK_HOOKS
 bool feb_pairing_window_is_open(void);
 

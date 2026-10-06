@@ -30,12 +30,14 @@ $scripts = @(
     "tests\esp32\build_session.ps1",
     "tests\esp32\build_location.ps1",
     "tests\esp32\build_wardriving.ps1",
+    "tests\esp32\build_agps.ps1",
     "tests\esp32\build_cluster_link.ps1",
     "tests\esp32\build_meshcore_proto.ps1",
     "tests\esp32\build_meshtastic_proto.ps1",
     "tests\flipper\build.ps1",
     "tests\flipper\build_pairing.ps1",
-    "tests\flipper\build_session.ps1"
+    "tests\flipper\build_session.ps1",
+    "tests\flipper\build_agps.ps1"
 )
 
 $anyFail = $false

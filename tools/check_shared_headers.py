@@ -146,6 +146,14 @@ def compare(path_a, path_b):
     return problems
 
 
+def strip_board_only(text):
+    # Blocks delimited by FEB_BOARD_ONLY_BEGIN/END comments are intentionally board-specific
+    # (e.g. esp32c5/main/location.c's `agps` UART sharing) and excluded from the comparison.
+    return re.sub(
+        r"/\*\s*FEB_BOARD_ONLY_BEGIN\s*\*/.*?/\*\s*FEB_BOARD_ONLY_END\s*\*/", "", text, flags=re.S
+    )
+
+
 def read_board_file(board, name):
     path = ROOT / board / "main" / name
     if not path.is_file():
@@ -177,7 +185,7 @@ def compare_board_module(name, identical):
         return problems, info
 
     allowed = BOARD_ALLOWED_MACRO_DIFFS.get(name, set())
-    texts = {b: strip_comments(raw[b].decode("utf-8", "replace")) for b in BOARDS}
+    texts = {b: strip_comments(strip_board_only(raw[b].decode("utf-8", "replace"))) for b in BOARDS}
     macros = {b: extract_macros(texts[b]) for b in BOARDS}
     all_names = sorted(set().union(*(set(m) for m in macros.values())))
     for macro in all_names:

@@ -688,6 +688,9 @@ int feb_gap_event(struct ble_gap_event *event, void *arg)
         feb_pairing_attempt_zeroize();
         feb_runtime_auth_zeroize();
         feb_wardriving_tx_in_flight = false;
+#if FEB_HAS_AGPS
+        feb_agps_on_disconnect();
+#endif
 #if FEB_HAS_LINK_HOOKS
         if (feb_app_hooks->on_disconnect != NULL) {
             feb_app_hooks->on_disconnect();
@@ -1051,6 +1054,9 @@ void feb_reassembly_timeout_cb(struct ble_npl_event *ev)
            pending -- gives a full FEB_IDLE_TIMEOUT_MS of grace before a repeat call. */
         last_record_activity_ms = now_ms;
     }
+#if FEB_HAS_AGPS
+    feb_agps_poll();
+#endif
     scan_summary_elapsed_ms += FEB_REASSEMBLY_CHECK_INTERVAL_MS;
     if (scan_summary_elapsed_ms >= FEB_SCAN_SUMMARY_INTERVAL_MS) {
         scan_summary_elapsed_ms = 0;

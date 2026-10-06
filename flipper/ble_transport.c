@@ -513,6 +513,16 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                             text_matches(status_peek.state, status_peek.state_len, "fix")) {
                             handle_gps_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else if(
+                            app_pending_command_kind == PendingCommandAgps &&
+                            (text_matches(
+                                 status_peek.state, status_peek.state_len, AGPS_WIRE_STATE_PARTIAL) ||
+                             text_matches(
+                                 status_peek.state, status_peek.state_len, AGPS_WIRE_STATE_COMPLETE))) {
+                            /* `partial`/`complete` collide with wifi_scan/ble_scan's own state
+                               names, so (like the scan routing below) the pending command kind
+                               decides; set for the whole agps transfer by agps_start(). */
+                            handle_agps_status(profile, decrypted.plaintext, decrypted.plaintext_len);
+                        } else if(
                             text_matches(status_peek.state, status_peek.state_len, "mesh_data")) {
                             handle_mesh_log_status(profile, decrypted.plaintext, decrypted.plaintext_len);
                         } else if(app_pending_command_kind == PendingCommandBleScan) {

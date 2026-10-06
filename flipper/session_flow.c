@@ -783,6 +783,7 @@ static void post_capability_info(Esp32App* app, const feb_capability_response_pa
     event->u.capability.has_gps = capability_has_feature(payload, "gps");
     event->u.capability.has_meshcore_scan = capability_has_feature(payload, "meshcore_scan");
     event->u.capability.has_mesh_log = capability_has_feature(payload, "mesh_log");
+    event->u.capability.has_agps = capability_has_feature(payload, AGPS_WIRE_CAPABILITY);
     app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
@@ -957,6 +958,14 @@ APP_FN void
     }
     FURI_LOG_W(
         TAG, "runtime error received: code='%.*s'", (int)error_payload.code_len, error_payload.code);
+    if(app_pending_command_kind == PendingCommandAgps) {
+        app_pending_command_kind = PendingCommandNone;
+        post_agps_error(
+            app,
+            text_matches(error_payload.code, error_payload.code_len, "busy") ? AgpsErrorBusy :
+                                                                               AgpsErrorRejected);
+        return;
+    }
     if(text_matches(error_payload.code, error_payload.code_len, "busy")) {
         if(app_pending_command_kind == PendingCommandBleScan) {
             post_ble_scan_error(app, "ESP32 busy, try again");

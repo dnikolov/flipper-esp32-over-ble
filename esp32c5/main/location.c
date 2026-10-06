@@ -7,6 +7,10 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+/* FEB_BOARD_ONLY_BEGIN */
+#include "freertos/semphr.h"
+#include "location_agps.h"
+/* FEB_BOARD_ONLY_END */
 
 /* docs/PLAN.md "Real GPS driver, wardriving fix-dependency, and real wardriving-record
    timestamps": compile-time pins/baud, ported from esp32/main/location.c onto this board
@@ -127,9 +131,22 @@ static void location_task(void *arg)
     size_t line_len = 0;
 
     (void)arg;
+    /* FEB_BOARD_ONLY_BEGIN */
+    uint32_t agps_epoch = location_agps_epoch();
+    /* FEB_BOARD_ONLY_END */
     while (1) {
+        /* FEB_BOARD_ONLY_BEGIN */
+        location_agps_task_lock();
+        if (agps_epoch != location_agps_epoch()) {
+            agps_epoch = location_agps_epoch();
+            line_len = 0;
+        }
+        /* FEB_BOARD_ONLY_END */
         int n = uart_read_bytes(FEB_GPS_UART_PORT, location_read_chunk,
                                  sizeof(location_read_chunk), pdMS_TO_TICKS(200));
+        /* FEB_BOARD_ONLY_BEGIN */
+        location_agps_task_unlock();
+        /* FEB_BOARD_ONLY_END */
         int i;
 
         for (i = 0; i < n; i++) {
@@ -185,6 +202,9 @@ void location_init(void)
         return;
     }
 
+    /* FEB_BOARD_ONLY_BEGIN */
+    location_agps_init();
+    /* FEB_BOARD_ONLY_END */
     if (xTaskCreate(location_task, "gps_parse", FEB_GPS_TASK_STACK_SIZE, NULL,
                     tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
         ESP_LOGE(TAG, "failed to start GPS parse task; GPS disabled");
@@ -203,3 +223,77 @@ feb_location_state_t location_get_fix(feb_location_t *out)
     portEXIT_CRITICAL(&location_spinlock);
     return state;
 }
+
+/* FEB_BOARD_ONLY_BEGIN */
+/* C5-only `agps` UART sharing (location_agps.h). Everything between FEB_BOARD_ONLY markers is
+   ignored by tools/check_shared_headers.py's cross-board comparison of this file. The mutex is
+   held by location_task() for one uart_read_bytes() at a time and by the feed for its whole
+   duration. Priority inheritance lets the feed task (higher priority) take it promptly. */
+static SemaphoreHandle_t location_uart_mutex;
+static volatile uint32_t location_uart_epoch;
+
+void location_agps_init(void)
+{
+    location_uart_mutex = xSemaphoreCreateMutex();
+    if (location_uart_mutex == NULL) {
+        ESP_LOGE(TAG, "agps UART mutex creation failed; A-GPS unavailable");
+    }
+}
+
+void location_agps_task_lock(void)
+{
+    if (location_uart_mutex != NULL) {
+        (void)xSemaphoreTake(location_uart_mutex, portMAX_DELAY);
+    }
+}
+
+void location_agps_task_unlock(void)
+{
+    if (location_uart_mutex != NULL) {
+        (void)xSemaphoreGive(location_uart_mutex);
+    }
+}
+
+uint32_t location_agps_epoch(void)
+{
+    return location_uart_epoch;
+}
+
+bool location_agps_available(void)
+{
+    return location_uart_mutex != NULL;
+}
+
+bool location_agps_begin(uint32_t timeout_ms)
+{
+    if (location_uart_mutex == NULL ||
+        xSemaphoreTake(location_uart_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return false;
+    }
+    location_uart_epoch++;
+    (void)uart_flush_input(FEB_GPS_UART_PORT);
+    return true;
+}
+
+void location_agps_end(void)
+{
+    location_uart_epoch++;
+    (void)xSemaphoreGive(location_uart_mutex);
+}
+
+void location_agps_write(const uint8_t *data, size_t len)
+{
+    if (uart_write_bytes(FEB_GPS_UART_PORT, data, len) < 0) {
+        ESP_LOGW(TAG, "agps uart_write_bytes failed");
+        return;
+    }
+    (void)uart_wait_tx_done(FEB_GPS_UART_PORT, pdMS_TO_TICKS(1000));
+}
+
+size_t location_agps_read(uint8_t *buf, size_t cap, uint32_t timeout_ms)
+{
+    int n = uart_read_bytes(FEB_GPS_UART_PORT, buf, (uint32_t)cap, pdMS_TO_TICKS(timeout_ms));
+
+    return n > 0 ? (size_t)n : 0u;
+}
+/* FEB_BOARD_ONLY_END */

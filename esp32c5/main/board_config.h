@@ -27,6 +27,9 @@
 /* No Heltec-style BLE link-lifecycle hooks (feb_app_hooks_t.on_ble_state et al.): their
    members and call sites compile out entirely. */
 #define FEB_HAS_LINK_HOOKS 0
+/* docs/AGPS.md: A-GPS assistance feed to the ATGM336H over its UART. C5 only. Requires
+   location_agps.h in this directory (exclusive GPS-UART access shared with location.c). */
+#define FEB_HAS_AGPS 1
 /* No Phase 9 cluster worker (docs/CLUSTER.md) as an alternative Wi-Fi scan source. */
 #define FEB_HAS_CLUSTER_WORKER 0
 

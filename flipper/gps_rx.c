@@ -134,6 +134,10 @@ APP_FN bool send_gps_command(Esp32App* app) {
 }
 
 APP_FN void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
+    if(app->agps_state != AgpsStateIdle) {
+        draw_agps_panel(canvas, app);
+        return;
+    }
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "GPS");
     canvas_set_font(canvas, FontSecondary);
@@ -193,5 +197,9 @@ APP_FN void draw_gps_screen(Canvas* canvas, const Esp32App* app) {
         snprintf(line, sizeof(line), "Alt: --  Spd: --");
     }
     canvas_draw_str(canvas, 2, 52, line);
+
+    if(app->capability_has_agps) {
+        canvas_draw_str(canvas, 2, 62, "OK: Send A-GPS");
+    }
 }
 

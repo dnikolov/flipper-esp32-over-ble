@@ -24,6 +24,7 @@
 
 #include <furi.h>
 #include <furi_hal_bt.h>
+#include <furi_hal_rtc.h>
 #include <furi_hal_random.h>
 #include <furi_hal_usb.h>
 #include <furi_hal_usb_hid.h>
@@ -53,6 +54,8 @@
 #include "session.h"
 #include "wardriving_csv.h"
 #include "mesh_nodes.h"
+#include "agps_file.h"
+#include "agps_wire.h"
 
 #define TAG "Esp32OverBle"
 #define PAYLOAD_MAX FEB_WRITE_CHAR_MAX_LEN
@@ -142,6 +145,18 @@
 #define FEB_PUBLISH_POLL_PERIOD_MS 2000u
 #define FEB_PUBLISH_POLL_TIMEOUT_MS 600000u
 #define FEB_PUBLISH_RESULT_MAX_LEN 512u
+/* Extra wait for the A-GPS part of a Sync run: the host script's generator has a 10 min
+   timeout, then RTC set and a ~115 KB serial push. Agps-only waits this long; All waits
+   FEB_PUBLISH_POLL_TIMEOUT_MS (Publish runs first) plus this. */
+#define FEB_SYNC_AGPS_TIMEOUT_MS 960000u
+/* A-GPS (docs/AGPS.md): SD file the host Sync script writes, and its result file (plain text,
+   same app data root as the publish result). Waits are counted in GPS-poll ticks: a chunk's
+   `partial` reply should take milliseconds; the final `complete` takes ~3-5 s, and the C5's
+   own worst case is 3 unanswered frames x 500 ms plus margin. */
+#define FEB_AGPS_FILENAME "agps.bin"
+#define FEB_AGPS_SYNC_RESULT_FILENAME "agps_sync_result.txt"
+#define FEB_AGPS_PARTIAL_TIMEOUT_MS 8000u
+#define FEB_AGPS_REPLY_TIMEOUT_MS 30000u
 /* Pinned commit for the fetched bootstrap script (docs/WARDRIVING_PUBLISH.md's BadUSB
    section: this runs unattended, with no review step, so "whatever's on the default branch
    right now" is not acceptable -- same discipline docs/PROTOCOL.md already applies to the
@@ -149,7 +164,7 @@
    the independent mesh-node/Method-2 upload alongside the existing CSV upload), confirmed
    pushed to origin/main via `git ls-remote` -- bump it again if that script's contract
    changes after this. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "3fae5b156c3d0266131be8c6807986a2738c28c3"
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "afe976b5343f8a119d94e0b421c7aa6245b93cb6"
 
 typedef enum {
     CharacteristicWrite,
@@ -190,7 +205,7 @@ typedef enum {
        draw_wardriving_running_screen()'s own comments. */
     AppScreenWardrivingStopped,
     AppScreenWardrivingRunning,
-    AppScreenPublish,
+    AppScreenPublish, /* shown to the user as "Sync" (was Publish) */
 } AppScreen;
 
 typedef enum {
@@ -215,6 +230,41 @@ typedef enum {
     PublishOutcomeNothingToPublish,
     PublishOutcomeTimeout,
 } PublishOutcome;
+
+/* Sync screen items, in menu order; the value is also the host script's `-Mode` selector
+   (publish_mode_name()). */
+typedef enum {
+    SyncModeAll = 0,
+    SyncModePublish,
+    SyncModeAgps,
+    SyncModeCount,
+} SyncMode;
+
+/* GPS-screen "Send A-GPS" flow (docs/AGPS.md). Idle shows the normal GPS screen; every other
+   state replaces it with the A-GPS panel until dismissed. Failed carries an AgpsError. */
+typedef enum {
+    AgpsStateIdle = 0,
+    AgpsStateSending,
+    AgpsStateWaitingReply,
+    AgpsStateDone,
+    AgpsStateFailed,
+} AgpsState;
+
+typedef enum {
+    AgpsErrorNone = 0,
+    AgpsErrorNoFile,
+    AgpsErrorExpired,
+    AgpsErrorNoWindowNow,
+    AgpsErrorBadFile,
+    AgpsErrorReadFailed,
+    AgpsErrorNotConnected,
+    AgpsErrorSendFailed,
+    AgpsErrorBusy,
+    AgpsErrorRejected,
+    AgpsErrorTimeout,
+    AgpsErrorNoMemory,
+    AgpsErrorBadClock,
+} AgpsError;
 
 typedef enum {
     ScanMenuWifi = 0,
@@ -328,6 +378,11 @@ typedef enum {
        way wardriving's own CSV write did -- see mesh_log_rx.c's mesh_log_ring. Carries no
        payload; posted by handle_mesh_log_status() once per drained mesh_data reply. */
     AppEventMeshLogPending,
+    /* A-GPS, all posted from BleEventWorker: Partial = the C5 accepted a chunk (send the next),
+       Result = the final `complete` status, Error = an `error` reply for the pending agps. */
+    AppEventAgpsPartial,
+    AppEventAgpsResult,
+    AppEventAgpsError,
 } AppEventType;
 
 /* One flat member per event type used to make this struct 576 bytes -- every field of
@@ -382,6 +437,7 @@ typedef struct {
                as every other has_* flag. */
             bool has_meshcore_scan;
             bool has_mesh_log;
+            bool has_agps;
         } capability; /* AppEventCapabilityInfo */
         /* AppEventWifiScanAp / AppEventBleScanDevice carry no payload (HP-08): the decoded
            AP/device is copied straight into wifi_scan_aps[]/ble_scan_devices[] under
@@ -417,6 +473,14 @@ typedef struct {
             uint64_t speed_e1_kmh;
             uint8_t state; /* GpsFixState value */
         } gps; /* AppEventGpsStatus */
+        struct {
+            uint16_t sent;
+            uint16_t acked;
+            uint16_t nacked;
+            uint16_t timeout;
+            uint8_t error; /* AgpsError; AgpsErrorNone for a Result */
+            uint32_t request_id; /* of the chunk this reply answers (Partial/Result) */
+        } agps; /* AppEventAgpsPartial / AppEventAgpsResult / AppEventAgpsError */
         /* AppEventWifiScanError / AppEventBleScanError / AppEventWardrivingError */
         char error_message[APP_EVENT_ERROR_MESSAGE_LEN];
         /* AppEventWifiScanDone / AppEventBleScanDone / AppEventSessionFatal /
@@ -532,6 +596,34 @@ typedef struct {
     uint32_t publish_no_gps;
     uint32_t publish_bad_rows;
     char publish_fail_message[96];
+    /* Sync screen (renamed from Publish): sync_menu_index is the highlighted item, sync_mode the
+       run in flight/last run. sync_*_done track which result files a run still waits for;
+       sync_agps_outcome reuses PublishOutcome's None/Ok/Fail/Timeout. */
+    SyncMode sync_menu_index;
+    SyncMode sync_mode;
+    bool sync_publish_done;
+    bool sync_agps_done;
+    PublishOutcome sync_agps_outcome;
+    uint32_t sync_agps_windows;
+    uint32_t sync_agps_valid_to;
+    char sync_agps_message[48];
+    /* GPS-screen A-GPS send (agps_rx.c). agps_window_offset is the file offset of the chosen
+       window; agps_off/agps_total count bytes streamed; the window itself is never held in RAM.
+       agps_date_unix is the date shown with Expired (last window end) or Done (window end). */
+    bool capability_has_agps;
+    AgpsState agps_state;
+    AgpsError agps_error;
+    uint32_t agps_utc;
+    uint32_t agps_window_offset;
+    uint32_t agps_date_unix;
+    uint16_t agps_total;
+    uint16_t agps_off;
+    uint16_t agps_sent;
+    uint16_t agps_acked;
+    uint16_t agps_nacked;
+    uint16_t agps_timeout;
+    uint32_t agps_wait_elapsed_ms;
+    uint32_t agps_sent_id; /* request_id of the chunk most recently sent */
 } Esp32App;
 
 typedef struct {
@@ -584,6 +676,7 @@ typedef enum {
     PendingCommandWardrivingStart,
     PendingCommandWardrivingStop,
     PendingCommandWardrivingStatus,
+    PendingCommandAgps,
 } PendingCommandKind;
 
 /* PairStage (pairing ceremony) and SessionStage (runtime session) -- declared here because
@@ -817,7 +910,15 @@ APP_FN void protocol_generation_bump(void);
 APP_FN void publish_finish_waiting(Esp32App* app);
 APP_FN void publish_poll_check(Esp32App* app);
 APP_FN void publish_poll_timer_callback(void* context);
-APP_FN void publish_start(Esp32App* app);
+APP_FN void publish_start(Esp32App* app, SyncMode mode);
+APP_FN void agps_start(Esp32App* app);
+APP_FN void agps_step(Esp32App* app);
+APP_FN void agps_wait_tick(Esp32App* app);
+APP_FN void agps_cancel(Esp32App* app);
+APP_FN void agps_apply_result(Esp32App* app, const AppEvent* event);
+APP_FN void agps_on_partial(Esp32App* app, uint32_t request_id);
+APP_FN void handle_agps_status(Esp32BleProfile* profile, const uint8_t* plaintext, size_t plaintext_len);
+APP_FN void post_agps_error(Esp32App* app, AgpsError error);
 APP_FN void reassembly_timeout_timer_callback(void* context);
 APP_FN void reset_scan_ui_state_keep_screen(Esp32App* app);
 APP_FN void session_reset_state(void);

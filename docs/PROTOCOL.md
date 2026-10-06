@@ -303,6 +303,84 @@ background task independent of the Wi-Fi/BLE radio the other capabilities conten
 `gps` command never blocks on or conflicts with `wifi_scan`/`ble_scan`/`wardriving`. No
 `request_id` dedup cache, matching `wifi_scan`/`ble_scan` (read-only, side-effect-free).
 
+### `agps` command and status payloads
+
+**Implemented on the ESP32-C5 only** (build-verified; hardware pending). The `agps` capability (see
+[CAPABILITIES.md](CAPABILITIES.md), design in [AGPS.md](AGPS.md)) loads one pre-built A-GPS
+ephemeris window into the board's GPS module. The Flipper sends the window blob (up to 4096
+bytes of back-to-back CASIC frames, one window from `agps.bin` on its SD card) as sequential
+chunks; the ESP32 buffers it, validates every frame, then feeds the module one frame at a time
+and reports the module's ACK/NACK counts. The Flipper never interprets CASIC frames. The C6 and
+Heltec do not advertise `agps` and reject the command `unsupported_capability`.
+
+- `command` for `agps`: `capability = "agps"`, `arguments` is a map with this fixed field order.
+  One command carries one chunk of one blob.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `action` | text string | Always `"load"`. Anything else is `invalid_command`. |
+| `utc` | unsigned integer | Flipper RTC, Unix seconds UTC, read when this chunk is built. Must be in `[1700000000, 4000000000)` (an unset RTC fails here). The ESP32 injects the `utc` of the **final** chunk (plus the milliseconds elapsed since that chunk arrived) as the module's time, claiming a 5 s one-sigma error. Required in every chunk. |
+| `total` | unsigned integer | Total blob length in bytes, `1..4096`, identical in every chunk of a transfer. |
+| `off` | unsigned integer | Byte offset of this chunk within the blob. Strictly sequential: the first chunk has `off = 0` and each later chunk has `off` equal to the sum of the previous chunks' lengths. |
+| `data` | byte string, 1-256 bytes | The chunk bytes. The chunk with `off + len(data) = total` is the final one. |
+| `lat_e7_offset` | unsigned integer, optional | Position hint, same `(int32_t)(lat * 1e7) + 900000000` encoding as `gps`. The three position fields `lat_e7_offset`, `lon_e7_offset`, `altitude_dm_offset` are all present or all absent (so `arguments` has 5 or 8 entries; any other count is `invalid_command`). Omitted by the v1 Flipper. Values from the final chunk are used and presence need not match across chunks. Ranges: lat offset `<= 1800000000`, lon offset `<= 3600000000`, altitude offset `<= 2000000`. |
+| `lon_e7_offset` | unsigned integer, optional | `(int32_t)(lon * 1e7) + 1800000000`, as in `gps`. |
+| `altitude_dm_offset` | unsigned integer, optional | `(int32_t)(altitude_m * 10) + 1000000`, as in `gps`. |
+
+Even with the position triple, a 256-byte chunk encodes to under 450 bytes, inside the 512-byte
+plaintext cap. The Flipper must not send chunks larger than 256 bytes.
+
+**Replies (all carry the `request_id` of the chunk they answer):**
+
+- Every accepted chunk, including the final one, is answered immediately with `status`
+  `state = "partial"` and **no `result`**. For the final chunk this also means the whole blob
+  passed validation and the feed has started. The Flipper sends the next chunk only after
+  receiving this reply.
+- After the final chunk's `partial`, the ESP32 later sends one **unsolicited** `status` with the
+  same `request_id`, `state = "complete"` and
+  `result = { "sent", "acked", "nacked", "timeout" }` (unsigned integers, in this field order). It
+  arrives roughly 3-5 s after the final `partial` (the feed is paced by the module's 9600 baud
+  UART and a per-frame ACK; delivery is polled once per second). `sent` counts frames written to
+  the module **including the generated AID-INI time message**, so a full window of 32
+  `MSG-GPSEPH` plus 1 `MSG-GPSION` reports `sent = 34`. Normally `acked + nacked + timeout =
+  sent`, and the feed stops early after 3 consecutive unanswered frames (the rest of the window
+  is then not sent). `sent = 0` means the GPS UART could not be claimed within 1 s and nothing
+  was written. The Flipper treats `acked == sent` as complete success. If the link drops before
+  this record is delivered it is discarded (not re-sent after reconnect). A pathologically slow
+  feed can exceed the 30 s idle timeout and have the ESP32 close the link; the Flipper treats
+  that as a failed load.
+- `error` `invalid_command`: malformed or wrongly typed arguments, `utc` out of range, `total`
+  of `0` or above `4096`, a chunk that is empty or above 256 bytes, an out-of-order, duplicate or
+  overlapping chunk (`off` is not the next expected offset, including a first chunk with
+  `off != 0` and a restart at `off = 0` mid-transfer), `total` changing mid-transfer,
+  `off + len(data) > total`, more than 5 s since the previous chunk of the transfer, or a completed
+  blob that fails validation (below). **Every `invalid_command` discards the whole partial
+  blob**; the Flipper restarts with a fresh transfer from `off = 0`.
+- `error` `busy`: a feed is running or its `complete` has not been delivered yet. The buffered
+  blob is untouched. Every `agps` chunk in that interval is `busy`, including a repeat of the
+  final chunk.
+- `error` `internal_error`: the GPS UART is unavailable or the feed task could not start. The
+  blob is discarded.
+- A disconnect discards any partial blob. A feed already running finishes, but its `complete`
+  is dropped.
+
+**Blob validation (before any byte reaches the GPS).** The reassembled blob must consist of
+whole CASIC frames filling exactly `total` bytes. Each frame is `BA CE`, a little-endian `uint16`
+payload length (a multiple of 4), class, id, the payload, and a little-endian 32-bit checksum
+`(id << 24) + (class << 16) + len + sum of the payload's little-endian 32-bit words`. Every frame
+must have a correct checksum and class `0x08` (MSG, i.e. `MSG-GPSEPH` `08/07` and `MSG-GPSION`
+`08/06`), and the blob may hold at most 64 frames. The ESP32 builds the AID-INI time message
+(class `0x0B`, id `0x01`, flags `0x02`, or `0x03` with a position hint) itself, writes only whole
+frames one at a time, waits up to 500 ms for the matching ACK/NACK (matched by class/id) before
+the next frame, and never sends any `$PCAS` NMEA command or other module configuration on this
+path. The Flipper chooses which window to send from its own RTC and the file's validity table and
+never sends an expired window.
+
+**Side effects the Flipper may observe.** While the feed runs (about 3-5 s) the feed owns the
+GPS UART exclusively, so `gps` status keeps answering from the last NMEA state without updating
+it. `agps` is otherwise independent of `wifi_scan`/`ble_scan`/`wardriving` (no radio contention)
+and has no `request_id` dedup cache.
+
 ### `wardriving` command and status payloads
 
 The `wardriving` capability (see [CAPABILITIES.md](CAPABILITIES.md)) is a composite capability:

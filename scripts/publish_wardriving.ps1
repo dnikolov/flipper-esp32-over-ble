@@ -16,10 +16,22 @@ param(
     # measured from before BadUSB even types the bootstrap, so this script must be done -- or
     # have deliberately skipped archiving -- well before that. Archiving is skipped (never a
     # delete) once the remaining budget can't cover it.
-    [int]$BudgetSec = 450
+    [int]$BudgetSec = 450,
+    # Publish: wdgwars upload only (default; what older pinned FAPs launch). Agps: set the
+    # Flipper RTC + push agps.bin, never touches the wdgwars key. All: Publish, then Agps.
+    [ValidateSet("All", "Publish", "Agps")]
+    [string]$Mode = "Publish",
+    # Local agps_gen.exe for development; skips the download AND the SHA-256 check.
+    [string]$AgpsGenPath = $env:FEB_AGPS_GEN_PATH
 )
 
 $ErrorActionPreference = "Stop"
+
+# Release-time constants (docs/AGPS.md "Build contract"). Fill $AgpsGenTag and $AgpsGenSha256
+# from the published agps_gen.exe release asset; the all-zero hash makes Agps mode refuse to run.
+$AgpsGenTag = "agps-gen-v0"
+$AgpsGenSha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+$AgpsGenUrl = "https://github.com/dnikolov/flipper-esp32-over-ble/releases/download/$AgpsGenTag/agps_gen.exe"
 
 $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
 # Held back from every budgeted step for the final CLI resync + result-file write.
@@ -46,6 +58,13 @@ $script:CredentialsFlipperPath = "$AppDataPath/wdgwars_credentials.txt"
 $script:ResultFlipperPath = "$AppDataPath/wardriving_publish_result.txt"
 # mesh_log's own accumulator (docs/WARDRIVING_PUBLISH.md "Flipper-side storage") -- own
 # subdirectory, own independent current/archive lifecycle, distinct from wardriving/'s CSV.
+$script:AgpsFlipperPath = "$AppDataPath/agps.bin"
+$script:AgpsTmpFlipperPath = "$AppDataPath/agps.bin.tmp"
+$script:AgpsResultFlipperPath = "$AppDataPath/agps_sync_result.txt"
+$script:AgpsDays = 7
+$script:AgpsMaxBytes = 200 * 1024
+$script:AgpsGenTimeoutSec = 600
+$script:AgpsClockToleranceSec = 5
 $script:MeshDir = "$AppDataPath/mesh"
 $script:MeshNodesFlipperPath = "$script:MeshDir/mesh_nodes_current.txt"
 
@@ -939,6 +958,305 @@ function Write-ResultFile {
 }
 
 # ---------------------------------------------------------------------------
+# A-GPS sync (docs/AGPS.md "Build contract"). Pure helpers first -- tested offline by
+# scripts/test_agps_sync.ps1, which loads them by name from this file's AST.
+# ---------------------------------------------------------------------------
+
+# Flipper `date` argument "%Y-%m-%d %H:%M:%S %u" (cli_main_commands.c): UTC, weekday 1-7
+# with Monday = 1 (ISO), so Sunday is 7.
+function ConvertTo-AgpsFlipperDateArg {
+    param([datetime]$Utc)
+    $u = $Utc.ToUniversalTime()
+    $dow = [int]$u.DayOfWeek
+    if ($dow -eq 0) { $dow = 7 }
+    return ($u.ToString("yyyy-MM-dd HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture) + " $dow")
+}
+
+# Finds "YYYY-MM-DD HH:MM:SS N" anywhere in the CLI output; returns a UTC DateTime or $null.
+function ConvertFrom-AgpsFlipperDateText {
+    param([string]$Text)
+    if ($Text -notmatch '(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) (\d)') { return $null }
+    try {
+        return (New-Object DateTime ([int]$matches[1]), ([int]$matches[2]), ([int]$matches[3]), `
+            ([int]$matches[4]), ([int]$matches[5]), ([int]$matches[6]), ([System.DateTimeKind]::Utc))
+    } catch {
+        return $null
+    }
+}
+
+function Test-AgpsClockClose {
+    param([datetime]$A, [datetime]$B, [int]$ToleranceSec)
+    return ([Math]::Abs(($A - $B).TotalSeconds) -le $ToleranceSec)
+}
+
+# Validates agps.bin per docs/AGPS.md: 16 B header (magic FAGP, u8 version 1, u8 mask, u16
+# window_count @6, u32 generated, u32 reserved), then window_count 16 B entries (u32 from, u32
+# to @4, u32 offset @8, u16 length @12, u16 reserved). Every window must lie inside the file.
+function Get-AgpsBinInfo {
+    param([byte[]]$Bytes, [int]$MaxBytes = 204800)
+
+    $fail = { param($m) return @{ Ok = $false; Error = $m; WindowCount = 0; LastValidTo = [uint32]0 } }
+    if ($null -eq $Bytes -or $Bytes.Length -lt 16) { return (& $fail "file shorter than header") }
+    if ($Bytes.Length -ge $MaxBytes) { return (& $fail "file too large ($($Bytes.Length) B)") }
+    if ($Bytes[0] -ne 0x46 -or $Bytes[1] -ne 0x41 -or $Bytes[2] -ne 0x47 -or $Bytes[3] -ne 0x50) {
+        return (& $fail "bad magic")
+    }
+    if ($Bytes[4] -ne 1) { return (& $fail "unsupported version $($Bytes[4])") }
+    $count = [int][BitConverter]::ToUInt16($Bytes, 6)
+    if ($count -eq 0) { return (& $fail "no windows") }
+    $tableEnd = 16 + 16 * $count
+    if ($Bytes.Length -lt $tableEnd) { return (& $fail "window table truncated") }
+
+    $lastTo = [uint32]0
+    for ($i = 0; $i -lt $count; $i++) {
+        $e = 16 + 16 * $i
+        $from = [BitConverter]::ToUInt32($Bytes, $e)
+        $to = [BitConverter]::ToUInt32($Bytes, $e + 4)
+        $off = [long][BitConverter]::ToUInt32($Bytes, $e + 8)
+        $len = [long][BitConverter]::ToUInt16($Bytes, $e + 12)
+        if ($to -le $from) { return (& $fail "window $i has an empty range") }
+        if ($len -eq 0 -or $len -gt 4096) { return (& $fail "window $i bad length") }
+        if ($off -lt $tableEnd -or ($off + $len) -gt $Bytes.Length) { return (& $fail "window $i outside file") }
+        $lastTo = $to
+    }
+    return @{ Ok = $true; Error = $null; WindowCount = $count; LastValidTo = $lastTo }
+}
+
+# Exactly one line, as the Flipper app parses it: "OK <window_count> <last_valid_to_unix>" or
+# "ERR <short message>" (printable ASCII, no CR/LF).
+function Format-AgpsResultLine {
+    param($Info, [string]$ErrorMessage)
+    if ($Info -and $Info.Ok) { return "OK $($Info.WindowCount) $([uint32]$Info.LastValidTo)" }
+    $text = [string]$ErrorMessage
+    if (-not $text -and $Info) { $text = [string]$Info.Error }
+    $text = ($text -replace '[\r\n\t]+', ' ') -replace '[^\x20-\x7E]', '?'
+    $text = $text.Trim()
+    if (-not $text) { $text = "failed" }
+    if ($text.Length -gt 60) { $text = $text.Substring(0, 57) + "..." }
+    return "ERR $text"
+}
+
+function Test-AgpsHashIsPlaceholder {
+    param([string]$Hash)
+    return (-not $Hash -or $Hash -notmatch '^[0-9a-fA-F]{64}$' -or $Hash -match '^0{64}$')
+}
+
+function Test-AgpsSha256Match {
+    param([string]$Actual, [string]$Expected)
+    if (-not $Actual -or -not $Expected) { return $false }
+    return ($Actual.Trim().ToLowerInvariant() -eq $Expected.Trim().ToLowerInvariant())
+}
+
+function Get-AgpsFileSha256 {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        return (-join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }))
+    } finally {
+        $stream.Close()
+        $sha.Dispose()
+    }
+}
+
+# Returns the path of a hash-verified agps_gen.exe, or throws. -AgpsGenPath skips the check.
+function Resolve-AgpsGenerator {
+    if ($AgpsGenPath) {
+        if (-not (Test-Path -LiteralPath $AgpsGenPath -PathType Leaf)) { throw "AgpsGenPath not found: $AgpsGenPath" }
+        Write-Host "WARNING: using a local generator ($AgpsGenPath) -- SHA-256 check SKIPPED. Development use only."
+        return (Resolve-Path -LiteralPath $AgpsGenPath).Path
+    }
+    if (Test-AgpsHashIsPlaceholder $AgpsGenSha256) {
+        throw "agps_gen release hash not set in this script (placeholder)"
+    }
+    $expected = $AgpsGenSha256.Trim().ToLowerInvariant()
+    $dir = Join-Path $env:LOCALAPPDATA "flipper-esp32-over-ble\agps_gen\$expected"
+    $exe = Join-Path $dir "agps_gen.exe"
+    if ((Test-Path -LiteralPath $exe) -and (Test-AgpsSha256Match (Get-AgpsFileSha256 $exe) $expected)) {
+        Write-Host "Using cached agps_gen ($AgpsGenTag)."
+        return $exe
+    }
+    [void](New-Item -ItemType Directory -Force -Path $dir)
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+    $part = Join-Path $dir "download_$([guid]::NewGuid().ToString('N')).part"
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        Write-Host "Downloading agps_gen ($AgpsGenTag) from $AgpsGenUrl ..."
+        $wc = New-Object System.Net.WebClient
+        try { $wc.DownloadFile($AgpsGenUrl, $part) } finally { $wc.Dispose() }
+        $actual = Get-AgpsFileSha256 $part
+        if (-not (Test-AgpsSha256Match $actual $expected)) {
+            throw "agps_gen SHA-256 mismatch (got $actual) - refusing to run it"
+        }
+        Move-Item -LiteralPath $part -Destination $exe -Force
+    } finally {
+        Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+    }
+    return $exe
+}
+
+# Runs the generator in its own process with an empty-but-for-basics environment (no secrets),
+# echoing its output to the console. Throws on non-zero exit or timeout.
+function Invoke-AgpsGenerator {
+    param([string]$ExePath, [string]$OutPath, [string]$CacheDir)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $ExePath
+    $psi.Arguments = "--out `"$OutPath`" --days $script:AgpsDays --cache `"$CacheDir`""
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables.Clear()
+    $sysRoot = [string]$env:SystemRoot
+    $psi.EnvironmentVariables["SystemRoot"] = $sysRoot
+    $psi.EnvironmentVariables["windir"] = $sysRoot
+    $psi.EnvironmentVariables["PATH"] = "$sysRoot\system32;$sysRoot"
+    foreach ($name in @("TEMP", "TMP", "LOCALAPPDATA", "APPDATA", "USERPROFILE")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($value) { $psi.EnvironmentVariables[$name] = $value }
+    }
+
+    Write-Host "Running agps_gen ($script:AgpsDays days)..."
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $deadline = (Get-Date).AddSeconds($script:AgpsGenTimeoutSec)
+        $outTask = $proc.StandardOutput.ReadLineAsync()
+        $errTask = $proc.StandardError.ReadLineAsync()
+        $outDone = $false
+        $errDone = $false
+        while (-not ($outDone -and $errDone)) {
+            if ((Get-Date) -gt $deadline) {
+                try { $proc.Kill() } catch { }
+                throw "agps_gen timed out after $([int]($script:AgpsGenTimeoutSec / 60)) min"
+            }
+            $progressed = $false
+            if (-not $outDone -and $outTask.IsCompleted) {
+                $line = $outTask.Result
+                if ($null -eq $line) { $outDone = $true } else { Write-Host $line; $outTask = $proc.StandardOutput.ReadLineAsync() }
+                $progressed = $true
+            }
+            if (-not $errDone -and $errTask.IsCompleted) {
+                $line = $errTask.Result
+                if ($null -eq $line) { $errDone = $true } else { Write-Host "[agps_gen] $line"; $errTask = $proc.StandardError.ReadLineAsync() }
+                $progressed = $true
+            }
+            if (-not $progressed) { Start-Sleep -Milliseconds 50 }
+        }
+        if (-not $proc.WaitForExit([Math]::Max(1000, [int](($deadline - (Get-Date)).TotalMilliseconds)))) {
+            try { $proc.Kill() } catch { }
+            throw "agps_gen did not exit"
+        }
+        if ($proc.ExitCode -ne 0) { throw "agps_gen failed (exit code $($proc.ExitCode))" }
+    } finally {
+        $proc.Dispose()
+    }
+}
+
+# Sends `date [args]` and returns the Flipper's reported UTC time (or $null if unparsable).
+function Invoke-FlipperDate {
+    param($Cli, [string]$SetArg)
+    $line = if ($SetArg) { "date $SetArg`r" } else { "date`r" }
+    Send-FlipperLine -Serial $Cli.Serial -Line $line
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null # echo
+    $text = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt
+    if ($SetArg -and $text -match 'Invalid') { throw "Flipper rejected the date: $($text.Trim())" }
+    return (ConvertFrom-AgpsFlipperDateText $text)
+}
+
+# Returns $null on success (an already-existing directory counts), else the Storage error.
+function Invoke-FlipperMkdir {
+    param($Cli, [string]$Path)
+    Send-FlipperLine -Serial $Cli.Serial -Line "storage mkdir `"$Path`"`r"
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol | Out-Null # echo
+    $line = Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliEol
+    Read-FlipperUntil -Serial $Cli.Serial -Buffer ([ref]$Cli.Buffer) -Terminator $script:CliPrompt | Out-Null
+    if (Test-FlipperErrorLine $line) {
+        $err = Get-FlipperErrorText $line
+        if ($err -ne "file/dir already exist") { return $err }
+    }
+    return $null
+}
+
+function Write-AgpsResultFile {
+    param($Cli, [string]$Line)
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        [System.IO.File]::WriteAllBytes($tmp, [System.Text.Encoding]::ASCII.GetBytes($Line + "`n"))
+        Send-FlipperFile -Cli $Cli -LocalPath $tmp -FlipperPath $script:AgpsResultFlipperPath
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Never reads the wdgwars key/credentials. Always attempts to leave one result line on the
+# Flipper; never throws (so in -Mode All a failure here can't hide the Publish outcome).
+function Invoke-AgpsSync {
+    $cli = $null
+    $localBin = $null
+    $resultLine = $null
+    try {
+        $agpsPort = $Port
+        if ($agpsPort -eq "auto") {
+            Write-Host "Looking for the Flipper's CLI serial port..."
+            $agpsPort = Find-FlipperPort
+            if (-not $agpsPort) { throw "Could not find a Flipper Zero on any serial port." }
+        }
+        Write-Host "A-GPS sync: using port $agpsPort"
+        $cli = Open-FlipperCli -PortName $agpsPort
+
+        $nowUtc = [DateTime]::UtcNow
+        Write-Host "Setting the Flipper clock to UTC $($nowUtc.ToString('yyyy-MM-dd HH:mm:ss'))..."
+        [void](Invoke-FlipperDate -Cli $cli -SetArg (ConvertTo-AgpsFlipperDateArg $nowUtc))
+        $readBack = Invoke-FlipperDate -Cli $cli
+        if (-not $readBack -or -not (Test-AgpsClockClose $readBack ([DateTime]::UtcNow) $script:AgpsClockToleranceSec)) {
+            throw "Flipper clock verify failed"
+        }
+
+        $gen = Resolve-AgpsGenerator
+        $cacheDir = Join-Path $env:LOCALAPPDATA "flipper-esp32-over-ble\agps_gen\cache"
+        [void](New-Item -ItemType Directory -Force -Path $cacheDir)
+        $localBin = Join-Path $env:TEMP "agps_$([guid]::NewGuid().ToString('N')).bin"
+        Invoke-AgpsGenerator -ExePath $gen -OutPath $localBin -CacheDir $cacheDir
+
+        if (-not (Test-Path -LiteralPath $localBin)) { throw "generator produced no file" }
+        $bytes = [System.IO.File]::ReadAllBytes($localBin)
+        $info = Get-AgpsBinInfo -Bytes $bytes -MaxBytes $script:AgpsMaxBytes
+        if (-not $info.Ok) { throw "bad agps.bin: $($info.Error)" }
+        Write-Host "agps.bin: $($bytes.Length) bytes, $($info.WindowCount) windows."
+
+        $mkErr = Invoke-FlipperMkdir -Cli $cli -Path $AppDataPath
+        if ($mkErr) { throw "mkdir failed: $mkErr" }
+
+        Write-Host "Pushing agps.bin to the Flipper..."
+        Send-FlipperFile -Cli $cli -LocalPath $localBin -FlipperPath $script:AgpsTmpFlipperPath
+        $remoteSize = Get-FlipperFileSize -Cli $cli -Path $script:AgpsTmpFlipperPath
+        if ($remoteSize -ne $bytes.Length) { throw "push size mismatch ($remoteSize of $($bytes.Length) B)" }
+        Remove-FlipperFile -Cli $cli -Path $script:AgpsFlipperPath
+        $renErr = Invoke-FlipperRename -Cli $cli -OldPath $script:AgpsTmpFlipperPath -NewPath $script:AgpsFlipperPath -TimeoutSec 30
+        if ($renErr) { throw "rename failed: $renErr" }
+
+        $resultLine = Format-AgpsResultLine -Info $info
+        Write-Host "A-GPS sync done: $resultLine"
+    } catch {
+        $msg = $_.Exception.Message
+        Write-Host "A-GPS sync failed: $msg"
+        $resultLine = Format-AgpsResultLine -ErrorMessage $msg
+    }
+
+    if ($cli) {
+        try {
+            try { Restore-FlipperCli -Cli $cli } catch { }
+            Write-AgpsResultFile -Cli $cli -Line $resultLine
+        } catch {
+            Write-Host "(could not write the A-GPS result file: $($_.Exception.Message))"
+        }
+        try { Close-FlipperCli -Cli $cli } catch { }
+    }
+    if ($localBin) { Remove-Item -LiteralPath $localBin -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -949,237 +1267,244 @@ foreach ($pattern in @("wdgwars_credentials_*.txt", "wardriving_current_*.csv", 
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-$tempCsv = $null
-$tempMesh = $null
-$cli = $null
-$haveMesh = $null
-$script:Creds = @{}
-$script:ApiKey = $null
-$script:KeyNeedsPersist = $false
-$script:KeyWasStored = $false
-$script:KeyRejected = $false
-# Accumulates fields from both independent operations below into the one result file the
-# Flipper's Publish screen reads (docs/WARDRIVING_PUBLISH.md "One result file, two outcome
-# blocks") -- unprefixed keys are the CSV/wifi-ble outcome, `mesh_`-prefixed keys are the
-# mesh_log outcome. Written exactly once, after both have had a chance to run, so neither
-# operation having nothing to publish (or failing) ever hides the other's real result.
-$resultFields = [ordered]@{}
+if ($Mode -ne "Agps") {
+    $tempCsv = $null
+    $tempMesh = $null
+    $cli = $null
+    $haveMesh = $null
+    $script:Creds = @{}
+    $script:ApiKey = $null
+    $script:KeyNeedsPersist = $false
+    $script:KeyWasStored = $false
+    $script:KeyRejected = $false
+    # Accumulates fields from both independent operations below into the one result file the
+    # Flipper's Publish screen reads (docs/WARDRIVING_PUBLISH.md "One result file, two outcome
+    # blocks") -- unprefixed keys are the CSV/wifi-ble outcome, `mesh_`-prefixed keys are the
+    # mesh_log outcome. Written exactly once, after both have had a chance to run, so neither
+    # operation having nothing to publish (or failing) ever hides the other's real result.
+    $resultFields = [ordered]@{}
 
-try {
-    if ($Port -eq "auto") {
-        Write-Host "Looking for the Flipper's CLI serial port..."
-        $Port = Find-FlipperPort
-        if (-not $Port) { throw "Could not find a Flipper Zero on any serial port." }
-    }
-    Write-Host "Using port $Port"
+    try {
+        if ($Port -eq "auto") {
+            Write-Host "Looking for the Flipper's CLI serial port..."
+            $Port = Find-FlipperPort
+            if (-not $Port) { throw "Could not find a Flipper Zero on any serial port." }
+        }
+        Write-Host "Using port $Port"
 
-    $cli = Open-FlipperCli -PortName $Port
+        $cli = Open-FlipperCli -PortName $Port
 
-    $haveCsv = Test-FlipperFileExists -Cli $cli -Path $script:CsvFlipperPath
-    $haveMesh = Test-FlipperFileExists -Cli $cli -Path $script:MeshNodesFlipperPath
+        $haveCsv = Test-FlipperFileExists -Cli $cli -Path $script:CsvFlipperPath
+        $haveMesh = Test-FlipperFileExists -Cli $cli -Path $script:MeshNodesFlipperPath
 
-    # Credentials are shared between both uploads (docs/WARDRIVING_PUBLISH.md "Separate HTTP
-    # calls": mesh reuses "the same 64-char wdgwars API key already stored" -- no new
-    # credential), so this is loaded/prompted-for once, before either operation. A newly
-    # entered key is only written to the Flipper once wdgwars.pl accepts it.
-    if ($haveCsv -or $haveMesh) {
-        $script:Creds = Read-FlipperCredentials -Cli $cli
-        $storedKey = [string]$script:Creds["wdgwars"]
-        if (Test-ApiKeyFormat $storedKey.Trim()) {
-            $script:ApiKey = $storedKey.Trim()
-            $script:KeyWasStored = $true
-        } else {
-            Write-Host ""
-            if ($storedKey) {
-                Write-Host "The wdgwars.pl API key stored on this Flipper is malformed (expected 64 hex characters)."
+        # Credentials are shared between both uploads (docs/WARDRIVING_PUBLISH.md "Separate HTTP
+        # calls": mesh reuses "the same 64-char wdgwars API key already stored" -- no new
+        # credential), so this is loaded/prompted-for once, before either operation. A newly
+        # entered key is only written to the Flipper once wdgwars.pl accepts it.
+        if ($haveCsv -or $haveMesh) {
+            $script:Creds = Read-FlipperCredentials -Cli $cli
+            $storedKey = [string]$script:Creds["wdgwars"]
+            if (Test-ApiKeyFormat $storedKey.Trim()) {
+                $script:ApiKey = $storedKey.Trim()
+                $script:KeyWasStored = $true
             } else {
-                Write-Host "No wdgwars.pl API key stored on this Flipper yet."
-            }
-            $script:ApiKey = Read-ApiKeyFromConsole
-            $script:KeyNeedsPersist = $true
-            Write-Host "The key will be saved to the Flipper's SD card once wdgwars.pl accepts it."
-        }
-    }
-
-    # ---- CSV (wifi/ble) publish -- Method 1 ----
-    if (-not $haveCsv) {
-        Write-Host "No wardriving CSV found on the Flipper -- nothing to publish."
-        $resultFields["status"] = "nothing_to_publish"
-    } else {
-        $tempCsv = Join-Path $env:TEMP "wardriving_current_$([guid]::NewGuid()).csv"
-        Write-Host "Pulling current CSV from the Flipper..."
-        Receive-FlipperFile -Cli $cli -FlipperPath $script:CsvFlipperPath -LocalPath $tempCsv
-
-        # WigleWifi-1.6 export is two header lines (metadata line, then column-name line);
-        # anything beyond that is real data.
-        $csvLineCount = 0
-        $csvReader = [System.IO.File]::OpenText($tempCsv)
-        try {
-            while ($csvLineCount -le 2 -and $null -ne $csvReader.ReadLine()) { $csvLineCount++ }
-        } finally {
-            $csvReader.Dispose()
-        }
-        if ($csvLineCount -le 2) {
-            Write-Host "CSV has no data rows yet -- nothing to publish."
-            $resultFields["status"] = "nothing_to_publish"
-        } elseif ((Get-SpendableSec) -lt 20) {
-            Write-Host "Out of time before the CSV upload -- leaving it in place."
-            $resultFields["status"] = "fail"
-            $resultFields["message"] = "Out of time before upload; CSV kept"
-        } else {
-            try {
-                Write-Host "Uploading CSV to wdgwars.pl..."
-                $result = Send-WdgwarsUpload -Url $UploadUrl -ApiKey $script:ApiKey -CsvPath $tempCsv -TimeoutSec (Get-HttpTimeoutSec 120)
-                Write-ResponseToConsole $result
-
-                $parsed = $null
-                try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
-                Update-ApiKeyState -Cli $cli -Result $result -CsvEndpoint $true
-
-                # 202 is wdgwars.pl's async-queued acknowledgement (docs/WARDRIVING_PUBLISH.md's
-                # v2 upload-job behavior) -- confirmed 2026-09-18 that even /api/upload-csv (v1)
-                # can return it under real conditions, not just the documented v2 endpoint.
-                # ok:true here means the server has accepted and queued the upload, which this
-                # project treats as confirmed enough to archive -- an explicit user decision
-                # over waiting on the job to finish via poll_url, which this script does not do.
-                if (($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) -and $parsed -and $parsed.ok -eq $true) {
-                    $resultFields["status"] = "ok"
-                    foreach ($name in @("imported", "captured", "updated", "duplicates", "no_gps", "bad_rows")) {
-                        if ($parsed.PSObject.Properties.Name -contains $name) { $resultFields[$name] = $parsed.$name }
-                    }
-
-                    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-                    Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
-                    $archive = Complete-FlipperArchive -Cli $cli -LocalSnapshot $tempCsv -LivePath $script:CsvFlipperPath `
-                        -ArchivePath "$script:WardrivingDir/$timestamp.csv" -Label "CSV"
-                    if (-not $archive.Archived) { $resultFields["message"] = $archive.Note }
+                Write-Host ""
+                if ($storedKey) {
+                    Write-Host "The wdgwars.pl API key stored on this Flipper is malformed (expected 64 hex characters)."
                 } else {
-                    Write-Host "Upload not confirmed as successful -- leaving the CSV in place, nothing archived."
-                    $resultFields["status"] = "fail"
-                    $resultFields["message"] = Get-UploadFailureMessage -Result $result -Parsed $parsed -KeyRejected $script:KeyRejected
+                    Write-Host "No wdgwars.pl API key stored on this Flipper yet."
                 }
-            } catch {
-                Write-Host "CSV publish failed: $($_.Exception.Message)"
-                $resultFields["status"] = "fail"
-                $resultFields["message"] = $_.Exception.Message
+                $script:ApiKey = Read-ApiKeyFromConsole
+                $script:KeyNeedsPersist = $true
+                Write-Host "The key will be saved to the Flipper's SD card once wdgwars.pl accepts it."
             }
         }
-    }
 
-    # ---- Mesh node (MeshCore/Meshtastic) publish -- Method 2, independent of the CSV above:
-    # own endpoint, own auth scheme (HMAC-signed body), own archive file, own result-file
-    # block. A failure or no-op here never blocks or is blocked by the CSV outcome above. ----
-    if (-not $haveMesh) {
-        Write-Host "No mesh node log found on the Flipper -- nothing to publish."
-        $resultFields["mesh_status"] = "nothing_to_publish"
-    } elseif ($script:KeyRejected) {
-        Write-Host "Skipping the mesh upload -- wdgwars.pl rejected the API key."
-        $resultFields["mesh_status"] = "fail"
-        $resultFields["mesh_message"] = "Invalid API key - re-enter it on next publish"
-    } elseif ((Get-SpendableSec) -lt 30) {
-        Write-Host "Out of time before the mesh upload -- leaving the mesh log in place."
-        $resultFields["mesh_status"] = "fail"
-        $resultFields["mesh_message"] = "Out of time before upload; mesh log kept"
-    } else {
-        $tempMesh = Join-Path $env:TEMP "mesh_nodes_current_$([guid]::NewGuid()).txt"
-        Write-Host "Pulling mesh node log from the Flipper..."
-        Receive-FlipperFile -Cli $cli -FlipperPath $script:MeshNodesFlipperPath -LocalPath $tempMesh
-
-        $meshLines = @(Get-Content -LiteralPath $tempMesh -ErrorAction SilentlyContinue)
-        $meshNodes = @(Get-MeshNodesFromLines -Lines $meshLines)
-
-        if ($meshNodes.Count -eq 0) {
-            Write-Host "Mesh node log has no valid records -- nothing to publish."
-            $resultFields["mesh_status"] = "nothing_to_publish"
+        # ---- CSV (wifi/ble) publish -- Method 1 ----
+        if (-not $haveCsv) {
+            Write-Host "No wardriving CSV found on the Flipper -- nothing to publish."
+            $resultFields["status"] = "nothing_to_publish"
         } else {
+            $tempCsv = Join-Path $env:TEMP "wardriving_current_$([guid]::NewGuid()).csv"
+            Write-Host "Pulling current CSV from the Flipper..."
+            Receive-FlipperFile -Cli $cli -FlipperPath $script:CsvFlipperPath -LocalPath $tempCsv
+
+            # WigleWifi-1.6 export is two header lines (metadata line, then column-name line);
+            # anything beyond that is real data.
+            $csvLineCount = 0
+            $csvReader = [System.IO.File]::OpenText($tempCsv)
             try {
-                Write-Host "Uploading $($meshNodes.Count) mesh node(s) to wdgwars.pl..."
-                $result = Send-WdgwarsMeshUpload -Url $MeshUploadUrl -ApiKey $script:ApiKey -MeshNodes $meshNodes -TimeoutSec (Get-HttpTimeoutSec 60)
-                Write-ResponseToConsole $result
+                while ($csvLineCount -le 2 -and $null -ne $csvReader.ReadLine()) { $csvLineCount++ }
+            } finally {
+                $csvReader.Dispose()
+            }
+            if ($csvLineCount -le 2) {
+                Write-Host "CSV has no data rows yet -- nothing to publish."
+                $resultFields["status"] = "nothing_to_publish"
+            } elseif ((Get-SpendableSec) -lt 20) {
+                Write-Host "Out of time before the CSV upload -- leaving it in place."
+                $resultFields["status"] = "fail"
+                $resultFields["message"] = "Out of time before upload; CSV kept"
+            } else {
+                try {
+                    Write-Host "Uploading CSV to wdgwars.pl..."
+                    $result = Send-WdgwarsUpload -Url $UploadUrl -ApiKey $script:ApiKey -CsvPath $tempCsv -TimeoutSec (Get-HttpTimeoutSec 120)
+                    Write-ResponseToConsole $result
 
-                $parsed = $null
-                try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
-                Update-ApiKeyState -Cli $cli -Result $result -CsvEndpoint $false
+                    $parsed = $null
+                    try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
+                    Update-ApiKeyState -Cli $cli -Result $result -CsvEndpoint $true
 
-                # Method 2 is synchronous (no job_id/poll_url documented for /api/upload, unlike
-                # the CSV v1/v2 pair) -- only a plain 200 + ok:true counts as confirmed.
-                if ($result.StatusCode -eq 200 -and $parsed -and $parsed.ok -eq $true) {
-                    $resultFields["mesh_status"] = "ok"
-                    # Real field names confirmed against wdgwars.pl's own docs (read 2026-09-27):
-                    # `meshcore_imported` (count) and `meshcore_reject_reasons` (an object of
-                    # reason -> count, e.g. bad_network/bad_node_id/no_gps). Flattened into
-                    # individual mesh_reject_<reason>=<count> lines rather than stored as a
-                    # nested blob -- this firmware's result file is flat key=value text with no
-                    # JSON decoder anywhere (same reasoning as the credentials file).
-                    if ($parsed.PSObject.Properties.Name -contains "meshcore_imported") {
-                        $resultFields["mesh_imported"] = $parsed.meshcore_imported
+                    # 202 is wdgwars.pl's async-queued acknowledgement (docs/WARDRIVING_PUBLISH.md's
+                    # v2 upload-job behavior) -- confirmed 2026-09-18 that even /api/upload-csv (v1)
+                    # can return it under real conditions, not just the documented v2 endpoint.
+                    # ok:true here means the server has accepted and queued the upload, which this
+                    # project treats as confirmed enough to archive -- an explicit user decision
+                    # over waiting on the job to finish via poll_url, which this script does not do.
+                    if (($result.StatusCode -eq 200 -or $result.StatusCode -eq 202) -and $parsed -and $parsed.ok -eq $true) {
+                        $resultFields["status"] = "ok"
+                        foreach ($name in @("imported", "captured", "updated", "duplicates", "no_gps", "bad_rows")) {
+                            if ($parsed.PSObject.Properties.Name -contains $name) { $resultFields[$name] = $parsed.$name }
+                        }
+
+                        $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+                        Write-Host "Upload confirmed -- archiving CSV on the Flipper as $timestamp.csv"
+                        $archive = Complete-FlipperArchive -Cli $cli -LocalSnapshot $tempCsv -LivePath $script:CsvFlipperPath `
+                            -ArchivePath "$script:WardrivingDir/$timestamp.csv" -Label "CSV"
+                        if (-not $archive.Archived) { $resultFields["message"] = $archive.Note }
+                    } else {
+                        Write-Host "Upload not confirmed as successful -- leaving the CSV in place, nothing archived."
+                        $resultFields["status"] = "fail"
+                        $resultFields["message"] = Get-UploadFailureMessage -Result $result -Parsed $parsed -KeyRejected $script:KeyRejected
                     }
-                    if ($parsed.PSObject.Properties.Name -contains "meshcore_reject_reasons") {
-                        $reasons = $parsed.meshcore_reject_reasons
-                        if ($reasons) {
-                            foreach ($prop in $reasons.PSObject.Properties) {
-                                $resultFields["mesh_reject_$($prop.Name)"] = $prop.Value
+                } catch {
+                    Write-Host "CSV publish failed: $($_.Exception.Message)"
+                    $resultFields["status"] = "fail"
+                    $resultFields["message"] = $_.Exception.Message
+                }
+            }
+        }
+
+        # ---- Mesh node (MeshCore/Meshtastic) publish -- Method 2, independent of the CSV above:
+        # own endpoint, own auth scheme (HMAC-signed body), own archive file, own result-file
+        # block. A failure or no-op here never blocks or is blocked by the CSV outcome above. ----
+        if (-not $haveMesh) {
+            Write-Host "No mesh node log found on the Flipper -- nothing to publish."
+            $resultFields["mesh_status"] = "nothing_to_publish"
+        } elseif ($script:KeyRejected) {
+            Write-Host "Skipping the mesh upload -- wdgwars.pl rejected the API key."
+            $resultFields["mesh_status"] = "fail"
+            $resultFields["mesh_message"] = "Invalid API key - re-enter it on next publish"
+        } elseif ((Get-SpendableSec) -lt 30) {
+            Write-Host "Out of time before the mesh upload -- leaving the mesh log in place."
+            $resultFields["mesh_status"] = "fail"
+            $resultFields["mesh_message"] = "Out of time before upload; mesh log kept"
+        } else {
+            $tempMesh = Join-Path $env:TEMP "mesh_nodes_current_$([guid]::NewGuid()).txt"
+            Write-Host "Pulling mesh node log from the Flipper..."
+            Receive-FlipperFile -Cli $cli -FlipperPath $script:MeshNodesFlipperPath -LocalPath $tempMesh
+
+            $meshLines = @(Get-Content -LiteralPath $tempMesh -ErrorAction SilentlyContinue)
+            $meshNodes = @(Get-MeshNodesFromLines -Lines $meshLines)
+
+            if ($meshNodes.Count -eq 0) {
+                Write-Host "Mesh node log has no valid records -- nothing to publish."
+                $resultFields["mesh_status"] = "nothing_to_publish"
+            } else {
+                try {
+                    Write-Host "Uploading $($meshNodes.Count) mesh node(s) to wdgwars.pl..."
+                    $result = Send-WdgwarsMeshUpload -Url $MeshUploadUrl -ApiKey $script:ApiKey -MeshNodes $meshNodes -TimeoutSec (Get-HttpTimeoutSec 60)
+                    Write-ResponseToConsole $result
+
+                    $parsed = $null
+                    try { $parsed = $result.Body | ConvertFrom-Json } catch { $parsed = $null }
+                    Update-ApiKeyState -Cli $cli -Result $result -CsvEndpoint $false
+
+                    # Method 2 is synchronous (no job_id/poll_url documented for /api/upload, unlike
+                    # the CSV v1/v2 pair) -- only a plain 200 + ok:true counts as confirmed.
+                    if ($result.StatusCode -eq 200 -and $parsed -and $parsed.ok -eq $true) {
+                        $resultFields["mesh_status"] = "ok"
+                        # Real field names confirmed against wdgwars.pl's own docs (read 2026-09-27):
+                        # `meshcore_imported` (count) and `meshcore_reject_reasons` (an object of
+                        # reason -> count, e.g. bad_network/bad_node_id/no_gps). Flattened into
+                        # individual mesh_reject_<reason>=<count> lines rather than stored as a
+                        # nested blob -- this firmware's result file is flat key=value text with no
+                        # JSON decoder anywhere (same reasoning as the credentials file).
+                        if ($parsed.PSObject.Properties.Name -contains "meshcore_imported") {
+                            $resultFields["mesh_imported"] = $parsed.meshcore_imported
+                        }
+                        if ($parsed.PSObject.Properties.Name -contains "meshcore_reject_reasons") {
+                            $reasons = $parsed.meshcore_reject_reasons
+                            if ($reasons) {
+                                foreach ($prop in $reasons.PSObject.Properties) {
+                                    $resultFields["mesh_reject_$($prop.Name)"] = $prop.Value
+                                }
                             }
                         }
-                    }
 
-                    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-                    Write-Host "Mesh upload confirmed -- archiving mesh node log on the Flipper as $timestamp.txt"
-                    $archive = Complete-FlipperArchive -Cli $cli -LocalSnapshot $tempMesh -LivePath $script:MeshNodesFlipperPath `
-                        -ArchivePath "$script:MeshDir/$timestamp.txt" -Label "mesh log"
-                    if (-not $archive.Archived) { $resultFields["mesh_message"] = $archive.Note }
-                } else {
-                    Write-Host "Mesh upload not confirmed as successful -- leaving the mesh log in place, nothing archived."
+                        $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+                        Write-Host "Mesh upload confirmed -- archiving mesh node log on the Flipper as $timestamp.txt"
+                        $archive = Complete-FlipperArchive -Cli $cli -LocalSnapshot $tempMesh -LivePath $script:MeshNodesFlipperPath `
+                            -ArchivePath "$script:MeshDir/$timestamp.txt" -Label "mesh log"
+                        if (-not $archive.Archived) { $resultFields["mesh_message"] = $archive.Note }
+                    } else {
+                        Write-Host "Mesh upload not confirmed as successful -- leaving the mesh log in place, nothing archived."
+                        $resultFields["mesh_status"] = "fail"
+                        $resultFields["mesh_message"] = Get-UploadFailureMessage -Result $result -Parsed $parsed -KeyRejected $script:KeyRejected
+                    }
+                } catch {
+                    Write-Host "Mesh publish failed: $($_.Exception.Message)"
                     $resultFields["mesh_status"] = "fail"
-                    $resultFields["mesh_message"] = Get-UploadFailureMessage -Result $result -Parsed $parsed -KeyRejected $script:KeyRejected
+                    $resultFields["mesh_message"] = $_.Exception.Message
                 }
-            } catch {
-                Write-Host "Mesh publish failed: $($_.Exception.Message)"
-                $resultFields["mesh_status"] = "fail"
-                $resultFields["mesh_message"] = $_.Exception.Message
             }
         }
-    }
 
-    Write-ResultFile -Cli $cli -Fields $resultFields
-    Write-Host "Done."
-} catch {
-    $failure = $_.Exception.Message
-    Write-Host "Publish failed: $failure"
-    if (-not $resultFields.Contains("status")) {
-        $resultFields["status"] = "fail"
-        $resultFields["message"] = $failure
-    }
-    # HP-35: a failure after the CSV step (e.g. reading the mesh log) must not leave the mesh
-    # outcome blank next to a status=ok.
-    if (-not $resultFields.Contains("mesh_status")) {
-        if ($haveMesh -eq $false) {
-            $resultFields["mesh_status"] = "nothing_to_publish"
-        } else {
-            $resultFields["mesh_status"] = "fail"
-            $resultFields["mesh_message"] = $failure
+        Write-ResultFile -Cli $cli -Fields $resultFields
+        Write-Host "Done."
+    } catch {
+        $failure = $_.Exception.Message
+        Write-Host "Publish failed: $failure"
+        if (-not $resultFields.Contains("status")) {
+            $resultFields["status"] = "fail"
+            $resultFields["message"] = $failure
         }
-    }
-    if ($cli) {
-        try {
-            Restore-FlipperCli -Cli $cli
-            Write-ResultFile -Cli $cli -Fields $resultFields
-        } catch {
-            Write-Host "(could not write a result file back to the Flipper either)"
+        # HP-35: a failure after the CSV step (e.g. reading the mesh log) must not leave the mesh
+        # outcome blank next to a status=ok.
+        if (-not $resultFields.Contains("mesh_status")) {
+            if ($haveMesh -eq $false) {
+                $resultFields["mesh_status"] = "nothing_to_publish"
+            } else {
+                $resultFields["mesh_status"] = "fail"
+                $resultFields["mesh_message"] = $failure
+            }
         }
+        if ($cli) {
+            try {
+                Restore-FlipperCli -Cli $cli
+                Write-ResultFile -Cli $cli -Fields $resultFields
+            } catch {
+                Write-Host "(could not write a result file back to the Flipper either)"
+            }
+        }
+    } finally {
+        if ($cli) { Close-FlipperCli -Cli $cli }
+        $script:ApiKey = $null
+        $script:Creds = $null
+        # Only the transient local copies get deleted -- the SD-persisted credential file is
+        # intentionally left on the Flipper (see docs/WARDRIVING_PUBLISH.md, "Credential storage").
+        if ($tempCsv -and (Test-Path $tempCsv)) { Remove-Item -LiteralPath $tempCsv -Force -ErrorAction SilentlyContinue }
+        if ($tempMesh -and (Test-Path $tempMesh)) { Remove-Item -LiteralPath $tempMesh -Force -ErrorAction SilentlyContinue }
+        Get-ChildItem -Path $env:TEMP -Filter "wdgwars_credentials_*.txt" -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
     }
-} finally {
-    if ($cli) { Close-FlipperCli -Cli $cli }
-    $script:ApiKey = $null
-    $script:Creds = $null
-    # Only the transient local copies get deleted -- the SD-persisted credential file is
-    # intentionally left on the Flipper (see docs/WARDRIVING_PUBLISH.md, "Credential storage").
-    if ($tempCsv -and (Test-Path $tempCsv)) { Remove-Item -LiteralPath $tempCsv -Force -ErrorAction SilentlyContinue }
-    if ($tempMesh -and (Test-Path $tempMesh)) { Remove-Item -LiteralPath $tempMesh -Force -ErrorAction SilentlyContinue }
-    Get-ChildItem -Path $env:TEMP -Filter "wdgwars_credentials_*.txt" -File -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-    # No confirmation gate (docs/WARDRIVING_PUBLISH.md): the script just finishes and returns
-    # control to the interactive PowerShell prompt the bootstrap opened, leaving output visible
-    # without requiring a keypress.
-    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }
+
+if ($Mode -ne "Publish") {
+    Invoke-AgpsSync
+}
+
+# No confirmation gate (docs/WARDRIVING_PUBLISH.md): the script just finishes and returns
+# control to the interactive PowerShell prompt the bootstrap opened, leaving output visible
+# without requiring a keypress.
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue

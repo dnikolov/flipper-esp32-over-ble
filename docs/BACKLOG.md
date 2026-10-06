@@ -261,6 +261,20 @@ in normal use · **P2** robustness/defense-in-depth/cost · **P3** style/docs dr
   ESP32 protected-TX FIFO now serializes backlog, handshake, capability, status, and error
   records. Hardware reconnect/wardriving retest remains before closing H03.
 
+### A-GPS follow-ups (design: [AGPS.md](AGPS.md); v1 is C5, GPS-only, manual trigger)
+
+- **A-GPS: BeiDou assist.** Same host tool/framing; GEO/IGSO satellites make the orbit fit
+  harder; separate CASIC BDS ephemeris message.
+- **A-GPS: GLONASS assist.** Cartesian state-vector model, different fit and message; lowest
+  value (none used in the fix in the 2026-09-28 bench test).
+- **A-GPS: auto-push on GPS start** (every start, short timeout so a failed push never delays
+  GPS startup).
+- **A-GPS: push only when the chip is cold** — needs a way to query chip ephemeris state
+  (unconfirmed for CASIC; Espruino heuristic: valid time stamp + >8 valid ephemerides).
+- **A-GPS: Authenticode-sign the generator tool** (v1 trusts a pinned SHA-256 only).
+- **A-GPS: position hint** (last wardriving fix persisted to SD) — deferred past the first
+  spike; v1 spike is time + ephemeris only.
+
 ## Accepted, not a bug — do not "fix"
 
 - Pairing X25519 is unauthenticated by design ([DECISIONS.md](DECISIONS.md)).

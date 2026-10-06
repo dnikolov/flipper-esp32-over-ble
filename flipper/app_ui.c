@@ -197,7 +197,7 @@ static void draw_home_screen(Canvas* canvas, Esp32App* app) {
 
     static const char* labels[HomeMenuCount] = {
         "Wardriving",
-        "Publish",
+        "Sync",
         "Scan",
         "GPS",
         "Mesh Log",
@@ -337,6 +337,10 @@ static void reset_scan_ui_state_impl(Esp32App* app, bool return_home) {
     furi_timer_stop(app_publish_poll_timer);
     app->publish_waiting = false;
     app_pending_command_kind = PendingCommandNone;
+    /* A-GPS transfer state does not survive a lost session either (the C5 drops the partial
+       blob on its own timeout). */
+    app->agps_state = AgpsStateIdle;
+    app->agps_error = AgpsErrorNone;
     app->wifi_scan_in_progress = false;
     app->wifi_scan_complete = false;
     app->wifi_scan_scroll_offset = 0;
@@ -533,6 +537,7 @@ APP_FN bool app_handle_input(Esp32App* app, const InputEvent* input) {
                    visit's outcome (or an abandoned wait) must not leak into this
                    one. */
                 app->publish_outcome = PublishOutcomeNone;
+                app->sync_agps_outcome = PublishOutcomeNone;
                 app->publish_waiting = false;
                 furi_timer_stop(app_publish_poll_timer);
                 break;
@@ -571,9 +576,19 @@ APP_FN bool app_handle_input(Esp32App* app, const InputEvent* input) {
             }
         }
     } else if(app->screen == AppScreenGps) {
-        if(input->key == InputKeyBack) {
+        if(app->agps_state != AgpsStateIdle) {
+            /* A-GPS panel: Back cancels an in-flight transfer (nothing persisted) or closes a
+               result, returning to the GPS view; OK also closes a finished result. */
+            bool finished =
+                app->agps_state == AgpsStateDone || app->agps_state == AgpsStateFailed;
+            if(input->key == InputKeyBack || (input->key == InputKeyOk && finished)) {
+                agps_cancel(app);
+            }
+        } else if(input->key == InputKeyBack) {
             app->screen = AppScreenHome;
             furi_timer_stop(app_gps_poll_timer);
+        } else if(input->key == InputKeyOk && app->capability_has_agps) {
+            agps_start(app);
         }
     } else if(app->screen == AppScreenMeshLog) {
         if(input->key == InputKeyBack) {
@@ -679,8 +694,17 @@ APP_FN bool app_handle_input(Esp32App* app, const InputEvent* input) {
                side is lost by cancelling. */
             publish_finish_waiting(app);
             app->screen = AppScreenHome;
-        } else if(input->key == InputKeyOk && !app->publish_waiting) {
-            publish_start(app);
+        } else if(!app->publish_waiting && input->key == InputKeyOk) {
+            publish_start(app, app->sync_menu_index);
+        } else if(
+            !app->publish_waiting && (input->key == InputKeyUp || input->key == InputKeyDown)) {
+            /* Moves the selection; from a result screen this first returns to the menu. */
+            app->publish_outcome = PublishOutcomeNone;
+            app->sync_agps_outcome = PublishOutcomeNone;
+            int idx = (int)app->sync_menu_index + (input->key == InputKeyDown ? 1 : -1);
+            if(idx < 0) idx = SyncModeCount - 1;
+            if(idx >= SyncModeCount) idx = 0;
+            app->sync_menu_index = (SyncMode)idx;
         }
     }
     return true;

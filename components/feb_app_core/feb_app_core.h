@@ -10,6 +10,13 @@
 #include "board_config.h"
 #include "cbor_codec.h"
 
+/* C5-only `agps` capability (docs/AGPS.md): the board's board_config.h opts in with
+   FEB_HAS_AGPS 1 and must then provide location_agps.h (exclusive GPS-UART access). Every other
+   board compiles the capability out entirely. */
+#ifndef FEB_HAS_AGPS
+#define FEB_HAS_AGPS 0
+#endif
+
 /* Shared application core (docs/SOURCE_SPLIT.md 5.2): BLE central, pairing/runtime auth,
    protected TX queue, and the wifi_scan/ble_scan/gps/wardriving capabilities, consumed by each
    board's main component.

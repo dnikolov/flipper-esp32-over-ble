@@ -19,7 +19,22 @@ static const char publish_bootstrap_command[] =
     "iwr -Uri 'https://raw.githubusercontent.com/dnikolov/flipper-esp32-over-ble/"
     WARDRIVING_PUBLISH_SCRIPT_COMMIT
     "/scripts/publish_wardriving.ps1' -OutFile \"$env:TEMP\\publish_wardriving.ps1\" -ErrorAction Stop; "
-    "if ($?) { & \"$env:TEMP\\publish_wardriving.ps1\" }";
+    "if ($?) { & \"$env:TEMP\\publish_wardriving.ps1\" -Mode ";
+/* Typed right after the line above, then publish_bootstrap_tail closes the block: the host
+   script's `-Mode All|Publish|Agps` (docs/AGPS.md "Host script / UI"). */
+static const char publish_bootstrap_tail[] = " }";
+
+static const char* publish_mode_name(SyncMode mode) {
+    switch(mode) {
+    case SyncModePublish:
+        return "Publish";
+    case SyncModeAgps:
+        return "Agps";
+    case SyncModeAll:
+    default:
+        return "All";
+    }
+}
 
 static void publish_badusb_press_release(uint16_t keycode) {
     furi_hal_hid_kb_press(keycode);
@@ -70,7 +85,7 @@ static void publish_badusb_type_string(const char* text) {
    first (furi_hal_usb_set_config(NULL, NULL)) before attaching the next one. Matched that
    shape here on both transitions, with a short settle delay for the detach to actually take
    before the next attach. */
-static bool publish_trigger_badusb(void) {
+static bool publish_trigger_badusb(SyncMode mode) {
     FuriHalUsbInterface* usb_if_prev = furi_hal_usb_get_config();
     furi_hal_usb_set_config(NULL, NULL);
     furi_delay_ms(200);
@@ -94,6 +109,8 @@ static bool publish_trigger_badusb(void) {
        the bootstrap line went missing, 2026-09-28). */
     furi_delay_ms(3500);
     publish_badusb_type_string(publish_bootstrap_command);
+    publish_badusb_type_string(publish_mode_name(mode));
+    publish_badusb_type_string(publish_bootstrap_tail);
     publish_badusb_press_release(HID_KEYBOARD_RETURN);
     furi_delay_ms(300);
 
@@ -212,7 +229,31 @@ static void publish_parse_result(Esp32App* app, const char* buf, size_t len) {
    file exist at 0 bytes for the brief window between that open and the single
    storage_file_write() call that follows it -- a poll landing in that window must not be
    read as a final, unreadable-file failure. */
-static bool publish_try_read_result(Esp32App* app, const char* path) {
+/* agps_sync_result.txt (docs/AGPS.md): first line `OK <windows> <last_valid_to>` or
+   `ERR <message>`; an unparseable file is reported as a failure, not ignored. */
+static void sync_parse_agps_result(Esp32App* app, const char* buf, size_t len) {
+    bool ok = false;
+    app->sync_agps_message[0] = '\0';
+    if(agps_parse_sync_result(
+           buf,
+           len,
+           &ok,
+           &app->sync_agps_windows,
+           &app->sync_agps_valid_to,
+           app->sync_agps_message,
+           sizeof(app->sync_agps_message))) {
+        app->sync_agps_outcome = ok ? PublishOutcomeOk : PublishOutcomeFail;
+        if(!ok && app->sync_agps_message[0] == '\0') {
+            strncpy(app->sync_agps_message, "A-GPS sync failed", sizeof(app->sync_agps_message) - 1);
+        }
+    } else {
+        app->sync_agps_outcome = PublishOutcomeFail;
+        strncpy(
+            app->sync_agps_message, "Unrecognized A-GPS result", sizeof(app->sync_agps_message) - 1);
+    }
+}
+
+static bool publish_try_read_result(Esp32App* app, const char* path, bool agps) {
     static char buf[FEB_PUBLISH_RESULT_MAX_LEN];
     /* Polled every FEB_PUBLISH_POLL_PERIOD_MS for up to FEB_PUBLISH_POLL_TIMEOUT_MS, so this is
        the one open/close pair in this file that repeats on a timer rather than happening once
@@ -238,6 +279,12 @@ static bool publish_try_read_result(Esp32App* app, const char* path) {
     storage_file_close(file);
     storage_file_free(file);
 
+    if(!ok && agps) {
+        app->sync_agps_outcome = PublishOutcomeFail;
+        strncpy(
+            app->sync_agps_message, "Result file unreadable", sizeof(app->sync_agps_message) - 1);
+        return true;
+    }
     if(!ok) {
         app->publish_outcome = PublishOutcomeFail;
         strncpy(
@@ -250,7 +297,11 @@ static bool publish_try_read_result(Esp32App* app, const char* path) {
     if(read_len == 0) {
         return false;
     }
-    publish_parse_result(app, buf, read_len);
+    if(agps) {
+        sync_parse_agps_result(app, buf, read_len);
+    } else {
+        publish_parse_result(app, buf, read_len);
+    }
     return true;
 }
 
@@ -274,19 +325,39 @@ APP_FN void publish_finish_waiting(Esp32App* app) {
    showing "waiting for publish..." (see that handler's own guard). */
 APP_FN void publish_poll_check(Esp32App* app) {
     static char result_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(!build_app_data_path(
-           result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME)) {
-        return;
+    bool want_publish = app->sync_mode != SyncModeAgps;
+    bool want_agps = app->sync_mode != SyncModePublish;
+    if(want_publish && !app->sync_publish_done &&
+       build_app_data_path(
+           result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME) &&
+       storage_file_exists(app->storage, result_path) &&
+       publish_try_read_result(app, result_path, false)) {
+        app->sync_publish_done = true;
     }
-    if(storage_file_exists(app->storage, result_path) &&
-       publish_try_read_result(app, result_path)) {
+    if(want_agps && !app->sync_agps_done &&
+       build_app_data_path(result_path, sizeof(result_path), FEB_AGPS_SYNC_RESULT_FILENAME) &&
+       storage_file_exists(app->storage, result_path) &&
+       publish_try_read_result(app, result_path, true)) {
+        app->sync_agps_done = true;
+    }
+    if((!want_publish || app->sync_publish_done) && (!want_agps || app->sync_agps_done)) {
         publish_finish_waiting(app);
         return;
     }
     app->publish_poll_elapsed_ms += FEB_PUBLISH_POLL_PERIOD_MS;
-    if(app->publish_poll_elapsed_ms >= FEB_PUBLISH_POLL_TIMEOUT_MS) {
+    uint32_t limit_ms = app->sync_mode == SyncModePublish ? FEB_PUBLISH_POLL_TIMEOUT_MS :
+                        app->sync_mode == SyncModeAgps ?
+                                                         FEB_SYNC_AGPS_TIMEOUT_MS :
+                                                         FEB_PUBLISH_POLL_TIMEOUT_MS +
+                                                             FEB_SYNC_AGPS_TIMEOUT_MS;
+    if(app->publish_poll_elapsed_ms >= limit_ms) {
         publish_finish_waiting(app);
-        app->publish_outcome = PublishOutcomeTimeout;
+        if(want_publish && !app->sync_publish_done) {
+            app->publish_outcome = PublishOutcomeTimeout;
+        }
+        if(want_agps && !app->sync_agps_done) {
+            app->sync_agps_outcome = PublishOutcomeTimeout;
+        }
     }
 }
 
@@ -295,23 +366,36 @@ APP_FN void publish_poll_check(Esp32App* app) {
    mistaken for this run's), triggers BadUSB, then starts polling. A failed USB-personality
    switch shows an immediate failure instead of entering the waiting state, since the
    bootstrap was never typed in that case. */
-APP_FN void publish_start(Esp32App* app) {
+APP_FN void publish_start(Esp32App* app, SyncMode mode) {
+    app->sync_mode = mode;
+    app->sync_publish_done = false;
+    app->sync_agps_done = false;
     app->publish_outcome = PublishOutcomeNone;
+    app->sync_agps_outcome = PublishOutcomeNone;
     app->publish_fail_message[0] = '\0';
+    app->sync_agps_message[0] = '\0';
 
     char result_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(build_app_data_path(
+    if(mode != SyncModeAgps &&
+       build_app_data_path(
            result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME)) {
         storage_common_remove(app->storage, result_path);
     }
+    if(mode != SyncModePublish &&
+       build_app_data_path(result_path, sizeof(result_path), FEB_AGPS_SYNC_RESULT_FILENAME)) {
+        storage_common_remove(app->storage, result_path);
+    }
 
-    if(!publish_trigger_badusb()) {
-        app->publish_outcome = PublishOutcomeFail;
-        strncpy(
-            app->publish_fail_message,
-            "Could not switch USB to HID",
-            sizeof(app->publish_fail_message) - 1);
-        app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+    if(!publish_trigger_badusb(mode)) {
+        const char* failure = "Could not switch USB to HID";
+        if(mode == SyncModeAgps) {
+            app->sync_agps_outcome = PublishOutcomeFail;
+            strncpy(app->sync_agps_message, failure, sizeof(app->sync_agps_message) - 1);
+        } else {
+            app->publish_outcome = PublishOutcomeFail;
+            strncpy(app->publish_fail_message, failure, sizeof(app->publish_fail_message) - 1);
+            app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        }
         return;
     }
 
@@ -391,27 +475,8 @@ static void wrap_field_rows(
    "don't conflate states" UI convention: idle instructions, waiting-with-poll, and outcome
    (one of PublishOutcome's four real values). Row y-coordinates match draw_gps_screen's own
    dense 22/32/42/52 layout, no separate footer row. */
-APP_FN void draw_publish_screen(Canvas* canvas, Esp32App* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 11, "Publish");
-    canvas_set_font(canvas, FontSecondary);
-
-    if(app->publish_waiting) {
-        canvas_draw_str(canvas, 2, 22, "Waiting for publish");
-        canvas_draw_str(canvas, 2, 32, "result...");
-        canvas_draw_str(canvas, 2, 42, "(watch the PC console)");
-        canvas_draw_str(canvas, 2, 52, "Back: cancel");
-        return;
-    }
-
-    if(app->publish_outcome == PublishOutcomeNone) {
-        canvas_draw_str(canvas, 2, 22, "Connect Flipper to a");
-        canvas_draw_str(canvas, 2, 32, "Windows PC via USB,");
-        canvas_draw_str(canvas, 2, 42, "then press OK.");
-        canvas_draw_str(canvas, 2, 52, "Back: return");
-        return;
-    }
-
+/* Publish-mode outcome rows (the pre-Sync screen, unchanged). */
+static void draw_publish_outcome(Canvas* canvas, Esp32App* app) {
     if(app->publish_outcome == PublishOutcomeOk) {
         char line[32];
         canvas_draw_str(canvas, 2, 22, "Publish OK");
@@ -463,3 +528,98 @@ APP_FN void draw_publish_screen(Canvas* canvas, Esp32App* app) {
     }
 }
 
+static void draw_sync_date(char* out, size_t cap, uint32_t unix_seconds) {
+    DateTime dt;
+    datetime_timestamp_to_datetime(unix_seconds, &dt);
+    snprintf(out, cap, "%04u-%02u-%02u", dt.year, dt.month, dt.day);
+}
+
+/* One-line A-GPS result for the Sync screen: `OK <n> windows` / error text. */
+static void draw_sync_agps_summary(Canvas* canvas, const Esp32App* app, uint8_t y_first) {
+    char line[40];
+    if(app->sync_agps_outcome == PublishOutcomeOk) {
+        snprintf(line, sizeof(line), "A-GPS OK: %lu windows", (unsigned long)app->sync_agps_windows);
+        canvas_draw_str(canvas, 2, y_first, line);
+        char date[16];
+        draw_sync_date(date, sizeof(date), app->sync_agps_valid_to);
+        snprintf(line, sizeof(line), "valid until %s", date);
+        canvas_draw_str(canvas, 2, (uint8_t)(y_first + HOME_ROW_HEIGHT), line);
+    } else if(app->sync_agps_outcome == PublishOutcomeTimeout) {
+        canvas_draw_str(canvas, 2, y_first, "A-GPS: timed out");
+    } else {
+        canvas_draw_str(canvas, 2, y_first, "A-GPS failed:");
+        canvas_draw_str(canvas, 2, (uint8_t)(y_first + HOME_ROW_HEIGHT), app->sync_agps_message);
+    }
+}
+
+/* Sync screen (renamed from Publish): menu / waiting / outcome, same three-state split as
+   before. Publish mode keeps the old rows exactly; Agps and All add the A-GPS result. */
+APP_FN void draw_publish_screen(Canvas* canvas, Esp32App* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Sync");
+    canvas_set_font(canvas, FontSecondary);
+
+    if(app->publish_waiting) {
+        canvas_draw_str(canvas, 2, 22, "Waiting for sync");
+        canvas_draw_str(canvas, 2, 32, "result...");
+        char elapsed[32];
+        uint32_t seconds = app->publish_poll_elapsed_ms / 1000u;
+        snprintf(
+            elapsed,
+            sizeof(elapsed),
+            "%lu:%02lu (watch PC)",
+            (unsigned long)(seconds / 60u),
+            (unsigned long)(seconds % 60u));
+        canvas_draw_str(canvas, 2, 42, elapsed);
+        canvas_draw_str(canvas, 2, 52, "Back: cancel");
+        return;
+    }
+
+    bool have_outcome = app->publish_outcome != PublishOutcomeNone ||
+                        app->sync_agps_outcome != PublishOutcomeNone;
+    if(!have_outcome) {
+        static const char* const labels[SyncModeCount] = {
+            "Sync all", "Publish Wardriving Logs", "Sync A-GPS"};
+        for(size_t i = 0; i < SyncModeCount; i++) {
+            char line[32];
+            snprintf(
+                line, sizeof(line), "%s%s", app->sync_menu_index == (SyncMode)i ? "> " : "  ", labels[i]);
+            canvas_set_font(canvas, app->sync_menu_index == (SyncMode)i ? FontPrimary : FontSecondary);
+            canvas_draw_str(canvas, 2, (uint8_t)(22 + i * HOME_ROW_HEIGHT), line);
+        }
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 2, 62, "USB to PC. OK: run");
+        return;
+    }
+
+    if(app->sync_mode == SyncModePublish) {
+        draw_publish_outcome(canvas, app);
+    } else if(app->sync_mode == SyncModeAgps) {
+        draw_sync_agps_summary(canvas, app, 22);
+        canvas_draw_str(canvas, 2, 52, "Back: return");
+    } else {
+        char line[40];
+        if(app->publish_outcome == PublishOutcomeOk) {
+            snprintf(
+                line,
+                sizeof(line),
+                "Publish OK imp=%lu dup=%lu",
+                (unsigned long)app->publish_imported,
+                (unsigned long)app->publish_duplicates);
+        } else if(app->publish_outcome == PublishOutcomeNothingToPublish) {
+            snprintf(line, sizeof(line), "Publish: no new data");
+        } else if(app->publish_outcome == PublishOutcomeTimeout) {
+            snprintf(line, sizeof(line), "Publish: timed out");
+        } else {
+            snprintf(line, sizeof(line), "Publish failed");
+        }
+        canvas_draw_str(canvas, 2, 22, line);
+        if(app->publish_outcome == PublishOutcomeFail && app->publish_fail_message[0] != '\0') {
+            canvas_draw_str(canvas, 2, 32, app->publish_fail_message);
+        }
+        if(app->sync_agps_outcome != PublishOutcomeNone) {
+            draw_sync_agps_summary(canvas, app, 42);
+        }
+        canvas_draw_str(canvas, 2, 62, "Back: return");
+    }
+}
