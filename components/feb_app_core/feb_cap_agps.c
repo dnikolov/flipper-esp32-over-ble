@@ -61,9 +61,22 @@ static uint32_t agps_io_now(void *ctx)
     return agps_now_ms();
 }
 
+static void agps_io_frame_log(void *ctx, const uint8_t *frame, int outcome, uint32_t waited_ms)
+{
+    static const char *const names[] = {"TIMEOUT", "ACK", "NACK"};
+
+    (void)ctx;
+    if (frame[4] == FEB_CASIC_CLASS_MSG && frame[5] == 0x07 && frame[2] == 72 && frame[3] == 0) {
+        ESP_LOGI(TAG, "agps 08/07 svid=%u %s %ums", (unsigned)frame[6 + 68], names[outcome], (unsigned)waited_ms);
+    } else {
+        ESP_LOGI(TAG, "agps %02x/%02x %s %ums", (unsigned)frame[4], (unsigned)frame[5], names[outcome],
+                 (unsigned)waited_ms);
+    }
+}
+
 static void agps_feed_task(void *arg)
 {
-    static const feb_agps_io_t io = {NULL, agps_io_write, agps_io_read, agps_io_now};
+    static const feb_agps_io_t io = {NULL, agps_io_write, agps_io_read, agps_io_now, agps_io_frame_log};
     uint8_t ini[FEB_AGPS_INI_LEN];
     feb_agps_result_t result = {0};
 
@@ -191,8 +204,9 @@ void feb_agps_poll(void)
     }
     if (!agps_orphaned && feb_connection_handle != BLE_HS_CONN_HANDLE_NONE &&
         feb_runtime_auth_state == RUNTIME_AUTH_STATE_AUTHENTICATED) {
-        ESP_LOGI(TAG, "agps: feed done sent=%u acked=%u nacked=%u timeout=%u", (unsigned)agps_result.sent,
-                 (unsigned)agps_result.acked, (unsigned)agps_result.nacked, (unsigned)agps_result.timeout);
+        ESP_LOGI(TAG, "agps: feed done sent=%u acked=%u nacked=%u timeout=%u late=%u in %ums",
+                 (unsigned)agps_result.sent, (unsigned)agps_result.acked, (unsigned)agps_result.nacked,
+                 (unsigned)agps_result.timeout, (unsigned)agps_result.late, (unsigned)agps_result.elapsed_ms);
         if (!agps_send_status(feb_connection_handle, agps_request_id, "complete", &agps_result)) {
             ble_gap_terminate(feb_connection_handle, BLE_ERR_REM_USER_CONN_TERM);
         }

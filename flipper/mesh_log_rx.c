@@ -191,10 +191,9 @@ APP_FN void mesh_log_display_reload(Esp32App* app) {
     furi_mutex_acquire(app_wardriving_state_mutex, FuriWaitForever);
     mesh_log_display_count = 0;
 
-    static char path[FEB_MESH_LOG_PATH_MAX_LEN];
-    if(build_mesh_path(path, sizeof(path), FEB_MESH_LOG_FILENAME)) {
+    if(build_mesh_path(app_path_a, sizeof(app_path_a), FEB_MESH_LOG_FILENAME)) {
         File* file = storage_file_alloc(app->storage);
-        bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+        bool ok = storage_file_open(file, app_path_a, FSAM_READ, FSOM_OPEN_EXISTING);
         if(ok) {
             static char chunk[128];
             static char line_carry[FEB_MESH_LOG_LINE_MAX_LEN];
@@ -262,7 +261,7 @@ APP_FN void
     static feb_status_payload_t status_payload;
     feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "mesh_log status payload decode failed: %d; dropping", status);
+        app_log_decode_fail("mesh_log status payload", status);
         return;
     }
     if(!status_payload.has_result) {
@@ -274,7 +273,7 @@ APP_FN void
     feb_cbor_status_t result_status = feb_cbor_decode_mesh_log_status_result_payload(
         status_payload.result_span, status_payload.result_span_len, result);
     if(result_status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "mesh_log status.result decode failed: %d; dropping", result_status);
+        app_log_decode_fail("mesh_log status.result", result_status);
         return;
     }
 

@@ -54,6 +54,8 @@
 #include "session.h"
 #include "wardriving_csv.h"
 #include "mesh_nodes.h"
+#include "capability_cache.h"
+#include "pairing_phase.h"
 #include "agps_file.h"
 #include "agps_wire.h"
 
@@ -172,21 +174,6 @@ typedef enum {
     CharacteristicCount,
 } CharacteristicId;
 
-typedef enum {
-    PairingPhaseNone,
-    PairingPhaseWaiting,
-    PairingPhaseExchanging,
-    PairingPhaseConfirming,
-    PairingPhaseSaving,
-    /* Runtime session establishment (docs/PLAN.md step 6) reuses this same connection-
-       phase enum rather than a parallel one -- a connecting peer is either running the
-       fresh-pairing ceremony (phases above) or the runtime hello/hello_ack/client_auth
-       flow (phases below); the two are mutually exclusive per connection. */
-    PairingPhaseAuthenticating,
-    PairingPhaseSessionActive,
-    PairingPhaseDone,
-    PairingPhaseFailed,
-} PairingPhase;
 
 /* docs/PLAN.md's Wi-Fi scan capability follow-on step: manual-trigger-only, results shown
    in a dedicated scrollable view, distinct from the fixed-layout main status screen. */
@@ -777,6 +764,13 @@ APP_DATA char app_wardriving_dir_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
 APP_DATA bool app_wardriving_dir_ready;
 APP_DATA char app_mesh_dir_path[FEB_MESH_LOG_PATH_MAX_LEN];
 APP_DATA bool app_mesh_dir_ready;
+/* Shared path scratch (was ~10 separate 160-byte function-local statics: .bss is permanent FAP
+   heap, H04). app_path_a/b: main thread only -- pairing/capability/settings saves, settings
+   load, publish poll, mesh display reload; none of these ever nest or run concurrently.
+   app_ble_path: BleEventWorker only -- pairing load, capability exists/load. */
+APP_DATA char app_path_a[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+APP_DATA char app_path_b[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
+APP_DATA char app_ble_path[FEB_CAPABILITIES_PATH_MAX_LEN];
 APP_DATA char app_wardriving_settings_buf[FEB_WARDRIVING_SETTINGS_MAX_LEN];
 
 /* wardriving_settings.c */
@@ -818,13 +812,17 @@ APP_FN void pairing_storage_save_pending(Esp32App* app);
 APP_FN void wardriving_csv_drain_pending(Esp32App* app);
 APP_FN void mesh_log_drain_pending(Esp32App* app);
 APP_FN bool
-    capability_storage_exists(Storage* storage, const char* board_id, size_t board_id_len);
-APP_FN bool
     pairing_storage_load(Storage* storage, const char* board_id, size_t board_id_len, uint8_t* secret_out);
 APP_FN bool
     pairing_storage_save(Storage* storage, const char* board_id, size_t board_id_len, const uint8_t* secret);
 APP_FN bool any_saved_pairing_exists(Storage* storage);
 APP_FN bool app_queue_put(FuriMessageQueue* queue, const AppEvent* event, uint32_t timeout_ms);
+/* Shared log helpers: one format string each instead of ~25 near-identical literals (FAP .rodata
+   is permanent heap, H04). */
+APP_FN void app_log_decode_fail(const char* what, int status);
+APP_FN void app_log_step(const char* what, const char* step);
+APP_FN void app_log_sent(const char* what, uint64_t request_id);
+APP_FN void app_log_bad_state(const char* what, const char* text, size_t text_len);
 APP_FN bool build_app_data_path(char* out, size_t out_cap, const char* filename);
 APP_FN bool build_mesh_path(char* out, size_t out_cap, const char* filename);
 APP_FN bool build_wardriving_path(char* out, size_t out_cap, const char* filename);

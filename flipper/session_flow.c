@@ -54,6 +54,22 @@ APP_FN bool app_queue_put(FuriMessageQueue* queue, const AppEvent* event, uint32
 
 #define APP_QUEUE_PUT_TIMEOUT_MS 20u
 
+APP_FN void app_log_decode_fail(const char* what, int status) {
+    FURI_LOG_W(TAG, "%s decode failed: %d", what, status);
+}
+
+APP_FN void app_log_step(const char* what, const char* step) {
+    FURI_LOG_W(TAG, "%s: %s failed", what, step);
+}
+
+APP_FN void app_log_sent(const char* what, uint64_t request_id) {
+    FURI_LOG_I(TAG, "%s sent (id=%llu)", what, (unsigned long long)request_id);
+}
+
+APP_FN void app_log_bad_state(const char* what, const char* text, size_t text_len) {
+    FURI_LOG_W(TAG, "%s: bad '%.*s'", what, (int)text_len, text);
+}
+
 APP_FN void post_pairing_phase(Esp32App* app, PairingPhase phase, const char* reason) {
     AppEvent* event = &app_shared_ble_event;
     memset(event, 0, sizeof(*event));
@@ -685,7 +701,7 @@ APP_FN void handle_hello(Esp32BleProfile* profile, const feb_unencrypted_record_
     size_t payload_len =
         feb_cbor_encode_hello_ack_payload(app_pairing_payload_buf, sizeof(app_pairing_payload_buf), &ack_payload);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "hello_ack: payload encode failed");
+        app_log_step("hello_ack", "payload encode");
         session_reset_state();
         return;
     }
@@ -710,7 +726,7 @@ APP_FN void handle_hello(Esp32BleProfile* profile, const feb_unencrypted_record_
     }
 
     if(!send_pairing_record(profile, app_pairing_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "hello_ack: send failed");
+        app_log_step("hello_ack", "send");
         session_reset_state();
         return;
     }
@@ -753,6 +769,10 @@ static void format_capability_display(
     }
     features_out[pos] = '\0';
 }
+
+/* One decode target for handle_capability_response() and capability_bootstrap() -- both
+   BleEventWorker-only and never overlapping, so they share it (276 B of permanent FAP heap). */
+static feb_capability_response_payload_t capability_payload_scratch;
 
 static bool capability_has_feature(const feb_capability_response_payload_t* payload, const char* feature) {
     size_t feature_len = strlen(feature);
@@ -841,11 +861,10 @@ APP_FN void handle_capability_response(
     const uint8_t* plaintext,
     size_t plaintext_len) {
     Esp32App* app = profile->app;
-    static feb_capability_response_payload_t response;
-    feb_cbor_status_t status =
-        feb_cbor_decode_capability_response_payload(plaintext, plaintext_len, &response);
+    feb_cbor_status_t status = feb_cbor_decode_capability_response_payload(
+        plaintext, plaintext_len, &capability_payload_scratch);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "capability_response payload decode failed: %d; dropping", status);
+        app_log_decode_fail("capability_response payload", status);
         return;
     }
 
@@ -867,7 +886,7 @@ APP_FN void handle_capability_response(
             (unsigned)plaintext_len);
     }
 
-    post_capability_info(app, &response);
+    post_capability_info(app, &capability_payload_scratch);
     FURI_LOG_I(TAG, "capability_response queued for save, board '%s'", app_session_board_id);
 }
 
@@ -876,25 +895,21 @@ APP_FN void handle_capability_response(
    displays the cached record instead when one already exists. No retry/timeout of its own
    on send/decode failure -- a dropped or malformed response is simply retried on the next
    reconnect (docs/PLAN.md step 7 implementation-level decisions). */
+static bool capability_cache_load_cb(void* ctx, uint8_t* out, size_t out_cap, size_t* out_len) {
+    Esp32App* app = ctx;
+    return capability_storage_load(
+        app->storage, app_session_board_id, app_session_board_id_len, out, out_cap, out_len);
+}
+
 APP_FN void capability_bootstrap(Esp32BleProfile* profile) {
     Esp32App* app = profile->app;
-    if(capability_storage_exists(app->storage, app_session_board_id, app_session_board_id_len)) {
-        size_t loaded_len = 0;
-        if(capability_storage_load(
-               app->storage,
-               app_session_board_id,
-               app_session_board_id_len,
-               app_session_plaintext_buf,
-               sizeof(app_session_plaintext_buf),
-               &loaded_len)) {
-            static feb_capability_response_payload_t cached;
-            if(feb_cbor_decode_capability_response_payload(app_session_plaintext_buf, loaded_len, &cached) ==
-               FEB_CBOR_OK) {
-                post_capability_info(app, &cached);
-            } else {
-                FURI_LOG_W(TAG, "Cached capability file for '%s' is malformed", app_session_board_id);
-            }
-        }
+    if(feb_capability_cache_resolve(
+           capability_cache_load_cb,
+           app,
+           app_session_plaintext_buf,
+           sizeof(app_session_plaintext_buf),
+           &capability_payload_scratch)) {
+        post_capability_info(app, &capability_payload_scratch);
         return;
     }
 
@@ -903,7 +918,7 @@ APP_FN void capability_bootstrap(Esp32BleProfile* profile) {
     size_t payload_len = feb_cbor_encode_capability_query_payload(
         app_pairing_payload_buf, sizeof(app_pairing_payload_buf), &query_payload);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "capability_query: payload encode failed");
+        app_log_step("capability_query", "payload encode");
         return;
     }
     size_t record_len = session_send_encrypted_command(
@@ -920,7 +935,7 @@ APP_FN void capability_bootstrap(Esp32BleProfile* profile) {
         return;
     }
     if(!send_pairing_record(profile, app_pairing_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "capability_query: send failed");
+        app_log_step("capability_query", "send");
         return;
     }
     FURI_LOG_I(TAG, "capability_query sent for board '%s'", app_session_board_id);
@@ -953,7 +968,7 @@ APP_FN void
     static feb_error_payload_t error_payload;
     feb_cbor_status_t status = feb_cbor_decode_error_payload(plaintext, plaintext_len, &error_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "runtime error payload decode failed: %d; dropping", status);
+        app_log_decode_fail("runtime error payload", status);
         return;
     }
     FURI_LOG_W(

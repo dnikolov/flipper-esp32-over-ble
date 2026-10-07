@@ -305,7 +305,10 @@ typedef struct {
     size_t write_total;
     size_t write_calls;
     size_t frame_starts[80];
-    uint8_t rx[256];
+    /* Received-byte FIFO: bytes persist across writes like a real UART and each becomes
+       readable only once `now` reaches its ready time. */
+    uint8_t rx[1024];
+    uint32_t rx_ready[1024];
     size_t rx_len;
     size_t rx_pos;
     mock_mode_t default_mode;
@@ -313,16 +316,39 @@ typedef struct {
     mock_mode_t mode_for_call;
     int preface_nmea;
     int split_ack;
+    int delay_at_call;      /* write call whose ACK is delayed ... */
+    uint32_t delay_ms;      /* ... by this long */
+    uint32_t max_wait_gap;  /* longest single idle read observed */
 } mock_t;
+
+static void mock_push(mock_t *m, const uint8_t *data, size_t len, uint32_t ready)
+{
+    size_t i;
+
+    if (m->rx_pos == m->rx_len) {
+        m->rx_pos = 0;
+        m->rx_len = 0;
+    }
+    for (i = 0; i < len && m->rx_len < sizeof(m->rx); i++) {
+        m->rx[m->rx_len] = data[i];
+        m->rx_ready[m->rx_len++] = ready;
+    }
+}
 
 static void mock_write(void *ctx, const uint8_t *data, size_t len)
 {
     mock_t *m = ctx;
     uint8_t payload[4] = {0, 0, 0, 0};
+    uint8_t ack[16];
+    size_t ack_len;
     mock_mode_t mode = m->default_mode;
+    uint32_t ready = m->now;
 
     if ((int)m->write_calls == m->mode_at_call) {
         mode = m->mode_for_call;
+    }
+    if ((int)m->write_calls == m->delay_at_call) {
+        ready += m->delay_ms;
     }
     if (m->write_calls < 80) {
         m->frame_starts[m->write_calls] = m->write_total;
@@ -330,39 +356,48 @@ static void mock_write(void *ctx, const uint8_t *data, size_t len)
     memcpy(m->writes + m->write_total, data, len);
     m->write_total += len;
     m->write_calls++;
-    m->rx_len = 0;
-    m->rx_pos = 0;
     if (mode == MOCK_SILENT) {
         return;
     }
     if (m->preface_nmea) {
         static const char nmea[] = "$GNRMC,091010.000,V,,,,,0.00,0.00,120926,,,N*54\r\n";
 
-        memcpy(m->rx, nmea, sizeof(nmea) - 1);
-        m->rx_len = sizeof(nmea) - 1;
+        mock_push(m, (const uint8_t *)nmea, sizeof(nmea) - 1, m->now);
     }
     payload[0] = (uint8_t)(mode == MOCK_WRONG_ID ? data[4] ^ 0x10 : data[4]);
     payload[1] = data[5];
-    m->rx_len += make_frame(m->rx + m->rx_len, 0x05, mode == MOCK_NACK ? 0x00 : 0x01, payload, 4);
+    ack_len = make_frame(ack, 0x05, mode == MOCK_NACK ? 0x00 : 0x01, payload, 4);
     if (mode == MOCK_BAD_CK) {
-        m->rx[m->rx_len - 1] ^= 0x01;
+        ack[ack_len - 1] ^= 0x01;
     }
+    mock_push(m, ack, ack_len, ready);
+}
+
+/* Two silent frames, then one ACKed frame, repeating. */
+static void mock_write_pattern(void *ctx, const uint8_t *data, size_t len)
+{
+    mock_t *m = ctx;
+
+    m->mode_at_call = (int)m->write_calls;
+    m->mode_for_call = (m->write_calls % 3u == 2u) ? MOCK_ACK : MOCK_SILENT;
+    mock_write(ctx, data, len);
 }
 
 static size_t mock_read(void *ctx, uint8_t *buf, size_t cap, uint32_t timeout_ms)
 {
     mock_t *m = ctx;
-    size_t n = m->rx_len - m->rx_pos;
+    size_t n = 0;
 
+    while (m->rx_pos + n < m->rx_len && m->rx_ready[m->rx_pos + n] <= m->now && n < cap &&
+           !(m->split_ack && n >= 3)) {
+        n++;
+    }
     if (n == 0) {
+        if (timeout_ms > m->max_wait_gap) {
+            m->max_wait_gap = timeout_ms;
+        }
         m->now += timeout_ms;
         return 0;
-    }
-    if (m->split_ack && n > 3) {
-        n = 3;
-    }
-    if (n > cap) {
-        n = cap;
     }
     memcpy(buf, m->rx + m->rx_pos, n);
     m->rx_pos += n;
@@ -387,6 +422,7 @@ static void test_feed(void)
     int clean = 1;
 
     feb_agps_build_ini(ini, 1791288000ull * 1000u, NULL);
+    memset(&io, 0, sizeof(io));
     io.ctx = &m;
     io.write = mock_write;
     io.read = mock_read;
@@ -419,7 +455,9 @@ static void test_feed(void)
     m.mode_for_call = MOCK_SILENT;
     feb_agps_feed(&io, ini, blob, len, &r);
     check(r.sent == 34 && r.acked == 33 && r.timeout == 1, "single timeout counted, feed continues");
-    check(m.now >= FEB_CASIC_ACK_TIMEOUT_MS, "timeout waited >= 500 ms");
+    check(m.now >= FEB_CASIC_ACK_TIMEOUT_MS && FEB_CASIC_ACK_TIMEOUT_MS == 1500u, "timeout waited >= 1500 ms");
+    check(r.elapsed_ms >= FEB_CASIC_ACK_TIMEOUT_MS && r.elapsed_ms < FEB_CASIC_ACK_TIMEOUT_MS + 500u,
+          "one timeout adds ~1.5 s to a fast feed");
 
     memset(&m, 0, sizeof(m));
     m.mode_at_call = -1;
@@ -428,6 +466,7 @@ static void test_feed(void)
     check(r.sent == FEB_AGPS_MAX_CONSECUTIVE_TIMEOUTS && r.timeout == FEB_AGPS_MAX_CONSECUTIVE_TIMEOUTS &&
               r.acked == 0,
           "silent module: aborts after 3 consecutive timeouts");
+    check(m.now == 3u * FEB_CASIC_ACK_TIMEOUT_MS, "silent module: aborts after exactly 3 x 1500 ms");
 
     memset(&m, 0, sizeof(m));
     m.mode_at_call = -1;
@@ -453,6 +492,59 @@ static void test_feed(void)
     m.mode_for_call = MOCK_SILENT;
     feb_agps_feed(&io, ini, blob, len, &r);
     check(r.timeout == 1 && r.acked == 33, "timeouts must be consecutive to abort");
+
+    /* Worst case: two timeouts then an ACK, repeating (never 3 in a row). The whole-feed budget,
+       not the consecutive rule, must bound it, well inside the Flipper's 30 s complete-wait. */
+    {
+        static mock_t pat;
+        static uint8_t big[FEB_AGPS_BLOB_MAX];
+        size_t big_len = make_window(big, 32);
+
+        memset(&pat, 0, sizeof(pat));
+        pat.mode_at_call = -1;
+        pat.delay_at_call = -1;
+        io.ctx = &pat;
+        io.write = mock_write_pattern;
+        feb_agps_feed(&io, ini, big, big_len, &r);
+        check(r.elapsed_ms >= FEB_AGPS_FEED_BUDGET_MS &&
+                  r.elapsed_ms <= FEB_AGPS_FEED_BUDGET_MS + FEB_CASIC_ACK_TIMEOUT_MS + FEB_CASIC_DRAIN_MAX_MS + 100u,
+              "2-timeouts-then-ACK pattern stops at the feed budget (worst case ~21.6 s)");
+        check(r.elapsed_ms < 30000u && r.sent < 34 && r.timeout >= 2 && r.acked >= 1,
+              "budget-bounded feed stays under 30 s and does not finish all frames");
+        io.ctx = &m;
+        io.write = mock_write;
+    }
+
+    /* An ACK that arrives exactly as its frame times out is still in the FIFO at the next send.
+       It must be drained (counted late), not credited to the next frame of the same class/id, and
+       every real ACK must then be consumed by its own frame (FIFO empty at the end, last
+       08/06 frame ACKed, which a one-off shift would have broken). */
+    memset(&m, 0, sizeof(m));
+    m.mode_at_call = -1;
+    m.delay_at_call = 5;
+    m.delay_ms = FEB_CASIC_ACK_TIMEOUT_MS;
+    feb_agps_feed(&io, ini, blob, len, &r);
+    check(r.sent == 34 && r.timeout == 1 && r.acked == 33 && r.late == 1,
+          "late ACK drained before next send: 1 timeout, 1 late, 33 acked");
+    check(m.rx_pos == m.rx_len, "no stray ACK bytes left unconsumed (lock-step held)");
+
+    /* Late ACK in the middle of a split frame at the drain boundary: still discarded. */
+    memset(&m, 0, sizeof(m));
+    m.mode_at_call = -1;
+    m.delay_at_call = 9;
+    m.delay_ms = FEB_CASIC_ACK_TIMEOUT_MS;
+    m.split_ack = 1;
+    feb_agps_feed(&io, ini, blob, len, &r);
+    check(r.timeout == 1 && r.acked == 33 && r.late == 1 && m.rx_pos == m.rx_len,
+          "late ACK drained with split reads");
+
+    /* NMEA text queued ahead of the ACK delays it by < 1500 ms: now matched, no timeout. */
+    memset(&m, 0, sizeof(m));
+    m.mode_at_call = -1;
+    m.delay_at_call = 4;
+    m.delay_ms = 900;
+    feb_agps_feed(&io, ini, blob, len, &r);
+    check(r.acked == 34 && r.timeout == 0 && r.late == 0, "ACK delayed 900 ms is still matched (was a timeout at 500 ms)");
 
     /* Defensive: a malformed blob handed to the feeder directly is cut short, not overrun. */
     memset(&m, 0, sizeof(m));

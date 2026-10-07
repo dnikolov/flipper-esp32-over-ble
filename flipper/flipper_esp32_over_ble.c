@@ -117,7 +117,13 @@ int32_t flipper_esp32_over_ble_app(void* context) {
         if(furi_message_queue_get(app.queue, &event, FuriWaitForever) != FuriStatusOk) continue;
         if(event.type == AppEventBtStatus) {
             if(app.profile) {
-                if(event.u.bt_status.status == BtStatusConnected) {
+                if(event.u.bt_status.status == BtStatusConnected &&
+                   !pairing_phase_accepts_bt_connected(app.pairing_phase)) {
+                    /* Late/duplicate "connected": BleEventWorker already advanced this
+                       connection's ceremony/session (see pairing_phase.h) -- applying it would
+                       reset the live session's UI/phase and hide the capability menu rows. */
+                    FURI_LOG_W(TAG, "stale BtStatusConnected ignored (phase %d)", (int)app.pairing_phase);
+                } else if(event.u.bt_status.status == BtStatusConnected) {
                     app.connection_lost = false;
                     /* HP-07/G10: gated on app_protocol_generation, not unconditional -- see
                        protocol_reset_if_unchanged()'s own comment. If BleEventWorker has
@@ -147,7 +153,7 @@ int32_t flipper_esp32_over_ble_app(void* context) {
                 }
             }
         } else if(event.type == AppEventPairingPhase) {
-            app.pairing_phase = event.u.pairing.phase;
+            app.pairing_phase = pairing_phase_after_event(app.pairing_phase, event.u.pairing.phase);
             if(event.u.pairing.phase == PairingPhaseFailed) {
                 app.connection_lost = strcmp(event.u.pairing.reason, "connection lost") == 0;
                 strncpy(app.pairing_reason, event.u.pairing.reason, sizeof(app.pairing_reason) - 1);

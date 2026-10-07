@@ -277,6 +277,9 @@ bool location_agps_begin(uint32_t timeout_ms)
 
 void location_agps_end(void)
 {
+    /* Hand the NMEA task a clean ring buffer: it may hold the tail of a late ACK or a line that
+       was cut when begin() flushed. The epoch bump makes the task drop its partial line. */
+    (void)uart_flush_input(FEB_GPS_UART_PORT);
     location_uart_epoch++;
     (void)xSemaphoreGive(location_uart_mutex);
 }

@@ -501,7 +501,7 @@ static BleEventAckStatus profile_event_handler(void* event, void* context) {
                         feb_cbor_status_t peek_status = feb_cbor_decode_status_payload(
                             decrypted.plaintext, decrypted.plaintext_len, &status_peek);
                         if(peek_status != FEB_CBOR_OK) {
-                            FURI_LOG_W(TAG, "status payload decode failed: %d; dropping", peek_status);
+                            app_log_decode_fail("status payload", peek_status);
                         } else if(
                             text_matches(status_peek.state, status_peek.state_len, "started") ||
                             text_matches(status_peek.state, status_peek.state_len, "data") ||

@@ -371,7 +371,7 @@ payload length (a multiple of 4), class, id, the payload, and a little-endian 32
 must have a correct checksum and class `0x08` (MSG, i.e. `MSG-GPSEPH` `08/07` and `MSG-GPSION`
 `08/06`), and the blob may hold at most 64 frames. The ESP32 builds the AID-INI time message
 (class `0x0B`, id `0x01`, flags `0x02`, or `0x03` with a position hint) itself, writes only whole
-frames one at a time, waits up to 500 ms for the matching ACK/NACK (matched by class/id) before
+frames one at a time, waits up to 1500 ms (whole feed capped at 20 s) for the matching ACK/NACK (matched by class/id) before
 the next frame, and never sends any `$PCAS` NMEA command or other module configuration on this
 path. The Flipper chooses which window to send from its own RTC and the file's validity table and
 never sends an expired window.

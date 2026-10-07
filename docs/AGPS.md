@@ -100,7 +100,7 @@ optional `lat`/`lon`/`alt` (omitted in v1), and the window blob as sequential ch
 (`total`, `off`, `data`; last chunk marks completion). The C5 buffers the blob (≤ 4096 B),
 validates every `BA CE` frame boundary and checksum before touching the GPS, then writes
 AID-INI (time, flags 0x02, or 0x03 if position given) followed by each frame **one at a time**,
-waiting for the CASIC ACK/NACK (500 ms timeout) between frames. Reply: `{sent, acked, nacked,
+waiting for the CASIC ACK/NACK (1500 ms timeout, 20 s whole-feed budget) between frames. Reply: `{sent, acked, nacked,
 timeout}`. Never send `$PCAS10,x` or any module-config command from this path. C5 board only;
 C6/Heltec report the capability absent.
 

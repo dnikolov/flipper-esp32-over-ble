@@ -278,18 +278,29 @@ static uint32_t wardriving_dedup_clamp_u32(uint64_t value) {
    operates at, not worth a full haversine for a distinction this coarse. lat/lon decoding
    mirrors feb_wardriving_csv_format_row()'s own arithmetic above (same e7-offset encoding,
    same explicit-double-literal style to avoid this project's known
-   -Werror=double-promotion/-fsingle-precision-constant trap on the real FBT build). */
-static double wardriving_dedup_distance_meters(
+   -Werror=double-promotion/-fsingle-precision-constant trap on the real FBT build).
+   Returns the SQUARED distance and uses an 8th-order even Taylor cos (|error| < 3e-6 on
+   [0, 90 deg]) instead of libm's cos()/sqrt(): those two pulled ~4.3 KB of resident FAP .text
+   (__ieee754_rem_pio2, __kernel_rem_pio2/cos/sin, floor, scalbn, sqrt) for a comparison against
+   a 30 m threshold (FAP heap budget, docs/HARDENING_BACKLOG.md H04). */
+static double wardriving_dedup_distance_sq_meters(
     uint64_t lat_e7_a, uint64_t lon_e7_a, uint64_t lat_e7_b, uint64_t lon_e7_b) {
     double lat_a = ((double)(int64_t)lat_e7_a - (double)900000000) / (double)10000000;
     double lon_a = ((double)(int64_t)lon_e7_a - (double)1800000000) / (double)10000000;
     double lat_b = ((double)(int64_t)lat_e7_b - (double)900000000) / (double)10000000;
     double lon_b = ((double)(int64_t)lon_e7_b - (double)1800000000) / (double)10000000;
     double meters_per_degree = (double)111320;
+    double abs_lat = lat_a < (double)0 ? -lat_a : lat_a;
+    if (abs_lat > (double)90) {
+        abs_lat = (double)90;
+    }
+    double rad = abs_lat * (double)0.017453292519943295;
+    double x2 = rad * rad;
+    double cos_lat = (double)1 + x2 * ((double)-0.5 + x2 * ((double)0.041666666666666664 +
+                     x2 * ((double)-0.001388888888888889 + x2 * (double)0.0000248015873015873)));
     double dlat_m = (lat_b - lat_a) * meters_per_degree;
-    double dlon_m = (lon_b - lon_a) * meters_per_degree *
-                    cos(lat_a * (double)3.14159265358979323846 / (double)180);
-    return sqrt(dlat_m * dlat_m + dlon_m * dlon_m);
+    double dlon_m = (lon_b - lon_a) * meters_per_degree * cos_lat;
+    return dlat_m * dlat_m + dlon_m * dlon_m;
 }
 
 void feb_wardriving_dedup_reset(feb_wardriving_dedup_table_t *table) {
@@ -319,11 +330,12 @@ static bool wardriving_dedup_table_should_write(
 
         if (entry->occupied && memcmp(entry->address, address, 6) == 0) {
             bool stronger = (rssi_dbm - entry->last_rssi_dbm) >= FEB_WARDRIVING_DEDUP_RSSI_IMPROVE_DB;
-            bool moved = wardriving_dedup_distance_meters(
+            bool moved = wardriving_dedup_distance_sq_meters(
                              entry->last_lat_e7_offset,
                              entry->last_lon_e7_offset,
                              clamped_lat,
-                             clamped_lon) >= FEB_WARDRIVING_DEDUP_MOVE_METERS;
+                             clamped_lon) >=
+                         FEB_WARDRIVING_DEDUP_MOVE_METERS * FEB_WARDRIVING_DEDUP_MOVE_METERS;
 
             if (!stronger && !moved) {
                 return false;

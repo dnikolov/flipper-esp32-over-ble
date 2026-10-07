@@ -177,12 +177,11 @@ static void wardriving_settings_set_defaults(Esp32App* app) {
 APP_FN void wardriving_settings_load(Esp32App* app) {
     wardriving_settings_set_defaults(app);
 
-    static char path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(!build_app_data_path(path, sizeof(path), FEB_WARDRIVING_SETTINGS_FILENAME)) {
+    if(!build_app_data_path(app_path_a, sizeof(app_path_a), FEB_WARDRIVING_SETTINGS_FILENAME)) {
         return;
     }
     File* file = storage_file_alloc(app->storage);
-    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    bool ok = storage_file_open(file, app_path_a, FSAM_READ, FSOM_OPEN_EXISTING);
     size_t read_len = 0;
     if(ok) {
         uint64_t size = storage_file_size(file);
@@ -248,10 +247,8 @@ APP_FN void wardriving_settings_load(Esp32App* app) {
    convention -- a failed save here just means the next app launch falls back to defaults,
    not a security-relevant loss. */
 APP_FN void wardriving_settings_save(const Esp32App* app) {
-    static char final_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    static char tmp_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(!build_app_data_path(final_path, sizeof(final_path), FEB_WARDRIVING_SETTINGS_FILENAME) ||
-       !build_app_data_path(tmp_path, sizeof(tmp_path), FEB_WARDRIVING_SETTINGS_FILENAME ".tmp")) {
+    if(!build_app_data_path(app_path_a, sizeof(app_path_a), FEB_WARDRIVING_SETTINGS_FILENAME) ||
+       !build_app_data_path(app_path_b, sizeof(app_path_b), FEB_WARDRIVING_SETTINGS_FILENAME ".tmp")) {
         FURI_LOG_E(TAG, "wardriving_settings_save: path build failed");
         return;
     }
@@ -276,7 +273,7 @@ APP_FN void wardriving_settings_save(const Esp32App* app) {
     size_t buf_len = (size_t)written;
 
     File* file = storage_file_alloc(app->storage);
-    bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    bool ok = storage_file_open(file, app_path_b, FSAM_WRITE, FSOM_CREATE_ALWAYS);
     if(ok) {
         size_t out_written = storage_file_write(file, app_wardriving_settings_buf, buf_len);
         ok = (out_written == buf_len) && storage_file_sync(file);
@@ -285,15 +282,15 @@ APP_FN void wardriving_settings_save(const Esp32App* app) {
     storage_file_free(file);
     if(!ok) {
         FURI_LOG_E(TAG, "wardriving_settings_save: write failed");
-        storage_common_remove(app->storage, tmp_path);
+        storage_common_remove(app->storage, app_path_b);
         return;
     }
 
-    storage_common_remove(app->storage, final_path);
-    FS_Error rename_err = storage_common_rename(app->storage, tmp_path, final_path);
+    storage_common_remove(app->storage, app_path_a);
+    FS_Error rename_err = storage_common_rename(app->storage, app_path_b, app_path_a);
     if(rename_err != FSE_OK) {
         FURI_LOG_E(TAG, "wardriving_settings_save: rename failed: %d", rename_err);
-        storage_common_remove(app->storage, tmp_path);
+        storage_common_remove(app->storage, app_path_b);
     }
 }
 

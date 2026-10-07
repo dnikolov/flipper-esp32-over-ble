@@ -206,32 +206,71 @@ feb_casic_rx_event_t feb_casic_rx_byte(feb_casic_rx_t *rx, uint8_t byte, uint8_t
     return FEB_CASIC_RX_NONE;
 }
 
+bool feb_casic_rx_busy(const feb_casic_rx_t *rx) { return rx->state == RX_BIN; }
+
+/* An ACK/NACK frame carries only the acked class/id (+2 reserved bytes), so back-to-back frames
+   of one class/id (all the EPH frames are 08/07) cannot be told apart by their ACKs. The only
+   sound scheme is lock-step: one frame in flight, wait for its ACK or the timeout, and throw away
+   whatever is already received before the next send, so an ACK that arrived after its frame timed
+   out is never credited to the following frame. An ACK that lands after the next send has
+   started is indistinguishable and can only be made unlikely by a generous timeout. */
+static void drain_late(const feb_agps_io_t *io, feb_casic_rx_t *rx, feb_agps_result_t *result)
+{
+    uint8_t rd[32];
+    uint32_t start = io->now_ms(io->ctx);
+
+    feb_casic_rx_init(rx);
+    for (;;) {
+        size_t n = io->read(io->ctx, rd, sizeof(rd), feb_casic_rx_busy(rx) ? 5u : 0u);
+        size_t i;
+
+        for (i = 0; i < n; i++) {
+            uint8_t c = 0;
+            uint8_t d = 0;
+
+            if (feb_casic_rx_byte(rx, rd[i], &c, &d) != FEB_CASIC_RX_NONE) {
+                result->late++;
+            }
+        }
+        if (n == 0 && !feb_casic_rx_busy(rx)) {
+            break;
+        }
+        if ((uint32_t)(io->now_ms(io->ctx) - start) >= FEB_CASIC_DRAIN_MAX_MS) {
+            break;
+        }
+    }
+    feb_casic_rx_init(rx);
+}
+
 /* Returns 0 timeout, 1 ACK, 2 NACK. */
-static int send_one(const feb_agps_io_t *io, feb_casic_rx_t *rx, const uint8_t *frame, size_t frame_len)
+static int send_one(const feb_agps_io_t *io, feb_casic_rx_t *rx, const uint8_t *frame, size_t frame_len,
+                    feb_agps_result_t *result, uint32_t *waited_ms)
 {
     uint8_t cls = frame[4];
     uint8_t id = frame[5];
     uint8_t rd[32];
     uint32_t start;
+    int outcome = 0;
 
-    feb_casic_rx_init(rx);
+    drain_late(io, rx, result);
     io->write(io->ctx, frame, frame_len);
     start = io->now_ms(io->ctx);
-    while ((uint32_t)(io->now_ms(io->ctx) - start) < FEB_CASIC_ACK_TIMEOUT_MS) {
+    while (outcome == 0 && (uint32_t)(io->now_ms(io->ctx) - start) < FEB_CASIC_ACK_TIMEOUT_MS) {
         size_t n = io->read(io->ctx, rd, sizeof(rd), 10u);
         size_t i;
 
-        for (i = 0; i < n; i++) {
+        for (i = 0; i < n && outcome == 0; i++) {
             uint8_t ack_cls = 0;
             uint8_t ack_id = 0;
             feb_casic_rx_event_t ev = feb_casic_rx_byte(rx, rd[i], &ack_cls, &ack_id);
 
             if (ev != FEB_CASIC_RX_NONE && ack_cls == cls && ack_id == id) {
-                return ev == FEB_CASIC_RX_ACK ? 1 : 2;
+                outcome = ev == FEB_CASIC_RX_ACK ? 1 : 2;
             }
         }
     }
-    return 0;
+    *waited_ms = (uint32_t)(io->now_ms(io->ctx) - start);
+    return outcome;
 }
 
 void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *blob, size_t blob_len,
@@ -240,6 +279,8 @@ void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *b
     feb_casic_rx_t rx;
     size_t pos = 0;
     unsigned consecutive_timeouts = 0;
+    uint32_t feed_start = io->now_ms(io->ctx);
+    uint32_t waited = 0;
     int r;
 
     memset(result, 0, sizeof(*result));
@@ -247,6 +288,9 @@ void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *b
         const uint8_t *frame;
         size_t frame_len;
 
+        if ((uint32_t)(io->now_ms(io->ctx) - feed_start) >= FEB_AGPS_FEED_BUDGET_MS) {
+            break;
+        }
         if (ini != NULL) {
             frame = ini;
             frame_len = FEB_AGPS_INI_LEN;
@@ -262,8 +306,11 @@ void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *b
             }
             pos += frame_len;
         }
-        r = send_one(io, &rx, frame, frame_len);
+        r = send_one(io, &rx, frame, frame_len, result, &waited);
         result->sent++;
+        if (io->frame_log != NULL) {
+            io->frame_log(io->ctx, frame, r, waited);
+        }
         if (r == 1) {
             result->acked++;
             consecutive_timeouts = 0;
@@ -277,4 +324,5 @@ void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *b
             }
         }
     }
+    result->elapsed_ms = (uint32_t)(io->now_ms(io->ctx) - feed_start);
 }

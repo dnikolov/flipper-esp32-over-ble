@@ -297,17 +297,14 @@ APP_FN bool storage_open_heap_margin_ok(const char* what, bool* logged_once) {
    replacing one board's pairing can never touch another's. */
 APP_FN bool
     pairing_storage_save(Storage* storage, const char* board_id, size_t board_id_len, const uint8_t* secret) {
-    static char final_path[FEB_PAIRINGS_PATH_MAX_LEN];
-    static char tmp_path[FEB_PAIRINGS_PATH_MAX_LEN];
-    if(!build_pairing_path(final_path, sizeof(final_path), board_id, board_id_len, false) ||
-       !build_pairing_path(tmp_path, sizeof(tmp_path), board_id, board_id_len, true)) {
-        FURI_LOG_E(TAG, "pairing_storage_save: path build failed for board_id '%.*s'",
-                   (int)board_id_len, board_id);
+    if(!build_pairing_path(app_path_a, sizeof(app_path_a), board_id, board_id_len, false) ||
+       !build_pairing_path(app_path_b, sizeof(app_path_b), board_id, board_id_len, true)) {
+        app_log_bad_state("storage path", board_id, board_id_len);
         return false;
     }
 
     File* file = storage_file_alloc(storage);
-    bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    bool ok = storage_file_open(file, app_path_b, FSAM_WRITE, FSOM_CREATE_ALWAYS);
     if(ok) {
         size_t written = storage_file_write(file, secret, FEB_PAIRING_SECRET_LEN);
         ok = (written == FEB_PAIRING_SECRET_LEN) && storage_file_sync(file);
@@ -315,15 +312,15 @@ APP_FN bool
     storage_file_close(file);
     storage_file_free(file);
     if(!ok) {
-        storage_common_remove(storage, tmp_path);
+        storage_common_remove(storage, app_path_b);
         return false;
     }
 
-    storage_common_remove(storage, final_path);
-    FS_Error rename_err = storage_common_rename(storage, tmp_path, final_path);
+    storage_common_remove(storage, app_path_a);
+    FS_Error rename_err = storage_common_rename(storage, app_path_b, app_path_a);
     if(rename_err != FSE_OK) {
         FURI_LOG_E(TAG, "rename pairing file failed: %d", rename_err);
-        storage_common_remove(storage, tmp_path);
+        storage_common_remove(storage, app_path_b);
         return false;
     }
     return true;
@@ -336,14 +333,12 @@ APP_FN bool
    logged locally for diagnostics. */
 APP_FN bool
     pairing_storage_load(Storage* storage, const char* board_id, size_t board_id_len, uint8_t* secret_out) {
-    static char path[FEB_PAIRINGS_PATH_MAX_LEN];
-    if(!build_pairing_path(path, sizeof(path), board_id, board_id_len, false)) {
-        FURI_LOG_E(TAG, "pairing_storage_load: path build failed for board_id '%.*s'",
-                   (int)board_id_len, board_id);
+    if(!build_pairing_path(app_ble_path, sizeof(app_ble_path), board_id, board_id_len, false)) {
+        app_log_bad_state("storage path", board_id, board_id_len);
         return false;
     }
     File* file = storage_file_alloc(storage);
-    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    bool ok = storage_file_open(file, app_ble_path, FSAM_READ, FSOM_OPEN_EXISTING);
     if(ok) {
         size_t read = storage_file_read(file, secret_out, FEB_PAIRING_SECRET_LEN);
         ok = (read == FEB_PAIRING_SECRET_LEN);
@@ -378,17 +373,6 @@ APP_FN bool any_saved_pairing_exists(Storage* storage) {
     return found;
 }
 
-APP_FN bool
-    capability_storage_exists(Storage* storage, const char* board_id, size_t board_id_len) {
-    static char path[FEB_CAPABILITIES_PATH_MAX_LEN];
-    if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
-        FURI_LOG_E(TAG, "capability_storage_exists: path build failed for board_id '%.*s'",
-                   (int)board_id_len, board_id);
-        return false;
-    }
-    return storage_file_exists(storage, path);
-}
-
 /* Persists the raw canonical-CBOR `capability_response` payload bytes verbatim (docs/
    CAPABILITIES.md "Storage and persistence") -- same atomic temp-file/exact-write/
    storage_file_sync()/close/rename sequence as pairing_storage_save(), but a variable
@@ -399,17 +383,14 @@ APP_FN bool capability_storage_save(
     size_t board_id_len,
     const uint8_t* payload,
     size_t payload_len) {
-    static char final_path[FEB_CAPABILITIES_PATH_MAX_LEN];
-    static char tmp_path[FEB_CAPABILITIES_PATH_MAX_LEN];
-    if(!build_capability_path(final_path, sizeof(final_path), board_id, board_id_len, false) ||
-       !build_capability_path(tmp_path, sizeof(tmp_path), board_id, board_id_len, true)) {
-        FURI_LOG_E(TAG, "capability_storage_save: path build failed for board_id '%.*s'",
-                   (int)board_id_len, board_id);
+    if(!build_capability_path(app_path_a, sizeof(app_path_a), board_id, board_id_len, false) ||
+       !build_capability_path(app_path_b, sizeof(app_path_b), board_id, board_id_len, true)) {
+        app_log_bad_state("storage path", board_id, board_id_len);
         return false;
     }
 
     File* file = storage_file_alloc(storage);
-    bool ok = storage_file_open(file, tmp_path, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    bool ok = storage_file_open(file, app_path_b, FSAM_WRITE, FSOM_CREATE_ALWAYS);
     if(ok) {
         size_t written = storage_file_write(file, payload, payload_len);
         ok = (written == payload_len) && storage_file_sync(file);
@@ -417,15 +398,15 @@ APP_FN bool capability_storage_save(
     storage_file_close(file);
     storage_file_free(file);
     if(!ok) {
-        storage_common_remove(storage, tmp_path);
+        storage_common_remove(storage, app_path_b);
         return false;
     }
 
-    storage_common_remove(storage, final_path);
-    FS_Error rename_err = storage_common_rename(storage, tmp_path, final_path);
+    storage_common_remove(storage, app_path_a);
+    FS_Error rename_err = storage_common_rename(storage, app_path_b, app_path_a);
     if(rename_err != FSE_OK) {
         FURI_LOG_E(TAG, "rename capability file failed: %d", rename_err);
-        storage_common_remove(storage, tmp_path);
+        storage_common_remove(storage, app_path_b);
         return false;
     }
     return true;
@@ -442,14 +423,12 @@ APP_FN bool capability_storage_load(
     uint8_t* out,
     size_t out_cap,
     size_t* out_len) {
-    static char path[FEB_CAPABILITIES_PATH_MAX_LEN];
-    if(!build_capability_path(path, sizeof(path), board_id, board_id_len, false)) {
-        FURI_LOG_E(TAG, "capability_storage_load: path build failed for board_id '%.*s'",
-                   (int)board_id_len, board_id);
+    if(!build_capability_path(app_ble_path, sizeof(app_ble_path), board_id, board_id_len, false)) {
+        app_log_bad_state("storage path", board_id, board_id_len);
         return false;
     }
     File* file = storage_file_alloc(storage);
-    bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+    bool ok = storage_file_open(file, app_ble_path, FSAM_READ, FSOM_OPEN_EXISTING);
     if(ok) {
         uint64_t size = storage_file_size(file);
         if(size == 0 || size > out_cap) {

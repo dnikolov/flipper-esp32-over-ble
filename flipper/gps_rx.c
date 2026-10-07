@@ -38,7 +38,7 @@ APP_FN void
     static feb_status_payload_t status_payload;
     feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "gps status payload decode failed: %d; dropping", status);
+        app_log_decode_fail("gps status payload", status);
         return;
     }
     GpsFixState state;
@@ -49,11 +49,7 @@ APP_FN void
     } else if(text_matches(status_payload.state, status_payload.state_len, "fix")) {
         state = GpsFixStateFix;
     } else {
-        FURI_LOG_W(
-            TAG,
-            "gps status: unexpected state '%.*s'; dropping",
-            (int)status_payload.state_len,
-            status_payload.state);
+        app_log_bad_state("gps status", status_payload.state, status_payload.state_len);
         return;
     }
     if(state != GpsFixStateFix) {
@@ -68,7 +64,7 @@ APP_FN void
     feb_cbor_status_t result_status = feb_cbor_decode_gps_result_payload(
         status_payload.result_span, status_payload.result_span_len, result);
     if(result_status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "gps status.result decode failed: %d; dropping", result_status);
+        app_log_decode_fail("gps status.result", result_status);
         return;
     }
     post_gps_status(app, state, result);
@@ -95,7 +91,7 @@ APP_FN bool send_gps_command(Esp32App* app) {
     uint8_t arguments_buf[2];
     size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "gps command: arguments encode failed");
+        app_log_step("gps command", "arguments encode");
         return false;
     }
 
@@ -109,7 +105,7 @@ APP_FN bool send_gps_command(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "gps command: payload encode failed");
+        app_log_step("gps command", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -126,10 +122,10 @@ APP_FN bool send_gps_command(Esp32App* app) {
         return false;
     }
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "gps command: send failed");
+        app_log_step("gps command", "send");
         return false;
     }
-    FURI_LOG_I(TAG, "gps command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    app_log_sent("gps command", command.request_id);
     return true;
 }
 

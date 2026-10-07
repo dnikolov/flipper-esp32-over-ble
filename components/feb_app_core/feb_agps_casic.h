@@ -19,7 +19,16 @@
 #define FEB_CASIC_CLASS_AID 0x0Bu
 #define FEB_CASIC_ID_AID_INI 0x01u
 #define FEB_CASIC_CLASS_MSG 0x08u
-#define FEB_CASIC_ACK_TIMEOUT_MS 500u
+/* The module's UART TX is shared with ~960 B/s of NMEA at 9600 baud, so an ACK can queue behind
+   several hundred ms of text (hardware 2026-10-07: 32/34 ACKs at 500 ms). */
+#define FEB_CASIC_ACK_TIMEOUT_MS 1500u
+/* Bound on the pre-send drain of already-received bytes (only matters while NMEA streams). */
+#define FEB_CASIC_DRAIN_MAX_MS 50u
+/* Whole-feed budget, checked before each frame. Worst case is therefore
+   FEED_BUDGET + ACK_TIMEOUT + DRAIN = 20000 + 1500 + 50 ms plus the final write, ~21.6 s, inside
+   the Flipper's 30 s complete-wait and the 30 s BLE idle timeout (3 consecutive timeouts alone
+   would end it after 4.5 s; without the budget 2-timeouts-then-ACK patterns could reach ~34 s). */
+#define FEB_AGPS_FEED_BUDGET_MS 20000u
 #define FEB_AGPS_INI_PAYLOAD_LEN 56u
 #define FEB_AGPS_INI_LEN (FEB_CASIC_OVERHEAD + FEB_AGPS_INI_PAYLOAD_LEN)
 /* Claimed 1-sigma host time error: the Sync script sets the Flipper RTC from the PC just before. */
@@ -75,6 +84,8 @@ typedef struct {
 } feb_casic_rx_t;
 
 void feb_casic_rx_init(feb_casic_rx_t *rx);
+/* True while a binary frame is partially received. */
+bool feb_casic_rx_busy(const feb_casic_rx_t *rx);
 feb_casic_rx_event_t feb_casic_rx_byte(feb_casic_rx_t *rx, uint8_t byte, uint8_t *acked_cls, uint8_t *acked_id);
 
 typedef struct {
@@ -83,18 +94,23 @@ typedef struct {
     /* Returns bytes read (0 on timeout). */
     size_t (*read)(void *ctx, uint8_t *buf, size_t cap, uint32_t timeout_ms);
     uint32_t (*now_ms)(void *ctx);
+    /* Optional, called once per sent frame: outcome 0 timeout / 1 ACK / 2 NACK. */
+    void (*frame_log)(void *ctx, const uint8_t *frame, int outcome, uint32_t waited_ms);
 } feb_agps_io_t;
 
+/* The first four fields are the wire result; `late` and `elapsed_ms` are local diagnostics. */
 typedef struct {
     uint16_t sent;
     uint16_t acked;
     uint16_t nacked;
     uint16_t timeout;
+    uint16_t late;        /* ACK/NACK frames discarded by the pre-send drain */
+    uint32_t elapsed_ms;
 } feb_agps_result_t;
 
-/* Sends `ini` then each frame of the (already validated) `blob`, one whole frame at a time,
-   waiting up to FEB_CASIC_ACK_TIMEOUT_MS for the matching ACK/NACK (by class/id) before the
-   next. Counts include the AID-INI frame. Stops early after FEB_AGPS_MAX_CONSECUTIVE_TIMEOUTS
+/* Sends `ini` then each frame of the (already validated) `blob`, strictly one whole frame at a
+   time: drain already-received bytes, send, wait up to FEB_CASIC_ACK_TIMEOUT_MS for the matching
+   ACK/NACK (by class/id) before the next. Stops when FEB_AGPS_FEED_BUDGET_MS has elapsed. Counts include the AID-INI frame. Stops early after FEB_AGPS_MAX_CONSECUTIVE_TIMEOUTS
    unanswered frames in a row. Never sends anything but the frames given. */
 void feb_agps_feed(const feb_agps_io_t *io, const uint8_t *ini, const uint8_t *blob, size_t blob_len,
                    feb_agps_result_t *result);

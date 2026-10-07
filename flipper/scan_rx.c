@@ -125,17 +125,13 @@ APP_FN void
     static feb_status_payload_t status_payload;
     feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "wifi_scan status payload decode failed: %d; dropping", status);
+        app_log_decode_fail("wifi_scan status payload", status);
         return;
     }
     bool is_partial = text_matches(status_payload.state, status_payload.state_len, "partial");
     bool is_complete = text_matches(status_payload.state, status_payload.state_len, "complete");
     if(!is_partial && !is_complete) {
-        FURI_LOG_W(
-            TAG,
-            "wifi_scan status: unexpected state '%.*s'; dropping",
-            (int)status_payload.state_len,
-            status_payload.state);
+        app_log_bad_state("wifi_scan status", status_payload.state, status_payload.state_len);
         return;
     }
     if(status_payload.has_result) {
@@ -155,7 +151,7 @@ APP_FN void
             NULL);
         furi_mutex_release(app_wardriving_state_mutex);
         if(result_status != FEB_CBOR_OK) {
-            FURI_LOG_W(TAG, "wifi_scan status.result decode failed: %d; dropping", result_status);
+            app_log_decode_fail("wifi_scan status.result", result_status);
             return;
         }
         post_wifi_scan_results_updated(app);
@@ -236,17 +232,13 @@ APP_FN void
     static feb_status_payload_t status_payload;
     feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "ble_scan status payload decode failed: %d; dropping", status);
+        app_log_decode_fail("ble_scan status payload", status);
         return;
     }
     bool is_partial = text_matches(status_payload.state, status_payload.state_len, "partial");
     bool is_complete = text_matches(status_payload.state, status_payload.state_len, "complete");
     if(!is_partial && !is_complete) {
-        FURI_LOG_W(
-            TAG,
-            "ble_scan status: unexpected state '%.*s'; dropping",
-            (int)status_payload.state_len,
-            status_payload.state);
+        app_log_bad_state("ble_scan status", status_payload.state, status_payload.state_len);
         return;
     }
     if(status_payload.has_result) {
@@ -262,7 +254,7 @@ APP_FN void
             NULL);
         furi_mutex_release(app_wardriving_state_mutex);
         if(result_status != FEB_CBOR_OK) {
-            FURI_LOG_W(TAG, "ble_scan status.result decode failed: %d; dropping", result_status);
+            app_log_decode_fail("ble_scan status.result", result_status);
             return;
         }
         post_ble_scan_results_updated(app);
@@ -296,7 +288,7 @@ APP_FN bool send_wifi_scan_command(Esp32App* app) {
     uint8_t arguments_buf[2];
     size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "wifi_scan command: arguments encode failed");
+        app_log_step("wifi_scan command", "arguments encode");
         return false;
     }
 
@@ -310,7 +302,7 @@ APP_FN bool send_wifi_scan_command(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "wifi_scan command: payload encode failed");
+        app_log_step("wifi_scan command", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -328,10 +320,10 @@ APP_FN bool send_wifi_scan_command(Esp32App* app) {
     }
     app_pending_command_kind = PendingCommandWifiScan;
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "wifi_scan command: send failed");
+        app_log_step("wifi_scan command", "send");
         return false;
     }
-    FURI_LOG_I(TAG, "wifi_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    app_log_sent("wifi_scan command", command.request_id);
     return true;
 }
 
@@ -356,7 +348,7 @@ APP_FN bool send_ble_scan_command(Esp32App* app) {
     uint8_t arguments_buf[2];
     size_t arguments_len = feb_cbor_encode_map_header(arguments_buf, sizeof(arguments_buf), 0);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "ble_scan command: arguments encode failed");
+        app_log_step("ble_scan command", "arguments encode");
         return false;
     }
 
@@ -370,7 +362,7 @@ APP_FN bool send_ble_scan_command(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "ble_scan command: payload encode failed");
+        app_log_step("ble_scan command", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -388,10 +380,10 @@ APP_FN bool send_ble_scan_command(Esp32App* app) {
     }
     app_pending_command_kind = PendingCommandBleScan;
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "ble_scan command: send failed");
+        app_log_step("ble_scan command", "send");
         return false;
     }
-    FURI_LOG_I(TAG, "ble_scan command sent (request_id=%llu)", (unsigned long long)command.request_id);
+    app_log_sent("ble_scan command", command.request_id);
     return true;
 }
 

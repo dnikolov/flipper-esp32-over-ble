@@ -7,6 +7,9 @@
 #include "cbor_codec.h"
 #include "wardriving_csv.h"
 #include "mesh_nodes.h"
+#include "capability_cache.h"
+#include "pairing_phase.h"
+#include <math.h>
 #include "vectors.h"
 
 static int g_total = 0;
@@ -1954,6 +1957,149 @@ static void test_wardriving_dedup(void) {
         "DEDUP: same 6 bytes but wifi vs ble lands in a separate sub-table, not treated as a repeat");
 }
 
+/* Dedup move threshold must stay ~30 m at any latitude (the distance helper uses a polynomial cos
+   instead of libm's; see wardriving_csv.c). East-west moves of 28 m / 32 m, latitudes 0..85 deg. */
+static void test_wardriving_dedup_move_threshold_by_latitude(void) {
+    static const uint8_t addr[6] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    static const double lats[] = {0.0, 30.0, 45.0, 60.0, 75.0, 85.0};
+    for(size_t i = 0; i < sizeof(lats) / sizeof(lats[0]); i++) {
+        double lat = lats[i];
+        uint64_t lat_off = (uint64_t)(900000000.0 + lat * 1e7);
+        double deg_per_meter = 1.0 / (111320.0 * cos(lat * 3.14159265358979323846 / 180.0));
+        uint64_t lon_28 = DEDUP_BASE_LON + (uint64_t)(28.0 * deg_per_meter * 1e7);
+        uint64_t lon_32 = DEDUP_BASE_LON + (uint64_t)(32.0 * deg_per_meter * 1e7);
+
+        feb_wardriving_dedup_table_t table;
+        feb_wardriving_dedup_reset(&table);
+        feb_wardriving_record_t first = make_dedup_wifi_record(addr, -60, lat_off, DEDUP_BASE_LON);
+        (void)feb_wardriving_dedup_should_write(&table, &first);
+        feb_wardriving_record_t near_rec = make_dedup_wifi_record(addr, -60, lat_off, lon_28);
+        CHECK(
+            !feb_wardriving_dedup_should_write(&table, &near_rec),
+            "DEDUP_LAT: a 28 m east-west move is below the 30 m threshold at every latitude");
+        feb_wardriving_record_t far_rec = make_dedup_wifi_record(addr, -60, lat_off, lon_32);
+        CHECK(
+            feb_wardriving_dedup_should_write(&table, &far_rec),
+            "DEDUP_LAT: a 32 m east-west move is past the 30 m threshold at every latitude");
+    }
+}
+
+/* Latent bug found 2026-10-07: an existing-but-unusable capability cache file made
+   capability_bootstrap() return silently (no re-query), hiding every capability menu row for
+   good. The decision now lives in feb_capability_cache_resolve(): only load+decode success is a
+   cache hit; everything else means "no cache -> send capability_query". */
+typedef struct {
+    int mode; /* 0 missing, 1 empty, 2 oversized, 3 malformed, 4 valid */
+    uint8_t valid[FEB_CBOR_MAX_PAYLOAD];
+    size_t valid_len;
+    int calls;
+} cache_fake_t;
+
+static bool cache_fake_load(void* ctx, uint8_t* out, size_t out_cap, size_t* out_len) {
+    cache_fake_t* fake = ctx;
+    fake->calls++;
+    switch(fake->mode) {
+    case 0:
+        return false; /* no file / unreadable */
+    case 1:
+        *out_len = 0; /* zero-length file reported as success by a sloppy loader */
+        return true;
+    case 2:
+        *out_len = out_cap + 1;
+        return true;
+    case 3:
+        memset(out, 0xFF, 16);
+        *out_len = 16;
+        return true;
+    default:
+        memcpy(out, fake->valid, fake->valid_len);
+        *out_len = fake->valid_len;
+        return true;
+    }
+}
+
+static void test_capability_cache_resolve(void) {
+    cache_fake_t fake;
+    memset(&fake, 0, sizeof(fake));
+    feb_capability_response_payload_t src;
+    memset(&src, 0, sizeof(src));
+    src.board = "esp32c6";
+    src.board_len = 7;
+    src.firmware = "1.0";
+    src.firmware_len = 3;
+    src.features[0] = "gps";
+    src.feature_lens[0] = 3;
+    src.features[1] = "wardriving";
+    src.feature_lens[1] = 10;
+    src.feature_count = 2;
+    fake.valid_len = feb_cbor_encode_capability_response_payload(fake.valid, sizeof(fake.valid), &src);
+    CHECK(fake.valid_len > 0, "CAP_CACHE: test payload encodes");
+
+    uint8_t buf[FEB_CBOR_MAX_PAYLOAD];
+    feb_capability_response_payload_t out;
+
+    for(int mode = 0; mode <= 3; mode++) {
+        fake.mode = mode;
+        memset(&out, 0, sizeof(out));
+        CHECK(
+            !feb_capability_cache_resolve(cache_fake_load, &fake, buf, sizeof(buf), &out),
+            "CAP_CACHE: missing/empty/oversized/malformed cache is NOT a hit (caller re-queries)");
+    }
+    fake.mode = 4;
+    memset(&out, 0, sizeof(out));
+    CHECK(
+        feb_capability_cache_resolve(cache_fake_load, &fake, buf, sizeof(buf), &out),
+        "CAP_CACHE: a valid cached record is a hit");
+    CHECK(out.feature_count == 2 && out.feature_lens[1] == 10, "CAP_CACHE: decoded features intact");
+}
+
+static void test_pairing_phase_rules(void) {
+    /* The reported symptom: SessionActive, then something regresses the phase. */
+    CHECK(
+        pairing_phase_after_event(PairingPhaseSessionActive, PairingPhaseDone) ==
+            PairingPhaseSessionActive,
+        "PHASE: a Done queued behind an active session must not end the session phase");
+    CHECK(
+        pairing_phase_after_event(PairingPhaseAuthenticating, PairingPhaseDone) ==
+            PairingPhaseAuthenticating,
+        "PHASE: Done does not pull an authenticating session back either");
+    CHECK(
+        pairing_phase_after_event(PairingPhaseSaving, PairingPhaseDone) == PairingPhaseDone,
+        "PHASE: Done after Saving (fresh pairing) still applies");
+    CHECK(
+        pairing_phase_after_event(PairingPhaseSessionActive, PairingPhaseFailed) ==
+            PairingPhaseFailed,
+        "PHASE: real failures (session fatal / storage failure) still apply");
+    CHECK(
+        pairing_phase_after_event(PairingPhaseExchanging, PairingPhaseSessionActive) ==
+            PairingPhaseSessionActive,
+        "PHASE: SessionActive always applies");
+
+    CHECK(
+        !pairing_phase_accepts_bt_connected(PairingPhaseSessionActive),
+        "PHASE: a late BtStatusConnected is ignored once the session is active");
+    CHECK(
+        !pairing_phase_accepts_bt_connected(PairingPhaseAuthenticating),
+        "PHASE: a late BtStatusConnected is ignored while authenticating");
+    CHECK(
+        pairing_phase_accepts_bt_connected(PairingPhaseWaiting) &&
+            pairing_phase_accepts_bt_connected(PairingPhaseNone) &&
+            pairing_phase_accepts_bt_connected(PairingPhaseFailed) &&
+            pairing_phase_accepts_bt_connected(PairingPhaseDone),
+        "PHASE: BtStatusConnected still applies when no ceremony/session is live");
+
+    /* Event-order replay of the symptom: queue = [Authenticating, SessionActive, Done]. */
+    PairingPhase phase = PairingPhaseWaiting;
+    PairingPhase queue[] = {PairingPhaseAuthenticating, PairingPhaseSessionActive, PairingPhaseDone};
+    for(size_t i = 0; i < 3; i++) {
+        phase = pairing_phase_after_event(phase, queue[i]);
+    }
+    CHECK(phase == PairingPhaseSessionActive, "PHASE: replayed late Done leaves the session active");
+    CHECK(
+        pairing_phase_accepts_bt_connected(phase) == false,
+        "PHASE: replayed late BtStatusConnected after that is still ignored");
+}
+
 static void test_wardriving_dedup_eviction(void) {
     feb_wardriving_dedup_table_t table;
     feb_wardriving_dedup_reset(&table);
@@ -2616,6 +2762,9 @@ int main(void) {
     test_wardriving_dedup_eviction();
     test_wardriving_dedup_wifi_survives_ble_eviction();
     test_wardriving_dedup_offset_bounds();
+    test_wardriving_dedup_move_threshold_by_latitude();
+    test_capability_cache_resolve();
+    test_pairing_phase_rules();
 
     test_meshcore_node_vectors();
     test_meshcore_command_and_status_vectors();

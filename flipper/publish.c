@@ -254,7 +254,6 @@ static void sync_parse_agps_result(Esp32App* app, const char* buf, size_t len) {
 }
 
 static bool publish_try_read_result(Esp32App* app, const char* path, bool agps) {
-    static char buf[FEB_PUBLISH_RESULT_MAX_LEN];
     /* Polled every FEB_PUBLISH_POLL_PERIOD_MS for up to FEB_PUBLISH_POLL_TIMEOUT_MS, so this is
        the one open/close pair in this file that repeats on a timer rather than happening once
        per session -- worth the margin check for that alone, and the reason its log line needs
@@ -268,41 +267,48 @@ static bool publish_try_read_result(Esp32App* app, const char* path, bool agps) 
     if(!storage_open_heap_margin_ok("publish result", &low_heap_logged)) {
         return false;
     }
+    /* On-demand 512 B read buffer instead of a permanent .bss one (H04): this runs only while
+       the Sync screen is polling, with the BLE profile already stopped, so the heap is roomiest. */
+    char* buf = malloc(FEB_PUBLISH_RESULT_MAX_LEN);
+    if(!buf) {
+        return false;
+    }
     File* file = storage_file_alloc(app->storage);
     bool ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
     size_t read_len = 0;
     if(ok) {
         uint64_t size = storage_file_size(file);
-        size_t cap = size > sizeof(buf) ? sizeof(buf) : (size_t)size;
+        size_t cap = size > FEB_PUBLISH_RESULT_MAX_LEN ? FEB_PUBLISH_RESULT_MAX_LEN : (size_t)size;
         read_len = storage_file_read(file, buf, cap);
     }
     storage_file_close(file);
     storage_file_free(file);
 
-    if(!ok && agps) {
-        app->sync_agps_outcome = PublishOutcomeFail;
-        strncpy(
-            app->sync_agps_message, "Result file unreadable", sizeof(app->sync_agps_message) - 1);
-        return true;
-    }
     if(!ok) {
-        app->publish_outcome = PublishOutcomeFail;
-        strncpy(
-            app->publish_fail_message,
-            "Result file unreadable",
-            sizeof(app->publish_fail_message) - 1);
-        app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        free(buf);
+        if(agps) {
+            app->sync_agps_outcome = PublishOutcomeFail;
+            strncpy(
+                app->sync_agps_message, "Result file unreadable", sizeof(app->sync_agps_message) - 1);
+        } else {
+            app->publish_outcome = PublishOutcomeFail;
+            strncpy(
+                app->publish_fail_message,
+                "Result file unreadable",
+                sizeof(app->publish_fail_message) - 1);
+            app->publish_fail_message[sizeof(app->publish_fail_message) - 1] = '\0';
+        }
         return true;
     }
-    if(read_len == 0) {
-        return false;
+    if(read_len != 0) {
+        if(agps) {
+            sync_parse_agps_result(app, buf, read_len);
+        } else {
+            publish_parse_result(app, buf, read_len);
+        }
     }
-    if(agps) {
-        sync_parse_agps_result(app, buf, read_len);
-    } else {
-        publish_parse_result(app, buf, read_len);
-    }
-    return true;
+    free(buf);
+    return read_len != 0;
 }
 
 /* Ends the "waiting for publish" state and, if this publish run stopped the BLE profile to
@@ -324,20 +330,19 @@ APP_FN void publish_finish_waiting(Esp32App* app) {
 /* Called from the main loop's AppEventPublishPollTick handler, only while AppScreenPublish is
    showing "waiting for publish..." (see that handler's own guard). */
 APP_FN void publish_poll_check(Esp32App* app) {
-    static char result_path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
     bool want_publish = app->sync_mode != SyncModeAgps;
     bool want_agps = app->sync_mode != SyncModePublish;
     if(want_publish && !app->sync_publish_done &&
        build_app_data_path(
-           result_path, sizeof(result_path), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME) &&
-       storage_file_exists(app->storage, result_path) &&
-       publish_try_read_result(app, result_path, false)) {
+           app_path_a, sizeof(app_path_a), FEB_WARDRIVING_PUBLISH_RESULT_FILENAME) &&
+       storage_file_exists(app->storage, app_path_a) &&
+       publish_try_read_result(app, app_path_a, false)) {
         app->sync_publish_done = true;
     }
     if(want_agps && !app->sync_agps_done &&
-       build_app_data_path(result_path, sizeof(result_path), FEB_AGPS_SYNC_RESULT_FILENAME) &&
-       storage_file_exists(app->storage, result_path) &&
-       publish_try_read_result(app, result_path, true)) {
+       build_app_data_path(app_path_a, sizeof(app_path_a), FEB_AGPS_SYNC_RESULT_FILENAME) &&
+       storage_file_exists(app->storage, app_path_a) &&
+       publish_try_read_result(app, app_path_a, true)) {
         app->sync_agps_done = true;
     }
     if((!want_publish || app->sync_publish_done) && (!want_agps || app->sync_agps_done)) {
@@ -578,12 +583,12 @@ APP_FN void draw_publish_screen(Canvas* canvas, Esp32App* app) {
     bool have_outcome = app->publish_outcome != PublishOutcomeNone ||
                         app->sync_agps_outcome != PublishOutcomeNone;
     if(!have_outcome) {
-        static const char* const labels[SyncModeCount] = {
+        static const char labels[SyncModeCount][24] = {
             "Sync all", "Publish Wardriving Logs", "Sync A-GPS"};
         for(size_t i = 0; i < SyncModeCount; i++) {
             char line[32];
             snprintf(
-                line, sizeof(line), "%s%s", app->sync_menu_index == (SyncMode)i ? "> " : "  ", labels[i]);
+                line, sizeof(line), "%s%.23s", app->sync_menu_index == (SyncMode)i ? "> " : "  ", labels[i]);
             canvas_set_font(canvas, app->sync_menu_index == (SyncMode)i ? FontPrimary : FontSecondary);
             canvas_draw_str(canvas, 2, (uint8_t)(22 + i * HOME_ROW_HEIGHT), line);
         }
@@ -598,21 +603,10 @@ APP_FN void draw_publish_screen(Canvas* canvas, Esp32App* app) {
         draw_sync_agps_summary(canvas, app, 22);
         canvas_draw_str(canvas, 2, 52, "Back: return");
     } else {
-        char line[40];
-        if(app->publish_outcome == PublishOutcomeOk) {
-            snprintf(
-                line,
-                sizeof(line),
-                "Publish OK imp=%lu dup=%lu",
-                (unsigned long)app->publish_imported,
-                (unsigned long)app->publish_duplicates);
-        } else if(app->publish_outcome == PublishOutcomeNothingToPublish) {
-            snprintf(line, sizeof(line), "Publish: no new data");
-        } else if(app->publish_outcome == PublishOutcomeTimeout) {
-            snprintf(line, sizeof(line), "Publish: timed out");
-        } else {
-            snprintf(line, sizeof(line), "Publish failed");
-        }
+        static const char publish_words[5][12] = {
+            "", "OK", "failed", "nothing new", "timed out"}; /* PublishOutcome order */
+        char line[32];
+        snprintf(line, sizeof(line), "Publish: %s", publish_words[app->publish_outcome]);
         canvas_draw_str(canvas, 2, 22, line);
         if(app->publish_outcome == PublishOutcomeFail && app->publish_fail_message[0] != '\0') {
             canvas_draw_str(canvas, 2, 32, app->publish_fail_message);

@@ -534,3 +534,31 @@ Sizes after E1 and DR:
 - Heltec DRAM free: 348 → **356 B**.
 
 Host tests 11/11 pass, the shared-header check is clean, and all four ESP projects build.
+
+**2026-10-07 FAP size pass (after A-GPS commit 516fbd4 made launches OOM).** Release `.fap`, sections
+as `arm-none-eabi-size -A` reports them:
+
+| Section | afe976b | 516fbd4 | now |
+| --- | --- | --- | --- |
+| .text | 58,000 | 62,296 | 57,460 |
+| .rodata | 12,200 | 13,232 | 10,850 |
+| .data | 56 | 64 | 44 |
+| .bss | 28,674 | 28,716 | 26,496 |
+| .fast.rel.text | 10,519 | 11,155 | 10,379 |
+| .fast.rel.rodata | 124 | 169 | 124 |
+| file | 124,376 | 132,816 | 122,524 |
+
+Largest single win: `wardriving_csv.c`'s dedup distance called libm `cos()`/`sqrt()`, which dragged in
+~4.3 KB of `.text` (`__ieee754_rem_pio2`, `__kernel_rem_pio2`, `__kernel_cos/sin`, `floor`, `scalbn`, `sqrt`).
+It now uses an 8th-order Taylor cos and compares squared distance (host test
+`DEDUP_LAT` pins the 30 m threshold at 0..85 deg). Also: ten 160 B function-local path statics became three
+shared scratch paths (`app_path_a/b` main thread, `app_ble_path` BleEventWorker), the 512 B publish-result
+buffer is `malloc`ed per poll, `cached`/`response` capability decode targets share one static, repeated
+`FURI_LOG` literals went through `app_log_*` helpers, and pointer tables became fixed-width arrays (no
+`.fast.rel.rodata` entries). Check `.fast.rel.*` too when measuring (the loader keeps them resident).
+
+**Phase-regression race (2026-10-07, "Home rows vanish ~1 s after session active"):** `pairing_phase.h` now
+holds the `PairingPhase` rules the main loop applies; a late `BtStatusConnected` or a `Done` queued behind an
+active session no longer overwrites `SessionActive`. `capability_bootstrap()` treats a missing, empty,
+oversized or malformed cache file as "no cache" and re-sends `capability_query`
+(`capability_cache.h`, host tests `CAP_CACHE`/`PHASE`).

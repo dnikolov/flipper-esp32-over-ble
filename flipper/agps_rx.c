@@ -13,6 +13,8 @@
    here runs on the main thread except handle_agps_status()/post_agps_error() (BleEventWorker,
    statics only). */
 
+static bool agps_low_heap_logged;
+
 typedef struct {
     File* file;
 } AgpsReadCtx;
@@ -36,7 +38,6 @@ static void agps_fail(Esp32App* app, AgpsError error) {
 /* OK on the GPS screen. Checks file and window first and refuses (never sends) on anything but
    a currently-valid window. */
 __attribute__((noinline)) APP_FN void agps_start(Esp32App* app) {
-    static bool low_heap_logged;
     app->agps_error = AgpsErrorNone;
     app->agps_sent = 0;
     app->agps_acked = 0;
@@ -57,20 +58,19 @@ __attribute__((noinline)) APP_FN void agps_start(Esp32App* app) {
         agps_fail(app, AgpsErrorBadClock);
         return;
     }
-    char path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(!build_app_data_path(path, sizeof(path), FEB_AGPS_FILENAME) ||
-       !storage_file_exists(app->storage, path)) {
+    if(!build_app_data_path(app_path_a, sizeof(app_path_a), FEB_AGPS_FILENAME) ||
+       !storage_file_exists(app->storage, app_path_a)) {
         agps_fail(app, AgpsErrorNoFile);
         return;
     }
-    if(!storage_open_heap_margin_ok("agps file", &low_heap_logged)) {
+    if(!storage_open_heap_margin_ok("agps", &agps_low_heap_logged)) {
         agps_fail(app, AgpsErrorNoMemory);
         return;
     }
     File* file = storage_file_alloc(app->storage);
     AgpsWindow window;
     AgpsSelResult selection = AgpsSelBadFormat;
-    if(storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+    if(storage_file_open(file, app_path_a, FSAM_READ, FSOM_OPEN_EXISTING)) {
         uint64_t size = storage_file_size(file);
         if(size <= 0x7FFFFFFFu) {
             AgpsReadCtx ctx = {.file = file};
@@ -94,13 +94,6 @@ __attribute__((noinline)) APP_FN void agps_start(Esp32App* app) {
         app->agps_date_unix = window.valid_to;
         app->agps_state = AgpsStateSending;
         app_pending_command_kind = PendingCommandAgps;
-        FURI_LOG_I(
-            TAG,
-            "A-GPS: sending window [%lu,%lu) len=%u (utc=%lu)",
-            (unsigned long)window.valid_from,
-            (unsigned long)window.valid_to,
-            (unsigned)window.length,
-            (unsigned long)now);
         agps_step(app);
     }
 }
@@ -109,7 +102,6 @@ static uint32_t agps_next_request_id = 1;
 
 /* Sends the next chunk; agps_on_partial() calls it again once the C5 accepted this one. */
 __attribute__((noinline)) APP_FN void agps_step(Esp32App* app) {
-    static bool low_heap_logged;
     if(app->agps_state != AgpsStateSending) {
         return;
     }
@@ -122,18 +114,17 @@ __attribute__((noinline)) APP_FN void agps_step(Esp32App* app) {
         len = AGPS_WIRE_CHUNK_MAX;
     }
     uint8_t chunk[AGPS_WIRE_CHUNK_MAX];
-    char path[FEB_WARDRIVING_EXPORT_PATH_MAX_LEN];
-    if(!build_app_data_path(path, sizeof(path), FEB_AGPS_FILENAME)) {
+    if(!build_app_data_path(app_path_a, sizeof(app_path_a), FEB_AGPS_FILENAME)) {
         agps_fail(app, AgpsErrorReadFailed);
         return;
     }
-    if(!storage_open_heap_margin_ok("agps file", &low_heap_logged)) {
+    if(!storage_open_heap_margin_ok("agps", &agps_low_heap_logged)) {
         agps_fail(app, AgpsErrorNoMemory);
         return;
     }
     File* file = storage_file_alloc(app->storage);
     AgpsReadCtx ctx = {.file = file};
-    bool read_ok = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING) &&
+    bool read_ok = storage_file_open(file, app_path_a, FSAM_READ, FSOM_OPEN_EXISTING) &&
                    agps_read_cb(&ctx, app->agps_window_offset + app->agps_off, chunk, len);
     storage_file_close(file);
     storage_file_free(file);
@@ -182,7 +173,6 @@ __attribute__((noinline)) APP_FN void agps_step(Esp32App* app) {
     if(app->agps_off >= app->agps_total) {
         /* The final chunk's own `partial` is ignored from here on; `complete` ends the wait. */
         app->agps_state = AgpsStateWaitingReply;
-        FURI_LOG_I(TAG, "A-GPS: all %u bytes sent, waiting for result", (unsigned)app->agps_total);
     }
 }
 
@@ -233,13 +223,6 @@ APP_FN void agps_apply_result(Esp32App* app, const AppEvent* event) {
     app->agps_nacked = event->u.agps.nacked;
     app->agps_timeout = event->u.agps.timeout;
     app->agps_state = AgpsStateDone;
-    FURI_LOG_I(
-        TAG,
-        "A-GPS: %u/%u accepted (nacked=%u timeout=%u)",
-        (unsigned)app->agps_acked,
-        (unsigned)app->agps_sent,
-        (unsigned)app->agps_nacked,
-        (unsigned)app->agps_timeout);
 }
 
 APP_FN void post_agps_error(Esp32App* app, AgpsError error) {
@@ -260,7 +243,6 @@ __attribute__((noinline)) APP_FN void
     feb_cbor_status_t status =
         feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "agps status decode failed (%d); dropping", status);
         return;
     }
     AppEvent* event = &app_shared_ble_event;
@@ -278,43 +260,29 @@ __attribute__((noinline)) APP_FN void
         event->u.agps.nacked = wire_result.nacked;
         event->u.agps.timeout = wire_result.timeout;
     } else {
-        FURI_LOG_W(TAG, "agps complete without a valid result; reporting rejected");
         post_agps_error(app, AgpsErrorRejected);
         return;
     }
     app_queue_put(app->queue, event, APP_QUEUE_PUT_TIMEOUT_MS);
 }
 
-static const char* agps_error_line1(AgpsError error) {
-    switch(error) {
-    case AgpsErrorNoFile:
-        return "No A-GPS file on SD";
-    case AgpsErrorExpired:
-        return "A-GPS data expired";
-    case AgpsErrorNoWindowNow:
-        return "No A-GPS window";
-    case AgpsErrorBadFile:
-        return "A-GPS file invalid";
-    case AgpsErrorReadFailed:
-        return "SD read failed";
-    case AgpsErrorNotConnected:
-        return "ESP32 not connected";
-    case AgpsErrorSendFailed:
-        return "Send failed";
-    case AgpsErrorBusy:
-        return "ESP32 busy";
-    case AgpsErrorRejected:
-        return "ESP32 rejected data";
-    case AgpsErrorTimeout:
-        return "No reply from ESP32";
-    case AgpsErrorNoMemory:
-        return "Low memory, retry";
-    case AgpsErrorBadClock:
-        return "Flipper clock not set";
-    default:
-        return "A-GPS error";
-    }
-}
+/* Indexed by AgpsError. Fixed-width rows (not a const char* table): no pointer relocations to
+   keep resident, FAP heap H04. */
+static const char agps_error_text[AgpsErrorBadClock + 1][22] = {
+    "A-GPS error", /* AgpsErrorNone */
+    "No A-GPS file on SD",
+    "A-GPS data expired",
+    "No A-GPS window",
+    "A-GPS file invalid",
+    "SD read failed",
+    "ESP32 not connected",
+    "Send failed",
+    "ESP32 busy",
+    "ESP32 rejected data",
+    "No reply from ESP32",
+    "Low memory, retry",
+    "Flipper clock not set",
+};
 
 /* Replaces the GPS screen body while agps_state != Idle. */
 static void draw_agps_panel(Canvas* canvas, const Esp32App* app) {
@@ -349,7 +317,7 @@ static void draw_agps_panel(Canvas* canvas, const Esp32App* app) {
         }
         canvas_draw_str(canvas, 2, 52, "OK/Back: close");
     } else {
-        canvas_draw_str(canvas, 2, 22, agps_error_line1(app->agps_error));
+        canvas_draw_str(canvas, 2, 22, agps_error_text[app->agps_error < AgpsErrorBadClock + 1 ? app->agps_error : AgpsErrorNone]);
         if(app->agps_error == AgpsErrorExpired) {
             DateTime dt;
             datetime_timestamp_to_datetime(app->agps_date_unix, &dt);

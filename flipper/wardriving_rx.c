@@ -599,7 +599,7 @@ APP_FN void
     static feb_status_payload_t status_payload;
     feb_cbor_status_t status = feb_cbor_decode_status_payload(plaintext, plaintext_len, &status_payload);
     if(status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "wardriving status payload decode failed: %d; dropping", status);
+        app_log_decode_fail("wardriving status payload", status);
         return;
     }
 
@@ -630,11 +630,7 @@ APP_FN void
         return;
     }
     if(!text_matches(status_payload.state, status_payload.state_len, "data")) {
-        FURI_LOG_W(
-            TAG,
-            "wardriving status: unexpected state '%.*s'; dropping",
-            (int)status_payload.state_len,
-            status_payload.state);
+        app_log_bad_state("wardriving status", status_payload.state, status_payload.state_len);
         return;
     }
     if(!status_payload.has_result) {
@@ -658,7 +654,7 @@ APP_FN void
         &stream_ctx,
         &backlog_remaining);
     if(result_status != FEB_CBOR_OK) {
-        FURI_LOG_W(TAG, "wardriving status.result decode failed: %d; dropping", result_status);
+        app_log_decode_fail("wardriving status.result", result_status);
         return;
     }
 
@@ -770,7 +766,7 @@ APP_FN bool send_wardriving_start_command(Esp32App* app) {
     size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
         arguments_buf, sizeof(arguments_buf), &command_args);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "wardriving start: arguments encode failed");
+        app_log_step("wardriving start", "arguments encode");
         return false;
     }
 
@@ -784,7 +780,7 @@ APP_FN bool send_wardriving_start_command(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "wardriving start: payload encode failed");
+        app_log_step("wardriving start", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -802,13 +798,10 @@ APP_FN bool send_wardriving_start_command(Esp32App* app) {
     }
     app_pending_command_kind = PendingCommandWardrivingStart;
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "wardriving start: send failed");
+        app_log_step("wardriving start", "send");
         return false;
     }
-    FURI_LOG_I(
-        TAG,
-        "wardriving start command sent (request_id=%llu)",
-        (unsigned long long)command.request_id);
+    app_log_sent("wardriving start command", command.request_id);
     return true;
 }
 
@@ -835,7 +828,7 @@ APP_FN bool send_wardriving_status_query(Esp32App* app) {
     size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
         arguments_buf, sizeof(arguments_buf), &command_args);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "wardriving status query: arguments encode failed");
+        app_log_step("wardriving status query", "arguments encode");
         return false;
     }
 
@@ -849,7 +842,7 @@ APP_FN bool send_wardriving_status_query(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "wardriving status query: payload encode failed");
+        app_log_step("wardriving status query", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -867,13 +860,10 @@ APP_FN bool send_wardriving_status_query(Esp32App* app) {
     }
     app_pending_command_kind = PendingCommandWardrivingStatus;
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "wardriving status query: send failed");
+        app_log_step("wardriving status query", "send");
         return false;
     }
-    FURI_LOG_I(
-        TAG,
-        "wardriving status query sent (request_id=%llu)",
-        (unsigned long long)command.request_id);
+    app_log_sent("wardriving status query", command.request_id);
     return true;
 }
 
@@ -896,7 +886,7 @@ APP_FN bool send_wardriving_stop_command(Esp32App* app) {
     size_t arguments_len = feb_cbor_encode_wardriving_command_payload(
         arguments_buf, sizeof(arguments_buf), &command_args);
     if(arguments_len == 0) {
-        FURI_LOG_W(TAG, "wardriving stop: arguments encode failed");
+        app_log_step("wardriving stop", "arguments encode");
         return false;
     }
 
@@ -910,7 +900,7 @@ APP_FN bool send_wardriving_stop_command(Esp32App* app) {
     size_t payload_len = feb_cbor_encode_command_payload(
         app_cmd_payload_buf, sizeof(app_cmd_payload_buf), &command);
     if(payload_len == 0) {
-        FURI_LOG_W(TAG, "wardriving stop: payload encode failed");
+        app_log_step("wardriving stop", "payload encode");
         return false;
     }
     size_t record_len = session_send_encrypted_command(
@@ -928,13 +918,10 @@ APP_FN bool send_wardriving_stop_command(Esp32App* app) {
     }
     app_pending_command_kind = PendingCommandWardrivingStop;
     if(!send_pairing_record(profile, app_cmd_record_buf, record_len)) {
-        FURI_LOG_W(TAG, "wardriving stop: send failed");
+        app_log_step("wardriving stop", "send");
         return false;
     }
-    FURI_LOG_I(
-        TAG,
-        "wardriving stop command sent (request_id=%llu)",
-        (unsigned long long)command.request_id);
+    app_log_sent("wardriving stop command", command.request_id);
     return true;
 }
 
