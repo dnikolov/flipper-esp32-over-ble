@@ -29,8 +29,8 @@ $ErrorActionPreference = "Stop"
 
 # Release-time constants (docs/AGPS.md "Build contract"). Fill $AgpsGenTag and $AgpsGenSha256
 # from the published agps_gen.exe release asset; the all-zero hash makes Agps mode refuse to run.
-$AgpsGenTag = "agps-gen-v0"
-$AgpsGenSha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+$AgpsGenTag = "agps-gen-v1"
+$AgpsGenSha256 = "16102f733f605d8be4ad085b2032965b397a921c10398553d8eb00b9766ef8b1"
 $AgpsGenUrl = "https://github.com/dnikolov/flipper-esp32-over-ble/releases/download/$AgpsGenTag/agps_gen.exe"
 
 $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
