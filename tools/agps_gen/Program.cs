@@ -28,7 +28,6 @@ namespace AgpsGen
         public string SelfTestProp;
         public string SelfTestBc;
         public string TrajIn;
-        public string TrajIn;
     }
 
     sealed class SvResult
@@ -87,7 +86,6 @@ namespace AgpsGen
                     else if (a == "--svs") o.Svs = val().Split(',').Select(delegate(string s) { return int.Parse(s, CultureInfo.InvariantCulture); }).ToList();
                     else if (a == "--selftest-prop") o.SelfTestProp = val();
                     else if (a == "--selftest-bc") o.SelfTestBc = val();
-                    else if (a == "--traj-in") o.TrajIn = val();
                     else if (a == "--traj-in") o.TrajIn = val();
                     else if (a == "--help" || a == "-h" || a == "/?") return Usage(null);
                     else return Usage("unknown argument " + a);
@@ -340,20 +338,6 @@ namespace AgpsGen
             catch (Exception ex) { res.Excluded = "internal error: " + ex.Message; }
             finally { res.Seconds = sw.Elapsed.TotalSeconds; }
             return res;
-        }
-
-        static OrbitResult LoadTraj(string dir, int sv)
-        {
-            string[] ls = File.ReadAllLines(Path.Combine(dir, "traj_" + sv + ".txt"));
-            OrbitResult r = new OrbitResult();
-            r.Times = new double[ls.Length]; r.Ecef = new double[3 * ls.Length]; r.ArcSeconds = 172800;
-            for (int i = 0; i < ls.Length; i++)
-            {
-                string[] f = ls[i].Split(' ');
-                r.Times[i] = double.Parse(f[0], CultureInfo.InvariantCulture);
-                for (int k = 0; k < 3; k++) r.Ecef[3 * i + k] = double.Parse(f[1 + k], CultureInfo.InvariantCulture);
-            }
-            return r;
         }
 
         static OrbitResult LoadTraj(string dir, int sv)
