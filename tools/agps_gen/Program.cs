@@ -17,6 +17,8 @@ namespace AgpsGen
         public string NowIso;
         public bool TruthCheck;
         public bool Offline;
+        public string Source = "auto";
+        public string BkgBase, WuhanBase, CompareNav, CompareBin;
         public string Csv;
         public string DumpDir;
         public double Step = 30.0;
@@ -55,8 +57,8 @@ namespace AgpsGen
         static int Usage(string err)
         {
             if (err != null) Console.Error.WriteLine("agps_gen: " + err);
-            Console.Error.WriteLine("usage: agps_gen.exe --out <path> [--days 7] [--cache <dir>] [--offline]");
-            Console.Error.WriteLine("       developer: [--now <iso utc>] [--truth-check] [--csv <file>] [--dump-dir <dir>] [--svs 1,2,..]");
+            Console.Error.WriteLine("usage: agps_gen.exe --out <path> [--days 7] [--cache <dir>] [--offline] [--source auto|bkg|wuhan]");
+            Console.Error.WriteLine("       developer: [--bkg-base <url>] [--wuhan-base <url>] [--now <iso utc>] [--truth-check] [--csv <file>] [--dump-dir <dir>] [--svs 1,2,..]");
             Console.Error.WriteLine("                  [--step <s>] [--selftest-prop <file>] [--selftest-bc <sv>:<doy>]");
             return 2;
         }
@@ -78,6 +80,11 @@ namespace AgpsGen
                     else if (a == "--now") o.NowIso = val();
                     else if (a == "--truth-check") o.TruthCheck = true;
                     else if (a == "--offline") o.Offline = true;
+                    else if (a == "--source") { o.Source = val(); if (o.Source != "auto" && o.Source != "bkg" && o.Source != "wuhan") throw new ArgumentException("--source must be auto, bkg or wuhan"); }
+                    else if (a == "--compare-nav") o.CompareNav = val();
+                    else if (a == "--compare-bin") o.CompareBin = val();
+                    else if (a == "--bkg-base") o.BkgBase = val();
+                    else if (a == "--wuhan-base") o.WuhanBase = val();
                     else if (a == "--csv") o.Csv = val();
                     else if (a == "--dump-dir") o.DumpDir = val();
                     else if (a == "--step") o.Step = double.Parse(val(), CultureInfo.InvariantCulture);
@@ -97,6 +104,12 @@ namespace AgpsGen
             {
                 if (o.SelfTestProp != null) return SelfTest.RunProp(o);
                 if (o.SelfTestBc != null) return SelfTest.RunBc(o);
+                if (o.CompareBin != null) return SelfTest.RunCompareBin(o);
+                if (o.CompareNav != null)
+                {
+                    if (o.Cache == null) o.Cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "agps_gen", "cache");
+                    return SelfTest.RunCompare(o);
+                }
                 if (o.Out == null && !o.TruthCheck) return Usage("--out is required");
                 if (o.Days < 1 || o.Days > 14) return Usage("--days must be 1..14");
                 if (o.Cache == null)
@@ -150,6 +163,9 @@ namespace AgpsGen
 
             // ------------------------------------------------------------------ data
             NavSource src = new NavSource(o.Cache, o.Offline, Log);
+            src.Mode = o.Source;
+            if (o.BkgBase != null) src.BkgBase = o.BkgBase;
+            if (o.WuhanBase != null) src.WuhanBase = o.WuhanBase;
             DateTime firstDay = DayOf((long)(T0 - fitW - 3 * 3600.0) + K.GPS_UNIX0 - K.LEAP);
             DateTime lastDay = DayOf(nowUnix);
             DateTime lastTruthDay = o.TruthCheck ? DayOf((long)(T0 + nWin * WinSec + 7200) + K.GPS_UNIX0 - K.LEAP) : lastDay;
@@ -159,17 +175,10 @@ namespace AgpsGen
             Log("[1/5] navigation data: " + days.Count + " UTC days " + firstDay.ToString("yyyy-MM-dd") + " .. " + lastTruthDay.ToString("yyyy-MM-dd"));
             List<BcRec>[] perDay = new List<BcRec>[days.Count];
             string[] dayErr = new string[days.Count];
-            Parallel.For(0, days.Count, delegate(int i)
-            {
-                try { perDay[i] = src.LoadNavDay(days[i]); Log("  " + days[i].ToString("yyyy-MM-dd") + ": " + perDay[i].Count + " GPS records"); }
-                catch (Exception ex) { dayErr[i] = ex.Message; }
-            });
+            src.LoadDays(days, lastDay, UtcFromUnix(nowUnix), out perDay, out dayErr);
             for (int i = 0; i < days.Count; i++)
             {
                 if (perDay[i] != null) continue;
-                bool needed = days[i] <= lastDay;
-                bool tolerable = days[i] == lastDay && (UtcFromUnix(nowUnix) - days[i]).TotalHours < 3.0 && i > 0;
-                if (needed && !tolerable) throw new NavException("navigation data for " + days[i].ToString("yyyy-MM-dd") + " unavailable: " + dayErr[i]);
                 Log("  " + days[i].ToString("yyyy-MM-dd") + ": not available (" + dayErr[i] + ") -- continuing without it");
             }
             Dictionary<string, int> index = new Dictionary<string, int>();
@@ -512,6 +521,110 @@ namespace AgpsGen
 
     static class SelfTest
     {
+        // Developer: compare cached BKG (RINEX 3) and Wuhan (RINEX 2) records of one 2026 day, matched on (PRN, toe, IODC).
+        public static int RunCompare(Options o)
+        {
+            int doy = int.Parse(o.CompareNav, CultureInfo.InvariantCulture);
+            DateTime day = NavSource.DayStart(2026, doy);
+            NavSource src = new NavSource(o.Cache ?? ".", true, delegate(string s) { });
+            src.Active = "bkg";
+            List<BcRec> a = src.LoadNavDay(day);
+            src.Active = "wuhan";
+            List<BcRec> b = src.LoadNavDay(day);
+            Dictionary<string, BcRec> bm = new Dictionary<string, BcRec>();
+            foreach (BcRec r in b) bm[r.Svid + "|" + (long)r.ToeAbs + "|" + (long)r.Iodc] = r;
+            Dictionary<string, BcRec> am = new Dictionary<string, BcRec>();
+            foreach (BcRec r in a) am[r.Svid + "|" + (long)r.ToeAbs + "|" + (long)r.Iodc] = r;
+            int matched = 0, onlyA = 0, onlyB = 0, uraDiff = 0; string uraEx = "";
+            double dPos = 0, dPosAt1h = 0, mxRel = 0; string mxField = "";
+            foreach (KeyValuePair<string, BcRec> kv in am)
+            {
+                BcRec x = kv.Value, y;
+                if (!bm.TryGetValue(kv.Key, out y)) { onlyA++; continue; }
+                matched++;
+                double[] fx = new double[] { x.Af0, x.Af1, x.Af2, x.Iode, x.Crs, x.DeltaN, x.M0, x.Cuc, x.E, x.Cus, x.SqrtA, x.Toe, x.Cic, x.Omega0, x.Cis, x.I0, x.Crc, x.Omega, x.OmegaDot, x.Idot, x.Week, x.UraM, x.Health, x.Tgd, x.Iodc, x.Toc };
+                double[] fy = new double[] { y.Af0, y.Af1, y.Af2, y.Iode, y.Crs, y.DeltaN, y.M0, y.Cuc, y.E, y.Cus, y.SqrtA, y.Toe, y.Cic, y.Omega0, y.Cis, y.I0, y.Crc, y.Omega, y.OmegaDot, y.Idot, y.Week, y.UraM, y.Health, y.Tgd, y.Iodc, y.Toc };
+                string[] nm = new string[] { "af0", "af1", "af2", "iode", "crs", "deltan", "m0", "cuc", "e", "cus", "sqrta", "toe", "cic", "omega0", "cis", "i0", "crc", "omega", "omegadot", "idot", "week", "ura", "health", "tgd", "iodc", "toc" };
+                for (int i = 0; i < fx.Length; i++)
+                {
+                    double rel = Math.Abs(fx[i] - fy[i]) / Math.Max(1e-300, Math.Max(Math.Abs(fx[i]), Math.Abs(fy[i])));
+                    if (fx[i] == fy[i]) rel = 0;
+                    if (nm[i] == "ura") { if (rel > 0) { uraDiff++; if (uraEx == "") uraEx = "G" + x.Svid + " bkg " + fx[i] + " wuhan " + fy[i]; } } else if (rel > mxRel) { mxRel = rel; mxField = nm[i] + " G" + x.Svid + " toe " + x.ToeAbs; }
+                }
+                double[] p = new double[3], q = new double[3];
+                foreach (double dt in new double[] { 0, 3600 })
+                {
+                    Bc.Pos(x, x.ToeAbs + dt, p); Bc.Pos(y, x.ToeAbs + dt, q);
+                    double d = Math.Sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]));
+                    if (dt == 0) dPos = Math.Max(dPos, d); else dPosAt1h = Math.Max(dPosAt1h, d);
+                }
+            }
+            foreach (string k in bm.Keys) if (!am.ContainsKey(k)) onlyB++;
+            Console.WriteLine("doy " + doy + ": bkg " + a.Count + " records (" + am.Count + " distinct), wuhan " + b.Count + " (" + bm.Count + " distinct); matched " + matched + ", only-bkg " + onlyA + ", only-wuhan " + onlyB);
+            Console.WriteLine("  ura differs in " + uraDiff + " matched records (" + uraEx + ")");
+            Console.WriteLine("  max relative field difference (excl. ura) over matched: " + mxRel.ToString("0.0e+00", CultureInfo.InvariantCulture) + " (" + mxField + ")");
+            Console.WriteLine("  max position difference at toe: " + dPos.ToString("0.000000", CultureInfo.InvariantCulture) + " m, at toe+1h: " + dPosAt1h.ToString("0.000000", CultureInfo.InvariantCulture) + " m");
+            return 0;
+        }
+
+        // Developer: decode two agps.bin files and compare the per-SV window ephemerides (position over each window).
+        public static int RunCompareBin(Options o)
+        {
+            string[] p = o.CompareBin.Split(',');
+            byte[] a = File.ReadAllBytes(p[0]), b = File.ReadAllBytes(p[1]);
+            int na = BitConverter.ToUInt16(a, 6), nb = BitConverter.ToUInt16(b, 6);
+            if (na != nb) { Console.WriteLine("window counts differ: " + na + " vs " + nb); return 1; }
+            List<double> errs = new List<double>();
+            int frames = 0, missing = 0, ionDiff = 0;
+            for (int k = 0; k < na; k++)
+            {
+                Dictionary<int, byte[]> fa = Frames(a, k), fb = Frames(b, k);
+                byte[] ia, ib;
+                bool hasIa = fa.TryGetValue(-1, out ia), hasIb = fb.TryGetValue(-1, out ib);
+                if (hasIa != hasIb) ionDiff++;
+                else if (hasIa) { ib = fb[-1]; for (int i = 0; i < ia.Length; i++) if (ia[i] != ib[i]) { ionDiff++; break; } }
+                foreach (KeyValuePair<int, byte[]> kv in fa)
+                {
+                    if (kv.Key < 0) continue;
+                    byte[] y;
+                    if (!fb.TryGetValue(kv.Key, out y)) { missing++; continue; }
+                    BcRec x1 = Casic.DecodeEph(kv.Value), y1 = Casic.DecodeEph(y);
+                    uint from = BitConverter.ToUInt32(a, 16 + 16 * k);
+                    double toeAbsGps = (double)from + K.LEAP - K.GPS_UNIX0 + 7200.0;
+                    x1.ToeAbs = Math.Floor(toeAbsGps / 604800.0) * 604800.0 + x1.Toe; y1.ToeAbs = Math.Floor(toeAbsGps / 604800.0) * 604800.0 + y1.Toe;
+                    double[] u = new double[3], v = new double[3];
+                    for (double t = toeAbsGps - 7200; t <= toeAbsGps + 7200 + 1e-6; t += 600)
+                    {
+                        Bc.Pos(x1, t, u); Bc.Pos(y1, t, v);
+                        errs.Add(Math.Sqrt((u[0] - v[0]) * (u[0] - v[0]) + (u[1] - v[1]) * (u[1] - v[1]) + (u[2] - v[2]) * (u[2] - v[2])));
+                    }
+                    frames++;
+                }
+            }
+            errs.Sort();
+            Console.WriteLine("windows " + na + ", eph frames compared " + frames + ", missing in 2nd " + missing + ", windows with ION frame differing " + ionDiff);
+            if (errs.Count > 0)
+                Console.WriteLine("position difference over each window (m): median " + errs[errs.Count / 2].ToString("0.000", CultureInfo.InvariantCulture) + ", p95 " + errs[(int)(errs.Count * 0.95)].ToString("0.000", CultureInfo.InvariantCulture) + ", max " + errs[errs.Count - 1].ToString("0.000", CultureInfo.InvariantCulture));
+            return 0;
+        }
+
+        static Dictionary<int, byte[]> Frames(byte[] f, int k)
+        {
+            Dictionary<int, byte[]> d = new Dictionary<int, byte[]>();
+            int e = 16 + 16 * k;
+            int off = (int)BitConverter.ToUInt32(f, e + 8), len = BitConverter.ToUInt16(f, e + 12);
+            int p = off;
+            while (p < off + len)
+            {
+                int pl = BitConverter.ToUInt16(f, p + 2);
+                byte[] pay = new byte[pl];
+                Array.Copy(f, p + 6, pay, 0, pl);
+                if (f[p + 4] == 8 && f[p + 5] == 7) d[Casic.DecodeEph(pay).Svid] = pay; else d[-1] = pay;
+                p += 10 + pl;
+            }
+            return d;
+        }
+
         public static int RunBc(Options o)
         {
             string[] p = o.SelfTestBc.Split(':');
