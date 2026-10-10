@@ -166,7 +166,7 @@
    the independent mesh-node/Method-2 upload alongside the existing CSV upload), confirmed
    pushed to origin/main via `git ls-remote` -- bump it again if that script's contract
    changes after this. */
-#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "afe976b5343f8a119d94e0b421c7aa6245b93cb6"
+#define WARDRIVING_PUBLISH_SCRIPT_COMMIT "7fa0adaeeb352a1d92a9f840a46be677c3ee7803"
 
 typedef enum {
     CharacteristicWrite,
